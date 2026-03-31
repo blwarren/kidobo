@@ -53,8 +53,8 @@ mod tests {
     use std::collections::{BTreeMap, VecDeque};
     use std::fs;
     use std::path::Path;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::Duration;
 
@@ -79,18 +79,18 @@ mod tests {
     use crate::core::network::{CanonicalCidr, cidr_overlaps, parse_ip_cidr_token};
     use crate::error::KidoboError;
 
-    struct MockHttpClient {
+    struct MockHttpClient<'a> {
         responses: Mutex<BTreeMap<String, VecDeque<Result<HttpResponse, HttpClientError>>>>,
-        events: Arc<Mutex<Vec<String>>>,
+        events: &'a Mutex<Vec<String>>,
         in_flight: AtomicUsize,
         max_in_flight: AtomicUsize,
         delay_ms: u64,
     }
 
-    impl MockHttpClient {
+    impl<'a> MockHttpClient<'a> {
         fn new(
             responses: BTreeMap<String, VecDeque<Result<HttpResponse, HttpClientError>>>,
-            events: Arc<Mutex<Vec<String>>>,
+            events: &'a Mutex<Vec<String>>,
             delay_ms: u64,
         ) -> Self {
             Self {
@@ -122,7 +122,7 @@ mod tests {
         }
     }
 
-    impl HttpClient for MockHttpClient {
+    impl HttpClient for MockHttpClient<'_> {
         fn fetch(&self, request: HttpRequest) -> Result<HttpResponse, HttpClientError> {
             {
                 let mut events = self
@@ -155,13 +155,13 @@ mod tests {
         }
     }
 
-    struct MockCommandRunner {
-        events: Arc<Mutex<Vec<String>>>,
+    struct MockCommandRunner<'a> {
+        events: &'a Mutex<Vec<String>>,
         restore_scripts: Mutex<Vec<String>>,
     }
 
-    impl MockCommandRunner {
-        fn new(events: Arc<Mutex<Vec<String>>>) -> Self {
+    impl<'a> MockCommandRunner<'a> {
+        fn new(events: &'a Mutex<Vec<String>>) -> Self {
             Self {
                 events,
                 restore_scripts: Mutex::new(Vec::new()),
@@ -266,13 +266,13 @@ mod tests {
         }
     }
 
-    impl IpsetCommandRunner for MockCommandRunner {
+    impl IpsetCommandRunner for MockCommandRunner<'_> {
         fn run(&self, command: &str, args: &[&str]) -> Result<CommandResult, CommandRunnerError> {
             Ok(self.run_impl(command, args))
         }
     }
 
-    impl FirewallCommandRunner for MockCommandRunner {
+    impl FirewallCommandRunner for MockCommandRunner<'_> {
         fn run(&self, command: &str, args: &[&str]) -> Result<CommandResult, CommandRunnerError> {
             Ok(self.run_impl(command, args))
         }
@@ -391,7 +391,7 @@ mod tests {
         let url_b = "https://example.com/b.txt".to_string();
         let config = test_config(vec![url_a.clone(), url_b.clone()]);
 
-        let events = Arc::new(Mutex::new(Vec::new()));
+        let events = Mutex::new(Vec::new());
 
         let mut responses = BTreeMap::new();
         responses.insert(
@@ -413,8 +413,8 @@ mod tests {
             })]),
         );
 
-        let http_client = MockHttpClient::new(responses, Arc::clone(&events), 0);
-        let runner = MockCommandRunner::new(Arc::clone(&events));
+        let http_client = MockHttpClient::new(responses, &events, 0);
+        let runner = MockCommandRunner::new(&events);
 
         let summary = run_sync_with_dependencies(
             &paths,
@@ -469,7 +469,7 @@ mod tests {
 
         let url = "https://example.com/a.txt".to_string();
         let config = test_config(vec![url.clone()]);
-        let events = Arc::new(Mutex::new(Vec::new()));
+        let events = Mutex::new(Vec::new());
         let responses = BTreeMap::from([(
             url,
             VecDeque::from([Ok(HttpResponse {
@@ -480,8 +480,8 @@ mod tests {
             })]),
         )]);
 
-        let http_client = MockHttpClient::new(responses, Arc::clone(&events), 0);
-        let runner = MockCommandRunner::new(events);
+        let http_client = MockHttpClient::new(responses, &events, 0);
+        let runner = MockCommandRunner::new(&events);
 
         run_sync_with_dependencies(
             &paths,
@@ -519,7 +519,7 @@ mod tests {
 
         let url = "https://example.com/a.txt".to_string();
         let config = test_config(vec![url.clone()]);
-        let events = Arc::new(Mutex::new(Vec::new()));
+        let events = Mutex::new(Vec::new());
         let responses = BTreeMap::from([(
             url,
             VecDeque::from([Ok(HttpResponse {
@@ -530,8 +530,8 @@ mod tests {
             })]),
         )]);
 
-        let http_client = MockHttpClient::new(responses, Arc::clone(&events), 0);
-        let runner = MockCommandRunner::new(events);
+        let http_client = MockHttpClient::new(responses, &events, 0);
+        let runner = MockCommandRunner::new(&events);
 
         run_sync_with_dependencies(
             &paths,
@@ -563,7 +563,7 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let cache_dir = temp.path();
 
-        let events = Arc::new(Mutex::new(Vec::new()));
+        let events = Mutex::new(Vec::new());
 
         let urls = (0..8)
             .map(|idx| format!("https://example.com/{idx}.txt"))
@@ -591,7 +591,7 @@ mod tests {
             }
         }
 
-        let http_client = MockHttpClient::new(responses, events, 25);
+        let http_client = MockHttpClient::new(responses, &events, 25);
 
         let networks =
             fetch_remote_networks_concurrently(&urls, &http_client, cache_dir, &BTreeMap::new());
@@ -624,7 +624,7 @@ mod tests {
         let mut config = test_config(vec![url.clone()]);
         config.safe.ips = vec![parse_ip_cidr_token("10.0.0.0/25").expect("valid safe cidr")];
 
-        let events = Arc::new(Mutex::new(Vec::new()));
+        let events = Mutex::new(Vec::new());
         let responses = BTreeMap::from([(
             url,
             VecDeque::from([Ok(HttpResponse {
@@ -635,8 +635,8 @@ mod tests {
             })]),
         )]);
 
-        let http_client = MockHttpClient::new(responses, Arc::clone(&events), 0);
-        let runner = MockCommandRunner::new(Arc::clone(&events));
+        let http_client = MockHttpClient::new(responses, &events, 0);
+        let runner = MockCommandRunner::new(&events);
 
         let summary = run_sync_with_dependencies(
             &paths,
@@ -706,9 +706,9 @@ mod tests {
             })]),
         )]);
 
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let http_client = MockHttpClient::new(responses, Arc::clone(&events), 0);
-        let runner = MockCommandRunner::new(events);
+        let events = Mutex::new(Vec::new());
+        let http_client = MockHttpClient::new(responses, &events, 0);
+        let runner = MockCommandRunner::new(&events);
 
         let summary = run_sync_with_dependencies(
             &paths,
@@ -819,9 +819,9 @@ mod tests {
             ),
         ]);
 
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let http_client = MockHttpClient::new(responses, Arc::clone(&events), 0);
-        let runner = MockCommandRunner::new(events);
+        let events = Mutex::new(Vec::new());
+        let http_client = MockHttpClient::new(responses, &events, 0);
+        let runner = MockCommandRunner::new(&events);
 
         let summary = run_sync_with_dependencies(
             &paths,
@@ -890,9 +890,9 @@ mod tests {
             })]),
         )]);
 
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let http_client = MockHttpClient::new(responses, Arc::clone(&events), 0);
-        let runner = MockCommandRunner::new(events);
+        let events = Mutex::new(Vec::new());
+        let http_client = MockHttpClient::new(responses, &events, 0);
+        let runner = MockCommandRunner::new(&events);
 
         let summary = run_sync_with_dependencies(
             &paths,
@@ -924,9 +924,9 @@ mod tests {
         let mut config = test_config(Vec::new());
         config.ipset.chain_action = FirewallAction::Reject;
 
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let http_client = MockHttpClient::new(BTreeMap::new(), Arc::clone(&events), 0);
-        let runner = MockCommandRunner::new(events);
+        let events = Mutex::new(Vec::new());
+        let http_client = MockHttpClient::new(BTreeMap::new(), &events, 0);
+        let runner = MockCommandRunner::new(&events);
 
         run_sync_with_dependencies(
             &paths,
@@ -960,7 +960,7 @@ mod tests {
 
         let url = "https://example.com/ipv6-off.txt".to_string();
         let config = test_config_with_ipv6(vec![url.clone()], false);
-        let events = Arc::new(Mutex::new(Vec::new()));
+        let events = Mutex::new(Vec::new());
         let responses = BTreeMap::from([(
             url,
             VecDeque::from([Ok(HttpResponse {
@@ -971,8 +971,8 @@ mod tests {
             })]),
         )]);
 
-        let http_client = MockHttpClient::new(responses, Arc::clone(&events), 0);
-        let runner = MockCommandRunner::new(events);
+        let http_client = MockHttpClient::new(responses, &events, 0);
+        let runner = MockCommandRunner::new(&events);
 
         let summary = run_sync_with_dependencies(
             &paths,
@@ -1011,9 +1011,10 @@ mod tests {
         let mut config = test_config_with_ipv6(Vec::new(), false);
         config.ipset.maxelem = MaxElem::new(1).expect("valid maxelem");
 
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let http_client = MockHttpClient::new(BTreeMap::new(), events, 0);
-        let runner = MockCommandRunner::new(Arc::new(Mutex::new(Vec::new())));
+        let events = Mutex::new(Vec::new());
+        let http_client = MockHttpClient::new(BTreeMap::new(), &events, 0);
+        let runner_events = Mutex::new(Vec::new());
+        let runner = MockCommandRunner::new(&runner_events);
 
         let err = run_sync_with_dependencies(
             &paths,

@@ -300,7 +300,7 @@ fn parse_cidrs_from_cache_contents(contents: &str) -> Option<Vec<CanonicalCidr>>
 mod tests {
     use std::collections::VecDeque;
     use std::fs;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Mutex;
     use std::time::Duration;
 
     use tempfile::TempDir;
@@ -338,17 +338,16 @@ mod tests {
         }
     }
 
-    #[derive(Clone)]
     struct MockCommandExecutor {
-        requests: Arc<Mutex<Vec<CommandRequest>>>,
-        responses: Arc<Mutex<VecDeque<Result<CommandResult, CommandRunnerError>>>>,
+        requests: Mutex<Vec<CommandRequest>>,
+        responses: Mutex<VecDeque<Result<CommandResult, CommandRunnerError>>>,
     }
 
     impl MockCommandExecutor {
         fn new(responses: Vec<Result<CommandResult, CommandRunnerError>>) -> Self {
             Self {
-                requests: Arc::new(Mutex::new(Vec::new())),
-                responses: Arc::new(Mutex::new(VecDeque::from(responses))),
+                requests: Mutex::new(Vec::new()),
+                responses: Mutex::new(VecDeque::from(responses)),
             }
         }
 
@@ -357,7 +356,7 @@ mod tests {
         }
     }
 
-    impl CommandExecutor for MockCommandExecutor {
+    impl CommandExecutor for &MockCommandExecutor {
         fn execute(&self, request: &CommandRequest) -> Result<CommandResult, CommandRunnerError> {
             self.requests.lock().expect("lock").push(request.clone());
             self.responses
@@ -412,7 +411,7 @@ mod tests {
                 stderr: String::new(),
             }),
         ]);
-        let resolver = Bgpq4AsnPrefixResolver::new(executor.clone(), Duration::from_secs(5));
+        let resolver = Bgpq4AsnPrefixResolver::new(&executor, Duration::from_secs(5));
 
         let prefixes = resolver.resolve_prefixes(64512).expect("resolve");
         let rendered = prefixes
@@ -438,7 +437,7 @@ mod tests {
             stdout: String::new(),
             stderr: "no route object".to_string(),
         })]);
-        let resolver = Bgpq4AsnPrefixResolver::new(executor, Duration::from_secs(5));
+        let resolver = Bgpq4AsnPrefixResolver::new(&executor, Duration::from_secs(5));
 
         let err = resolver.resolve_prefixes(64512).expect_err("must fail");
         match err {
@@ -458,7 +457,7 @@ mod tests {
             stdout: String::new(),
             stderr: "   ".to_string(),
         })]);
-        let resolver = Bgpq4AsnPrefixResolver::new(executor, Duration::from_secs(5));
+        let resolver = Bgpq4AsnPrefixResolver::new(&executor, Duration::from_secs(5));
 
         let err = resolver.resolve_prefixes(64512).expect_err("must fail");
         match err {
@@ -484,7 +483,7 @@ mod tests {
                 stderr: "ipv6 failed".to_string(),
             }),
         ]);
-        let resolver = Bgpq4AsnPrefixResolver::new(executor.clone(), Duration::from_secs(5));
+        let resolver = Bgpq4AsnPrefixResolver::new(&executor, Duration::from_secs(5));
 
         let err = resolver.resolve_prefixes(64512).expect_err("must fail");
         match err {
