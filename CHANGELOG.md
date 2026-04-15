@@ -4,7 +4,7 @@
 
 ### Changed
 
-- TODO
+- Updated the `rustls-webpki` dependency to `0.103.12` to address recent certificate name-constraint vulnerabilities in TLS verification.
 
 ## [0.10.0] - 2026-03-31
 
