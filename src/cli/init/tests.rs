@@ -137,6 +137,18 @@ fn ensure_systemd_timer_enabled_runs_expected_commands() {
 }
 
 #[test]
+fn ensure_systemd_timer_enabled_propagates_non_zero_exit_as_init_systemd() {
+    let runner = MockInitCommandRunner::new(vec![Ok(CommandResult {
+        status: ProcessStatus::Exited(1),
+        stdout: String::new(),
+        stderr: "failed".to_string(),
+    })]);
+
+    let err = ensure_systemd_timer_enabled(&runner).expect_err("must fail");
+    assert!(matches!(err, KidoboError::InitSystemd { .. }));
+}
+
+#[test]
 fn run_init_with_paths_creates_expected_files() {
     let temp = TempDir::new().expect("tempdir");
     let paths = test_paths(temp.path());
@@ -165,17 +177,13 @@ fn run_init_with_paths_with_summary_reports_created_files() {
 }
 
 #[test]
-fn run_init_with_paths_and_runner_propagates_systemd_errors() {
+fn run_init_with_paths_and_runner_skips_systemd_commands_for_root_override() {
     let temp = TempDir::new().expect("tempdir");
     let paths = test_paths(temp.path());
-    let runner = MockInitCommandRunner::new(vec![Ok(CommandResult {
-        status: ProcessStatus::Exited(1),
-        stdout: String::new(),
-        stderr: "failed".to_string(),
-    })]);
+    let runner = MockInitCommandRunner::new(vec![]);
 
-    let err = run_init_with_paths_and_runner(&paths, &runner, None).expect_err("must fail");
-    assert!(matches!(err, KidoboError::InitSystemd { .. }));
+    run_init_with_paths_and_runner(&paths, &runner, Some(temp.path())).expect("init");
+    assert!(runner.invocations().is_empty());
 }
 
 #[test]
