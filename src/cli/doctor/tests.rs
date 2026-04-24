@@ -156,6 +156,16 @@ fn build_doctor_report_preserves_json_status_shape() {
             .iter()
             .any(|check| check.name == "config_parse" && check.status == DoctorCheckStatus::Ok)
     );
+
+    let json = serde_json::to_value(&report).expect("doctor report serializes");
+    assert_eq!(json["overall"], "OK");
+    assert!(
+        json["checks"]
+            .as_array()
+            .expect("checks is an array")
+            .iter()
+            .any(|check| check["name"] == "config_parse" && check["status"] == "OK")
+    );
 }
 
 fn success() -> CommandResult {

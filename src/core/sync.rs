@@ -178,6 +178,80 @@ mod tests {
         expanded
     }
 
+    fn assert_ipv4_coverage_exact(cidrs: &[Ipv4Cidr], expected_start: u32, expected_end: u32) {
+        let mut intervals = cidrs
+            .iter()
+            .copied()
+            .map(ipv4_to_interval)
+            .collect::<Vec<_>>();
+        intervals.sort_unstable();
+
+        let mut next_start = expected_start;
+        for (idx, interval) in intervals.iter().enumerate() {
+            assert_eq!(
+                interval.start, next_start,
+                "IPv4 coverage has a gap or overlap before interval {interval:?}"
+            );
+            assert!(
+                interval.end <= expected_end,
+                "IPv4 coverage extends beyond expected end: {interval:?}"
+            );
+
+            if interval.end == expected_end {
+                assert_eq!(
+                    idx + 1,
+                    intervals.len(),
+                    "IPv4 coverage has extra intervals after expected end"
+                );
+                return;
+            }
+
+            next_start = interval
+                .end
+                .checked_add(1)
+                .expect("IPv4 interval end should not overflow before expected end");
+        }
+
+        panic!("IPv4 coverage ended before expected range {expected_start}..={expected_end}");
+    }
+
+    fn assert_ipv6_coverage_exact(cidrs: &[Ipv6Cidr], expected_start: u128, expected_end: u128) {
+        let mut intervals = cidrs
+            .iter()
+            .copied()
+            .map(ipv6_to_interval)
+            .collect::<Vec<_>>();
+        intervals.sort_unstable();
+
+        let mut next_start = expected_start;
+        for (idx, interval) in intervals.iter().enumerate() {
+            assert_eq!(
+                interval.start, next_start,
+                "IPv6 coverage has a gap or overlap before interval {interval:?}"
+            );
+            assert!(
+                interval.end <= expected_end,
+                "IPv6 coverage extends beyond expected end: {interval:?}"
+            );
+
+            if interval.end == expected_end {
+                assert_eq!(
+                    idx + 1,
+                    intervals.len(),
+                    "IPv6 coverage has extra intervals after expected end"
+                );
+                return;
+            }
+
+            next_start = interval
+                .end
+                .checked_add(1)
+                .expect("IPv6 interval end should not overflow before expected end");
+        }
+
+        panic!("IPv6 coverage ended before expected range {expected_start}..={expected_end}");
+    }
+
     #[test]
     fn pipeline_collapses_and_carves_per_family() {
         let candidates = vec![
@@ -237,14 +311,9 @@ mod tests {
         ];
 
         let effective = compute_effective_blocklists(&candidates, &safelist, true);
-        assert!(
-            !effective.ipv4.is_empty(),
-            "carving edge hosts from IPv4 /0 must leave blocked space"
-        );
-        assert!(
-            !effective.ipv6.is_empty(),
-            "carving edge hosts from IPv6 /0 must leave blocked space"
-        );
+
+        assert_ipv4_coverage_exact(&effective.ipv4, 1, u32::MAX - 1);
+        assert_ipv6_coverage_exact(&effective.ipv6, 1, u128::MAX - 1);
         assert_disjoint_from_safelist(&effective, &safelist, true);
     }
 
