@@ -16,7 +16,8 @@ use crate::adapters::ipset::{
     IpsetCommandRunner, IpsetFamily, IpsetSetSpec, atomic_replace_ipset_values, ensure_ipset_exists,
 };
 use crate::adapters::iptables::{
-    ChainAction, FirewallCommandRunner, ensure_firewall_wiring_for_families,
+    ChainAction, FirewallCommandRunner, FirewallFamily, cleanup_firewall_wiring,
+    ensure_firewall_wiring_for_families,
 };
 use crate::adapters::path::ResolvedPaths;
 use crate::core::config::{Config, FirewallAction};
@@ -90,6 +91,9 @@ pub(crate) fn run(
         config.ipset.enable_ipv6,
         chain_action(config),
     )?;
+    if !config.ipset.enable_ipv6 {
+        cleanup_disabled_ipv6_artifacts(firewall_runner, ipset_runner, &config.ipset.set_name_v6);
+    }
     timer.mark("ensure_firewall_wiring");
 
     let fast_state_path = paths.cache_dir.join(BLOCKLIST_FAST_STATE_FILE);
@@ -258,6 +262,22 @@ fn chain_action(config: &Config) -> ChainAction {
     match config.ipset.chain_action {
         FirewallAction::Drop => ChainAction::Drop,
         FirewallAction::Reject => ChainAction::Reject,
+    }
+}
+
+fn cleanup_disabled_ipv6_artifacts(
+    firewall_runner: &dyn FirewallCommandRunner,
+    ipset_runner: &dyn IpsetCommandRunner,
+    set_name_v6: &str,
+) {
+    if let Err(err) = cleanup_firewall_wiring(firewall_runner, FirewallFamily::Ipv6) {
+        warn!("disabled IPv6 firewall cleanup failed softly: {err}");
+    }
+
+    match ipset_runner.run("ipset", &["destroy", set_name_v6]) {
+        Ok(result) if result.status.success() => {}
+        Ok(_) => {}
+        Err(err) => warn!("disabled IPv6 ipset cleanup failed softly for {set_name_v6}: {err}"),
     }
 }
 

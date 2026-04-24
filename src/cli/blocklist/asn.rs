@@ -25,6 +25,7 @@ pub(super) fn run_ban_asn_command(
     asn_tokens: &[String],
 ) -> Result<(), KidoboError> {
     let requested_asns = normalize_asn_tokens(asn_tokens)?;
+    let _lock = acquire_non_blocking(lock_path)?;
     let config = load_config_from_file(config_path)?;
     let stale_after = Duration::from_secs(u64::from(config.asn.cache_stale_after_secs.get()));
     let asn_cache_dir = cache_dir.join("asn");
@@ -41,18 +42,13 @@ pub(super) fn run_ban_asn_command(
     resolved_prefixes.sort_unstable();
     resolved_prefixes.dedup();
 
-    let (update, removed_dups) = {
-        let _lock = acquire_non_blocking(lock_path)?;
-        let update = update_asn_bans(config_path, &requested_asns, &[])?;
-        let removed_dups =
-            match remove_exact_blocklist_duplicates(blocklist_path, &resolved_prefixes) {
-                Ok(removed) => removed,
-                Err(err) => {
-                    warn!("ASN ban duplicate cleanup failed after config update: {err}");
-                    0
-                }
-            };
-        (update, removed_dups)
+    let update = update_asn_bans(config_path, &requested_asns, &[])?;
+    let removed_dups = match remove_exact_blocklist_duplicates(blocklist_path, &resolved_prefixes) {
+        Ok(removed) => removed,
+        Err(err) => {
+            warn!("ASN ban duplicate cleanup failed after config update: {err}");
+            0
+        }
     };
 
     println!(

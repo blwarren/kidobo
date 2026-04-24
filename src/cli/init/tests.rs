@@ -167,6 +167,23 @@ fn run_init_with_paths_creates_expected_files() {
 }
 
 #[test]
+fn run_init_rejects_directory_at_config_file_path() {
+    let temp = TempDir::new().expect("tempdir");
+    let paths = test_paths(temp.path());
+    fs::create_dir_all(&paths.config_file).expect("create blocking directory");
+
+    let err = run_init_with_paths(&paths).expect_err("init must fail");
+
+    match err {
+        KidoboError::InitIo { path, reason } => {
+            assert_eq!(path, paths.config_file);
+            assert_eq!(reason, "path exists but is not a file");
+        }
+        _ => panic!("expected InitIo"),
+    }
+}
+
+#[test]
 fn run_init_with_paths_with_summary_reports_created_files() {
     let temp = TempDir::new().expect("tempdir");
     let paths = test_paths(temp.path());

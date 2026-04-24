@@ -7,18 +7,16 @@ use crate::adapters::command_common::display_command;
 use crate::adapters::command_runner::{CommandResult, CommandRunnerError, SudoCommandRunner};
 use crate::adapters::config::load_config_from_file;
 use crate::adapters::ipset::IpsetCommandRunner;
-use crate::adapters::iptables::{
-    FirewallCommandRunner, FirewallFamily, KIDOBO_CHAIN_NAME, remove_all_input_jumps_for_chain,
-};
+use crate::adapters::iptables::{FirewallCommandRunner, FirewallFamily, cleanup_firewall_wiring};
 use crate::adapters::lock::acquire_non_blocking;
-use crate::adapters::path::{PathResolutionInput, resolve_paths, resolve_paths_for_init};
+use crate::adapters::path::{PathResolutionInput, resolve_paths, resolve_paths_without_config};
 use crate::core::config::Config;
 use crate::error::KidoboError;
 
 pub fn run_flush_command(cache_only: bool) -> Result<(), KidoboError> {
     let path_input = PathResolutionInput::from_process(None);
     let paths = if cache_only {
-        resolve_paths_for_init(&path_input)?
+        resolve_paths_without_config(&path_input)?
     } else {
         resolve_paths(&path_input)?
     };
@@ -43,37 +41,17 @@ pub(crate) fn run_flush_with_runner(
     remote_cache_dir: &Path,
 ) {
     cleanup_firewall_family(firewall_runner, FirewallFamily::Ipv4);
-    if config.ipset.enable_ipv6 {
-        cleanup_firewall_family(firewall_runner, FirewallFamily::Ipv6);
-    }
+    cleanup_firewall_family(firewall_runner, FirewallFamily::Ipv6);
 
     best_effort_ipset_destroy(ipset_runner, &config.ipset.set_name);
-    if config.ipset.enable_ipv6 {
-        best_effort_ipset_destroy(ipset_runner, &config.ipset.set_name_v6);
-    }
+    best_effort_ipset_destroy(ipset_runner, &config.ipset.set_name_v6);
 
     best_effort_clear_remote_cache_dir(remote_cache_dir);
 }
 
 fn cleanup_firewall_family(runner: &dyn FirewallCommandRunner, family: FirewallFamily) {
-    if let Err(err) = remove_all_input_jumps_for_chain(runner, family, KIDOBO_CHAIN_NAME) {
-        let binary = firewall_binary(family);
-        warn!("best-effort flush command failed: {binary} -D INPUT -j {KIDOBO_CHAIN_NAME} ({err})");
-    }
-
-    let binary = firewall_binary(family);
-    best_effort_command(binary, &["-F", KIDOBO_CHAIN_NAME], |command, args| {
-        runner.run(command, args)
-    });
-    best_effort_command(binary, &["-X", KIDOBO_CHAIN_NAME], |command, args| {
-        runner.run(command, args)
-    });
-}
-
-fn firewall_binary(family: FirewallFamily) -> &'static str {
-    match family {
-        FirewallFamily::Ipv4 => "iptables",
-        FirewallFamily::Ipv6 => "ip6tables",
+    if let Err(err) = cleanup_firewall_wiring(runner, family) {
+        warn!("best-effort flush firewall cleanup failed for {family:?}: {err}");
     }
 }
 
@@ -312,7 +290,7 @@ mod tests {
     }
 
     #[test]
-    fn flush_skips_ipv6_cleanup_when_disabled() {
+    fn flush_attempts_ipv6_cleanup_when_disabled_to_remove_stale_artifacts() {
         let config = test_config(false);
         let runner = MockRunner::new(1, 99, false);
         let temp = TempDir::new().expect("tempdir");
@@ -322,11 +300,11 @@ mod tests {
         run_flush_with_runner(&config, &runner, &runner, &remote_cache_dir);
 
         let invocations = runner.invocations();
-        assert!(invocations.iter().all(|(cmd, _)| cmd != "ip6tables"));
+        assert!(invocations.iter().any(|(cmd, _)| cmd == "ip6tables"));
         assert!(
             invocations
                 .iter()
-                .all(|(cmd, args)| !(cmd == "ipset" && args == &["destroy", "kidobo-v6"]))
+                .any(|(cmd, args)| cmd == "ipset" && args == &["destroy", "kidobo-v6"])
         );
     }
 

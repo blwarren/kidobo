@@ -79,6 +79,14 @@ struct CachedFallback<'a> {
     sidecar: Option<&'a GithubMetaCategorySidecar>,
 }
 
+#[derive(Debug, Clone)]
+struct GithubMetaCache {
+    raw: Option<Vec<u8>>,
+    networks: Option<Vec<CanonicalCidr>>,
+    meta: Option<GithubMetaCacheMetadata>,
+    sidecar: Option<GithubMetaCategorySidecar>,
+}
+
 impl CachePaths {
     fn from_cache_dir(cache_dir: &Path) -> Self {
         Self {
@@ -99,41 +107,8 @@ pub fn load_github_meta_safelist(
     let selection = CategorySelection::from_mode(category_mode);
     let max_bytes = max_http_body_bytes(env);
     let paths = CachePaths::from_cache_dir(cache_dir);
-
-    let cached_meta = read_optional_json_lossy::<GithubMetaCacheMetadata>(
-        &paths.meta_path,
-        GITHUB_META_META_READ_LIMIT,
-        "github meta cache file",
-    );
-    let cached_raw = read_validated_bytes_lossy(
-        &paths.raw_path,
-        GITHUB_META_CACHE_READ_LIMIT,
-        "github meta cache file",
-        cached_meta.as_ref().map(|meta| meta.sha256_raw.as_str()),
-        "github meta raw cache",
-        "raw body",
-    );
-    let cached_sidecar = read_optional_json_lossy::<GithubMetaCategorySidecar>(
-        &paths.category_path,
-        GITHUB_META_CATEGORY_READ_LIMIT,
-        "github meta cache file",
-    );
-    let cache_is_compatible = cache_scope_compatible(&selection, cached_sidecar.as_ref());
-    let cached_networks = if cache_is_compatible {
-        cached_raw
-            .as_deref()
-            .and_then(|raw| parse_and_extract_networks(raw, &selection))
-    } else {
-        None
-    };
-    let (cached_etag, cached_last_modified) = cached_meta.as_ref().map_or((None, None), |meta| {
-        (meta.etag.clone(), meta.last_modified.clone())
-    });
-
-    let cached_networks_for_not_modified = cached_networks.clone();
-    let cached_meta_for_not_modified = cached_meta.clone();
-    let cached_networks_for_fallback = cached_networks.clone();
-    let cached_meta_for_fallback = cached_meta.clone();
+    let cache = read_github_meta_cache(&paths, &selection, github_meta_url);
+    let (cached_etag, cached_last_modified) = cache.http_validators();
 
     run_cached_fetch(
         CachedFetchRequest {
@@ -142,34 +117,28 @@ pub fn load_github_meta_safelist(
             max_body_bytes: max_bytes,
             cached_etag,
             cached_last_modified,
-            has_usable_cache: cached_networks.is_some(),
+            has_usable_cache: cache.networks.is_some(),
             log_subject: "github meta",
             missing_response_warning: "github meta fetch returned network outcome without response",
         },
         || {
-            if let Some(networks) = cached_networks_for_not_modified {
+            if let Some(networks) = cache.networks.clone() {
                 return Ok(GithubMetaLoadResult {
                     networks,
                     source: GithubMetaSource::CacheNotModified,
-                    metadata: cached_meta_for_not_modified,
+                    metadata: cache.meta.clone(),
                 });
             }
 
-            Ok::<GithubMetaLoadResult, GithubMetaLoadError>(cache_fallback(
-                cached_raw.as_deref(),
+            Ok::<GithubMetaLoadResult, GithubMetaLoadError>(cache.fallback(
                 None,
-                cached_meta_for_not_modified,
-                cached_sidecar.as_ref(),
                 &selection,
                 GithubMetaSource::FallbackCache,
             ))
         },
         || {
-            Ok(cache_fallback(
-                cached_raw.as_deref(),
-                cached_networks_for_fallback,
-                cached_meta_for_fallback,
-                cached_sidecar.as_ref(),
+            Ok(cache.fallback(
+                cache.networks.clone(),
                 &selection,
                 GithubMetaSource::FallbackCache,
             ))
@@ -180,16 +149,99 @@ pub fn load_github_meta_safelist(
                 &paths,
                 github_meta_url,
                 max_bytes,
-                CachedFallback {
-                    raw: cached_raw.as_deref(),
-                    networks: cached_networks,
-                    meta: cached_meta,
-                    sidecar: cached_sidecar.as_ref(),
-                },
+                cache.as_fallback(),
                 &selection,
             )
         },
     )
+}
+
+fn read_github_meta_cache(
+    paths: &CachePaths,
+    selection: &CategorySelection,
+    github_meta_url: &str,
+) -> GithubMetaCache {
+    let cached_meta = read_optional_json_lossy::<GithubMetaCacheMetadata>(
+        &paths.meta_path,
+        GITHUB_META_META_READ_LIMIT,
+        "github meta cache file",
+    );
+    let cache_url_matches = cached_meta
+        .as_ref()
+        .is_none_or(|meta| github_meta_cache_url_matches(meta, github_meta_url));
+    if !cache_url_matches {
+        warn!("github meta cache URL differs from configured URL; ignoring stale cache");
+    }
+
+    let meta = if cache_url_matches { cached_meta } else { None };
+    let raw = if cache_url_matches {
+        read_validated_bytes_lossy(
+            &paths.raw_path,
+            GITHUB_META_CACHE_READ_LIMIT,
+            "github meta cache file",
+            meta.as_ref().map(|metadata| metadata.sha256_raw.as_str()),
+            "github meta raw cache",
+            "raw body",
+        )
+    } else {
+        None
+    };
+    let sidecar = if cache_url_matches {
+        read_optional_json_lossy::<GithubMetaCategorySidecar>(
+            &paths.category_path,
+            GITHUB_META_CATEGORY_READ_LIMIT,
+            "github meta cache file",
+        )
+    } else {
+        None
+    };
+
+    let networks = if cache_scope_compatible(selection, sidecar.as_ref()) {
+        raw.as_deref()
+            .and_then(|contents| parse_and_extract_networks(contents, selection))
+    } else {
+        None
+    };
+
+    GithubMetaCache {
+        raw,
+        networks,
+        meta,
+        sidecar,
+    }
+}
+
+impl GithubMetaCache {
+    fn http_validators(&self) -> (Option<String>, Option<String>) {
+        self.meta.as_ref().map_or((None, None), |meta| {
+            (meta.etag.clone(), meta.last_modified.clone())
+        })
+    }
+
+    fn as_fallback(&self) -> CachedFallback<'_> {
+        CachedFallback {
+            raw: self.raw.as_deref(),
+            networks: self.networks.clone(),
+            meta: self.meta.clone(),
+            sidecar: self.sidecar.as_ref(),
+        }
+    }
+
+    fn fallback(
+        &self,
+        cached_networks: Option<Vec<CanonicalCidr>>,
+        selection: &CategorySelection,
+        source: GithubMetaSource,
+    ) -> GithubMetaLoadResult {
+        cache_fallback(
+            self.raw.as_deref(),
+            cached_networks,
+            self.meta.clone(),
+            self.sidecar.as_ref(),
+            selection,
+            source,
+        )
+    }
 }
 
 fn handle_network_response(
@@ -409,6 +461,10 @@ fn cache_scope_compatible(
             normalize_categories(sidecar.categories.iter().map(String::as_str)) == *categories
         }
     }
+}
+
+fn github_meta_cache_url_matches(meta: &GithubMetaCacheMetadata, configured_url: &str) -> bool {
+    meta.url.trim() == configured_url.trim()
 }
 
 impl CategorySelection {
@@ -707,6 +763,59 @@ mod tests {
 
         assert_eq!(result.source, GithubMetaSource::FallbackCache);
         assert_eq!(result.networks.len(), 1);
+    }
+
+    #[test]
+    fn cache_with_different_url_is_not_reused() {
+        let temp = TempDir::new().expect("tempdir");
+        let raw = br#"{"api":["192.30.252.0/22"]}"#;
+        fs::write(temp.path().join(GITHUB_META_RAW_CACHE_FILE), raw).expect("write raw cache");
+        fs::write(
+            temp.path().join(GITHUB_META_META_CACHE_FILE),
+            serde_json::to_vec_pretty(&GithubMetaCacheMetadata {
+                url: "https://example.com/old-meta".to_string(),
+                etag: Some("old-etag".to_string()),
+                last_modified: Some("Mon, 01 Jan 2024 00:00:00 GMT".to_string()),
+                sha256_raw: sha256_hex(raw),
+            })
+            .expect("meta json"),
+        )
+        .expect("write metadata");
+        fs::write(
+            temp.path().join(GITHUB_META_CATEGORY_CACHE_FILE),
+            serde_json::to_vec_pretty(&GithubMetaCategorySidecar {
+                mode: "selected".to_string(),
+                categories: vec![
+                    "api".to_string(),
+                    "git".to_string(),
+                    "hooks".to_string(),
+                    "packages".to_string(),
+                ],
+            })
+            .expect("sidecar json"),
+        )
+        .expect("write sidecar");
+
+        let client = MockHttpClient::new(vec![Err(HttpClientError::Request {
+            reason: "offline".to_string(),
+        })]);
+
+        let result = load_github_meta_safelist(
+            &client,
+            temp.path(),
+            TEST_GITHUB_META_URL,
+            &GithubMetaCategoryMode::Default,
+            &BTreeMap::new(),
+        )
+        .expect("load");
+
+        assert_eq!(result.source, GithubMetaSource::Empty);
+        assert!(result.networks.is_empty());
+
+        let requests = client.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].if_none_match, None);
+        assert_eq!(requests[0].if_modified_since, None);
     }
 
     #[test]

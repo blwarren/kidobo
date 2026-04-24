@@ -403,7 +403,9 @@ fn parse_remote(raw: RawRemoteConfig) -> Result<RemoteConfig, ConfigError> {
     let mut urls = Vec::new();
     if let Some(values) = raw.urls {
         for value in values {
-            urls.push(non_empty(&value, "remote.urls")?);
+            let parsed = non_empty(&value, "remote.urls")?;
+            validate_http_url(&parsed, "remote.urls")?;
+            urls.push(parsed);
         }
     }
 
@@ -913,6 +915,21 @@ mod tests {
             ConfigError::InvalidField {
                 field: "remote.urls",
                 reason: "value must not be empty".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn remote_urls_must_be_http_or_https() {
+        let err = Config::from_toml_str(
+            "[ipset]\nset_name='kidobo'\n[remote]\nurls=['file:///tmp/list.txt']\n",
+        )
+        .expect_err("must fail");
+        assert_eq!(
+            err,
+            ConfigError::InvalidField {
+                field: "remote.urls",
+                reason: "must start with http:// or https://".to_string(),
             }
         );
     }
