@@ -168,6 +168,57 @@ fn build_doctor_report_preserves_json_status_shape() {
     );
 }
 
+#[test]
+fn build_doctor_report_preserves_json_fail_and_skip_status_shape() {
+    let temp = TempDir::new().expect("tempdir");
+    write_config(temp.path(), false);
+    write_blocklist(temp.path());
+    fs::create_dir_all(temp.path().join("cache/remote")).expect("mkdir cache");
+
+    let input = path_input_for_root(temp.path());
+    let locator = MockBinaryLocator::new(&[
+        "sudo",
+        "ipset",
+        "iptables",
+        "iptables-save",
+        "iptables-restore",
+    ]);
+    let runner = MockProbeRunner::new(vec![
+        Ok(success()),
+        Ok(success()),
+        Ok(success()),
+        Ok(success()),
+    ]);
+
+    let report = build_doctor_report(&input, &locator, &runner);
+    assert_eq!(report.overall, DoctorOverall::Fail);
+    assert!(
+        report
+            .checks
+            .iter()
+            .any(|check| check.name == "binary_bgpq4" && check.status == DoctorCheckStatus::Fail)
+    );
+    assert!(
+        report.checks.iter().any(
+            |check| check.name == "binary_ip6tables" && check.status == DoctorCheckStatus::Skip
+        )
+    );
+
+    let json = serde_json::to_value(&report).expect("doctor report serializes");
+    assert_eq!(json["overall"], "FAIL");
+    let checks = json["checks"].as_array().expect("checks is an array");
+    assert!(
+        checks
+            .iter()
+            .any(|check| check["name"] == "binary_bgpq4" && check["status"] == "FAIL")
+    );
+    assert!(
+        checks
+            .iter()
+            .any(|check| check["name"] == "binary_ip6tables" && check["status"] == "SKIP")
+    );
+}
+
 fn success() -> CommandResult {
     CommandResult {
         status: ProcessStatus::Exited(0),
