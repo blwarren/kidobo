@@ -858,7 +858,7 @@ fn ban_fails_when_lock_is_held() {
 }
 
 #[test]
-fn ban_asn_resolves_prefixes_before_lock_failure() {
+fn ban_asn_lock_failure_does_not_resolve_prefixes() {
     let root = create_root("[ipset]\nset_name='kidobo'\n", "");
     let _held_lock = hold_lock(&root.path().join("cache/sync.lock"));
     let fake_bgpq4 = write_fake_bgpq4_script(&root);
@@ -879,8 +879,8 @@ fn ban_asn_resolves_prefixes_before_lock_failure() {
         "missing lock-held error message: {stderr}"
     );
     assert!(
-        touched.exists(),
-        "ASN resolution did not run before lock failure"
+        !touched.exists(),
+        "ASN resolution should not run after lock acquisition fails"
     );
 }
 

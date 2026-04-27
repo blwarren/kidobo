@@ -200,18 +200,6 @@ pub fn split_by_family(cidrs: &[CanonicalCidr]) -> FamilyCidrs {
     separated
 }
 
-pub fn dedup_ipv4(mut cidrs: Vec<Ipv4Cidr>) -> Vec<Ipv4Cidr> {
-    cidrs.sort_unstable();
-    cidrs.dedup();
-    cidrs
-}
-
-pub fn dedup_ipv6(mut cidrs: Vec<Ipv6Cidr>) -> Vec<Ipv6Cidr> {
-    cidrs.sort_unstable();
-    cidrs.dedup();
-    cidrs
-}
-
 pub fn collapse_ipv4(cidrs: &[Ipv4Cidr]) -> Vec<Ipv4Cidr> {
     let intervals = cidrs.iter().copied().map(IntervalU32::from).collect();
     let merged = merge_intervals_u32_owned(intervals);

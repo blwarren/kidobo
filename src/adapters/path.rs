@@ -11,7 +11,6 @@ pub const ENV_KIDOBO_DISABLE_TEST_SANDBOX: &str = "KIDOBO_DISABLE_TEST_SANDBOX";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PathResolutionInput {
     pub explicit_config_path: Option<PathBuf>,
-    pub cwd: Option<PathBuf>,
     pub temp_dir: PathBuf,
     pub env: BTreeMap<String, String>,
 }
@@ -20,7 +19,6 @@ impl PathResolutionInput {
     pub fn from_process(explicit_config_path: Option<PathBuf>) -> Self {
         Self {
             explicit_config_path,
-            cwd: env::current_dir().ok(),
             temp_dir: env::temp_dir(),
             env: env::vars().collect(),
         }
@@ -96,12 +94,6 @@ pub fn resolve_paths_without_config(
     input: &PathResolutionInput,
 ) -> Result<ResolvedPaths, PathResolutionError> {
     resolve_paths_with_policy(input, true)
-}
-
-pub fn resolve_paths_for_init(
-    input: &PathResolutionInput,
-) -> Result<ResolvedPaths, PathResolutionError> {
-    resolve_paths_without_config(input)
 }
 
 fn resolve_paths_with_policy(
@@ -199,13 +191,12 @@ mod tests {
     use super::{
         ENV_KIDOBO_DISABLE_TEST_SANDBOX, ENV_KIDOBO_ROOT, ENV_KIDOBO_TEST_SANDBOX,
         PathResolutionError, PathResolutionInput, is_truthy_value, resolve_paths,
-        resolve_paths_for_init, resolve_paths_without_config,
+        resolve_paths_without_config,
     };
 
     fn test_input(temp: &TempDir) -> PathResolutionInput {
         PathResolutionInput {
             explicit_config_path: None,
-            cwd: Some(temp.path().to_path_buf()),
             temp_dir: temp.path().join("tmp"),
             env: BTreeMap::new(),
         }
@@ -344,7 +335,7 @@ mod tests {
     }
 
     #[test]
-    fn init_resolution_allows_missing_default_config_path() {
+    fn config_optional_resolution_allows_missing_default_config_path_for_init_callers() {
         let temp = TempDir::new().expect("tempdir");
         let root = temp.path().join("root");
         fs::create_dir_all(&root).expect("mkdir root");
@@ -354,7 +345,7 @@ mod tests {
             .env
             .insert(ENV_KIDOBO_ROOT.to_string(), root.display().to_string());
 
-        let resolved = resolve_paths_for_init(&input).expect("resolve");
+        let resolved = resolve_paths_without_config(&input).expect("resolve");
         assert_eq!(resolved.config_file, root.join("config/config.toml"));
     }
 

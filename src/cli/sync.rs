@@ -991,11 +991,16 @@ mod tests {
             runner.entries_for_target_set("kidobo"),
             vec!["10.0.0.0/24".to_string(), "198.51.100.7/32".to_string()]
         );
+        let events = runner.events();
         assert!(
-            runner
-                .events()
+            events
                 .iter()
-                .all(|entry| !entry.starts_with("cmd:ip6tables"))
+                .any(|entry| entry == "cmd:ip6tables -D INPUT -j kidobo-input")
+        );
+        assert!(
+            events
+                .iter()
+                .any(|entry| entry == "cmd:ipset destroy kidobo-v6")
         );
     }
 

@@ -62,6 +62,12 @@ pub(super) fn ensure_file_if_missing(
     contents: &str,
 ) -> Result<ProvisionState, KidoboError> {
     if path.exists() {
+        if !path.is_file() {
+            return Err(KidoboError::InitIo {
+                path: path.to_path_buf(),
+                reason: "path exists but is not a file".to_string(),
+            });
+        }
         return Ok(ProvisionState::Unchanged);
     }
 

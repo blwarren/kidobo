@@ -12,9 +12,6 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum KidoboError {
-    #[error("command `{command}` is not implemented yet")]
-    UnimplementedCommand { command: &'static str },
-
     #[error("failed to initialize logger: {reason}")]
     LoggerInit { reason: String },
 
@@ -167,7 +164,6 @@ mod tests {
 
     #[test]
     fn non_interrupted_maps_to_1() {
-        let err = KidoboError::UnimplementedCommand { command: "sync" };
-        assert_eq!(err.exit_code(), 1);
+        assert_eq!(KidoboError::DoctorFailed.exit_code(), 1);
     }
 }

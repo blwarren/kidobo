@@ -68,7 +68,6 @@ fn path_input_for_root(root: &Path) -> PathResolutionInput {
     env.insert(ENV_KIDOBO_ROOT.to_string(), root.display().to_string());
     PathResolutionInput {
         explicit_config_path: None,
-        cwd: Some(root.to_path_buf()),
         temp_dir: root.join("tmp"),
         env,
     }
@@ -156,6 +155,16 @@ fn build_doctor_report_preserves_json_status_shape() {
             .checks
             .iter()
             .any(|check| check.name == "config_parse" && check.status == DoctorCheckStatus::Ok)
+    );
+
+    let json = serde_json::to_value(&report).expect("doctor report serializes");
+    assert_eq!(json["overall"], "OK");
+    assert!(
+        json["checks"]
+            .as_array()
+            .expect("checks is an array")
+            .iter()
+            .any(|check| check["name"] == "config_parse" && check["status"] == "OK")
     );
 }
 

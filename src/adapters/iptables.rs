@@ -120,6 +120,21 @@ pub fn ensure_firewall_wiring_for_families(
     Ok(())
 }
 
+pub fn cleanup_firewall_wiring(
+    runner: &dyn FirewallCommandRunner,
+    family: FirewallFamily,
+) -> Result<(), FirewallError> {
+    let jump_result = remove_all_input_jumps_for_chain(runner, family, KIDOBO_CHAIN_NAME);
+    let flush_result =
+        run_checked_allow_missing_chain(runner, family.binary(), &["-F", KIDOBO_CHAIN_NAME]);
+    let delete_result =
+        run_checked_allow_missing_chain(runner, family.binary(), &["-X", KIDOBO_CHAIN_NAME]);
+
+    jump_result?;
+    flush_result?;
+    delete_result
+}
+
 fn ensure_chain_exists(
     runner: &dyn FirewallCommandRunner,
     family: FirewallFamily,
@@ -215,6 +230,23 @@ fn run_checked(
     })
 }
 
+fn run_checked_allow_missing_chain(
+    runner: &dyn FirewallCommandRunner,
+    command: &str,
+    args: &[&str],
+) -> Result<(), FirewallError> {
+    let result = runner.run(command, args)?;
+    if result.status.success() || is_missing_chain_result(&result) {
+        return Ok(());
+    }
+
+    Err(FirewallError::CommandFailed {
+        command: display_command(command, args),
+        status: result.status,
+        stderr: result.stderr,
+    })
+}
+
 fn is_missing_chain_result(result: &CommandResult) -> bool {
     result.status.code() == Some(1)
         && result
@@ -234,7 +266,8 @@ mod tests {
 
     use super::{
         ChainAction, FirewallCommandRunner, FirewallError, FirewallFamily, KIDOBO_CHAIN_NAME,
-        chain_exists, ensure_firewall_wiring, ensure_firewall_wiring_for_families,
+        chain_exists, cleanup_firewall_wiring, ensure_firewall_wiring,
+        ensure_firewall_wiring_for_families,
     };
     use crate::adapters::command_runner::{CommandResult, CommandRunnerError, ProcessStatus};
 
@@ -522,5 +555,77 @@ mod tests {
                 "REJECT",
             ]
         );
+    }
+
+    #[test]
+    fn cleanup_firewall_wiring_removes_jumps_and_deletes_chain() {
+        let runner = MockRunner::new(vec![
+            Ok(ok(0)), // first -D INPUT -j chain
+            Ok(CommandResult {
+                status: ProcessStatus::Exited(1),
+                stdout: String::new(),
+                stderr: "Bad rule (does a matching rule exist in that chain?).".to_string(),
+            }),
+            Ok(ok(0)), // -F chain
+            Ok(ok(0)), // -X chain
+        ]);
+
+        cleanup_firewall_wiring(&runner, FirewallFamily::Ipv6).expect("cleanup");
+
+        let invocations = runner.invocations();
+        assert_eq!(
+            invocations,
+            vec![
+                (
+                    "ip6tables".to_string(),
+                    vec![
+                        "-D".to_string(),
+                        "INPUT".to_string(),
+                        "-j".to_string(),
+                        KIDOBO_CHAIN_NAME.to_string()
+                    ]
+                ),
+                (
+                    "ip6tables".to_string(),
+                    vec![
+                        "-D".to_string(),
+                        "INPUT".to_string(),
+                        "-j".to_string(),
+                        KIDOBO_CHAIN_NAME.to_string()
+                    ]
+                ),
+                (
+                    "ip6tables".to_string(),
+                    vec!["-F".to_string(), KIDOBO_CHAIN_NAME.to_string()]
+                ),
+                (
+                    "ip6tables".to_string(),
+                    vec!["-X".to_string(), KIDOBO_CHAIN_NAME.to_string()]
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn cleanup_firewall_wiring_treats_missing_chain_as_success() {
+        let runner = MockRunner::new(vec![
+            Ok(CommandResult {
+                status: ProcessStatus::Exited(1),
+                stdout: String::new(),
+                stderr: "Bad rule (does a matching rule exist in that chain?).".to_string(),
+            }),
+            Ok(CommandResult {
+                status: ProcessStatus::Exited(1),
+                stdout: String::new(),
+                stderr: "No chain/target/match by that name".to_string(),
+            }),
+            Ok(CommandResult {
+                status: ProcessStatus::Exited(1),
+                stdout: String::new(),
+                stderr: "No chain/target/match by that name".to_string(),
+            }),
+        ]);
+
+        cleanup_firewall_wiring(&runner, FirewallFamily::Ipv6).expect("cleanup");
     }
 }

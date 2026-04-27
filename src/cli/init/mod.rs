@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use crate::adapters::command_common::find_executable_in_path;
 use crate::adapters::command_runner::SudoCommandRunner;
 use crate::adapters::path::{
-    ENV_KIDOBO_ROOT, PathResolutionInput, ResolvedPaths, resolve_paths_for_init,
+    ENV_KIDOBO_ROOT, PathResolutionInput, ResolvedPaths, resolve_paths_without_config,
 };
 use crate::error::KidoboError;
 
@@ -31,7 +31,7 @@ use self::templates::{
 pub fn run_init_command() -> Result<(), KidoboError> {
     ensure_init_binaries_available(env::var_os("PATH"))?;
     let path_input = PathResolutionInput::from_process(None);
-    let paths = resolve_paths_for_init(&path_input)?;
+    let paths = resolve_paths_without_config(&path_input)?;
     let executable_path = resolve_installed_executable_path(&[
         PathBuf::from(DEFAULT_KIDOBO_BINARY_PATH),
         PathBuf::from(FALLBACK_KIDOBO_BINARY_PATH),
