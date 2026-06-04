@@ -104,23 +104,21 @@ fn ipv6_skip_reason_matches_mode() {
 
 #[test]
 fn collect_binary_checks_skips_ipv6_binary_when_disabled() {
-    let locator = MockBinaryLocator::new(&[
-        "sudo",
-        "bgpq4",
-        "ipset",
-        "iptables",
-        "iptables-save",
-        "iptables-restore",
-    ]);
+    let locator = MockBinaryLocator::new(&["sudo", "bgpq4", "ipset", "iptables"]);
     let mut checks = Vec::new();
     let availability = collect_binary_checks(&mut checks, &locator, Ipv6Mode::Disabled);
 
+    assert!(!availability.contains_key("iptables-save"));
+    assert!(!availability.contains_key("iptables-restore"));
     assert_eq!(availability.get("ip6tables"), Some(&false));
     assert!(
         checks.iter().any(
             |check| check.name == "binary_ip6tables" && check.status == DoctorCheckStatus::Skip
         )
     );
+    assert!(!checks.iter().any(
+        |check| check.name == "binary_iptables_save" || check.name == "binary_iptables_restore"
+    ));
 }
 
 #[test]
@@ -131,22 +129,8 @@ fn build_doctor_report_preserves_json_status_shape() {
     fs::create_dir_all(temp.path().join("cache/remote")).expect("mkdir cache");
 
     let input = path_input_for_root(temp.path());
-    let locator = MockBinaryLocator::new(&[
-        "sudo",
-        "bgpq4",
-        "ipset",
-        "iptables",
-        "iptables-save",
-        "iptables-restore",
-        "ip6tables",
-    ]);
-    let runner = MockProbeRunner::new(vec![
-        Ok(success()),
-        Ok(success()),
-        Ok(success()),
-        Ok(success()),
-        Ok(success()),
-    ]);
+    let locator = MockBinaryLocator::new(&["sudo", "bgpq4", "ipset", "iptables", "ip6tables"]);
+    let runner = MockProbeRunner::new(vec![Ok(success()), Ok(success()), Ok(success())]);
 
     let report = build_doctor_report(&input, &locator, &runner);
     assert_eq!(report.overall, DoctorOverall::Ok);
@@ -155,6 +139,13 @@ fn build_doctor_report_preserves_json_status_shape() {
             .checks
             .iter()
             .any(|check| check.name == "config_parse" && check.status == DoctorCheckStatus::Ok)
+    );
+    assert!(
+        !report
+            .checks
+            .iter()
+            .any(|check| check.name == "sudo_probe_iptables_save"
+                || check.name == "sudo_probe_iptables_restore")
     );
 
     let json = serde_json::to_value(&report).expect("doctor report serializes");
@@ -176,19 +167,8 @@ fn build_doctor_report_preserves_json_fail_and_skip_status_shape() {
     fs::create_dir_all(temp.path().join("cache/remote")).expect("mkdir cache");
 
     let input = path_input_for_root(temp.path());
-    let locator = MockBinaryLocator::new(&[
-        "sudo",
-        "ipset",
-        "iptables",
-        "iptables-save",
-        "iptables-restore",
-    ]);
-    let runner = MockProbeRunner::new(vec![
-        Ok(success()),
-        Ok(success()),
-        Ok(success()),
-        Ok(success()),
-    ]);
+    let locator = MockBinaryLocator::new(&["sudo", "ipset", "iptables"]);
+    let runner = MockProbeRunner::new(vec![Ok(success()), Ok(success())]);
 
     let report = build_doctor_report(&input, &locator, &runner);
     assert_eq!(report.overall, DoctorOverall::Fail);

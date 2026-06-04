@@ -382,7 +382,11 @@ curl -fsSL -o "${workdir}/SHA256SUMS" "${BASE_URL}/SHA256SUMS"
 
 (
     cd "${workdir}"
-    expected_line="$(grep " ${ARCHIVE}\$" SHA256SUMS || true)"
+    expected_line="$(
+        awk -v archive="${ARCHIVE}" \
+            '$2 == archive { print; found = 1; exit } END { exit (found ? 0 : 1) }' \
+            SHA256SUMS || true
+    )"
     if [[ -z "${expected_line}" ]]; then
         echo "checksum entry not found for ${ARCHIVE}" >&2
         exit 1

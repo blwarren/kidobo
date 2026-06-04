@@ -2,3 +2,15 @@
 /scripts/internal/
 /config.toml
 /.local-scenarios/
+/coverage/
+/tmp/
+*.db
+*.key
+*.log
+*.pem
+*.sqlite
+*.sqlite3
+.env
+.env.*
+!.env.example
+!.env.*.example

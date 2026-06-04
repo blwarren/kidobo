@@ -5,11 +5,8 @@ mod templates;
 #[cfg(test)]
 mod tests;
 
-use std::env;
-use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-use crate::adapters::command_common::find_executable_in_path;
 use crate::adapters::command_runner::SudoCommandRunner;
 use crate::adapters::path::{
     ENV_KIDOBO_ROOT, PathResolutionInput, ResolvedPaths, resolve_paths_without_config,
@@ -29,7 +26,6 @@ use self::templates::{
 
 #[allow(clippy::print_stdout)]
 pub fn run_init_command() -> Result<(), KidoboError> {
-    ensure_init_binaries_available(env::var_os("PATH"))?;
     let path_input = PathResolutionInput::from_process(None);
     let paths = resolve_paths_without_config(&path_input)?;
     let executable_path = resolve_installed_executable_path(&[
@@ -45,13 +41,6 @@ pub fn run_init_command() -> Result<(), KidoboError> {
         &sudo_runner,
     )?;
     print_init_summary(&summary);
-    Ok(())
-}
-
-fn ensure_init_binaries_available(path: Option<OsString>) -> Result<(), KidoboError> {
-    if find_executable_in_path("bgpq4", path).is_none() {
-        return Err(KidoboError::MissingRequiredBinary { binary: "bgpq4" });
-    }
     Ok(())
 }
 

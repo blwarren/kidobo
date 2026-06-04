@@ -24,13 +24,11 @@ pub(super) enum Ipv6Mode {
 pub(super) type BinaryAvailability = BTreeMap<&'static str, bool>;
 pub(super) type PathsResult = Result<ResolvedPaths, PathResolutionError>;
 
-const REQUIRED_BINARY_CHECKS: [(&str, &str); 6] = [
+const REQUIRED_BINARY_CHECKS: [(&str, &str); 4] = [
     ("binary_sudo", "sudo"),
     ("binary_bgpq4", "bgpq4"),
     ("binary_ipset", "ipset"),
     ("binary_iptables", "iptables"),
-    ("binary_iptables_save", "iptables-save"),
-    ("binary_iptables_restore", "iptables-restore"),
 ];
 
 #[derive(Debug)]
@@ -199,14 +197,14 @@ fn cache_writability_check(remote_cache_dir: &Path) -> DoctorCheck {
         Ok(CachePathReady::ExistingDirectory) => ok_check(
             "cache_writable",
             format!(
-                "remote cache directory is writable: {}",
+                "remote cache directory exists and has write permission bits: {}",
                 remote_cache_dir.display()
             ),
         ),
         Ok(CachePathReady::CreatableFromParent { parent }) => ok_check(
             "cache_writable",
             format!(
-                "remote cache can be created under writable parent: {}",
+                "remote cache can be created under parent with write permission bits: {}",
                 parent.display()
             ),
         ),
@@ -232,7 +230,7 @@ enum CacheWritableError {
     #[error("path exists but is not a directory: {path}")]
     NotDirectory { path: PathBuf },
 
-    #[error("path is read-only: {path}")]
+    #[error("path has no write permission bits: {path}")]
     ReadOnly { path: PathBuf },
 
     #[error("no existing parent directory found for {path}")]
@@ -273,10 +271,24 @@ fn ensure_directory_is_writable(path: &Path) -> Result<(), CacheWritableError> {
             path: path.to_path_buf(),
         });
     }
-    if metadata.permissions().readonly() {
+    if !directory_has_write_permission_bits(&metadata) {
         return Err(CacheWritableError::ReadOnly {
             path: path.to_path_buf(),
         });
     }
     Ok(())
+}
+
+fn directory_has_write_permission_bits(metadata: &fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        metadata.permissions().mode() & 0o222 != 0
+    }
+
+    #[cfg(not(unix))]
+    {
+        !metadata.permissions().readonly()
+    }
 }

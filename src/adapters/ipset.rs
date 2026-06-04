@@ -202,8 +202,28 @@ fn run_checked(
 }
 
 fn best_effort_destroy_set(runner: &dyn IpsetCommandRunner, set_name: &str) {
-    if let Err(err) = runner.run("ipset", &["destroy", set_name]) {
-        warn!("best-effort ipset destroy for {set_name} failed: {err}");
+    let args = ["destroy", set_name];
+    match runner.run("ipset", &args) {
+        Ok(result) if result.status.success() => {}
+        Ok(result) => warn!(
+            "best-effort {} failed with status {:?}: {}",
+            display_command("ipset", &args),
+            result.status,
+            stderr_detail(&result.stderr)
+        ),
+        Err(err) => warn!(
+            "best-effort {} execution failed: {err}",
+            display_command("ipset", &args)
+        ),
+    }
+}
+
+fn stderr_detail(stderr: &str) -> &str {
+    let trimmed = stderr.trim();
+    if trimmed.is_empty() {
+        "no stderr"
+    } else {
+        trimmed
     }
 }
 

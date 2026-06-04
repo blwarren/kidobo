@@ -287,6 +287,7 @@ fn parse_ipset(raw: RawIpsetConfig) -> Result<IpsetConfig, ConfigError> {
     let set_name = required_non_empty(raw.set_name, "ipset.set_name")?;
     validate_ipset_set_name(&set_name, "ipset.set_name")?;
 
+    let enable_ipv6 = raw.enable_ipv6.unwrap_or(true);
     let set_name_v6 = match raw.set_name_v6 {
         Some(value) => {
             let parsed = non_empty(&value, "ipset.set_name_v6")?;
@@ -295,12 +296,19 @@ fn parse_ipset(raw: RawIpsetConfig) -> Result<IpsetConfig, ConfigError> {
         }
         None => {
             let derived = format!("{set_name}-v6");
-            validate_ipset_set_name(&derived, "ipset.set_name_v6")?;
+            if enable_ipv6 {
+                validate_ipset_set_name(&derived, "ipset.set_name_v6")?;
+            }
             derived
         }
     };
+    if enable_ipv6 && set_name_v6 == set_name {
+        return Err(ConfigError::InvalidField {
+            field: "ipset.set_name_v6",
+            reason: "must differ from ipset.set_name when ipv6 is enabled".to_string(),
+        });
+    }
 
-    let enable_ipv6 = raw.enable_ipv6.unwrap_or(true);
     let chain_action = parse_chain_action(raw.chain_action)?;
     let set_type = match raw.set_type {
         Some(value) => {
@@ -560,14 +568,18 @@ fn validate_ipset_set_type(value: &str) -> Result<(), ConfigError> {
 }
 
 fn validate_http_url(value: &str, field: &'static str) -> Result<(), ConfigError> {
-    if value.starts_with("http://") || value.starts_with("https://") {
-        Ok(())
-    } else {
-        Err(ConfigError::InvalidField {
-            field,
-            reason: "must start with http:// or https://".to_string(),
-        })
+    let parsed = reqwest::Url::parse(value).map_err(|_| ConfigError::InvalidField {
+        field,
+        reason: "must be a valid http:// or https:// URL with a host".to_string(),
+    })?;
+    if matches!(parsed.scheme(), "http" | "https") && parsed.host_str().is_some() {
+        return Ok(());
     }
+
+    Err(ConfigError::InvalidField {
+        field,
+        reason: "must be a valid http:// or https:// URL with a host".to_string(),
+    })
 }
 
 fn parse_chain_action(value: Option<String>) -> Result<FirewallAction, ConfigError> {
@@ -647,11 +659,50 @@ mod tests {
     }
 
     #[test]
+    fn set_name_v6_must_not_match_set_name_when_ipv6_enabled() {
+        let err = Config::from_toml_str("[ipset]\nset_name = 'kidobo'\nset_name_v6 = 'kidobo'\n")
+            .expect_err("must fail");
+
+        assert_eq!(
+            err,
+            ConfigError::InvalidField {
+                field: "ipset.set_name_v6",
+                reason: "must differ from ipset.set_name when ipv6 is enabled".to_string(),
+            }
+        );
+    }
+
+    #[test]
     fn enable_ipv6_false_is_respected() {
         let config = Config::from_toml_str("[ipset]\nset_name='kidobo'\nenable_ipv6=false\n")
             .expect("parse");
 
         assert!(!config.ipset.enable_ipv6);
+    }
+
+    #[test]
+    fn enable_ipv6_false_does_not_require_valid_derived_v6_set_name() {
+        let config = Config::from_toml_str(
+            "[ipset]\nset_name='kidobo-name-that-is-thirty-one'\nenable_ipv6=false\n",
+        )
+        .expect("parse");
+
+        assert_eq!(config.ipset.set_name, "kidobo-name-that-is-thirty-one");
+        assert!(!config.ipset.enable_ipv6);
+    }
+
+    #[test]
+    fn enabled_ipv6_requires_valid_derived_v6_set_name() {
+        let err = Config::from_toml_str("[ipset]\nset_name='kidobo-name-that-is-thirty-one'\n")
+            .expect_err("must fail");
+
+        assert_eq!(
+            err,
+            ConfigError::InvalidField {
+                field: "ipset.set_name_v6",
+                reason: "must be 31 characters or fewer".to_string(),
+            }
+        );
     }
 
     #[test]
@@ -755,7 +806,22 @@ mod tests {
             err,
             ConfigError::InvalidField {
                 field: "safe.github_meta_url",
-                reason: "must start with http:// or https://".to_string(),
+                reason: "must be a valid http:// or https:// URL with a host".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn safe_github_meta_url_must_be_structurally_valid() {
+        let err = Config::from_toml_str(
+            "[ipset]\nset_name='kidobo'\n[safe]\ngithub_meta_url='https://'\n",
+        )
+        .expect_err("must fail");
+        assert_eq!(
+            err,
+            ConfigError::InvalidField {
+                field: "safe.github_meta_url",
+                reason: "must be a valid http:// or https:// URL with a host".to_string(),
             }
         );
     }
@@ -929,7 +995,22 @@ mod tests {
             err,
             ConfigError::InvalidField {
                 field: "remote.urls",
-                reason: "must start with http:// or https://".to_string(),
+                reason: "must be a valid http:// or https:// URL with a host".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn remote_urls_must_be_structurally_valid() {
+        let err = Config::from_toml_str(
+            "[ipset]\nset_name='kidobo'\n[remote]\nurls=['https:// example.com/list.txt']\n",
+        )
+        .expect_err("must fail");
+        assert_eq!(
+            err,
+            ConfigError::InvalidField {
+                field: "remote.urls",
+                reason: "must be a valid http:// or https:// URL with a host".to_string(),
             }
         );
     }

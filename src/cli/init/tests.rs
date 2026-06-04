@@ -207,3 +207,8 @@ fn run_init_with_paths_and_runner_skips_systemd_commands_for_root_override() {
 fn init_writes_default_timer_template() {
     assert!(DEFAULT_SYSTEMD_TIMER_TEMPLATE.contains("OnUnitActiveSec=1h"));
 }
+
+#[test]
+fn init_default_config_includes_remote_cache_staleness() {
+    assert!(DEFAULT_CONFIG_TEMPLATE.contains("cache_stale_after_secs = 86400\nurls = []"));
+}

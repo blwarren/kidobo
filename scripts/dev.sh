@@ -70,6 +70,7 @@ run_post_coding_gates() {
   run_cmd "post-coding" cargo test --lib --bins --tests --all-features
   run_cmd "post-coding" cargo deny check advisories bans licenses sources
   run_cmd "post-coding" cargo build --release --locked
+  release_notes_check
   log_step "post-coding" "post-coding check complete"
 }
 

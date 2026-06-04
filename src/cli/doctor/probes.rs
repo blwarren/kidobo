@@ -6,15 +6,9 @@ use crate::adapters::command_runner::{
 use super::checks::{BinaryAvailability, Ipv6Mode, ipv6_skip_reason};
 use super::report::{DoctorCheck, fail_check, ok_check, skip_check};
 
-const SUDO_PROBE_CHECKS: [(&str, &str, &[&str]); 4] = [
+const SUDO_PROBE_CHECKS: [(&str, &str, &[&str]); 2] = [
     ("sudo_probe_ipset", "ipset", &["list"]),
     ("sudo_probe_iptables", "iptables", &["-S"]),
-    ("sudo_probe_iptables_save", "iptables-save", &[]),
-    (
-        "sudo_probe_iptables_restore",
-        "iptables-restore",
-        &["--version"],
-    ),
 ];
 
 pub(super) trait SudoProbeRunner {

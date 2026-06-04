@@ -12,7 +12,9 @@ use crate::adapters::cached_fetch::{
 };
 use crate::adapters::hash::sha256_hex;
 use crate::adapters::http_cache::{HttpClient, HttpResponse, max_http_body_bytes};
-use crate::core::config::{DEFAULT_GITHUB_META_CATEGORIES, GithubMetaCategoryMode};
+use crate::core::config::{
+    DEFAULT_GITHUB_META_CATEGORIES, DEFAULT_GITHUB_META_URL, GithubMetaCategoryMode,
+};
 use crate::core::network::{CanonicalCidr, parse_ip_cidr_non_strict};
 
 const GITHUB_META_RAW_CACHE_FILE: &str = "github-meta.raw.json";
@@ -166,11 +168,16 @@ fn read_github_meta_cache(
         GITHUB_META_META_READ_LIMIT,
         "github meta cache file",
     );
-    let cache_url_matches = cached_meta
-        .as_ref()
-        .is_none_or(|meta| github_meta_cache_url_matches(meta, github_meta_url));
+    let cache_url_matches = match cached_meta.as_ref() {
+        Some(meta) => github_meta_cache_url_matches(meta, github_meta_url),
+        None => github_meta_url == DEFAULT_GITHUB_META_URL,
+    };
     if !cache_url_matches {
-        warn!("github meta cache URL differs from configured URL; ignoring stale cache");
+        if cached_meta.is_some() {
+            warn!("github meta cache URL differs from configured URL; ignoring stale cache");
+        } else {
+            warn!("github meta cache metadata is missing for custom URL; ignoring stale cache");
+        }
     }
 
     let meta = if cache_url_matches { cached_meta } else { None };
@@ -804,6 +811,51 @@ mod tests {
             &client,
             temp.path(),
             TEST_GITHUB_META_URL,
+            &GithubMetaCategoryMode::Default,
+            &BTreeMap::new(),
+        )
+        .expect("load");
+
+        assert_eq!(result.source, GithubMetaSource::Empty);
+        assert!(result.networks.is_empty());
+
+        let requests = client.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].if_none_match, None);
+        assert_eq!(requests[0].if_modified_since, None);
+    }
+
+    #[test]
+    fn cache_without_metadata_is_not_reused_for_custom_url() {
+        let temp = TempDir::new().expect("tempdir");
+        fs::write(
+            temp.path().join(GITHUB_META_RAW_CACHE_FILE),
+            br#"{"api":["192.30.252.0/22"]}"#,
+        )
+        .expect("write raw cache");
+        fs::write(
+            temp.path().join(GITHUB_META_CATEGORY_CACHE_FILE),
+            serde_json::to_vec_pretty(&GithubMetaCategorySidecar {
+                mode: "selected".to_string(),
+                categories: vec![
+                    "api".to_string(),
+                    "git".to_string(),
+                    "hooks".to_string(),
+                    "packages".to_string(),
+                ],
+            })
+            .expect("sidecar json"),
+        )
+        .expect("write sidecar");
+
+        let client = MockHttpClient::new(vec![Err(HttpClientError::Request {
+            reason: "offline".to_string(),
+        })]);
+
+        let result = load_github_meta_safelist(
+            &client,
+            temp.path(),
+            "https://example.com/custom-meta",
             &GithubMetaCategoryMode::Default,
             &BTreeMap::new(),
         )
