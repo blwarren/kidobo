@@ -234,40 +234,41 @@ fn execute_ipset_restore_with_entries<T: Ord + Display>(
     entries: &[T],
 ) -> Result<(), IpsetError> {
     let (file, path) = create_restore_script_file()?;
+    let script = TempRestoreScript { path };
     let mut writer = BufWriter::new(file);
-    if let Err(err) = write_restore_script(&mut writer, spec, temp_set_name, entries) {
-        let reason = err.to_string();
-        if let Err(cleanup_err) = fs::remove_file(&path) {
-            warn!(
-                "failed to remove temporary ipset restore script {}: {cleanup_err}",
-                path.display()
-            );
+    write_restore_script(&mut writer, spec, temp_set_name, entries).map_err(|err| {
+        IpsetError::WriteRestoreScript {
+            path: script.path.clone(),
+            reason: err.to_string(),
         }
-        return Err(IpsetError::WriteRestoreScript { path, reason });
-    }
-    if let Err(err) = writer.flush() {
-        let reason = err.to_string();
-        if let Err(cleanup_err) = fs::remove_file(&path) {
-            warn!(
-                "failed to remove temporary ipset restore script {}: {cleanup_err}",
-                path.display()
-            );
-        }
-        return Err(IpsetError::WriteRestoreScript { path, reason });
-    }
+    })?;
+    writer
+        .flush()
+        .map_err(|err| IpsetError::WriteRestoreScript {
+            path: script.path.clone(),
+            reason: err.to_string(),
+        })?;
     drop(writer);
 
-    let path_string = path.display().to_string();
+    let path_string = script.path.display().to_string();
     let restore_result = run_checked(runner, "ipset", &["restore", "-file", &path_string]);
 
-    if let Err(err) = fs::remove_file(&path) {
-        warn!(
-            "failed to remove temporary ipset restore script {}: {err}",
-            path.display()
-        );
-    }
-
     restore_result.map(|_| ())
+}
+
+struct TempRestoreScript {
+    path: PathBuf,
+}
+
+impl Drop for TempRestoreScript {
+    fn drop(&mut self) {
+        if let Err(err) = fs::remove_file(&self.path) {
+            warn!(
+                "failed to remove temporary ipset restore script {}: {err}",
+                self.path.display()
+            );
+        }
+    }
 }
 
 fn write_restore_script<T: Ord + Display>(

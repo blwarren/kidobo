@@ -319,33 +319,23 @@ fn parse_ipset(raw: RawIpsetConfig) -> Result<IpsetConfig, ConfigError> {
         None => DEFAULT_IPSET_TYPE.to_string(),
     };
 
-    let hashsize = bounded_u32(
+    let hashsize = bounded_newtype(
         raw.hashsize.unwrap_or(i64::from(DEFAULT_HASHSIZE)),
         "ipset.hashsize",
         1,
         u32::MAX,
+        "must be a power-of-two positive integer".to_string(),
+        HashsizePow2::new,
     )?;
-    if !hashsize.is_power_of_two() {
-        return Err(ConfigError::InvalidField {
-            field: "ipset.hashsize",
-            reason: "must be a power-of-two positive integer".to_string(),
-        });
-    }
-    let hashsize = HashsizePow2::new(hashsize).ok_or_else(|| ConfigError::InvalidField {
-        field: "ipset.hashsize",
-        reason: "must be a power-of-two positive integer".to_string(),
-    })?;
 
-    let maxelem = bounded_u32(
+    let maxelem = bounded_newtype(
         raw.maxelem.unwrap_or(i64::from(DEFAULT_MAXELEM)),
         "ipset.maxelem",
         1,
         DEFAULT_MAXELEM,
+        format!("must be between 1 and {DEFAULT_MAXELEM}"),
+        MaxElem::new,
     )?;
-    let maxelem = MaxElem::new(maxelem).ok_or_else(|| ConfigError::InvalidField {
-        field: "ipset.maxelem",
-        reason: format!("must be between 1 and {DEFAULT_MAXELEM}"),
-    })?;
 
     let timeout = bounded_u32(
         raw.timeout.unwrap_or(i64::from(DEFAULT_TIMEOUT)),
@@ -417,31 +407,25 @@ fn parse_remote(raw: RawRemoteConfig) -> Result<RemoteConfig, ConfigError> {
         }
     }
 
-    let timeout_secs = bounded_u32(
+    let timeout_secs = bounded_newtype(
         raw.timeout_secs
             .unwrap_or(i64::from(DEFAULT_REMOTE_TIMEOUT_SECS)),
         "remote.timeout_secs",
         1,
         REMOTE_TIMEOUT_SECS_MAX,
+        format!("must be between 1 and {REMOTE_TIMEOUT_SECS_MAX}"),
+        RemoteTimeoutSecs::new,
     )?;
-    let timeout_secs =
-        RemoteTimeoutSecs::new(timeout_secs).ok_or_else(|| ConfigError::InvalidField {
-            field: "remote.timeout_secs",
-            reason: format!("must be between 1 and {REMOTE_TIMEOUT_SECS_MAX}"),
-        })?;
 
-    let cache_stale_after_secs = bounded_u32(
+    let cache_stale_after_secs = bounded_newtype(
         raw.cache_stale_after_secs
             .unwrap_or(i64::from(DEFAULT_REMOTE_CACHE_STALE_AFTER_SECS)),
         "remote.cache_stale_after_secs",
         1,
         REMOTE_CACHE_STALE_AFTER_SECS_MAX,
+        format!("must be between 1 and {REMOTE_CACHE_STALE_AFTER_SECS_MAX}"),
+        RemoteCacheStaleAfterSecs::new,
     )?;
-    let cache_stale_after_secs = RemoteCacheStaleAfterSecs::new(cache_stale_after_secs)
-        .ok_or_else(|| ConfigError::InvalidField {
-            field: "remote.cache_stale_after_secs",
-            reason: format!("must be between 1 and {REMOTE_CACHE_STALE_AFTER_SECS_MAX}"),
-        })?;
 
     Ok(RemoteConfig {
         urls,
@@ -461,20 +445,15 @@ fn parse_asn(raw: RawAsnConfig) -> Result<AsnConfig, ConfigError> {
     banned.sort_unstable();
     banned.dedup();
 
-    let cache_stale_after_secs = bounded_u32(
+    let cache_stale_after_secs = bounded_newtype(
         raw.cache_stale_after_secs
             .unwrap_or(i64::from(DEFAULT_ASN_CACHE_STALE_AFTER_SECS)),
         "asn.cache_stale_after_secs",
         1,
         ASN_CACHE_STALE_AFTER_SECS_MAX,
+        format!("must be between 1 and {ASN_CACHE_STALE_AFTER_SECS_MAX}"),
+        AsnCacheStaleAfterSecs::new,
     )?;
-    let cache_stale_after_secs =
-        AsnCacheStaleAfterSecs::new(cache_stale_after_secs).ok_or_else(|| {
-            ConfigError::InvalidField {
-                field: "asn.cache_stale_after_secs",
-                reason: format!("must be between 1 and {ASN_CACHE_STALE_AFTER_SECS_MAX}"),
-            }
-        })?;
 
     Ok(AsnConfig {
         banned,
@@ -530,6 +509,21 @@ fn bounded_u32(value: i64, field: &'static str, min: u32, max: u32) -> Result<u3
     u32::try_from(value).map_err(|err| ConfigError::InvalidField {
         field,
         reason: err.to_string(),
+    })
+}
+
+fn bounded_newtype<T>(
+    value: i64,
+    field: &'static str,
+    min: u32,
+    max: u32,
+    invalid_reason: String,
+    parse: impl FnOnce(u32) -> Option<T>,
+) -> Result<T, ConfigError> {
+    let value = bounded_u32(value, field, min, max)?;
+    parse(value).ok_or(ConfigError::InvalidField {
+        field,
+        reason: invalid_reason,
     })
 }
 

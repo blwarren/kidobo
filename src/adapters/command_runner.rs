@@ -1,4 +1,4 @@
-use std::io::{self, Read};
+use std::io::Read;
 use std::process::{Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 
 use crate::adapters::command_common::display_command;
+use crate::adapters::limited_io::read_to_end_with_limit;
 
 pub const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(not(test))]
@@ -169,40 +170,11 @@ fn spawn_output_reader<R>(mut reader: R) -> thread::JoinHandle<std::io::Result<V
 where
     R: Read + Send + 'static,
 {
-    thread::spawn(move || read_to_end_with_limit(&mut reader, DEFAULT_COMMAND_OUTPUT_LIMIT))
-}
-
-fn read_to_end_with_limit(reader: &mut impl Read, max_bytes: usize) -> io::Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    let mut chunk = [0_u8; 8192];
-
-    loop {
-        let read = reader.read(&mut chunk)?;
-        if read == 0 {
-            break;
-        }
-
-        if bytes
-            .len()
-            .checked_add(read)
-            .is_none_or(|next| next > max_bytes)
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("command output exceeds {max_bytes} byte limit"),
-            ));
-        }
-
-        let Some(slice) = chunk.get(..read) else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "output reader returned an invalid chunk size",
-            ));
-        };
-        bytes.extend_from_slice(slice);
-    }
-
-    Ok(bytes)
+    thread::spawn(move || {
+        read_to_end_with_limit(&mut reader, DEFAULT_COMMAND_OUTPUT_LIMIT, |limit| {
+            format!("command output exceeds {limit} byte limit")
+        })
+    })
 }
 
 fn join_output_reader(

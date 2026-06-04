@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Once;
 use std::time::Duration;
@@ -11,11 +10,13 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::adapters::cached_fetch::{
-    CachedFetchRequest, read_optional_json_lossy, run_cached_fetch, write_bytes_atomic_in_cache,
-    write_json_pretty_atomic,
+    read_optional_json_lossy, write_bytes_atomic_in_cache, write_json_pretty_atomic,
 };
 use crate::adapters::hash::sha256_hex;
-use crate::adapters::limited_io::{read_to_string_with_limit, write_string_atomic};
+use crate::adapters::http_fetch::{ConditionalFetchResult, fetch_with_conditional_cache};
+use crate::adapters::limited_io::{
+    read_to_end_with_limit, read_to_string_with_limit, write_string_atomic,
+};
 use crate::core::network::{CanonicalCidr, parse_ip_cidr_non_strict, parse_lines_non_strict};
 
 pub const DEFAULT_MAX_HTTP_BODY_BYTES: usize = 32 * 1024 * 1024;
@@ -158,37 +159,12 @@ fn read_response_body_capped(
     response: &mut reqwest::blocking::Response,
     max_body_bytes: usize,
 ) -> Result<Vec<u8>, HttpClientError> {
-    let mut out = Vec::new();
-    let mut chunk = [0_u8; 8192];
-
-    loop {
-        let read = response
-            .read(&mut chunk)
-            .map_err(|err| HttpClientError::Request {
-                reason: err.to_string(),
-            })?;
-
-        if read == 0 {
-            break;
-        }
-
-        if out
-            .len()
-            .checked_add(read)
-            .is_none_or(|next| next > max_body_bytes)
-        {
-            return Err(HttpClientError::Request {
-                reason: format!("response body exceeds max {max_body_bytes} bytes"),
-            });
-        }
-
-        let slice = chunk.get(..read).ok_or_else(|| HttpClientError::Request {
-            reason: "response reader returned an invalid chunk size".to_string(),
-        })?;
-        out.extend_from_slice(slice);
-    }
-
-    Ok(out)
+    read_to_end_with_limit(response, max_body_bytes, |limit| {
+        format!("response body exceeds max {limit} bytes")
+    })
+    .map_err(|err| HttpClientError::Request {
+        reason: err.to_string(),
+    })
 }
 
 #[derive(Debug, Error)]
@@ -282,55 +258,41 @@ pub fn fetch_iplist_with_cache(
     let (cached_etag, cached_last_modified) = cached_meta.as_ref().map_or((None, None), |meta| {
         (meta.etag.clone(), meta.last_modified.clone())
     });
-    let cached_networks_for_not_modified = cached_networks.clone();
-    let cached_meta_for_not_modified = cached_meta.clone();
-    let cached_networks_for_fallback = cached_networks.clone();
-    let cached_meta_for_fallback = cached_meta.clone();
 
-    run_cached_fetch(
-        CachedFetchRequest {
-            client,
-            url,
-            max_body_bytes: max_bytes,
-            cached_etag,
-            cached_last_modified,
-            has_usable_cache: cached_networks.is_some(),
-            log_subject: "remote source",
-            missing_response_warning: &format!(
-                "remote fetch returned network outcome without response for {url}"
-            ),
-        },
-        || {
-            if let Some(networks) = cached_networks_for_not_modified {
-                return Ok(CachedIplist {
+    match fetch_with_conditional_cache(
+        client,
+        url,
+        max_bytes,
+        cached_etag,
+        cached_last_modified,
+        cached_networks.is_some(),
+        "remote source",
+    ) {
+        ConditionalFetchResult::CacheNotModified => {
+            if let Some(networks) = cached_networks {
+                Ok(CachedIplist {
                     networks,
                     source: CacheSource::CacheNotModified,
-                    metadata: cached_meta_for_not_modified,
-                });
+                    metadata: cached_meta,
+                })
+            } else {
+                Ok(CachedIplist {
+                    networks: Vec::new(),
+                    source: CacheSource::Empty,
+                    metadata: None,
+                })
             }
-            Ok::<CachedIplist, HttpCacheError>(CachedIplist {
-                networks: Vec::new(),
-                source: CacheSource::Empty,
-                metadata: None,
-            })
-        },
-        || {
-            Ok(cache_fallback(
-                cached_networks_for_fallback,
-                cached_meta_for_fallback,
-            ))
-        },
-        |response| {
-            handle_network_response(
-                response,
-                url,
-                &cache_paths,
-                max_bytes,
-                cached_networks,
-                cached_meta,
-            )
-        },
-    )
+        }
+        ConditionalFetchResult::FallbackCache => Ok(cache_fallback(cached_networks, cached_meta)),
+        ConditionalFetchResult::Network(response) => handle_network_response(
+            response,
+            url,
+            &cache_paths,
+            max_bytes,
+            cached_networks,
+            cached_meta,
+        ),
+    }
 }
 
 fn handle_network_response(

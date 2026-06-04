@@ -6,22 +6,7 @@ use serde::de::DeserializeOwned;
 use thiserror::Error;
 
 use crate::adapters::hash::sha256_hex;
-use crate::adapters::http_cache::{HttpClient, HttpResponse};
-use crate::adapters::http_fetch::{
-    dispatch_conditional_fetch_result, fetch_with_conditional_cache,
-};
 use crate::adapters::limited_io::{read_bytes_with_limit, write_bytes_atomic};
-
-pub struct CachedFetchRequest<'a> {
-    pub client: &'a dyn HttpClient,
-    pub url: &'a str,
-    pub max_body_bytes: usize,
-    pub cached_etag: Option<String>,
-    pub cached_last_modified: Option<String>,
-    pub has_usable_cache: bool,
-    pub log_subject: &'a str,
-    pub missing_response_warning: &'a str,
-}
 
 #[derive(Debug, Error)]
 pub enum WriteJsonError {
@@ -30,36 +15,6 @@ pub enum WriteJsonError {
 
     #[error("failed to write JSON file: {reason}")]
     Write { reason: String },
-}
-
-pub fn run_cached_fetch<T, E, FCacheNotModified, FFallback, FNetwork>(
-    request: CachedFetchRequest<'_>,
-    on_cache_not_modified: FCacheNotModified,
-    on_fallback_cache: FFallback,
-    on_network: FNetwork,
-) -> Result<T, E>
-where
-    FCacheNotModified: FnOnce() -> Result<T, E>,
-    FFallback: FnOnce() -> Result<T, E>,
-    FNetwork: FnOnce(HttpResponse) -> Result<T, E>,
-{
-    let result = fetch_with_conditional_cache(
-        request.client,
-        request.url,
-        request.max_body_bytes,
-        request.cached_etag,
-        request.cached_last_modified,
-        request.has_usable_cache,
-        request.log_subject,
-    );
-
-    dispatch_conditional_fetch_result(
-        result,
-        request.missing_response_warning,
-        on_cache_not_modified,
-        on_fallback_cache,
-        on_network,
-    )
 }
 
 pub fn read_optional_bytes_lossy(
@@ -148,179 +103,20 @@ fn ensure_parent_dir(path: &Path) -> Result<(), std::io::Error> {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
-    use std::collections::VecDeque;
     use std::fs;
 
-    use reqwest::StatusCode;
     use serde::{Deserialize, Serialize};
     use tempfile::TempDir;
 
     use super::{
-        CachedFetchRequest, read_optional_json_lossy, read_validated_bytes_lossy, run_cached_fetch,
-        write_bytes_atomic_in_cache, write_json_pretty_atomic,
+        read_optional_json_lossy, read_validated_bytes_lossy, write_bytes_atomic_in_cache,
+        write_json_pretty_atomic,
     };
-    use crate::adapters::http_cache::{HttpClient, HttpClientError, HttpRequest, HttpResponse};
     use crate::adapters::limited_io::read_bytes_with_limit;
-
-    struct MockHttpClient {
-        responses: RefCell<VecDeque<Result<HttpResponse, HttpClientError>>>,
-        requests: RefCell<Vec<HttpRequest>>,
-    }
-
-    impl MockHttpClient {
-        fn new(responses: Vec<Result<HttpResponse, HttpClientError>>) -> Self {
-            Self {
-                responses: RefCell::new(VecDeque::from(responses)),
-                requests: RefCell::new(Vec::new()),
-            }
-        }
-
-        fn requests(&self) -> Vec<HttpRequest> {
-            self.requests.borrow().clone()
-        }
-    }
-
-    impl HttpClient for MockHttpClient {
-        fn fetch(&self, request: HttpRequest) -> Result<HttpResponse, HttpClientError> {
-            self.requests.borrow_mut().push(request);
-            self.responses
-                .borrow_mut()
-                .pop_front()
-                .expect("queued response")
-        }
-    }
 
     #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
     struct SampleJson {
         value: String,
-    }
-
-    #[test]
-    fn returns_network_response_for_successful_fetch() {
-        let client = MockHttpClient::new(vec![Ok(HttpResponse {
-            status: StatusCode::OK,
-            body: b"body".to_vec(),
-            etag: Some("etag-1".to_string()),
-            last_modified: None,
-        })]);
-
-        let result = run_cached_fetch(
-            CachedFetchRequest {
-                client: &client,
-                url: "https://example.com/feed.txt",
-                max_body_bytes: 1024,
-                cached_etag: None,
-                cached_last_modified: None,
-                has_usable_cache: false,
-                log_subject: "remote source",
-                missing_response_warning: "missing response",
-            },
-            || Ok::<String, String>("cache-not-modified".to_string()),
-            || Ok("fallback".to_string()),
-            |response| Ok(String::from_utf8_lossy(&response.body).to_string()),
-        )
-        .expect("fetch result");
-
-        assert_eq!(result, "body");
-        assert_eq!(client.requests().len(), 1);
-    }
-
-    #[test]
-    fn returns_cache_not_modified_when_304_has_usable_cache() {
-        let client = MockHttpClient::new(vec![Ok(HttpResponse {
-            status: StatusCode::NOT_MODIFIED,
-            body: Vec::new(),
-            etag: None,
-            last_modified: None,
-        })]);
-
-        let result = run_cached_fetch(
-            CachedFetchRequest {
-                client: &client,
-                url: "https://example.com/feed.txt",
-                max_body_bytes: 1024,
-                cached_etag: Some("etag-1".to_string()),
-                cached_last_modified: None,
-                has_usable_cache: true,
-                log_subject: "remote source",
-                missing_response_warning: "missing response",
-            },
-            || Ok::<String, String>("cache-not-modified".to_string()),
-            || Ok("fallback".to_string()),
-            |_| Ok("network".to_string()),
-        )
-        .expect("fetch result");
-
-        assert_eq!(result, "cache-not-modified");
-        assert_eq!(client.requests().len(), 1);
-    }
-
-    #[test]
-    fn refetches_when_304_does_not_have_usable_cache() {
-        let client = MockHttpClient::new(vec![
-            Ok(HttpResponse {
-                status: StatusCode::NOT_MODIFIED,
-                body: Vec::new(),
-                etag: None,
-                last_modified: None,
-            }),
-            Ok(HttpResponse {
-                status: StatusCode::OK,
-                body: b"network".to_vec(),
-                etag: None,
-                last_modified: None,
-            }),
-        ]);
-
-        let result = run_cached_fetch(
-            CachedFetchRequest {
-                client: &client,
-                url: "https://example.com/feed.txt",
-                max_body_bytes: 1024,
-                cached_etag: Some("etag-1".to_string()),
-                cached_last_modified: Some("Mon, 01 Jan 2024 00:00:00 GMT".to_string()),
-                has_usable_cache: false,
-                log_subject: "remote source",
-                missing_response_warning: "missing response",
-            },
-            || Ok::<String, String>("cache-not-modified".to_string()),
-            || Ok("fallback".to_string()),
-            |response| Ok(String::from_utf8_lossy(&response.body).to_string()),
-        )
-        .expect("fetch result");
-
-        assert_eq!(result, "network");
-        let requests = client.requests();
-        assert_eq!(requests.len(), 2);
-        assert_eq!(requests[1].if_none_match, None);
-        assert_eq!(requests[1].if_modified_since, None);
-    }
-
-    #[test]
-    fn falls_back_when_network_fetch_fails() {
-        let client = MockHttpClient::new(vec![Err(HttpClientError::Request {
-            reason: "offline".to_string(),
-        })]);
-
-        let result = run_cached_fetch(
-            CachedFetchRequest {
-                client: &client,
-                url: "https://example.com/feed.txt",
-                max_body_bytes: 1024,
-                cached_etag: None,
-                cached_last_modified: None,
-                has_usable_cache: false,
-                log_subject: "remote source",
-                missing_response_warning: "missing response",
-            },
-            || Ok::<String, String>("cache-not-modified".to_string()),
-            || Ok("fallback".to_string()),
-            |_| Ok("network".to_string()),
-        )
-        .expect("fetch result");
-
-        assert_eq!(result, "fallback");
     }
 
     #[test]

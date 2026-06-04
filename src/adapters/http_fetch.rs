@@ -3,40 +3,11 @@ use reqwest::StatusCode;
 
 use crate::adapters::http_cache::{HttpClient, HttpRequest, HttpResponse};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConditionalFetchOutcome {
-    Network,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConditionalFetchResult {
+    Network(HttpResponse),
     CacheNotModified,
     FallbackCache,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ConditionalFetchResult {
-    pub outcome: ConditionalFetchOutcome,
-    pub response: Option<HttpResponse>,
-}
-
-pub fn dispatch_conditional_fetch_result<T, E, FCacheNotModified, FFallback, FNetwork>(
-    result: ConditionalFetchResult,
-    missing_response_warning: &str,
-    on_cache_not_modified: FCacheNotModified,
-    on_fallback_cache: FFallback,
-    on_network: FNetwork,
-) -> Result<T, E>
-where
-    FCacheNotModified: FnOnce() -> Result<T, E>,
-    FFallback: FnOnce() -> Result<T, E>,
-    FNetwork: FnOnce(HttpResponse) -> Result<T, E>,
-{
-    match (result.outcome, result.response) {
-        (ConditionalFetchOutcome::CacheNotModified, _) => on_cache_not_modified(),
-        (ConditionalFetchOutcome::FallbackCache, _) => on_fallback_cache(),
-        (ConditionalFetchOutcome::Network, Some(response)) => on_network(response),
-        (ConditionalFetchOutcome::Network, None) => {
-            warn!("{missing_response_warning}");
-            on_fallback_cache()
-        }
-    }
 }
 
 pub fn fetch_with_conditional_cache(
@@ -59,25 +30,16 @@ pub fn fetch_with_conditional_cache(
         Ok(response) => response,
         Err(err) => {
             warn!("{log_subject} fetch failed for {url}: {err}");
-            return ConditionalFetchResult {
-                outcome: ConditionalFetchOutcome::FallbackCache,
-                response: None,
-            };
+            return ConditionalFetchResult::FallbackCache;
         }
     };
 
     if response.status != StatusCode::NOT_MODIFIED {
-        return ConditionalFetchResult {
-            outcome: ConditionalFetchOutcome::Network,
-            response: Some(response),
-        };
+        return ConditionalFetchResult::Network(response);
     }
 
     if has_usable_cache {
-        return ConditionalFetchResult {
-            outcome: ConditionalFetchOutcome::CacheNotModified,
-            response: None,
-        };
+        return ConditionalFetchResult::CacheNotModified;
     }
 
     let unconditional_request = HttpRequest {
@@ -88,16 +50,10 @@ pub fn fetch_with_conditional_cache(
     };
 
     match client.fetch(unconditional_request) {
-        Ok(response) => ConditionalFetchResult {
-            outcome: ConditionalFetchOutcome::Network,
-            response: Some(response),
-        },
+        Ok(response) => ConditionalFetchResult::Network(response),
         Err(err) => {
             warn!("{log_subject} refetch failed for {url} after 304: {err}");
-            ConditionalFetchResult {
-                outcome: ConditionalFetchOutcome::FallbackCache,
-                response: None,
-            }
+            ConditionalFetchResult::FallbackCache
         }
     }
 }
@@ -109,7 +65,7 @@ mod tests {
 
     use reqwest::StatusCode;
 
-    use super::{ConditionalFetchOutcome, ConditionalFetchResult, fetch_with_conditional_cache};
+    use super::{ConditionalFetchResult, fetch_with_conditional_cache};
     use crate::adapters::http_cache::{HttpClient, HttpClientError, HttpRequest, HttpResponse};
 
     struct MockHttpClient {
@@ -140,9 +96,11 @@ mod tests {
         }
     }
 
-    fn unwrap_result(result: ConditionalFetchResult) -> (ConditionalFetchOutcome, HttpResponse) {
-        let response = result.response.expect("response should exist");
-        (result.outcome, response)
+    fn unwrap_network_result(result: ConditionalFetchResult) -> HttpResponse {
+        match result {
+            ConditionalFetchResult::Network(response) => response,
+            _ => panic!("response should exist"),
+        }
     }
 
     #[test]
@@ -154,7 +112,7 @@ mod tests {
             last_modified: None,
         })]);
 
-        let (outcome, response) = unwrap_result(fetch_with_conditional_cache(
+        let response = unwrap_network_result(fetch_with_conditional_cache(
             &client,
             "https://example.com/feed.txt",
             1024,
@@ -164,7 +122,6 @@ mod tests {
             "remote source",
         ));
 
-        assert_eq!(outcome, ConditionalFetchOutcome::Network);
         assert_eq!(response.status, StatusCode::OK);
         assert_eq!(client.requests().len(), 1);
     }
@@ -188,8 +145,7 @@ mod tests {
             "remote source",
         );
 
-        assert_eq!(result.outcome, ConditionalFetchOutcome::CacheNotModified);
-        assert!(result.response.is_none());
+        assert_eq!(result, ConditionalFetchResult::CacheNotModified);
         assert_eq!(client.requests().len(), 1);
     }
 
@@ -210,7 +166,7 @@ mod tests {
             }),
         ]);
 
-        let (outcome, response) = unwrap_result(fetch_with_conditional_cache(
+        let response = unwrap_network_result(fetch_with_conditional_cache(
             &client,
             "https://example.com/feed.txt",
             1024,
@@ -220,7 +176,6 @@ mod tests {
             "remote source",
         ));
 
-        assert_eq!(outcome, ConditionalFetchOutcome::Network);
         assert_eq!(response.status, StatusCode::OK);
 
         let requests = client.requests();
@@ -253,7 +208,6 @@ mod tests {
             "remote source",
         );
 
-        assert_eq!(result.outcome, ConditionalFetchOutcome::FallbackCache);
-        assert!(result.response.is_none());
+        assert_eq!(result, ConditionalFetchResult::FallbackCache);
     }
 }

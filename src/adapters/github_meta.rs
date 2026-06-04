@@ -7,11 +7,12 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::adapters::cached_fetch::{
-    CachedFetchRequest, read_optional_json_lossy, read_validated_bytes_lossy, run_cached_fetch,
-    write_bytes_atomic_in_cache, write_json_pretty_atomic,
+    read_optional_json_lossy, read_validated_bytes_lossy, write_bytes_atomic_in_cache,
+    write_json_pretty_atomic,
 };
 use crate::adapters::hash::sha256_hex;
 use crate::adapters::http_cache::{HttpClient, HttpResponse, max_http_body_bytes};
+use crate::adapters::http_fetch::{ConditionalFetchResult, fetch_with_conditional_cache};
 use crate::core::config::{
     DEFAULT_GITHUB_META_CATEGORIES, DEFAULT_GITHUB_META_URL, GithubMetaCategoryMode,
 };
@@ -112,50 +113,40 @@ pub fn load_github_meta_safelist(
     let cache = read_github_meta_cache(&paths, &selection, github_meta_url);
     let (cached_etag, cached_last_modified) = cache.http_validators();
 
-    run_cached_fetch(
-        CachedFetchRequest {
-            client,
-            url: github_meta_url,
-            max_body_bytes: max_bytes,
-            cached_etag,
-            cached_last_modified,
-            has_usable_cache: cache.networks.is_some(),
-            log_subject: "github meta",
-            missing_response_warning: "github meta fetch returned network outcome without response",
-        },
-        || {
+    match fetch_with_conditional_cache(
+        client,
+        github_meta_url,
+        max_bytes,
+        cached_etag,
+        cached_last_modified,
+        cache.networks.is_some(),
+        "github meta",
+    ) {
+        ConditionalFetchResult::CacheNotModified => {
             if let Some(networks) = cache.networks.clone() {
-                return Ok(GithubMetaLoadResult {
+                Ok(GithubMetaLoadResult {
                     networks,
                     source: GithubMetaSource::CacheNotModified,
                     metadata: cache.meta.clone(),
-                });
+                })
+            } else {
+                Ok(cache.fallback(None, &selection, GithubMetaSource::FallbackCache))
             }
-
-            Ok::<GithubMetaLoadResult, GithubMetaLoadError>(cache.fallback(
-                None,
-                &selection,
-                GithubMetaSource::FallbackCache,
-            ))
-        },
-        || {
-            Ok(cache.fallback(
-                cache.networks.clone(),
-                &selection,
-                GithubMetaSource::FallbackCache,
-            ))
-        },
-        |response| {
-            handle_network_response(
-                response,
-                &paths,
-                github_meta_url,
-                max_bytes,
-                cache.as_fallback(),
-                &selection,
-            )
-        },
-    )
+        }
+        ConditionalFetchResult::FallbackCache => Ok(cache.fallback(
+            cache.networks.clone(),
+            &selection,
+            GithubMetaSource::FallbackCache,
+        )),
+        ConditionalFetchResult::Network(response) => handle_network_response(
+            response,
+            &paths,
+            github_meta_url,
+            max_bytes,
+            cache.as_fallback(),
+            &selection,
+        ),
+    }
 }
 
 fn read_github_meta_cache(

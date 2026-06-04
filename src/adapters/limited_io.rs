@@ -15,17 +15,32 @@ pub fn read_to_string_with_limit(path: &Path, max_bytes: usize) -> io::Result<St
 /// Read the entire file into a byte vector, while capping how many bytes are read.
 pub fn read_bytes_with_limit(path: &Path, max_bytes: usize) -> io::Result<Vec<u8>> {
     let file = File::open(path)?;
+    let mut reader = BufReader::new(file);
+    read_to_end_with_limit(&mut reader, max_bytes, |limit| {
+        format!("file exceeds {limit} byte limit")
+    })
+}
+
+/// Read from any stream into a byte vector while capping how many bytes are read.
+pub fn read_to_end_with_limit<F>(
+    reader: &mut impl Read,
+    max_bytes: usize,
+    over_limit_message: F,
+) -> io::Result<Vec<u8>>
+where
+    F: FnOnce(usize) -> String,
+{
     let extra_byte_limit = u64::try_from(max_bytes)
         .unwrap_or(u64::MAX - 1)
         .saturating_add(1);
-    let mut reader = BufReader::new(file).take(extra_byte_limit);
+    let mut limited = reader.take(extra_byte_limit);
     let mut contents = Vec::new();
-    reader.read_to_end(&mut contents)?;
+    limited.read_to_end(&mut contents)?;
 
     if contents.len() > max_bytes {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("file exceeds {max_bytes} byte limit"),
+            over_limit_message(max_bytes),
         ));
     }
 

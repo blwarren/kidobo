@@ -335,21 +335,6 @@ mod tests {
     }
 
     #[test]
-    fn config_optional_resolution_allows_missing_default_config_path_for_init_callers() {
-        let temp = TempDir::new().expect("tempdir");
-        let root = temp.path().join("root");
-        fs::create_dir_all(&root).expect("mkdir root");
-
-        let mut input = test_input(&temp);
-        input
-            .env
-            .insert(ENV_KIDOBO_ROOT.to_string(), root.display().to_string());
-
-        let resolved = resolve_paths_without_config(&input).expect("resolve");
-        assert_eq!(resolved.config_file, root.join("config/config.toml"));
-    }
-
-    #[test]
     fn config_optional_resolution_allows_missing_default_config_path() {
         let temp = TempDir::new().expect("tempdir");
         let root = temp.path().join("root");
