@@ -368,6 +368,16 @@ fn analyze_overlap_uses_cached_sources_only_and_exits_zero() {
         "missing per-remote overlap section: {stdout}"
     );
     assert!(
+        stdout.contains("metric") && stdout.contains("value"),
+        "missing summary table headers: {stdout}"
+    );
+    assert!(
+        stdout.contains("rank")
+            && stdout.contains("source")
+            && stdout.contains("covered_pct_local"),
+        "missing per-remote table headers: {stdout}"
+    );
+    assert!(
         stdout.contains("https://example.com/a.txt"),
         "missing remote source label: {stdout}"
     );

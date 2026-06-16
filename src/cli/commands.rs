@@ -3,8 +3,8 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use log::warn;
+use tabled::builder::Builder;
 use tabled::settings::Style;
-use tabled::{Table, Tabled};
 
 use crate::adapters::blocklist_analysis_sources::load_analysis_sources;
 use crate::adapters::config::load_config_from_file;
@@ -42,24 +42,6 @@ struct OverlapSummaryData {
     stale_after_secs: u64,
     fully_covered_total: usize,
     reduced_total: usize,
-}
-
-#[derive(Debug, Tabled)]
-struct SummaryRow {
-    metric: String,
-    value: String,
-}
-
-#[derive(Debug, Tabled)]
-struct RemoteOverlapDisplayRow<'a> {
-    rank: usize,
-    source: &'a str,
-    ov4: usize,
-    ov6: usize,
-    covered4: usize,
-    covered6: usize,
-    covered_pct_local: String,
-    stale: &'a str,
 }
 
 pub fn dispatch(command: Command) -> Result<(), KidoboError> {
@@ -241,52 +223,52 @@ fn print_overlap_summary(
     println!("analyze overlap (offline cache only)");
     println!();
     println!("summary:");
-    let rows = vec![
-        SummaryRow {
-            metric: "local collapsed".to_string(),
-            value: format!(
-                "ipv4={} ipv6={} total={}",
-                local.ipv4.len(),
-                local.ipv6.len(),
-                local.ipv4.len() + local.ipv6.len()
-            ),
-        },
-        SummaryRow {
-            metric: "remote cache sources".to_string(),
-            value: format!(
-                "total={} stale={} stale_after_secs={}",
-                summary.remote_source_count, summary.stale_source_count, summary.stale_after_secs
-            ),
-        },
-        SummaryRow {
-            metric: "remote union".to_string(),
-            value: format!(
-                "ipv4={} ipv6={} total={}",
-                remote_union.ipv4.len(),
-                remote_union.ipv6.len(),
-                remote_union.ipv4.len() + remote_union.ipv6.len()
-            ),
-        },
-        SummaryRow {
-            metric: "overlap with union".to_string(),
-            value: format!(
-                "ov4={} ov6={} covered4={} covered6={}",
-                union_overlap.ipv4.overlapping,
-                union_overlap.ipv6.overlapping,
-                union_overlap.ipv4.fully_covered,
-                union_overlap.ipv6.fully_covered
-            ),
-        },
-        SummaryRow {
-            metric: "reduction options".to_string(),
-            value: format!(
-                "remove_fully_covered={} reduced_local={}",
-                summary.fully_covered_total, summary.reduced_total
-            ),
-        },
-    ];
+    let mut builder = Builder::default();
+    builder.push_record(["metric", "value"]);
+    builder.push_record([
+        "local collapsed".to_string(),
+        format!(
+            "ipv4={} ipv6={} total={}",
+            local.ipv4.len(),
+            local.ipv6.len(),
+            local.ipv4.len() + local.ipv6.len()
+        ),
+    ]);
+    builder.push_record([
+        "remote cache sources".to_string(),
+        format!(
+            "total={} stale={} stale_after_secs={}",
+            summary.remote_source_count, summary.stale_source_count, summary.stale_after_secs
+        ),
+    ]);
+    builder.push_record([
+        "remote union".to_string(),
+        format!(
+            "ipv4={} ipv6={} total={}",
+            remote_union.ipv4.len(),
+            remote_union.ipv6.len(),
+            remote_union.ipv4.len() + remote_union.ipv6.len()
+        ),
+    ]);
+    builder.push_record([
+        "overlap with union".to_string(),
+        format!(
+            "ov4={} ov6={} covered4={} covered6={}",
+            union_overlap.ipv4.overlapping,
+            union_overlap.ipv6.overlapping,
+            union_overlap.ipv4.fully_covered,
+            union_overlap.ipv6.fully_covered
+        ),
+    ]);
+    builder.push_record([
+        "reduction options".to_string(),
+        format!(
+            "remove_fully_covered={} reduced_local={}",
+            summary.fully_covered_total, summary.reduced_total
+        ),
+    ]);
 
-    let mut table = Table::new(rows);
+    let mut table = builder.build();
     table.with(Style::modern());
     println!("{table}");
 
@@ -347,21 +329,34 @@ fn print_remote_overlap_rows(rows: &[RemoteOverlapRow<'_>], local_total: usize) 
     println!();
     println!("per-remote overlap:");
     println!("  sorted by covered then overlap");
-    let display_rows = displayed
-        .iter()
-        .enumerate()
-        .map(|(idx, row)| RemoteOverlapDisplayRow {
-            rank: idx + 1,
-            source: row.label,
-            ov4: row.ov4,
-            ov6: row.ov6,
-            covered4: row.covered4,
-            covered6: row.covered6,
-            covered_pct_local: percent_str(row.covered4 + row.covered6, local_total),
-            stale: if row.stale { "yes" } else { "no" },
-        })
-        .collect::<Vec<_>>();
-    let mut table = Table::new(display_rows);
+    let mut builder = Builder::default();
+    builder.push_record([
+        "rank",
+        "source",
+        "ov4",
+        "ov6",
+        "covered4",
+        "covered6",
+        "covered_pct_local",
+        "stale",
+    ]);
+    for (idx, row) in displayed.iter().enumerate() {
+        builder.push_record([
+            (idx + 1).to_string(),
+            row.label.to_string(),
+            row.ov4.to_string(),
+            row.ov6.to_string(),
+            row.covered4.to_string(),
+            row.covered6.to_string(),
+            percent_str(row.covered4 + row.covered6, local_total),
+            if row.stale {
+                "yes".to_string()
+            } else {
+                "no".to_string()
+            },
+        ]);
+    }
+    let mut table = builder.build();
     table.with(Style::modern());
     println!("{table}");
 
