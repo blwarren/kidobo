@@ -1,14 +1,23 @@
 # Mutation Testing Remediation Plan
 
-This plan is based on the current `mutants.out` report in the repository root.
+This plan preserves the original repo-wide mutation snapshot and tracks newer scoped reports as stage
+follow-ups. The current actionable Stage 1 follow-up is the network-only `mutants.out`; `mutants.out.old`
+has empty missed and timeout files and is non-actionable.
 
-Report snapshot:
+Original repo-wide report snapshot:
 
 - `mutants.out/missed.txt`: 212 missed mutants
 - `mutants.out/timeout.txt`: 22 timeout mutants
 - `mutants.out/unviable.txt`: 314 unviable mutants
 - Runner evidence: `cargo-mutants 27.1.0` against package `kidobo 0.10.1`
 - Test command evidence: `cargo test --package=kidobo@0.10.1 --all-features --lib --bins --tests`
+
+Current network-only report snapshot:
+
+- `mutants.out/missed.txt`: 14 missed mutants before the run was interrupted
+- `mutants.out/timeout.txt`: 6 timeout mutants before the run was interrupted
+- `mutants.out/unviable.txt`: 33 unviable mutants before the run was interrupted
+- Baseline evidence from the user-run report: clean unmutated baseline, 60 caught mutants before interruption
 
 Do not rerun mutation testing from agent turns. Use user-provided mutation reports, and ask the user for a rerun after meaningful stages are complete. When asking for a rerun, provide a targeted command that scopes mutation testing to the code changed in that stage.
 
@@ -89,6 +98,36 @@ Stage 1 completion notes from 2026-06-23:
 - Reworked CIDR regeneration increments to use checked shifts, largest-prefix search to use bounded descending prefix ranges, and alignment masks to use checked right shifts. This addresses timeout-only mutation risks without suppressions.
 - Stage-local ignored missed mutants: `ipv4_to_interval` and `ipv6_to_interval` `|` to `^` is equivalent for valid `Ipv4Cidr` and `Ipv6Cidr` values because constructors and `from_parts` canonicalize host bits before interval conversion.
 - Stage-local ignored missed mutants: radix-sort fallback mutations that still return ordinary sorted output are performance-path changes, not observable correctness changes. The large-input test pins output equivalence rather than over-specifying whether fallback sorting ran.
+
+Stage 1 network-only follow-up notes from 2026-06-23:
+
+- Re-reviewed the current scoped `mutants.out` report: 14 missed, 6 timeout, and 33 unviable results in
+  `src/core/network.rs` before interruption. `mutants.out.old` is not actionable because its missed and
+  timeout files are empty.
+- Replaced branchy IPv4 and IPv6 host-mask logic with shared checked-shift helpers, then reused those
+  helpers for CIDR interval conversion, block-end calculation, and network masks.
+- Added direct radix-sort tests that assert successful sorting, preservation of every interval, mixed high
+  and low 16-bit start handling, and two-item sorting. These target bucket extraction and shift mutants in
+  both radix passes without testing whether the merge path chose radix sorting or ordinary sorting.
+- Added full IPv4 and IPv6 address-space interval regeneration tests that require `/0` output. Existing
+  max-tail regeneration tests still pin preservation of the final address near `u32::MAX` and `u128::MAX`.
+- Intentional non-fix: `start | suffix` to `start ^ suffix` in interval conversion is equivalent for valid
+  `Ipv4Cidr` and `Ipv6Cidr` values because constructors canonicalize host bits before conversion.
+- Intentional non-fix: the `radix_sort_intervals_u32_by_start` length guard changed from `<` to `==` is
+  equivalent for observable output because an empty slice still returns `true` unchanged after the two
+  no-op passes.
+- Intentional non-fix: radix threshold and fallback mutations that only swap between radix sort and
+  ordinary sort are performance-path mutants when the sorted output is unchanged.
+- Intentional non-fix: the `intervals_to_ipv*_cidrs_from_merged` overflow guard changed from `>` to `>=`
+  is equivalent for observable output on valid merged intervals; equality occurs only after a CIDR has
+  already covered the last address needed for that interval.
+- Timeout triage: `ipv4_to_interval` `==` to `!=`, `ipv6_to_interval` `|` to `&`, and `+=` to `*=` in CIDR
+  regeneration are artificial timeout risks under mutation, not supported-input nontermination in the
+  original code after the checked-shift and bounded-progress cleanup.
+- Unviable default-value mutants remain inconclusive unless a later review finds dead, redundant, or
+  confusing production code.
+- Agents did not run mutation execution. After validation, ask the user to rerun only the scoped
+  network batches listed in Stage 13.
 
 ## Stage 2: Safelist Subtraction
 
@@ -185,3 +224,11 @@ Stage 1 completion notes from 2026-06-23:
 - [ ] Run `./scripts/dev.sh release-notes-check` after every repo change and include rewritten changelog or release-note files if it changes them.
 - [ ] Ask the user to rerun mutation testing after safety-critical stages because agents should not run mutation testing directly.
 - [ ] Compare the user's rerun report against this plan and check off completed tasks only when corresponding mutants are caught, justified, or suppressed.
+
+Suggested scoped network reruns for the user after Stage 1 validation:
+
+```bash
+cargo mutants --no-config --file src/core/network.rs --re 'ipv[46]_to_interval|intervals_to_ipv[46]_cidrs|largest_prefix|is_aligned|block_end|ipv[46]_mask' --all-features --minimum-test-timeout 60 --timeout-multiplier 3 --build-timeout-multiplier 3 -- --lib --bins --tests
+cargo mutants --no-config --file src/core/network.rs --re 'merge_intervals|sort_intervals|radix_sort' --all-features --minimum-test-timeout 60 --timeout-multiplier 3 --build-timeout-multiplier 3 -- --lib --bins --tests
+cargo mutants --no-config --file src/core/network.rs --re 'subtract_intervals|subtract_safelist|intervals_overlap|cidr_overlaps' --all-features --minimum-test-timeout 60 --timeout-multiplier 3 --build-timeout-multiplier 3 -- --lib --bins --tests
+```
