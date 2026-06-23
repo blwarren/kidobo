@@ -8,7 +8,6 @@ cd "${repo_root}"
 CARGO_DENY_VERSION="${CARGO_DENY_VERSION:-0.19.0}"
 CARGO_AUDIT_VERSION="${CARGO_AUDIT_VERSION:-0.22.1}"
 CARGO_UDEPS_VERSION="${CARGO_UDEPS_VERSION:-0.1.60}"
-CARGO_MUTANTS_VERSION="${CARGO_MUTANTS_VERSION:-27.1.0}"
 
 usage() {
   cat <<'USAGE'
@@ -27,8 +26,6 @@ Commands:
   ci-supply-chain    Run CI supply-chain checks
   ci-udeps           Run CI unused dependency checks
   udeps              Install and run local unused dependency checks
-  ci-mutants [args...]
-                     Install and run CI mutation tests, passing optional args to cargo-mutants
   mutants [args...]  Run local mutation tests, passing optional args to cargo-mutants
   help               Show this help
 USAGE
@@ -125,23 +122,18 @@ run_mutants() {
   run_cmd "mutants" cargo mutants -vV "$@"
 }
 
-run_ci_mutants() {
-  run_cmd "ci-mutants" cargo install --locked cargo-mutants --version "${CARGO_MUTANTS_VERSION}"
-  run_cmd "ci-mutants" cargo mutants -vV --in-place "$@"
-}
-
 main() {
   local command="${1:-help}"
   if [[ $# -gt 0 ]]; then
     shift
   fi
 
-  if [[ "${command}" != "mutants" && "${command}" != "ci-mutants" && ( "${1:-}" == "-h" || "${1:-}" == "--help" ) ]]; then
+  if [[ "${command}" != "mutants" && ( "${1:-}" == "-h" || "${1:-}" == "--help" ) ]]; then
     usage
     return 0
   fi
 
-  if [[ "${command}" != "mutants" && "${command}" != "ci-mutants" && $# -gt 0 ]]; then
+  if [[ "${command}" != "mutants" && $# -gt 0 ]]; then
     echo "unexpected extra arguments for '${command}': $*" >&2
     usage >&2
     return 2
@@ -177,9 +169,6 @@ main() {
       ;;
     udeps)
       run_udeps
-      ;;
-    ci-mutants)
-      run_ci_mutants "$@"
       ;;
     mutants)
       run_mutants "$@"
