@@ -10,7 +10,7 @@ Report snapshot:
 - Runner evidence: `cargo-mutants 27.1.0` against package `kidobo 0.10.1`
 - Test command evidence: `cargo test --package=kidobo@0.10.1 --all-features --lib --bins --tests`
 
-Do not rerun mutation testing from agent turns. Use user-provided mutation reports, and ask the user for a rerun after meaningful stages are complete. Provide targeted commands for the user to run to ensure rerun mutation testing targets only the relevant code for review of that stage.
+Do not rerun mutation testing from agent turns. Use user-provided mutation reports, and ask the user for a rerun after meaningful stages are complete. When asking for a rerun, provide a targeted command that scopes mutation testing to the code changed in that stage.
 
 ## Priorities
 
