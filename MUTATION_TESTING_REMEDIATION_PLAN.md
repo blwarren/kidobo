@@ -1,8 +1,8 @@
 # Mutation Testing Remediation Plan
 
 This plan preserves the original repo-wide mutation snapshot and tracks newer scoped reports as stage
-follow-ups. The current actionable Stage 1 follow-up is the network-only `mutants.out`; `mutants.out.old`
-has empty missed and timeout files and is non-actionable.
+follow-ups. The scoped `src/core/network.rs` follow-up is complete; `mutants.out.old` has empty missed and
+timeout files and is non-actionable.
 
 Original repo-wide report snapshot:
 
@@ -18,6 +18,7 @@ Current network-only report snapshot:
 - `mutants.out/timeout.txt`: 6 timeout mutants before the run was interrupted
 - `mutants.out/unviable.txt`: 33 unviable mutants before the run was interrupted
 - Baseline evidence from the user-run report: clean unmutated baseline, 60 caught mutants before interruption
+- Status: complete. All `src/core/network.rs` mutation follow-up items are resolved.
 
 Do not rerun mutation testing from agent turns. Use user-provided mutation reports, and ask the user for a rerun after meaningful stages are complete. When asking for a rerun, provide a targeted command that scopes mutation testing to the code changed in that stage.
 
@@ -50,7 +51,7 @@ Stage 0 completion notes from 2026-06-23:
 
 | Area | Missed | Timeout | Stage 0 classification | Planned follow-up |
 | --- | ---: | ---: | --- | --- |
-| `src/core/network.rs` | 29 | 16 | Safety-critical deterministic core | Stages 1 and 2 |
+| `src/core/network.rs` | 29 | 16 | Safety-critical deterministic core | Completed in Stages 1 and 2 |
 | `src/core/blocklist_analysis.rs` | 12 | 3 | Safety-critical deterministic core | Stage 3 |
 | `src/core/lookup.rs` | 3 | 0 | Safety-critical deterministic core | Stage 3 |
 | `src/core/config.rs` | 14 | 0 | Safety-critical config validation | Stage 4 |
@@ -126,16 +127,21 @@ Stage 1 network-only follow-up notes from 2026-06-23:
   original code after the checked-shift and bounded-progress cleanup.
 - Unviable default-value mutants remain inconclusive unless a later review finds dead, redundant, or
   confusing production code.
-- Agents did not run mutation execution. After validation, ask the user to rerun only the scoped
-  network batches listed in Stage 13.
+- Agents did not run mutation execution. The scoped `src/core/network.rs` follow-up is now complete.
 
 ## Stage 2: Safelist Subtraction
 
-- [ ] Add IPv4 safelist subtraction tests for first-address, last-address, middle split, full removal, and no-overlap cases.
-- [ ] Add IPv6 safelist subtraction tests for first-address, last-address, middle split, full removal, and high-bit tail boundaries.
-- [ ] Add tests where multiple safelist entries carve one candidate so ignoring later safelist entries fails.
-- [ ] Add order-independence tests with unsorted candidates and unsorted safelist entries.
-- [ ] Add adjacency tests proving adjacent blocklist intervals merge while carved output remains minimal and non-overlapping.
+- [x] Add IPv4 safelist subtraction tests for first-address, last-address, middle split, full removal, and no-overlap cases.
+- [x] Add IPv6 safelist subtraction tests for first-address, last-address, middle split, full removal, and high-bit tail boundaries.
+- [x] Add tests where multiple safelist entries carve one candidate so ignoring later safelist entries fails.
+- [x] Add order-independence tests with unsorted candidates and unsorted safelist entries.
+- [x] Add adjacency tests proving adjacent blocklist intervals merge while carved output remains minimal and non-overlapping.
+
+Stage 2 completion notes from 2026-06-23:
+
+- The remaining `src/core/network.rs` safelist subtraction mutants are resolved.
+- This completes the network-only follow-up tracked by Stages 1 and 2. No open `src/core/network.rs`
+  mutation remediation remains in this plan.
 
 ## Stage 3: Overlap And Lookup
 
@@ -213,7 +219,8 @@ Stage 1 network-only follow-up notes from 2026-06-23:
 
 ## Stage 12: Unviable And Timeout Cleanup
 
-- [ ] Spot-check top unviable clusters in `src/core/network.rs`, `src/adapters/http_cache.rs`, `src/adapters/ipset.rs`, `src/adapters/github_meta.rs`, and `src/adapters/command_runner.rs` for dead or confusing code.
+- [x] Spot-check top unviable clusters in `src/core/network.rs` for dead or confusing code.
+- [ ] Spot-check top unviable clusters in `src/adapters/http_cache.rs`, `src/adapters/ipset.rs`, `src/adapters/github_meta.rs`, and `src/adapters/command_runner.rs` for dead or confusing code.
 - [ ] Simplify production code instead of adding tests where an unviable or missed mutant exposes redundant branches or unreachable helpers.
 - [ ] For timeout mutants that are predictable nontermination and not useful tests, propose the narrowest `.cargo/mutants.toml` exclude for user approval.
 - [ ] Keep any mutation-test configuration change narrow and explain the suppressed mutant by file, function, and reason.
@@ -225,10 +232,12 @@ Stage 1 network-only follow-up notes from 2026-06-23:
 - [ ] Ask the user to rerun mutation testing after safety-critical stages because agents should not run mutation testing directly.
 - [ ] Compare the user's rerun report against this plan and check off completed tasks only when corresponding mutants are caught, justified, or suppressed.
 
-Suggested scoped network reruns for the user after Stage 1 validation:
+Completed scoped network reruns for `src/core/network.rs`:
 
 ```bash
 cargo mutants --no-config --file src/core/network.rs --re 'ipv[46]_to_interval|intervals_to_ipv[46]_cidrs|largest_prefix|is_aligned|block_end|ipv[46]_mask' --all-features --minimum-test-timeout 60 --timeout-multiplier 3 --build-timeout-multiplier 3 -- --lib --bins --tests
 cargo mutants --no-config --file src/core/network.rs --re 'merge_intervals|sort_intervals|radix_sort' --all-features --minimum-test-timeout 60 --timeout-multiplier 3 --build-timeout-multiplier 3 -- --lib --bins --tests
 cargo mutants --no-config --file src/core/network.rs --re 'subtract_intervals|subtract_safelist|intervals_overlap|cidr_overlaps' --all-features --minimum-test-timeout 60 --timeout-multiplier 3 --build-timeout-multiplier 3 -- --lib --bins --tests
 ```
+
+No further scoped `src/core/network.rs` mutation rerun is pending from this plan.
