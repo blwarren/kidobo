@@ -681,7 +681,7 @@ mod tests {
 
     use super::{
         CanonicalCidr, IntervalU32, IntervalU128, Ipv4Cidr, Ipv6Cidr, block_end_u32,
-        block_end_u128, collapse_ipv4, collapse_ipv6, intervals_to_ipv4_cidrs,
+        block_end_u128, cidr_overlaps, collapse_ipv4, collapse_ipv6, intervals_to_ipv4_cidrs,
         intervals_to_ipv6_cidrs, ipv4_mask, ipv4_to_interval, ipv6_mask, ipv6_to_interval,
         is_aligned_u32, is_aligned_u128, largest_prefix_u32, largest_prefix_u128,
         merge_intervals_u32, merge_intervals_u128, parse_ip_cidr_non_strict,
@@ -964,6 +964,22 @@ mod tests {
                 end: 0x20010db8000000000000000000000003,
             }
         );
+    }
+
+    #[test]
+    fn cidr_overlap_includes_shared_endpoint_for_each_family() {
+        let v4_block = CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a00_0000, 24));
+        let v4_last_host = CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a00_00ff, 32));
+
+        assert!(cidr_overlaps(v4_block, v4_last_host));
+        assert!(cidr_overlaps(v4_last_host, v4_block));
+
+        let v6_base = 0x2001_0db8_0000_0000_0000_0000_0000_0000_u128;
+        let v6_block = CanonicalCidr::V6(Ipv6Cidr::from_parts(v6_base, 127));
+        let v6_last_host = CanonicalCidr::V6(Ipv6Cidr::from_parts(v6_base + 1, 128));
+
+        assert!(cidr_overlaps(v6_block, v6_last_host));
+        assert!(cidr_overlaps(v6_last_host, v6_block));
     }
 
     #[test]
