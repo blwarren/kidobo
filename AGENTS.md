@@ -101,7 +101,9 @@ If a change does not increase behavioral surface, no adversarial expansion is re
 
 Do not chase a surviving mutant merely to improve the mutation score. Treat mutation testing as a risk-discovery tool, not a target metric.
 
-For each relevant surviving mutant, decide whether it indicates:
+cargo-mutants reports mutants as `caught`, `missed`, `unviable`, or `timeout`. Triage `missed` and `timeout` results first because they are actionable. Treat `unviable` mutants as inconclusive unless they reveal dead, over-constrained, or confusing production code.
+
+For each relevant `missed` mutant, decide whether it indicates:
 
 * A missing or weak assertion.
 * An untested boundary condition.
@@ -110,7 +112,7 @@ For each relevant surviving mutant, decide whether it indicates:
 * Dead, redundant, or unclear production code.
 * A mutant that is equivalent or not worth testing.
 
-Add or revise tests when the surviving mutation changes behavior that matters to users, operators, persisted data, alerting decisions, parser correctness, time handling, frequency/band logic, callsign/entity/reference matching, deduplication, quiet-hours behavior, stale-data behavior, or repository/migration correctness.
+Add or revise tests when the missed mutation changes behavior that matters to firewall safety, operator-visible CLI behavior, config validation, lock handling, source loading, safelist subtraction, CIDR collapse/regeneration, IPv4/IPv6 separation, lookup results, ipset atomicity, iptables chain/jump correctness, cleanup, or deterministic output.
 
 Prefer improving tests when the mutant involves:
 
@@ -118,27 +120,27 @@ Prefer improving tests when the mutant involves:
 * Boolean logic changes.
 * Removed method calls with observable effects.
 * Changed constants used in domain rules.
-* Changed exception or error-handling behavior.
-* Altered persistence behavior.
-* Altered alert matching or notification suppression.
-* Altered parsing, normalization, matching, or deduplication outcomes.
+* Changed `Result` handling, fallback behavior, or exit-code behavior.
+* Altered parsing, canonicalization, normalization, matching, sorting, merging, or deduplication outcomes.
+* Removed side effects in adapters where the side effect is part of the public firewall or filesystem contract.
 
-It is acceptable to ignore or suppress surviving mutants when there is a clear reason, including:
+It is acceptable to ignore or suppress missed mutants when there is a clear reason, including:
 
 * The mutant is behaviorally equivalent to the original code.
-* The mutation affects generated code, mechanical DTOs, dependency-injection wiring, or framework glue.
-* The mutation affects logging, tracing, diagnostics, or cosmetic text that is not part of the contract.
+* The mutation affects generated code, mechanical DTOs, or dependency-injection wiring.
+* The mutation affects logging, tracing, diagnostics, or cosmetic text that is not part of the stable CLI contract.
 * The mutation affects defensive code for a state that cannot be reached through supported paths.
 * The mutation affects performance-only behavior better covered by benchmarks or profiling.
 * The mutation is in low-risk presentation or convenience code where additional tests would be brittle or low value.
 * The test needed to kill the mutant would over-specify implementation details rather than observable behavior.
 
-When ignoring a survivor, leave a brief rationale in the response or code review summary. Do not silently ignore surprising surviving mutants in core logic.
+When ignoring a missed mutant, leave a brief rationale in the response or code review summary. Do not silently ignore surprising missed mutants in core logic.
 
 If a mutant survives because the production code is redundant, unreachable, or unclear, prefer simplifying the production code over adding artificial tests.
 
-If a mutant survives in important behavior that is difficult to test with unit tests, consider a higher-level test, contract test, integration test, fixture-based parser test, or explicit manual verification note rather than forcing an unnatural unit test.
+If a mutant survives in important behavior that is difficult to test with unit tests, consider a higher-level test, contract test, integration test, fixture-based CLI test, or explicit manual verification note rather than forcing an unnatural unit test.
 
+For `timeout` results, first determine whether the mutant exposes an actual termination, retry, or lock-release risk. If the timeout is an uninteresting mutation that predictably hangs and cannot produce a useful test, skip it with a narrow `#[mutants::skip]` or cargo-mutants filter and document the reason. Preview persistent filters with `cargo mutants --list`.
 
 ## 7. CI and Release Discipline
 
