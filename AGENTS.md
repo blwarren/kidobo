@@ -97,6 +97,49 @@ Tests must constrain behavior, not just happy paths.
 
 If a change does not increase behavioral surface, no adversarial expansion is required.
 
+### Mutation Testing Result Triage
+
+Do not chase a surviving mutant merely to improve the mutation score. Treat mutation testing as a risk-discovery tool, not a target metric.
+
+For each relevant surviving mutant, decide whether it indicates:
+
+* A missing or weak assertion.
+* An untested boundary condition.
+* An untested error path.
+* Overly broad mocking.
+* Dead, redundant, or unclear production code.
+* A mutant that is equivalent or not worth testing.
+
+Add or revise tests when the surviving mutation changes behavior that matters to users, operators, persisted data, alerting decisions, parser correctness, time handling, frequency/band logic, callsign/entity/reference matching, deduplication, quiet-hours behavior, stale-data behavior, or repository/migration correctness.
+
+Prefer improving tests when the mutant involves:
+
+* Boundary changes such as `<` to `<=`, `>` to `>=`, or off-by-one behavior.
+* Boolean logic changes.
+* Removed method calls with observable effects.
+* Changed constants used in domain rules.
+* Changed exception or error-handling behavior.
+* Altered persistence behavior.
+* Altered alert matching or notification suppression.
+* Altered parsing, normalization, matching, or deduplication outcomes.
+
+It is acceptable to ignore or suppress surviving mutants when there is a clear reason, including:
+
+* The mutant is behaviorally equivalent to the original code.
+* The mutation affects generated code, mechanical DTOs, dependency-injection wiring, or framework glue.
+* The mutation affects logging, tracing, diagnostics, or cosmetic text that is not part of the contract.
+* The mutation affects defensive code for a state that cannot be reached through supported paths.
+* The mutation affects performance-only behavior better covered by benchmarks or profiling.
+* The mutation is in low-risk presentation or convenience code where additional tests would be brittle or low value.
+* The test needed to kill the mutant would over-specify implementation details rather than observable behavior.
+
+When ignoring a survivor, leave a brief rationale in the response or code review summary. Do not silently ignore surprising surviving mutants in core logic.
+
+If a mutant survives because the production code is redundant, unreachable, or unclear, prefer simplifying the production code over adding artificial tests.
+
+If a mutant survives in important behavior that is difficult to test with unit tests, consider a higher-level test, contract test, integration test, fixture-based parser test, or explicit manual verification note rather than forcing an unnatural unit test.
+
+
 ## 7. CI and Release Discipline
 
 * Required workflows must pass before merge.
