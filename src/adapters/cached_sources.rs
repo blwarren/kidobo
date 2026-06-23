@@ -87,7 +87,8 @@ fn cache_age_secs(path: &Path) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::fs::{self, File, FileTimes};
+    use std::time::{Duration, SystemTime};
 
     use tempfile::TempDir;
 
@@ -158,14 +159,21 @@ mod tests {
     }
 
     #[test]
-    fn reports_cache_age_when_metadata_is_available() {
+    fn reports_elapsed_cache_age_when_metadata_is_available() {
         let temp = TempDir::new().expect("tempdir");
         let remote_cache_dir = temp.path().join("remote");
         fs::create_dir_all(&remote_cache_dir).expect("mkdir remote");
-        fs::write(remote_cache_dir.join("a.iplist"), "203.0.113.0/24\n").expect("write a");
+        let iplist_path = remote_cache_dir.join("a.iplist");
+        fs::write(&iplist_path, "203.0.113.0/24\n").expect("write a");
+        let old_mtime = SystemTime::now() - Duration::from_secs(30);
+        File::open(&iplist_path)
+            .expect("open iplist")
+            .set_times(FileTimes::new().set_modified(old_mtime))
+            .expect("set mtime");
 
         let sources = load_remote_sources(&remote_cache_dir).expect("load");
         assert_eq!(sources.len(), 1);
-        assert!(sources[0].age_secs.is_some());
+        let age_secs = sources[0].age_secs.expect("age");
+        assert!(age_secs >= 30, "expected age >= 30s, got {age_secs}s");
     }
 }

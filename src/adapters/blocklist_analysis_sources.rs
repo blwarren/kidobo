@@ -43,7 +43,7 @@ pub fn load_analysis_sources(
         for source in loaded {
             let cidrs = source.entries.into_iter().map(|entry| entry.cidr).collect();
             let age_secs = source.age_secs;
-            let stale = age_secs.is_some_and(|age| age > stale_after_secs);
+            let stale = remote_source_is_stale(age_secs, stale_after_secs);
             remote_sources.push(AnalysisRemoteSource {
                 label: source.label,
                 cidrs,
@@ -68,13 +68,17 @@ fn read_source_file(path: &Path) -> Result<Vec<CanonicalCidr>, AnalysisSourceLoa
     })
 }
 
+fn remote_source_is_stale(age_secs: Option<u64>, stale_after_secs: u64) -> bool {
+    age_secs.is_some_and(|age| age > stale_after_secs)
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
 
     use tempfile::TempDir;
 
-    use super::load_analysis_sources;
+    use super::{load_analysis_sources, remote_source_is_stale};
     use crate::adapters::hash::sha256_hex;
     use crate::adapters::path::ResolvedPaths;
     use crate::adapters::source_load::SourceLoadError;
@@ -140,5 +144,12 @@ mod tests {
             }
             _ => panic!("unexpected error variant"),
         }
+    }
+
+    #[test]
+    fn remote_staleness_uses_strict_threshold() {
+        assert!(!remote_source_is_stale(None, 86_400));
+        assert!(!remote_source_is_stale(Some(86_400), 86_400));
+        assert!(remote_source_is_stale(Some(86_401), 86_400));
     }
 }

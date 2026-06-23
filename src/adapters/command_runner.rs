@@ -9,8 +9,9 @@ use crate::adapters::command_common::display_command;
 use crate::adapters::limited_io::read_to_end_with_limit;
 
 pub const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+const PRODUCTION_COMMAND_OUTPUT_LIMIT: usize = 16 * 1024 * 1024;
 #[cfg(not(test))]
-const DEFAULT_COMMAND_OUTPUT_LIMIT: usize = 16 * 1024 * 1024;
+const DEFAULT_COMMAND_OUTPUT_LIMIT: usize = PRODUCTION_COMMAND_OUTPUT_LIMIT;
 #[cfg(test)]
 const DEFAULT_COMMAND_OUTPUT_LIMIT: usize = 1024 * 1024;
 
@@ -345,6 +346,11 @@ mod tests {
     fn default_runner_uses_default_timeout() {
         let runner: SudoCommandRunner<SystemCommandExecutor> = SudoCommandRunner::default();
         assert_eq!(runner.default_timeout, DEFAULT_COMMAND_TIMEOUT);
+    }
+
+    #[test]
+    fn production_command_output_limit_is_16_mib() {
+        assert_eq!(super::PRODUCTION_COMMAND_OUTPUT_LIMIT, 16 * 1024 * 1024);
     }
 
     #[cfg(unix)]
