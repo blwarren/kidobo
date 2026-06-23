@@ -99,11 +99,15 @@ If a change does not increase behavioral surface, no adversarial expansion is re
 
 ### Mutation Testing Result Triage
 
+Agents must not run mutation testing themselves. The user owns all `cargo-mutants` execution and any other
+mutation-test runs. Agents may use mutation-test result reports produced by the user, such as `missed`,
+`timeout`, or `unviable` reports, to identify risks and guide code or test improvements.
+
 Do not chase cargo-mutants results merely to improve the mutation score. Treat mutation testing as a risk-discovery tool, not a target metric.
 
 cargo-mutants reports mutants as `caught`, `missed`, `unviable`, or `timeout`. Triage `missed` and `timeout` results first because they are actionable. Treat `unviable` mutants as inconclusive unless they reveal dead, over-constrained, or confusing production code. Only interpret results after the unmutated baseline passes reliably; flaky or environment-dependent tests make mutation results unreliable.
 
-Because this project wraps firewall commands, mutation runs must use tests that fake command execution or otherwise run in a disposable environment. Mutation testing must not exercise real firewall changes on a developer machine or CI runner.
+Because this project wraps firewall commands, user-run mutation testing must use tests that fake command execution or otherwise run in a disposable environment. Mutation testing must not exercise real firewall changes on a developer machine or CI runner.
 
 For each relevant `missed` mutant, decide whether it indicates:
 
