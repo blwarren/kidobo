@@ -99,9 +99,11 @@ If a change does not increase behavioral surface, no adversarial expansion is re
 
 ### Mutation Testing Result Triage
 
-Do not chase a surviving mutant merely to improve the mutation score. Treat mutation testing as a risk-discovery tool, not a target metric.
+Do not chase cargo-mutants results merely to improve the mutation score. Treat mutation testing as a risk-discovery tool, not a target metric.
 
-cargo-mutants reports mutants as `caught`, `missed`, `unviable`, or `timeout`. Triage `missed` and `timeout` results first because they are actionable. Treat `unviable` mutants as inconclusive unless they reveal dead, over-constrained, or confusing production code.
+cargo-mutants reports mutants as `caught`, `missed`, `unviable`, or `timeout`. Triage `missed` and `timeout` results first because they are actionable. Treat `unviable` mutants as inconclusive unless they reveal dead, over-constrained, or confusing production code. Only interpret results after the unmutated baseline passes reliably; flaky or environment-dependent tests make mutation results unreliable.
+
+Because this project wraps firewall commands, mutation runs must use tests that fake command execution or otherwise run in a disposable environment. Mutation testing must not exercise real firewall changes on a developer machine or CI runner.
 
 For each relevant `missed` mutant, decide whether it indicates:
 
@@ -119,7 +121,7 @@ Prefer improving tests when the mutant involves:
 * Boundary changes such as `<` to `<=`, `>` to `>=`, or off-by-one behavior.
 * Boolean logic changes.
 * Removed method calls with observable effects.
-* Changed constants used in domain rules.
+* Changed constants used in firewall, ipset, CIDR, config, or path rules.
 * Changed `Result` handling, fallback behavior, or exit-code behavior.
 * Altered parsing, canonicalization, normalization, matching, sorting, merging, or deduplication outcomes.
 * Removed side effects in adapters where the side effect is part of the public firewall or filesystem contract.
@@ -136,11 +138,11 @@ It is acceptable to ignore or suppress missed mutants when there is a clear reas
 
 When ignoring a missed mutant, leave a brief rationale in the response or code review summary. Do not silently ignore surprising missed mutants in core logic.
 
-If a mutant survives because the production code is redundant, unreachable, or unclear, prefer simplifying the production code over adding artificial tests.
+If a mutant is missed because the production code is redundant, unreachable, or unclear, prefer simplifying the production code over adding artificial tests.
 
-If a mutant survives in important behavior that is difficult to test with unit tests, consider a higher-level test, contract test, integration test, fixture-based CLI test, or explicit manual verification note rather than forcing an unnatural unit test.
+If a missed mutant affects important behavior that is difficult to test with unit tests, consider a higher-level test, contract test, integration test, fixture-based CLI test, or explicit manual verification note rather than forcing an unnatural unit test.
 
-For `timeout` results, first determine whether the mutant exposes an actual termination, retry, or lock-release risk. If the timeout is an uninteresting mutation that predictably hangs and cannot produce a useful test, skip it with a narrow `#[mutants::skip]` or cargo-mutants filter and document the reason. Preview persistent filters with `cargo mutants --list`.
+For `timeout` results, first determine whether the mutant exposes an actual termination, retry, or lock-release risk. If the timeout is an uninteresting mutation that predictably hangs and cannot produce a useful test, suppress it with the narrowest practical `#[mutants::skip]`, `--exclude`, or `--exclude-re` rule and document the reason. Preview persistent filters with `cargo mutants --list`.
 
 ## 7. CI and Release Discipline
 
