@@ -74,11 +74,21 @@ Stage 0 completion notes from 2026-06-23:
 
 ## Stage 1: Core Interval Conversion
 
-- [ ] Add IPv4 tests for `/0`, `/32`, non-zero host-bit canonicalization, and max-address interval endpoints.
-- [ ] Add IPv6 tests for `/0`, `/128`, high-bit networks, and max-address interval endpoints.
-- [ ] Add interval-to-CIDR tests for single-host, two-host, unaligned, and max-boundary ranges in both families.
-- [ ] Add a large unsorted IPv4 input test that forces radix sorting and proves output matches ordinary sorting.
-- [ ] Review timeout mutants in `intervals_to_*`, `largest_prefix_*`, and `is_aligned_*` for explicit progress assertions or documented skip candidates.
+- [x] Add IPv4 tests for `/0`, `/32`, non-zero host-bit canonicalization, and max-address interval endpoints.
+- [x] Add IPv6 tests for `/0`, `/128`, high-bit networks, and max-address interval endpoints.
+- [x] Add interval-to-CIDR tests for single-host, two-host, unaligned, and max-boundary ranges in both families.
+- [x] Add a large unsorted IPv4 input test that forces radix sorting and proves output matches ordinary sorting.
+- [x] Review timeout mutants in `intervals_to_*`, `largest_prefix_*`, and `is_aligned_*` for explicit progress assertions or documented skip candidates.
+
+Stage 1 completion notes from 2026-06-23:
+
+- Added boundary tests for IPv4 `/0`, `/32`, host-bit canonicalization, and intervals ending at `u32::MAX`.
+- Added boundary tests for IPv6 `/0`, `/128`, high-bit network canonicalization, and intervals ending at `u128::MAX`.
+- Added interval-to-CIDR tests for single-host, two-host, unaligned, and max-boundary ranges for both families.
+- Added a large unsorted IPv4 merge test that exceeds the radix-sort threshold and verifies output against an independent ordinary-sort merge helper.
+- Reworked CIDR regeneration increments to use checked shifts, largest-prefix search to use bounded descending prefix ranges, and alignment masks to use checked right shifts. This addresses timeout-only mutation risks without suppressions.
+- Stage-local ignored missed mutants: `ipv4_to_interval` and `ipv6_to_interval` `|` to `^` is equivalent for valid `Ipv4Cidr` and `Ipv6Cidr` values because constructors and `from_parts` canonicalize host bits before interval conversion.
+- Stage-local ignored missed mutants: radix-sort fallback mutations that still return ordinary sorted output are performance-path changes, not observable correctness changes. The large-input test pins output equivalence rather than over-specifying whether fallback sorting ran.
 
 ## Stage 2: Safelist Subtraction
 

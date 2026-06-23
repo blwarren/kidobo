@@ -4,6 +4,7 @@
 /.local-scenarios/
 /coverage/
 /mutants.out/
+/mutants.out.old/
 /tmp/
 *.db
 *.key

@@ -334,7 +334,9 @@ fn intervals_to_ipv4_cidrs_from_merged(intervals: &[IntervalU32]) -> Vec<Ipv4Cid
             }
 
             let host_bits = 32_u32 - u32::from(prefix);
-            let increment = 1_u32 << host_bits;
+            let Some(increment) = 1_u32.checked_shl(host_bits) else {
+                break;
+            };
             if start > u32::MAX - increment {
                 break;
             }
@@ -359,7 +361,10 @@ fn intervals_to_ipv6_cidrs_from_merged(intervals: &[IntervalU128]) -> Vec<Ipv6Ci
                 break;
             }
 
-            let size = 1_u128 << (128_u32 - u32::from(prefix));
+            let host_bits = 128_u32 - u32::from(prefix);
+            let Some(size) = 1_u128.checked_shl(host_bits) else {
+                break;
+            };
             if start > u128::MAX - size {
                 break;
             }
@@ -615,8 +620,7 @@ fn subtract_intervals_u128_merged(
 fn largest_prefix_u32(start: u32, end: u32) -> u8 {
     let mut prefix = 32_u8;
 
-    while prefix > 0 {
-        let next_prefix = prefix - 1;
+    for next_prefix in (0_u8..32_u8).rev() {
         if !is_aligned_u32(start, next_prefix) {
             break;
         }
@@ -632,8 +636,7 @@ fn largest_prefix_u32(start: u32, end: u32) -> u8 {
 fn largest_prefix_u128(start: u128, end: u128) -> u8 {
     let mut prefix = 128_u8;
 
-    while prefix > 0 {
-        let next_prefix = prefix - 1;
+    for next_prefix in (0_u8..128_u8).rev() {
         if !is_aligned_u128(start, next_prefix) {
             break;
         }
@@ -647,22 +650,12 @@ fn largest_prefix_u128(start: u128, end: u128) -> u8 {
 }
 
 fn is_aligned_u32(start: u32, prefix: u8) -> bool {
-    if prefix == 0 {
-        return start == 0;
-    }
-
-    let host_bits = 32_u32 - u32::from(prefix);
-    let host_mask = (1_u32 << host_bits) - 1;
+    let host_mask = u32::MAX.checked_shr(u32::from(prefix)).unwrap_or(0);
     (start & host_mask) == 0
 }
 
 fn is_aligned_u128(start: u128, prefix: u8) -> bool {
-    if prefix == 0 {
-        return start == 0;
-    }
-
-    let host_bits = 128_u32 - u32::from(prefix);
-    let host_mask = (1_u128 << host_bits) - 1;
+    let host_mask = u128::MAX.checked_shr(u32::from(prefix)).unwrap_or(0);
     (start & host_mask) == 0
 }
 
@@ -711,9 +704,12 @@ fn ipv6_mask(prefix: u8) -> u128 {
 
 #[cfg(test)]
 mod tests {
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
     use super::{
         CanonicalCidr, IntervalU32, IntervalU128, Ipv4Cidr, Ipv6Cidr, collapse_ipv4, collapse_ipv6,
         intervals_to_ipv4_cidrs, intervals_to_ipv6_cidrs, ipv4_to_interval, ipv6_to_interval,
+        is_aligned_u32, is_aligned_u128, largest_prefix_u32, largest_prefix_u128,
         merge_intervals_u32, merge_intervals_u128, parse_ip_cidr_non_strict,
         parse_lines_non_strict, split_by_family, subtract_safelist_ipv4, subtract_safelist_ipv6,
     };
@@ -890,6 +886,31 @@ mod tests {
         forms
     }
 
+    fn merge_intervals_u32_with_standard_sort(mut intervals: Vec<IntervalU32>) -> Vec<IntervalU32> {
+        if intervals.is_empty() {
+            return Vec::new();
+        }
+
+        intervals.sort_unstable();
+        let mut iter = intervals.into_iter();
+        let mut current = iter
+            .next()
+            .expect("non-empty intervals must have a first item");
+        let mut merged = Vec::new();
+
+        for interval in iter {
+            if interval.start <= current.end.saturating_add(1) {
+                current.end = current.end.max(interval.end);
+            } else {
+                merged.push(current);
+                current = interval;
+            }
+        }
+
+        merged.push(current);
+        merged
+    }
+
     #[test]
     fn parse_non_strict_accepts_hosts_and_canonicalizes_networks() {
         let host = parse_ip_cidr_non_strict("10.0.0.1").expect("parse host");
@@ -968,6 +989,129 @@ mod tests {
                 end: 0x20010db8000000000000000000000003,
             }
         );
+    }
+
+    #[test]
+    fn ipv4_interval_conversion_covers_boundary_prefixes() {
+        let full_space = Ipv4Cidr::new(Ipv4Addr::new(203, 0, 113, 99), 0).expect("valid /0");
+        assert_eq!(full_space.network(), Ipv4Addr::UNSPECIFIED);
+        assert_eq!(full_space.prefix(), 0);
+        assert_eq!(
+            ipv4_to_interval(full_space),
+            IntervalU32 {
+                start: 0,
+                end: u32::MAX,
+            }
+        );
+
+        let canonicalized = Ipv4Cidr::new(Ipv4Addr::new(192, 0, 2, 129), 25).expect("valid /25");
+        assert_eq!(canonicalized.network(), Ipv4Addr::new(192, 0, 2, 128));
+        assert_eq!(canonicalized.prefix(), 25);
+        assert_eq!(
+            ipv4_to_interval(canonicalized),
+            IntervalU32 {
+                start: 0xc000_0280,
+                end: 0xc000_02ff,
+            }
+        );
+
+        let max_host = Ipv4Cidr::new(Ipv4Addr::BROADCAST, 32).expect("valid /32");
+        assert_eq!(max_host.prefix(), 32);
+        assert_eq!(
+            ipv4_to_interval(max_host),
+            IntervalU32 {
+                start: u32::MAX,
+                end: u32::MAX,
+            }
+        );
+
+        let max_pair = Ipv4Cidr::new(Ipv4Addr::new(255, 255, 255, 254), 31).expect("valid /31");
+        assert_eq!(
+            ipv4_to_interval(max_pair),
+            IntervalU32 {
+                start: u32::MAX - 1,
+                end: u32::MAX,
+            }
+        );
+    }
+
+    #[test]
+    fn ipv6_interval_conversion_covers_boundary_prefixes() {
+        let full_space =
+            Ipv6Cidr::new(Ipv6Addr::from(0x2001_0db8_0000_0000_u128), 0).expect("valid /0");
+        assert_eq!(full_space.network(), Ipv6Addr::from(0));
+        assert_eq!(full_space.prefix(), 0);
+        assert_eq!(
+            ipv6_to_interval(full_space),
+            IntervalU128 {
+                start: 0,
+                end: u128::MAX,
+            }
+        );
+
+        let high_bit_network = Ipv6Cidr::new(
+            Ipv6Addr::from(0xffff_0000_0000_0000_0000_0000_0000_0001_u128),
+            16,
+        )
+        .expect("valid /16");
+        assert_eq!(
+            high_bit_network.network(),
+            Ipv6Addr::from(0xffff_0000_0000_0000_0000_0000_0000_0000_u128)
+        );
+        assert_eq!(high_bit_network.prefix(), 16);
+        assert_eq!(
+            ipv6_to_interval(high_bit_network),
+            IntervalU128 {
+                start: 0xffff_0000_0000_0000_0000_0000_0000_0000_u128,
+                end: 0xffff_ffff_ffff_ffff_ffff_ffff_ffff_ffff_u128,
+            }
+        );
+
+        let max_host = Ipv6Cidr::new(Ipv6Addr::from(u128::MAX), 128).expect("valid /128");
+        assert_eq!(max_host.prefix(), 128);
+        assert_eq!(
+            ipv6_to_interval(max_host),
+            IntervalU128 {
+                start: u128::MAX,
+                end: u128::MAX,
+            }
+        );
+
+        let max_pair = Ipv6Cidr::new(Ipv6Addr::from(u128::MAX - 1), 127).expect("valid /127");
+        assert_eq!(
+            ipv6_to_interval(max_pair),
+            IntervalU128 {
+                start: u128::MAX - 1,
+                end: u128::MAX,
+            }
+        );
+    }
+
+    #[test]
+    fn largest_prefix_helpers_cover_progress_boundaries() {
+        assert_eq!(largest_prefix_u32(0, u32::MAX), 0);
+        assert_eq!(largest_prefix_u32(u32::MAX - 1, u32::MAX), 31);
+        assert_eq!(largest_prefix_u32(u32::MAX, u32::MAX), 32);
+        assert_eq!(largest_prefix_u32(0x0a00_0003, 0x0a00_0006), 32);
+        assert!(is_aligned_u32(0, 0));
+        assert!(!is_aligned_u32(1, 0));
+        assert!(is_aligned_u32(u32::MAX, 32));
+        assert!(!is_aligned_u32(u32::MAX, 31));
+
+        assert_eq!(largest_prefix_u128(0, u128::MAX), 0);
+        assert_eq!(largest_prefix_u128(u128::MAX - 1, u128::MAX), 127);
+        assert_eq!(largest_prefix_u128(u128::MAX, u128::MAX), 128);
+        assert_eq!(
+            largest_prefix_u128(
+                0x2001_0db8_0000_0000_0000_0000_0000_0003,
+                0x2001_0db8_0000_0000_0000_0000_0000_0006,
+            ),
+            128
+        );
+        assert!(is_aligned_u128(0, 0));
+        assert!(!is_aligned_u128(1, 0));
+        assert!(is_aligned_u128(u128::MAX, 128));
+        assert!(!is_aligned_u128(u128::MAX, 127));
     }
 
     #[test]
@@ -1257,6 +1401,23 @@ mod tests {
     }
 
     #[test]
+    fn large_unsorted_ipv4_merge_matches_standard_sorting() {
+        let mut intervals = Vec::with_capacity(20_000);
+
+        for i in 0..20_000_u32 {
+            let start = ((i * 65_537) % 1_000_003) * 4 + 1;
+            intervals.push(IntervalU32 { start, end: start });
+        }
+
+        let expected = merge_intervals_u32_with_standard_sort(intervals.clone());
+        let actual = merge_intervals_u32(&intervals);
+
+        assert_eq!(actual, expected);
+        assert_eq!(actual.len(), intervals.len());
+        assert_ne!(intervals, expected);
+    }
+
+    #[test]
     fn safelist_subtraction_carves_ipv4_ranges() {
         let carved = subtract_safelist_ipv4(
             &[Ipv4Cidr::from_parts(0x0a000000, 24)],
@@ -1353,6 +1514,92 @@ mod tests {
                 0x20010db8000000000000000000000002,
                 127
             )]
+        );
+    }
+
+    #[test]
+    fn interval_regeneration_covers_ipv4_boundary_shapes() {
+        assert_eq!(
+            intervals_to_ipv4_cidrs(&[IntervalU32 {
+                start: 0x0a00_0001,
+                end: 0x0a00_0001,
+            }]),
+            vec![Ipv4Cidr::from_parts(0x0a00_0001, 32)]
+        );
+
+        assert_eq!(
+            intervals_to_ipv4_cidrs(&[IntervalU32 {
+                start: 0x0a00_0002,
+                end: 0x0a00_0003,
+            }]),
+            vec![Ipv4Cidr::from_parts(0x0a00_0002, 31)]
+        );
+
+        assert_eq!(
+            intervals_to_ipv4_cidrs(&[IntervalU32 {
+                start: 0x0a00_0003,
+                end: 0x0a00_0006,
+            }]),
+            vec![
+                Ipv4Cidr::from_parts(0x0a00_0003, 32),
+                Ipv4Cidr::from_parts(0x0a00_0004, 31),
+                Ipv4Cidr::from_parts(0x0a00_0006, 32),
+            ]
+        );
+
+        assert_eq!(
+            intervals_to_ipv4_cidrs(&[IntervalU32 {
+                start: u32::MAX - 2,
+                end: u32::MAX,
+            }]),
+            vec![
+                Ipv4Cidr::from_parts(u32::MAX - 2, 32),
+                Ipv4Cidr::from_parts(u32::MAX - 1, 31),
+            ]
+        );
+    }
+
+    #[test]
+    fn interval_regeneration_covers_ipv6_boundary_shapes() {
+        let base = 0x2001_0db8_0000_0000_0000_0000_0000_0000_u128;
+
+        assert_eq!(
+            intervals_to_ipv6_cidrs(&[IntervalU128 {
+                start: base + 1,
+                end: base + 1,
+            }]),
+            vec![Ipv6Cidr::from_parts(base + 1, 128)]
+        );
+
+        assert_eq!(
+            intervals_to_ipv6_cidrs(&[IntervalU128 {
+                start: base + 2,
+                end: base + 3,
+            }]),
+            vec![Ipv6Cidr::from_parts(base + 2, 127)]
+        );
+
+        assert_eq!(
+            intervals_to_ipv6_cidrs(&[IntervalU128 {
+                start: base + 3,
+                end: base + 6,
+            }]),
+            vec![
+                Ipv6Cidr::from_parts(base + 3, 128),
+                Ipv6Cidr::from_parts(base + 4, 127),
+                Ipv6Cidr::from_parts(base + 6, 128),
+            ]
+        );
+
+        assert_eq!(
+            intervals_to_ipv6_cidrs(&[IntervalU128 {
+                start: u128::MAX - 2,
+                end: u128::MAX,
+            }]),
+            vec![
+                Ipv6Cidr::from_parts(u128::MAX - 2, 128),
+                Ipv6Cidr::from_parts(u128::MAX - 1, 127),
+            ]
         );
     }
 
