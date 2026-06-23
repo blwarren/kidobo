@@ -26,10 +26,51 @@ Each stage is intended to be small enough for one focused implementation turn.
 
 ## Stage 0: Baseline Triage
 
-- [ ] Confirm the unmutated `cargo test --lib --bins --tests --all-features` baseline passes before changing tests.
-- [ ] Reconcile `mutants.out/missed.txt` and `mutants.out/timeout.txt` against current source line numbers before coding.
-- [ ] Classify each targeted mutant as safety-critical, operator-visible, equivalent, low-value diagnostic, or timeout-only before adding tests.
-- [ ] Track any intentionally ignored missed mutants in the stage completion notes with a brief rationale.
+- [x] Confirm the unmutated `cargo test --lib --bins --tests --all-features` baseline passes before changing tests.
+- [x] Reconcile `mutants.out/missed.txt` and `mutants.out/timeout.txt` against current source line numbers before coding.
+- [x] Classify each targeted mutant as safety-critical, operator-visible, equivalent, low-value diagnostic, or timeout-only before adding tests.
+- [x] Track any intentionally ignored missed mutants in the stage completion notes with a brief rationale.
+
+Stage 0 completion notes from 2026-06-23:
+
+- Baseline passed with `cargo test --lib --bins --tests --all-features`: 328 library tests, 0 binary tests, and 31 integration tests.
+- Report reconciliation found 212 missed mutants and 22 timeout mutants, matching the snapshot above.
+- Every referenced `file:line` entry in `mutants.out/missed.txt` and `mutants.out/timeout.txt` still points to an existing, nonblank source line in the current tree.
+- No missed mutants were intentionally ignored during Stage 0. Equivalent and low-value diagnostic decisions remain stage-local until the exact mutant is addressed or explicitly deferred.
+- Timeout entries were classified as timeout-only for triage. Do not suppress them without later review of whether the timeout exposes a termination, retry, or cleanup risk.
+
+| Area | Missed | Timeout | Stage 0 classification | Planned follow-up |
+| --- | ---: | ---: | --- | --- |
+| `src/core/network.rs` | 29 | 16 | Safety-critical deterministic core | Stages 1 and 2 |
+| `src/core/blocklist_analysis.rs` | 12 | 3 | Safety-critical deterministic core | Stage 3 |
+| `src/core/lookup.rs` | 3 | 0 | Safety-critical deterministic core | Stage 3 |
+| `src/core/config.rs` | 14 | 0 | Safety-critical config validation | Stage 4 |
+| `src/core/blocklist.rs` | 2 | 0 | Safety-critical blocklist parsing | Stage 4 |
+| `src/adapters/ipset.rs` | 26 | 1 | Safety-critical firewall atomicity | Stage 5 |
+| `src/adapters/iptables.rs` | 3 | 1 | Safety-critical firewall wiring | Stage 6 |
+| `src/app/sync.rs` | 4 | 0 | Safety-critical sync ordering and cleanup | Stage 6 |
+| `src/cli/flush.rs` | 2 | 0 | Safety-critical cleanup command behavior | Stage 6 |
+| `src/adapters/limited_io.rs` | 5 | 0 | Safety-critical bounded I/O and atomic writes | Stage 7 |
+| `src/adapters/lock.rs` | 1 | 0 | Safety-critical lock contention | Stage 7 |
+| `src/adapters/path.rs` | 2 | 0 | Safety-critical path resolution | Stage 7 |
+| `src/adapters/command_runner.rs` | 2 | 1 | Operator-visible command execution and timeout behavior | Stage 7 |
+| `src/adapters/http_cache.rs` | 13 | 0 | Source-loading and cache correctness | Stage 8 |
+| `src/adapters/github_meta.rs` | 7 | 0 | Source-loading and metadata cache correctness | Stage 8 |
+| `src/adapters/asn.rs` | 3 | 0 | Source-loading correctness | Stage 9 |
+| `src/adapters/source_files.rs` | 4 | 0 | Source-loading correctness | Stage 9 |
+| `src/cli/commands.rs` | 28 | 0 | Operator-visible CLI output and lookup behavior | Stage 10 |
+| `src/cli/blocklist/asn.rs` | 9 | 0 | Operator-visible blocklist ASN behavior | Stage 10 |
+| `src/cli/blocklist/confirm.rs` | 8 | 0 | Operator-visible confirmation behavior | Stage 10 |
+| `src/cli/blocklist/plan.rs` | 1 | 0 | Operator-visible blocklist planning | Stage 10 |
+| `src/cli/blocklist/targets.rs` | 3 | 0 | Operator-visible blocklist target handling | Stage 10 |
+| `src/cli/doctor/checks.rs` | 5 | 0 | Operator-visible diagnostics | Stage 10 |
+| `src/cli/doctor/mod.rs` | 3 | 0 | Operator-visible diagnostics | Stage 10 |
+| `src/cli/doctor/probes.rs` | 5 | 0 | Operator-visible diagnostics | Stage 10 |
+| `src/cli/init/provision.rs` | 1 | 0 | Operator-visible install behavior | Stage 10 |
+| `src/cli/init/systemd.rs` | 2 | 0 | Operator-visible install behavior | Stage 10 |
+| `src/cli/init/templates.rs` | 3 | 0 | Operator-visible install behavior | Stage 10 |
+| `src/adapters/config_edit.rs` | 3 | 0 | Operator-visible config edit behavior | Stage 10 |
+| `src/logging.rs` | 9 | 0 | Low-value diagnostic unless exact output is operator-visible | Stage 11 |
 
 ## Stage 1: Core Interval Conversion
 
