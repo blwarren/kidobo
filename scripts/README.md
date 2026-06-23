@@ -9,6 +9,7 @@ Top-level gate scripts are thin wrappers kept for backward compatibility.
 - `scripts/install.sh`: public install/uninstall flow used by operators.
 - `scripts/changelog/*`: release-notes normalization and changelog generation.
 - `scripts/perf/*`: benchmark and lookup RSS regression tooling.
+- `.cargo/mutants.toml`: cargo-mutants mutation-testing configuration.
 
 ## Common Commands
 
@@ -17,6 +18,8 @@ Top-level gate scripts are thin wrappers kept for backward compatibility.
 - `./scripts/dev.sh post-coding-gates`
 - `./scripts/dev.sh gates-minimum`
 - `./scripts/dev.sh gates-extended`
+- `./scripts/dev.sh mutants`
+- `./scripts/dev.sh mutants --shard 1/4`
 - `./scripts/dev.sh release-notes-check`
 
 ## Backward Compatibility

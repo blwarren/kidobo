@@ -1,0 +1,10 @@
+# Keep mutation testing focused on production Rust sources. The test command
+# mirrors the repository's normal all-features test gate, excluding doctests.
+examine_globs = ["src/**/*.rs"]
+all_features = true
+additional_cargo_test_args = ["--lib", "--bins", "--tests"]
+
+# Give runtime-heavy CLI tests enough room while still failing hung mutants.
+minimum_test_timeout = 60.0
+timeout_multiplier = 3.0
+build_timeout_multiplier = 3.0

@@ -3,6 +3,7 @@
 /config.toml
 /.local-scenarios/
 /coverage/
+/mutants.out/
 /tmp/
 *.db
 *.key
