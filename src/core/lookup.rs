@@ -362,6 +362,25 @@ mod tests {
     }
 
     #[test]
+    fn lookup_index_v6_keeps_endpoint_boundary_matches() {
+        let sources = vec![LookupSourceEntry {
+            source_label: "source:v6-boundary".into(),
+            source_line: "2001:db8::/124".to_string(),
+            cidr: CanonicalCidr::V6(Ipv6Cidr::from_parts(
+                0x20010db8000000000000000000000000,
+                124,
+            )),
+        }];
+
+        let report = run_lookup(&["2001:db8::f".to_string()], &sources);
+
+        assert!(report.invalid_targets.is_empty());
+        assert_eq!(report.matches.len(), 1);
+        assert_eq!(report.matches[0].source_label, "source:v6-boundary");
+        assert_eq!(report.matches[0].matched_source_entry, "2001:db8::/124");
+    }
+
+    #[test]
     fn lookup_index_handles_non_overlapping_prefix_sections() {
         let sources = vec![
             LookupSourceEntry {

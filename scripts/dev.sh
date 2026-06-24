@@ -119,7 +119,7 @@ run_udeps() {
 }
 
 run_mutants() {
-  run_cmd "mutants" cargo mutants -vV "$@"
+  run_cmd "mutants" env CARGO_MUTANTS_JOBS="${CARGO_MUTANTS_JOBS:-4}" cargo mutants -vV "$@"
 }
 
 main() {
