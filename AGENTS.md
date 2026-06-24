@@ -11,8 +11,6 @@ Pre-1.0 stabilization. Priority order:
 
 ## 2. Hard Invariants (Non-Negotiable)
 
-**Never reference this file in commits or repo content.**
-
 * Rust stable toolchain.
 * One-shot CLI only (no daemon/service behavior).
 * Public commands and exit codes remain stable (`0,1,2,130`).
@@ -159,7 +157,6 @@ For `timeout` results, first determine whether the mutant exposes an actual term
   regenerates `CHANGELOG.md`, and fails if those generated files were rewritten.
 * If `release-notes-check` rewrites `CHANGELOG.md` or `release-notes/*`, include those rewrites in the diff.
 * Version bumps use provided script.
-* Conventional Commits required.
 * No broad refactors without necessity.
 * Prefer narrow diffs.
 
@@ -180,5 +177,5 @@ After coding:
 2. List validation commands run.
 3. Call out skipped gates.
 4. State whether `./scripts/dev.sh release-notes-check` was run and whether it rewrote `CHANGELOG.md` or `release-notes/*`.
-5. Provide a Conventional Commit message.
+5. Provide a commit message.
 6. **Do not** run `git commit` unless instructed.
