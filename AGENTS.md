@@ -152,7 +152,7 @@ For `timeout` results, first determine whether the mutant exposes an actual term
 * Release notes only for user-visible production impact.
 * `CHANGELOG.md` is generated only. Do not hand-edit it.
 * Update `release-notes/unreleased.md` only when the change has user-visible production impact.
-* After any repo changes, run `./scripts/dev.sh release-notes-check`.
+* After any repo changes, run `just release-notes-check`.
   This is the canonical changelog workflow: it normalizes `release-notes/*`,
   regenerates `CHANGELOG.md`, and fails if those generated files were rewritten.
 * If `release-notes-check` rewrites `CHANGELOG.md` or `release-notes/*`, include those rewrites in the diff.
@@ -176,6 +176,6 @@ After coding:
 1. Explain what changed and why.
 2. List validation commands run.
 3. Call out skipped gates.
-4. State whether `./scripts/dev.sh release-notes-check` was run and whether it rewrote `CHANGELOG.md` or `release-notes/*`.
+4. State whether `just release-notes-check` was run and whether it rewrote `CHANGELOG.md` or `release-notes/*`.
 5. Provide a commit message.
 6. **Do not** run `git commit` unless instructed.

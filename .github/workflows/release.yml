@@ -14,6 +14,9 @@ on:
 permissions:
   contents: write
 
+env:
+  JUST_VERSION: 1.55.1
+
 jobs:
   release:
     name: release
@@ -31,6 +34,9 @@ jobs:
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
+
+      - name: Install just
+        run: cargo install --locked just --version "${JUST_VERSION}"
 
       - name: Validate release tag format
         shell: bash
@@ -67,7 +73,7 @@ jobs:
           fi
 
       - name: Run quality gates
-        run: ./scripts/dev.sh ci-quality
+        run: just ci-quality
 
       - name: Build release binary
         run: cargo build --release --locked --bin kidobo

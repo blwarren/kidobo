@@ -190,6 +190,19 @@ an arbitrary build or `cargo run` path.
   usable without creating directories or writing probe files.
 - `KIDOBO_ROOT` relocates config/data/cache paths under a custom root.
 
+## Development
+
+Development commands are defined in `Justfile`.
+
+```bash
+cargo install --locked just --version 1.55.1
+just pre-commit-fast
+just pre-push-tests
+just release-notes-check
+```
+
+Use `just --list` to see all available local and CI recipes.
+
 ## License
 
 MIT (see `LICENSE`).

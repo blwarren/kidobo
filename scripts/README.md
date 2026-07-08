@@ -1,11 +1,15 @@
-# Scripts Layout
+# Development Commands
 
-`scripts/dev.sh` is the canonical entrypoint for local and CI tooling gates.
-Top-level gate scripts are thin wrappers kept for backward compatibility.
+`Justfile` is the canonical entrypoint for local and CI tooling gates.
+Install `just` before running development recipes:
+
+```bash
+cargo install --locked just --version 1.55.1
+```
 
 ## Structure
 
-- `scripts/dev.sh`: central command dispatcher for validation and CI tasks.
+- `Justfile`: validation, CI, release-note, udeps, and mutation-test recipes.
 - `scripts/install.sh`: public install/uninstall flow used by operators.
 - `scripts/changelog/*`: release-notes normalization and changelog generation.
 - `scripts/perf/*`: benchmark and lookup RSS regression tooling.
@@ -13,18 +17,11 @@ Top-level gate scripts are thin wrappers kept for backward compatibility.
 
 ## Common Commands
 
-- `./scripts/dev.sh pre-commit-fast`
-- `./scripts/dev.sh pre-push-tests`
-- `./scripts/dev.sh post-coding-gates`
-- `./scripts/dev.sh gates-minimum`
-- `./scripts/dev.sh gates-extended`
-- `./scripts/dev.sh mutants`
-- `./scripts/dev.sh mutants --shard 1/4`
-- `./scripts/dev.sh release-notes-check`
-
-## Backward Compatibility
-
-These wrapper paths remain valid and delegate to `scripts/dev.sh`:
-
-- `scripts/pre-commit-fast.sh`
-- `scripts/pre-push-tests.sh`
+- `just pre-commit-fast`
+- `just pre-push-tests`
+- `just post-coding-gates`
+- `just gates-minimum`
+- `just gates-extended`
+- `just release-notes-check`
+- `just mutants`
+- `just mutants --shard 1/4`

@@ -8,6 +8,9 @@ on:
 permissions:
   contents: read
 
+env:
+  JUST_VERSION: 1.55.1
+
 jobs:
   udeps:
     name: udeps
@@ -24,5 +27,8 @@ jobs:
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
 
+      - name: Install just
+        run: cargo install --locked just --version "${JUST_VERSION}"
+
       - name: Run udeps checks
-        run: ./scripts/dev.sh ci-udeps
+        run: just ci-udeps
