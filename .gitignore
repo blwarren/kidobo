@@ -1,5 +1,4 @@
 /target
-/scripts/internal/
 /config.toml
 /.local-scenarios/
 /coverage/
