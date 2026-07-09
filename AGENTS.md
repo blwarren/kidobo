@@ -1,79 +1,121 @@
-# kidobo — AI Agent Contract (Pre-1.0 Hardening)
+# kidobo — AI Agent Contract (Late Pre-1.0 Hardening)
 
 ## 1. Stage and Priority
 
-Pre-1.0 stabilization. Priority order:
+Kidobo is a released, operational pre-1.0 product with a public installer and release workflow. Treat
+the current stage as late stabilization, not initial product development. Priority order:
 
-1. Firewall safety and correctness
+1. Firewall safety and fail-closed correctness
 2. Deterministic core logic
-3. Reliable install/release
-4. Maintainable, reviewable diffs
+3. Compatibility for existing operators
+4. Reliable install, upgrade, uninstall, and release
+5. Maintainable, reviewable diffs
+
+Prefer regression closure, safety hardening, and documentation over speculative features or broad
+redesigns. New commands, configuration surface, or runtime modes require explicit scope.
 
 ## 2. Hard Invariants (Non-Negotiable)
 
-* Rust stable toolchain.
-* One-shot CLI only (no daemon/service behavior).
-* Public commands and exit codes remain stable (`0,1,2,130`).
+* Use the pinned stable toolchain in `rust-toolchain.toml`; keep it synchronized with
+  `package.rust-version` and explicit CI/release workflow pins.
+* The process remains one-shot. The supported systemd timer may invoke the existing `Type=oneshot`
+  sync service; do not add a resident daemon, watcher, or internal scheduler.
+* Keep the public command surface and exit meanings stable: `0` for success/help/version, `1` for
+  runtime or check failure, `2` for usage errors, and `130` for SIGINT.
+* Treat documented CLI behavior, configuration keys/defaults, system paths, machine-readable output,
+  generated systemd units, and install/uninstall behavior as compatibility-sensitive surfaces.
 * IPv4 and IPv6 logic remain strictly separated.
-* Sync ordering semantics remain intact (config → lock → ensure artifacts → load sources → safelist subtract → collapse/dedupe → atomic restore+swap → cleanup → log → unlock).
-* Ipset atomicity must never be weakened (temp set suffix, ≤31 char names, restore+swap, no corruption).
-* Firewall contract remains: single `kidobo-input` chain, exactly one INPUT jump at position 1, deterministic cleanup.
-* Lookup is offline-only.
+* Preserve sync ordering: resolve paths/config → acquire the nonblocking lock → ensure set/chain
+  existence without activating new wiring → normalize and load all sources → compute family-separated
+  effective sets (merge, safelist carve, and minimal CIDR regeneration) → preflight every
+  enabled-family capacity → atomically replace each set → activate and normalize firewall wiring →
+  clean up disabled-family artifacts → log → unlock.
+* Ipset atomicity is per set, not a transaction across both families. Preserve the temporary suffix,
+  the 31-character name limit, restore+swap replacement, and best-effort temporary-set destruction.
+  Check every enabled-family `maxelem` limit before swapping either family.
+* After a successful sync, each managed family has one `kidobo-input` chain, one set-match action rule,
+  and exactly one `INPUT` jump at position 1. Preserve fail-closed replacement ordering: establish new
+  enforcement before deleting old copies, even if a partial failure can leave duplicates.
+* `lookup` and `analyze overlap` remain offline-only; analysis and `doctor` remain read-only.
+  `ban`/`unban` update source/config state only and never enforce changes before `sync`.
 
 No silent behavioral changes.
 
-## 3. Architecture Boundary
+## 3. Architecture Boundaries
 
-Core = pure, deterministic compute (no I/O):
+`core` owns pure, deterministic domain computation with no filesystem, network, process, clock, or
+terminal I/O:
 
 * canonicalization
 * family split
 * interval merge
 * safelist subtraction
 * minimal CIDR regeneration
-* lookup overlap
+* lookup and overlap analysis
+* configuration parsing and validation from in-memory text
 
-Adapters = all I/O (filesystem, HTTP, locking, ipset, iptables, sudo wrapper).
+`adapters` own bounded filesystem, HTTP, cache, locking, ipset, iptables, and subprocess I/O.
 
-Do not mix compute and side effects.
+`app` currently owns the ordered, safety-critical sync workflow and accepts replaceable I/O boundaries
+where tests need safe substitutes.
+
+`cli` owns argument parsing, dispatch, command-specific orchestration not extracted into `app`, prompts,
+reports, logging setup, and exit-code mapping.
+
+Dependencies point inward: `core` must not import outer layers. Keep reusable computation out of
+adapters and CLI code; keep side effects out of `core`.
 
 ## 4. Determinism and Error Model
 
-* Fail fast on invalid config or missing binaries.
-* Lock contention fails.
-* Per-remote failures are soft (warn + continue).
-* Cleanup is best effort.
+* Commands that require configuration fail fast on invalid config. Preserve commands intentionally
+  designed to work without config, including `lookup` and `flush --cache-only`.
+* Missing required binaries and lock contention in mutating workflows are hard failures.
+* Individual remote-feed and GitHub metadata failures are soft: warn, continue, and retain the last
+  usable cache. Invalid non-empty responses must not replace good cached data.
+* Cleanup attempts every scoped step. `flush` returns `1` when required cleanup remains incomplete,
+  and uninstall preserves runtime files when live cleanup cannot be confirmed. Ancillary cleanup or
+  cache-maintenance failures may remain soft only where the workflow explicitly documents and tests
+  that behavior.
 * No `panic!` except internal invariants.
 * Outputs must remain deterministic unless explicitly documented.
 
-## 5. Testing Requirements
+## 5. Validation and Testing
 
-Minimum gates for any change:
+`Justfile` is the canonical interface for local and CI validation. Do not duplicate its Cargo commands
+in new scripts or documentation.
 
-```bash
-cargo fmt --all
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-targets --all-features
-```
-
-Extended gates when runtime logic, deps, or CI policy change:
+After Rust, test, or executable-script changes, run:
 
 ```bash
-cargo deny check advisories bans licenses sources
-cargo audit
-cargo llvm-cov --all-features --fail-under-lines 85
+just gates-minimum
 ```
 
-Core logic tests must cover:
+When runtime behavior, dependencies, the toolchain, CI, or release policy changes, run the extended
+gate instead:
+
+```bash
+just gates-extended
+```
+
+Documentation-only changes do not require Rust gates unless they affect executable examples, generated
+artifacts, or build/release behavior. Every repository change still requires
+`just release-notes-check` as described in Section 7.
+
+Never validate by invoking real `sync`, `flush`, `init`, the installer, `ipset`, `iptables`,
+`ip6tables`, `sudo`, or `systemctl` against the development host. Use injected runners, fake binaries,
+and a temporary `KIDOBO_ROOT`. Live validation requires explicit direction and a disposable environment.
+
+Safety-critical tests must preserve:
 
 * collapse + safelist carving
 * IPv4/IPv6 separation
 * minimal CIDR regeneration
-* atomic set-name constraints
-* sync ordering + idempotent flush
+* atomic set-name, capacity-preflight, restore, and swap constraints
+* sync and fail-closed firewall ordering
+* idempotent cleanup and incomplete-cleanup exit behavior
 * path resolution semantics
 
-## 6. Adversarial Testing Strategy (Required for Core Logic Changes)
+## 6. Adversarial Testing Strategy (Required for Core and Safety-Critical Changes)
 
 When modifying interval math, safelist subtraction, collapse logic, lookup behavior, or any safety-critical runtime logic:
 
@@ -90,6 +132,8 @@ Specifically consider:
 * unsorted input handling
 * adjacency merge errors
 * IPv4/IPv6 cross-family leakage
+* partial failures that create a fail-open window
+* mutating one family before validating the other
 
 Tests must constrain behavior, not just happy paths.
 
@@ -155,23 +199,27 @@ For `timeout` results, first determine whether the mutant exposes an actual term
 * After any repo changes, run `just release-notes-check`.
   This is the canonical changelog workflow: it normalizes `release-notes/*`,
   regenerates `CHANGELOG.md`, and fails if those generated files were rewritten.
-* If `release-notes-check` rewrites `CHANGELOG.md` or `release-notes/*`, include those rewrites in the diff.
-* Version bumps use provided script.
+* If `release-notes-check` rewrites `CHANGELOG.md` or `release-notes/*`, include those rewrites in the
+  diff.
+* Do not bump versions or create tags unless explicitly requested. When requested, keep
+  `Cargo.toml`, `Cargo.lock`, README install examples, and the tag-named release notes aligned.
 * No broad refactors without necessity.
 * Prefer narrow diffs.
 
-### 8. Forbidden Changes
+## 8. Forbidden Changes
 
 Do not:
 
 * introduce daemon behavior
 * weaken atomic ipset guarantees
+* introduce fail-open firewall replacement ordering
 * modify unrelated firewall chains
-* change cache semantics without explicit approval
+* change cache format, fallback, or staleness semantics without explicit approval
+* run live firewall or systemd validation on the development host
 
-### 9. Agent Handoff
+## 9. Agent Handoff
 
-After coding:
+After making changes:
 
 1. Explain what changed and why.
 2. List validation commands run.
