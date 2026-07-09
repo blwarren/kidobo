@@ -42,7 +42,7 @@ impl Ipv4Cidr {
         Some(Self::from_parts(raw, prefix))
     }
 
-    pub fn from_parts(network: u32, prefix: u8) -> Self {
+    pub(crate) fn from_parts(network: u32, prefix: u8) -> Self {
         debug_assert!(prefix <= 32);
         let mask = ipv4_mask(prefix);
         Self {
@@ -82,7 +82,7 @@ impl Ipv6Cidr {
         Some(Self::from_parts(raw, prefix))
     }
 
-    pub fn from_parts(network: u128, prefix: u8) -> Self {
+    pub(crate) fn from_parts(network: u128, prefix: u8) -> Self {
         debug_assert!(prefix <= 128);
         let mask = ipv6_mask(prefix);
         Self {
@@ -700,6 +700,23 @@ mod tests {
             }
         }
         intervals
+    }
+
+    #[test]
+    fn checked_constructors_reject_invalid_prefixes() {
+        assert!(Ipv4Cidr::new(Ipv4Addr::UNSPECIFIED, 33).is_none());
+        assert!(Ipv6Cidr::new(Ipv6Addr::UNSPECIFIED, 129).is_none());
+    }
+
+    #[test]
+    fn checked_constructors_canonicalize_boundary_prefixes() {
+        let v4 = Ipv4Cidr::new(Ipv4Addr::new(203, 0, 113, 7), 0).expect("valid prefix");
+        let v6 = Ipv6Cidr::new(Ipv6Addr::LOCALHOST, 0).expect("valid prefix");
+
+        assert_eq!(v4.network(), Ipv4Addr::UNSPECIFIED);
+        assert_eq!(v6.network(), Ipv6Addr::UNSPECIFIED);
+        assert!(Ipv4Cidr::new(Ipv4Addr::BROADCAST, 32).is_some());
+        assert!(Ipv6Cidr::new(Ipv6Addr::from(u128::MAX), 128).is_some());
     }
 
     fn all_intervals_u128(base: u128, width: u32) -> Vec<IntervalU128> {

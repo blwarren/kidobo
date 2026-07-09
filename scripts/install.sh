@@ -81,13 +81,17 @@ run_init_after_install() {
     if [[ -w /etc || -w /var || -w /usr ]]; then
         if "${TARGET_PATH}" init > >(tee "${init_log}") 2>&1; then
             return 0
+        else
+            local status=$?
+            return "${status}"
         fi
-        return $?
     elif has_cmd sudo; then
         if sudo "${TARGET_PATH}" init > >(tee "${init_log}") 2>&1; then
             return 0
+        else
+            local status=$?
+            return "${status}"
         fi
-        return $?
     else
         echo "skipping init: insufficient privileges and sudo unavailable" >&2
         return 1
@@ -242,28 +246,70 @@ run_flush_best_effort() {
 cleanup_firewall_chain_family() {
     local binary="$1"
     if ! has_cmd "${binary}"; then
-        echo "warning: ${binary} is unavailable; skipping direct firewall cleanup for ${KIDOBO_CHAIN_NAME}" >&2
-        return
+        echo "failed to confirm cleanup: ${binary} is unavailable" >&2
+        return 1
     fi
 
-    while run_with_optional_sudo "${binary}" -D INPUT -j "${KIDOBO_CHAIN_NAME}" >/dev/null 2>&1; do
-        :
+    local output
+    while true; do
+        if output="$(run_with_optional_sudo "${binary}" -w 5 -D INPUT -j "${KIDOBO_CHAIN_NAME}" 2>&1)"; then
+            continue
+        fi
+        if [[ "${output}" == *"Bad rule"* || "${output}" == *"does a matching rule exist"* ]]; then
+            break
+        fi
+        echo "failed to remove ${binary} INPUT jump: ${output:-no diagnostic output}" >&2
+        return 1
     done
 
-    warn_best_effort "flush ${binary} chain ${KIDOBO_CHAIN_NAME}" \
-        "${binary}" -F "${KIDOBO_CHAIN_NAME}"
-    warn_best_effort "delete ${binary} chain ${KIDOBO_CHAIN_NAME}" \
-        "${binary}" -X "${KIDOBO_CHAIN_NAME}"
+    if ! cleanup_allow_missing_chain "flush ${binary} chain" \
+        "${binary}" -w 5 -F "${KIDOBO_CHAIN_NAME}"; then
+        return 1
+    fi
+    cleanup_allow_missing_chain "delete ${binary} chain" \
+        "${binary}" -w 5 -X "${KIDOBO_CHAIN_NAME}"
 }
 
 cleanup_default_ipsets() {
     if ! has_cmd ipset; then
-        echo "warning: ipset is unavailable; skipping default ipset cleanup" >&2
-        return
+        echo "failed to confirm cleanup: ipset is unavailable" >&2
+        return 1
     fi
 
-    warn_best_effort "destroy ipset ${DEFAULT_SET_NAME}" ipset destroy "${DEFAULT_SET_NAME}"
-    warn_best_effort "destroy ipset ${DEFAULT_SET_NAME_V6}" ipset destroy "${DEFAULT_SET_NAME_V6}"
+    local failed=0
+    cleanup_allow_missing_set "destroy ipset ${DEFAULT_SET_NAME}" \
+        ipset destroy "${DEFAULT_SET_NAME}" || failed=1
+    cleanup_allow_missing_set "destroy ipset ${DEFAULT_SET_NAME_V6}" \
+        ipset destroy "${DEFAULT_SET_NAME_V6}" || failed=1
+    return "${failed}"
+}
+
+cleanup_allow_missing_chain() {
+    local description="$1"
+    shift
+    local output
+    if output="$(run_with_optional_sudo "$@" 2>&1)"; then
+        return 0
+    fi
+    if [[ "${output}" == *"No chain/target/match by that name"* ]]; then
+        return 0
+    fi
+    echo "failed to ${description}: ${output:-no diagnostic output}" >&2
+    return 1
+}
+
+cleanup_allow_missing_set() {
+    local description="$1"
+    shift
+    local output
+    if output="$(run_with_optional_sudo "$@" 2>&1)"; then
+        return 0
+    fi
+    if [[ "${output}" == *"does not exist"* ]]; then
+        return 0
+    fi
+    echo "failed to ${description}: ${output:-no diagnostic output}" >&2
+    return 1
 }
 
 disable_systemd_timer_best_effort() {
@@ -301,9 +347,14 @@ uninstall_artifacts() {
     echo "uninstalling ${BINARY_NAME} artifacts"
 
     if ! run_flush_best_effort; then
-        cleanup_firewall_chain_family iptables
-        cleanup_firewall_chain_family ip6tables
-        cleanup_default_ipsets
+        local cleanup_failed=0
+        cleanup_firewall_chain_family iptables || cleanup_failed=1
+        cleanup_firewall_chain_family ip6tables || cleanup_failed=1
+        cleanup_default_ipsets || cleanup_failed=1
+        if [[ "${cleanup_failed}" -ne 0 ]]; then
+            echo "uninstall aborted: live firewall cleanup could not be confirmed; runtime artifacts were preserved" >&2
+            return 1
+        fi
     fi
 
     disable_systemd_timer_best_effort
@@ -317,6 +368,7 @@ uninstall_artifacts() {
     remove_path "${TARGET_PATH}" "binary"
 }
 
+main() {
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --version)
@@ -409,4 +461,9 @@ if [[ "${INIT_AFTER_INSTALL}" -eq 1 ]]; then
             exit 1
         fi
     fi
+fi
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
 fi

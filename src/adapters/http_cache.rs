@@ -204,12 +204,21 @@ pub fn max_http_body_bytes(env: &BTreeMap<String, String>) -> usize {
 
 #[cfg(test)]
 pub fn normalize_remote_text(raw: &[u8]) -> String {
-    format_normalized_cidrs(&parse_remote_cidrs(raw))
+    format_normalized_cidrs(&parse_remote_cidrs(raw).networks)
 }
 
-fn parse_remote_cidrs(raw: &[u8]) -> Vec<CanonicalCidr> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedRemoteCidrs {
+    networks: Vec<CanonicalCidr>,
+    data_lines: usize,
+    invalid_lines: usize,
+}
+
+fn parse_remote_cidrs(raw: &[u8]) -> ParsedRemoteCidrs {
     let text = String::from_utf8_lossy(raw);
     let mut parsed = Vec::new();
+    let mut data_lines = 0_usize;
+    let mut invalid_lines = 0_usize;
 
     for line in text.lines() {
         let without_bom = line.trim_start_matches('\u{feff}').trim();
@@ -217,16 +226,24 @@ fn parse_remote_cidrs(raw: &[u8]) -> Vec<CanonicalCidr> {
             continue;
         }
 
+        data_lines += 1;
+
         let Some(token) = without_bom.split_whitespace().next() else {
             continue;
         };
 
         if let Some(cidr) = parse_ip_cidr_non_strict(token) {
             parsed.push(cidr);
+        } else {
+            invalid_lines += 1;
         }
     }
 
-    parsed
+    ParsedRemoteCidrs {
+        networks: parsed,
+        data_lines,
+        invalid_lines,
+    }
 }
 
 fn parse_cached_iplist(iplist: &str) -> Vec<CanonicalCidr> {
@@ -320,7 +337,20 @@ fn handle_network_response(
         return Ok(cache_fallback(cached_networks, cached_meta));
     }
 
-    let networks = parse_remote_cidrs(&response.body);
+    let parsed = parse_remote_cidrs(&response.body);
+    if parsed.data_lines > 0 && parsed.networks.is_empty() {
+        warn!(
+            "remote fetch failed for {url}: non-empty response contained no valid IP/CIDR entries"
+        );
+        return Ok(cache_fallback(cached_networks, cached_meta));
+    }
+    if parsed.invalid_lines > 0 {
+        warn!(
+            "remote source {url} ignored {} invalid line(s)",
+            parsed.invalid_lines
+        );
+    }
+    let networks = parsed.networks;
     let normalized = format_normalized_cidrs(&networks);
     let metadata = RemoteCacheMetadata {
         url: url.to_string(),
@@ -479,6 +509,15 @@ mod tests {
                 .borrow_mut()
                 .pop_front()
                 .expect("queued response")
+        }
+    }
+
+    fn network_response_for_test(body: &[u8]) -> HttpResponse {
+        HttpResponse {
+            status: StatusCode::OK,
+            body: body.to_vec(),
+            etag: None,
+            last_modified: None,
         }
     }
 
@@ -704,6 +743,77 @@ mod tests {
             metadata.last_modified.as_deref(),
             Some("Mon, 01 Jan 2024 00:00:00 GMT")
         );
+    }
+
+    #[test]
+    fn all_invalid_network_body_preserves_existing_cache() {
+        let temp = TempDir::new().expect("tempdir");
+        let url = "https://example.com/feed.txt";
+        let paths = cache_paths_for_url(temp.path(), url);
+        fs::write(&paths.iplist_path, "10.0.0.0/24\n").expect("write cache");
+
+        let client = MockHttpClient::new(vec![Ok(HttpResponse {
+            status: StatusCode::OK,
+            body: b"not-a-network\nalso-invalid\n".to_vec(),
+            etag: Some("bad-etag".to_string()),
+            last_modified: None,
+        })]);
+
+        let result =
+            fetch_iplist_with_cache(&client, url, temp.path(), &BTreeMap::new()).expect("fetch");
+
+        assert_eq!(result.source, CacheSource::FallbackCache);
+        assert_eq!(result.networks.len(), 1);
+        assert_eq!(
+            read_to_string_with_limit(&paths.iplist_path, super::MAX_IPLIST_READ_BYTES)
+                .expect("read"),
+            "10.0.0.0/24\n"
+        );
+        assert!(!paths.raw_path.exists());
+        assert!(!paths.meta_path.exists());
+    }
+
+    #[test]
+    fn all_invalid_network_body_without_cache_stays_empty_and_unpersisted() {
+        let temp = TempDir::new().expect("tempdir");
+        let url = "https://example.com/feed.txt";
+        let paths = cache_paths_for_url(temp.path(), url);
+        let client = MockHttpClient::new(vec![Ok(network_response_for_test(b"invalid\n"))]);
+
+        let result =
+            fetch_iplist_with_cache(&client, url, temp.path(), &BTreeMap::new()).expect("fetch");
+
+        assert_eq!(result.source, CacheSource::Empty);
+        assert!(result.networks.is_empty());
+        assert!(!paths.iplist_path.exists());
+        assert!(!paths.raw_path.exists());
+        assert!(!paths.meta_path.exists());
+    }
+
+    #[test]
+    fn comment_only_network_body_is_an_intentional_empty_feed() {
+        let temp = TempDir::new().expect("tempdir");
+        let url = "https://example.com/feed.txt";
+        let paths = cache_paths_for_url(temp.path(), url);
+        let body = b"# intentionally empty\n\n";
+        let client = MockHttpClient::new(vec![Ok(network_response_for_test(body))]);
+
+        let result =
+            fetch_iplist_with_cache(&client, url, temp.path(), &BTreeMap::new()).expect("fetch");
+
+        assert_eq!(result.source, CacheSource::Network);
+        assert!(result.networks.is_empty());
+        assert_eq!(
+            read_to_string_with_limit(&paths.iplist_path, super::MAX_IPLIST_READ_BYTES)
+                .expect("read"),
+            ""
+        );
+        assert_eq!(
+            read_bytes_with_limit(&paths.raw_path, super::DEFAULT_MAX_HTTP_BODY_BYTES)
+                .expect("read raw"),
+            body
+        );
+        assert!(paths.meta_path.exists());
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use std::fs;
 use std::hint::black_box;
 use std::io::{self, Read};
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,7 +23,7 @@ fn generate_ipv4_cidrs(count: usize) -> Vec<Ipv4Cidr> {
     for i in 0..count {
         let idx = i as u32;
         let network = (10_u32 << 24) | ((idx & 0x00ff_ffff) << 8);
-        cidrs.push(Ipv4Cidr::from_parts(network, 24));
+        cidrs.push(Ipv4Cidr::new(Ipv4Addr::from(network), 24).expect("valid benchmark prefix"));
     }
     cidrs
 }
@@ -32,7 +33,7 @@ fn generate_ipv6_cidrs(count: usize) -> Vec<Ipv6Cidr> {
     for i in 0..count {
         let idx = i as u128;
         let network = 0x20010db8000000000000000000000000_u128 | (idx << 64);
-        cidrs.push(Ipv6Cidr::from_parts(network, 64));
+        cidrs.push(Ipv6Cidr::new(Ipv6Addr::from(network), 64).expect("valid benchmark prefix"));
     }
     cidrs
 }
@@ -66,7 +67,9 @@ fn deterministic_shuffle<T>(data: &mut [T]) {
 fn generate_disjoint_ipv4_hosts(count: usize) -> Vec<Ipv4Cidr> {
     let mut out = Vec::with_capacity(count);
     for i in 0..count {
-        out.push(Ipv4Cidr::from_parts((i as u32) * 4, 32));
+        out.push(
+            Ipv4Cidr::new(Ipv4Addr::from((i as u32) * 4), 32).expect("valid benchmark prefix"),
+        );
     }
     out
 }
@@ -74,7 +77,7 @@ fn generate_disjoint_ipv4_hosts(count: usize) -> Vec<Ipv4Cidr> {
 fn generate_contiguous_ipv4_hosts(count: usize) -> Vec<Ipv4Cidr> {
     let mut out = Vec::with_capacity(count);
     for i in 0..count {
-        out.push(Ipv4Cidr::from_parts(i as u32, 32));
+        out.push(Ipv4Cidr::new(Ipv4Addr::from(i as u32), 32).expect("valid benchmark prefix"));
     }
     out
 }

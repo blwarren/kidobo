@@ -45,6 +45,12 @@ pub struct IpsetSetSpec {
     pub timeout: u32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IpsetSetInfo {
+    set_type: String,
+    family: IpsetFamily,
+}
+
 #[derive(Debug, Error)]
 pub enum IpsetError {
     #[error("ipset command execution failed: {source}")]
@@ -65,6 +71,20 @@ pub enum IpsetError {
 
     #[error("failed to create ipset restore script {path}: {reason}")]
     CreateRestoreScript { path: PathBuf, reason: String },
+
+    #[error("failed to inspect existing ipset `{set_name}`: {reason}")]
+    MalformedInspection { set_name: String, reason: String },
+
+    #[error(
+        "existing ipset `{set_name}` is incompatible: expected type `{expected_type}` family `{expected_family}`, found type `{actual_type}` family `{actual_family}`"
+    )]
+    IncompatibleSet {
+        set_name: String,
+        expected_type: String,
+        expected_family: &'static str,
+        actual_type: String,
+        actual_family: &'static str,
+    },
 }
 
 pub trait IpsetCommandRunner {
@@ -77,51 +97,94 @@ impl<E: CommandExecutor> IpsetCommandRunner for SudoCommandRunner<E> {
     }
 }
 
-pub fn ipset_exists(runner: &dyn IpsetCommandRunner, set_name: &str) -> Result<bool, IpsetError> {
+pub fn ensure_ipset_exists(
+    runner: &dyn IpsetCommandRunner,
+    spec: &IpsetSetSpec,
+) -> Result<(), IpsetError> {
+    if let Some(info) = inspect_ipset(runner, &spec.set_name)? {
+        if info.set_type != spec.set_type || info.family != spec.family {
+            return Err(IpsetError::IncompatibleSet {
+                set_name: spec.set_name.clone(),
+                expected_type: spec.set_type.clone(),
+                expected_family: spec.family.as_str(),
+                actual_type: info.set_type,
+                actual_family: info.family.as_str(),
+            });
+        }
+        return Ok(());
+    }
+
+    create_ipset(runner, spec)
+}
+
+fn inspect_ipset(
+    runner: &dyn IpsetCommandRunner,
+    set_name: &str,
+) -> Result<Option<IpsetSetInfo>, IpsetError> {
     let terse_args = ["list", set_name, "-terse"];
     let terse_result = runner.run("ipset", &terse_args)?;
-    if terse_result.status.success() {
-        return Ok(true);
-    }
-
-    if is_missing_set_result(&terse_result) {
-        return Ok(false);
-    }
-
-    if !is_unsupported_terse_option_result(&terse_result) {
+    let result = if terse_result.status.success() {
+        terse_result
+    } else if is_missing_set_result(&terse_result) {
+        return Ok(None);
+    } else if is_unsupported_terse_option_result(&terse_result) {
+        let list_args = ["list", set_name];
+        let result = runner.run("ipset", &list_args)?;
+        if is_missing_set_result(&result) {
+            return Ok(None);
+        }
+        ensure_command_succeeded(result, "ipset", &list_args, |command, status, stderr| {
+            IpsetError::CommandFailed {
+                command,
+                status,
+                stderr,
+            }
+        })?
+    } else {
         return Err(IpsetError::CommandFailed {
             command: display_command("ipset", &terse_args),
             status: terse_result.status,
             stderr: terse_result.stderr,
         });
-    }
+    };
 
-    let list_args = ["list", set_name];
-    let result = runner.run("ipset", &list_args)?;
-    if result.status.success() {
-        return Ok(true);
-    }
-
-    if is_missing_set_result(&result) {
-        return Ok(false);
-    }
-
-    Err(IpsetError::CommandFailed {
-        command: display_command("ipset", &list_args),
-        status: result.status,
-        stderr: result.stderr,
-    })
+    parse_ipset_info(&result.stdout)
+        .map(Some)
+        .map_err(|reason| IpsetError::MalformedInspection {
+            set_name: set_name.to_string(),
+            reason,
+        })
 }
 
-pub fn ensure_ipset_exists(
-    runner: &dyn IpsetCommandRunner,
-    spec: &IpsetSetSpec,
-) -> Result<(), IpsetError> {
-    if ipset_exists(runner, &spec.set_name)? {
-        return Ok(());
-    }
+fn parse_ipset_info(stdout: &str) -> Result<IpsetSetInfo, String> {
+    let set_type = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("Type:").map(str::trim))
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "missing `Type:` field".to_string())?;
+    let header = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("Header:").map(str::trim))
+        .ok_or_else(|| "missing `Header:` field".to_string())?;
+    let tokens = header.split_whitespace().collect::<Vec<_>>();
+    let family = tokens
+        .windows(2)
+        .find_map(|pair| {
+            pair.first()
+                .zip(pair.get(1))
+                .and_then(|(key, value)| (*key == "family").then_some(*value))
+        })
+        .ok_or_else(|| "missing family in `Header:` field".to_string())?;
+    let family = match family {
+        "inet" => IpsetFamily::Inet,
+        "inet6" => IpsetFamily::Inet6,
+        other => return Err(format!("unsupported family `{other}`")),
+    };
 
-    create_ipset(runner, spec)
+    Ok(IpsetSetInfo {
+        set_type: set_type.to_string(),
+        family,
+    })
 }
 
 pub fn create_ipset(
@@ -406,7 +469,8 @@ mod tests {
 
     use super::{
         IpsetCommandRunner, IpsetError, IpsetFamily, IpsetSetSpec, RESTORE_SCRIPT_READ_LIMIT,
-        atomic_replace_ipset_values, generate_temp_set_name, ipset_exists, write_restore_script,
+        atomic_replace_ipset_values, ensure_ipset_exists, generate_temp_set_name,
+        write_restore_script,
     };
     use crate::adapters::command_runner::{CommandResult, CommandRunnerError, ProcessStatus};
     use crate::adapters::limited_io::read_to_string_with_limit;
@@ -463,6 +527,17 @@ mod tests {
             status: ProcessStatus::Exited(status),
             stdout: String::new(),
             stderr: String::new(),
+        }
+    }
+
+    fn test_spec(family: IpsetFamily) -> IpsetSetSpec {
+        IpsetSetSpec {
+            set_name: "kidobo".to_string(),
+            set_type: "hash:net".to_string(),
+            family,
+            hashsize: 65_536,
+            maxelem: 500_000,
+            timeout: 0,
         }
     }
 
@@ -530,31 +605,21 @@ mod tests {
     }
 
     #[test]
-    fn ipset_exists_maps_missing_set_to_false() {
+    fn ensure_existing_ipset_validates_type_and_family() {
         let runner = MockRunner::new(vec![Ok(CommandResult {
-            status: ProcessStatus::Exited(1),
-            stdout: String::new(),
-            stderr: "The set with the given name does not exist".to_string(),
+            status: ProcessStatus::Exited(0),
+            stdout:
+                "Name: kidobo\nType: hash:net\nHeader: family inet hashsize 1024 maxelem 500000\n"
+                    .to_string(),
+            stderr: String::new(),
         })]);
 
-        let exists = ipset_exists(&runner, "kidobo").expect("exists check");
-        assert!(!exists);
+        ensure_ipset_exists(&runner, &test_spec(IpsetFamily::Inet)).expect("compatible set");
+        assert_eq!(runner.invocations().len(), 1);
     }
 
     #[test]
-    fn ipset_exists_errors_on_unexpected_failure() {
-        let runner = MockRunner::new(vec![Ok(CommandResult {
-            status: ProcessStatus::Exited(2),
-            stdout: String::new(),
-            stderr: "permission denied".to_string(),
-        })]);
-
-        let err = ipset_exists(&runner, "kidobo").expect_err("must fail");
-        assert!(matches!(err, IpsetError::CommandFailed { .. }));
-    }
-
-    #[test]
-    fn ipset_exists_falls_back_when_terse_flag_is_unsupported() {
+    fn ensure_existing_ipset_falls_back_when_terse_is_unsupported() {
         let runner = MockRunner::new(vec![
             Ok(CommandResult {
                 status: ProcessStatus::Exited(2),
@@ -563,27 +628,63 @@ mod tests {
             }),
             Ok(CommandResult {
                 status: ProcessStatus::Exited(0),
-                stdout: "Name: kidobo".to_string(),
+                stdout: "Name: kidobo\nType: hash:net\nHeader: family inet hashsize 1024\n"
+                    .to_string(),
                 stderr: String::new(),
             }),
         ]);
 
-        let exists = ipset_exists(&runner, "kidobo").expect("exists check");
-        assert!(exists);
+        ensure_ipset_exists(&runner, &test_spec(IpsetFamily::Inet)).expect("compatible set");
+        assert_eq!(runner.invocations().len(), 2);
+    }
 
+    #[test]
+    fn ensure_existing_ipset_rejects_wrong_type_or_family() {
+        for stdout in [
+            "Name: kidobo\nType: hash:ip\nHeader: family inet hashsize 1024\n",
+            "Name: kidobo\nType: hash:net\nHeader: family inet6 hashsize 1024\n",
+        ] {
+            let runner = MockRunner::new(vec![Ok(CommandResult {
+                status: ProcessStatus::Exited(0),
+                stdout: stdout.to_string(),
+                stderr: String::new(),
+            })]);
+
+            let err = ensure_ipset_exists(&runner, &test_spec(IpsetFamily::Inet))
+                .expect_err("incompatible set");
+            assert!(matches!(err, IpsetError::IncompatibleSet { .. }));
+            assert_eq!(runner.invocations().len(), 1);
+        }
+    }
+
+    #[test]
+    fn ensure_existing_ipset_rejects_malformed_inspection_output() {
+        let runner = MockRunner::new(vec![Ok(CommandResult {
+            status: ProcessStatus::Exited(0),
+            stdout: "Name: kidobo\nHeader: hashsize 1024\n".to_string(),
+            stderr: String::new(),
+        })]);
+
+        let err = ensure_ipset_exists(&runner, &test_spec(IpsetFamily::Inet))
+            .expect_err("malformed inspection");
+        assert!(matches!(err, IpsetError::MalformedInspection { .. }));
+    }
+
+    #[test]
+    fn ensure_missing_ipset_creates_it() {
+        let runner = MockRunner::new(vec![
+            Ok(CommandResult {
+                status: ProcessStatus::Exited(1),
+                stdout: String::new(),
+                stderr: "The set with the given name does not exist".to_string(),
+            }),
+            Ok(ok(0)),
+        ]);
+
+        ensure_ipset_exists(&runner, &test_spec(IpsetFamily::Inet)).expect("created");
         let invocations = runner.invocations();
-        assert_eq!(
-            invocations[0].1,
-            vec![
-                "list".to_string(),
-                "kidobo".to_string(),
-                "-terse".to_string()
-            ]
-        );
-        assert_eq!(
-            invocations[1].1,
-            vec!["list".to_string(), "kidobo".to_string()]
-        );
+        assert_eq!(invocations.len(), 2);
+        assert_eq!(invocations[1].1[0], "create");
     }
 
     #[test]

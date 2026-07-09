@@ -17,12 +17,12 @@ use crate::adapters::ipset::{
 };
 use crate::adapters::iptables::{
     ChainAction, FirewallCommandRunner, FirewallFamily, cleanup_firewall_wiring,
-    ensure_firewall_wiring_for_families,
+    ensure_firewall_artifacts_for_families, ensure_firewall_wiring_for_families,
 };
 use crate::adapters::path::ResolvedPaths;
 use crate::core::config::{Config, FirewallAction};
 use crate::core::network::CanonicalCidr;
-use crate::core::sync::compute_effective_blocklists;
+use crate::core::sync::{EffectiveBlocklists, compute_effective_blocklists};
 use crate::error::KidoboError;
 
 pub(crate) const MAX_REMOTE_FETCH_WORKERS: usize = 5;
@@ -78,23 +78,14 @@ pub(crate) fn run(
     let ipv4_spec = ipv4_set_spec(config);
     let ipv6_spec = ipv6_set_spec(config);
 
-    ensure_ipset_exists(ipset_runner, &ipv4_spec)?;
-    if config.ipset.enable_ipv6 {
-        ensure_ipset_exists(ipset_runner, &ipv6_spec)?;
-    }
-    timer.mark("ensure_ipset_artifacts");
-
-    ensure_firewall_wiring_for_families(
+    ensure_runtime_artifacts(
+        config,
+        ipset_runner,
         firewall_runner,
-        &config.ipset.set_name,
-        &config.ipset.set_name_v6,
-        config.ipset.enable_ipv6,
-        chain_action(config),
+        &ipv4_spec,
+        &ipv6_spec,
     )?;
-    if !config.ipset.enable_ipv6 {
-        cleanup_disabled_ipv6_artifacts(firewall_runner, ipset_runner, &config.ipset.set_name_v6);
-    }
-    timer.mark("ensure_firewall_wiring");
+    timer.mark("ensure_ipset_artifacts");
 
     let fast_state_path = paths.cache_dir.join(BLOCKLIST_FAST_STATE_FILE);
     let normalize_result =
@@ -165,14 +156,15 @@ pub(crate) fn run(
     let effective = compute_effective_blocklists(&candidates, &safelist, config.ipset.enable_ipv6);
     timer.mark("compute_effective_blocklists");
 
-    if config.ipset.enable_ipv6 {
-        ensure_within_maxelem(&ipv6_spec, effective.ipv6.len())?;
-        atomic_replace_ipset_values(ipset_runner, &ipv6_spec, &effective.ipv6)?;
-        timer.mark("apply_ipv6_ipset");
-    }
-    ensure_within_maxelem(&ipv4_spec, effective.ipv4.len())?;
-    atomic_replace_ipset_values(ipset_runner, &ipv4_spec, &effective.ipv4)?;
-    timer.mark("apply_ipv4_ipset");
+    apply_runtime_state(
+        config,
+        &effective,
+        &ipv4_spec,
+        &ipv6_spec,
+        ipset_runner,
+        firewall_runner,
+        timer,
+    )?;
 
     info!(
         "sync source counts: internal={internal_count} remote={remote_count} asn={asn_count} safelist={safelist_count}"
@@ -187,6 +179,61 @@ pub(crate) fn run(
         ipv4_entries: effective.ipv4.len(),
         ipv6_entries: effective.ipv6.len(),
     })
+}
+
+fn ensure_runtime_artifacts(
+    config: &Config,
+    ipset_runner: &dyn IpsetCommandRunner,
+    firewall_runner: &dyn FirewallCommandRunner,
+    ipv4_spec: &IpsetSetSpec,
+    ipv6_spec: &IpsetSetSpec,
+) -> Result<(), KidoboError> {
+    ensure_ipset_exists(ipset_runner, ipv4_spec)?;
+    if config.ipset.enable_ipv6 {
+        ensure_ipset_exists(ipset_runner, ipv6_spec)?;
+    }
+    ensure_firewall_artifacts_for_families(firewall_runner, config.ipset.enable_ipv6)?;
+    Ok(())
+}
+
+fn apply_runtime_state(
+    config: &Config,
+    effective: &EffectiveBlocklists,
+    ipv4_spec: &IpsetSetSpec,
+    ipv6_spec: &IpsetSetSpec,
+    ipset_runner: &dyn IpsetCommandRunner,
+    firewall_runner: &dyn FirewallCommandRunner,
+    timer: &mut SyncStageTimer,
+) -> Result<(), KidoboError> {
+    if config.ipset.enable_ipv6 {
+        ensure_within_maxelem(ipv6_spec, effective.ipv6.len())?;
+    }
+    ensure_within_maxelem(ipv4_spec, effective.ipv4.len())?;
+
+    if config.ipset.enable_ipv6 {
+        atomic_replace_ipset_values(ipset_runner, ipv6_spec, &effective.ipv6)?;
+        timer.mark("apply_ipv6_ipset");
+    }
+    atomic_replace_ipset_values(ipset_runner, ipv4_spec, &effective.ipv4)?;
+    timer.mark("apply_ipv4_ipset");
+
+    ensure_firewall_wiring_for_families(
+        firewall_runner,
+        &config.ipset.set_name,
+        &config.ipset.set_name_v6,
+        config.ipset.enable_ipv6,
+        chain_action(config),
+    )?;
+    if !config.ipset.enable_ipv6 {
+        cleanup_disabled_ipv6_artifacts(
+            firewall_runner,
+            ipset_runner,
+            &config.ipset.set_name,
+            &config.ipset.set_name_v6,
+        );
+    }
+    timer.mark("ensure_firewall_wiring");
+    Ok(())
 }
 
 #[cfg(test)]
@@ -268,10 +315,16 @@ fn chain_action(config: &Config) -> ChainAction {
 fn cleanup_disabled_ipv6_artifacts(
     firewall_runner: &dyn FirewallCommandRunner,
     ipset_runner: &dyn IpsetCommandRunner,
+    set_name_v4: &str,
     set_name_v6: &str,
 ) {
     if let Err(err) = cleanup_firewall_wiring(firewall_runner, FirewallFamily::Ipv6) {
         warn!("disabled IPv6 firewall cleanup failed softly: {err}");
+    }
+
+    if set_name_v6 == set_name_v4 {
+        warn!("disabled IPv6 ipset cleanup skipped because its name matches the IPv4 set");
+        return;
     }
 
     match ipset_runner.run("ipset", &["destroy", set_name_v6]) {

@@ -151,14 +151,30 @@ case "${cmd}" in
     esac
     ;;
   iptables|ip6tables)
+    if [[ "${1:-}" == "-w" ]]; then
+      shift 2
+    fi
+    chain_marker="${KIDOBO_ROOT:-/tmp}/cache/test-${cmd}-chain"
     case "${1:-}" in
       -S)
+        if [[ "${2:-}" == "INPUT" || -f "${chain_marker}" ]]; then
+          exit 0
+        fi
         echo "No chain/target/match by that name" >&2
         exit 1
+        ;;
+      -N)
+        mkdir -p "$(dirname "${chain_marker}")"
+        : > "${chain_marker}"
+        exit 0
         ;;
       -D)
         echo "Bad rule (does a matching rule exist in that chain?)." >&2
         exit 1
+        ;;
+      -X)
+        rm -f "${chain_marker}"
+        exit 0
         ;;
       *)
         exit 0

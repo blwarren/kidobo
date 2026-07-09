@@ -218,6 +218,7 @@ pub enum ConfigError {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawConfig {
     ipset: Option<RawIpsetConfig>,
     safe: Option<RawSafeConfig>,
@@ -226,6 +227,7 @@ struct RawConfig {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawIpsetConfig {
     set_name: Option<String>,
     set_name_v6: Option<String>,
@@ -238,6 +240,7 @@ struct RawIpsetConfig {
 }
 
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct RawSafeConfig {
     ips: Option<Vec<String>>,
     include_github_meta: Option<bool>,
@@ -246,6 +249,7 @@ struct RawSafeConfig {
 }
 
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct RawRemoteConfig {
     urls: Option<Vec<String>>,
     timeout_secs: Option<i64>,
@@ -253,6 +257,7 @@ struct RawRemoteConfig {
 }
 
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct RawAsnConfig {
     banned: Option<Vec<i64>>,
     cache_stale_after_secs: Option<i64>,
@@ -302,10 +307,10 @@ fn parse_ipset(raw: RawIpsetConfig) -> Result<IpsetConfig, ConfigError> {
             derived
         }
     };
-    if enable_ipv6 && set_name_v6 == set_name {
+    if set_name_v6 == set_name {
         return Err(ConfigError::InvalidField {
             field: "ipset.set_name_v6",
-            reason: "must differ from ipset.set_name when ipv6 is enabled".to_string(),
+            reason: "must differ from ipset.set_name".to_string(),
         });
     }
 
@@ -653,7 +658,7 @@ mod tests {
     }
 
     #[test]
-    fn set_name_v6_must_not_match_set_name_when_ipv6_enabled() {
+    fn set_name_v6_must_not_match_set_name() {
         let err = Config::from_toml_str("[ipset]\nset_name = 'kidobo'\nset_name_v6 = 'kidobo'\n")
             .expect_err("must fail");
 
@@ -661,7 +666,23 @@ mod tests {
             err,
             ConfigError::InvalidField {
                 field: "ipset.set_name_v6",
-                reason: "must differ from ipset.set_name when ipv6 is enabled".to_string(),
+                reason: "must differ from ipset.set_name".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn set_name_v6_must_not_match_set_name_when_ipv6_disabled() {
+        let err = Config::from_toml_str(
+            "[ipset]\nset_name = 'kidobo'\nset_name_v6 = 'kidobo'\nenable_ipv6 = false\n",
+        )
+        .expect_err("must fail");
+
+        assert_eq!(
+            err,
+            ConfigError::InvalidField {
+                field: "ipset.set_name_v6",
+                reason: "must differ from ipset.set_name".to_string(),
             }
         );
     }
@@ -1071,6 +1092,26 @@ mod tests {
         match err {
             ConfigError::Parse { .. } => {}
             _ => panic!("expected parse error"),
+        }
+    }
+
+    #[test]
+    fn parser_rejects_unknown_root_and_nested_keys() {
+        for contents in [
+            "[ipset]\nset_name='kidobo'\nunknown=true\n",
+            "[ipset]\nset_name='kidobo'\n[remote]\ntimeout_second=30\n",
+            "[ipset]\nset_name='kidobo'\n[safe]\ninclude_github=true\n",
+            "[ipset]\nset_name='kidobo'\n[extra]\nvalue=true\n",
+            "ipset = { set_name = 'kidobo', typo = true }\n",
+            "ipset.set_name='kidobo'\nasn.stale_seconds=30\n",
+        ] {
+            assert!(
+                matches!(
+                    Config::from_toml_str(contents),
+                    Err(ConfigError::Parse { .. })
+                ),
+                "unexpectedly accepted {contents:?}"
+            );
         }
     }
 

@@ -514,6 +514,32 @@ mod tests {
     }
 
     #[test]
+    fn lookup_ipv6_index_keeps_same_start_nested_matches() {
+        let base = 0x20010db8000000000000000000000000_u128;
+        let sources = vec![
+            LookupSourceEntry {
+                source_label: "source:super".into(),
+                source_line: "2001:db8::/48".to_string(),
+                cidr: CanonicalCidr::V6(Ipv6Cidr::from_parts(base, 48)),
+            },
+            LookupSourceEntry {
+                source_label: "source:narrow".into(),
+                source_line: "2001:db8::/64".to_string(),
+                cidr: CanonicalCidr::V6(Ipv6Cidr::from_parts(base, 64)),
+            },
+        ];
+
+        let report = run_lookup(&["2001:db8::7".to_string()], &sources);
+        let labels = report
+            .matches
+            .iter()
+            .map(|entry| entry.source_label.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(labels, vec!["source:narrow", "source:super"]);
+    }
+
+    #[test]
     fn lookup_preserves_distinct_source_labels_for_same_cidr() {
         let sources = vec![
             LookupSourceEntry {

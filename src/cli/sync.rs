@@ -240,7 +240,13 @@ mod tests {
                 return success();
             }
 
-            match (command, args.first().copied()) {
+            let effective_args = if args.starts_with(&["-w", "5"]) {
+                &args[2..]
+            } else {
+                args
+            };
+
+            match (command, effective_args.first().copied()) {
                 ("ipset", Some("list")) => CommandResult {
                     status: ProcessStatus::Exited(1),
                     stdout: String::new(),
@@ -251,11 +257,27 @@ mod tests {
                     stdout: String::new(),
                     stderr: "The set with the given name does not exist".to_string(),
                 },
-                ("iptables" | "ip6tables", Some("-S")) => CommandResult {
-                    status: ProcessStatus::Exited(1),
-                    stdout: String::new(),
-                    stderr: "No chain/target/match by that name".to_string(),
-                },
+                ("iptables" | "ip6tables", Some("-S")) => {
+                    if effective_args.get(1) == Some(&"INPUT") {
+                        success()
+                    } else {
+                        let created = self
+                            .events
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .iter()
+                            .any(|event| event.starts_with(&format!("cmd:{command} -w 5 -N ")));
+                        if created {
+                            success()
+                        } else {
+                            CommandResult {
+                                status: ProcessStatus::Exited(1),
+                                stdout: String::new(),
+                                stderr: "No chain/target/match by that name".to_string(),
+                            }
+                        }
+                    }
+                }
                 ("iptables" | "ip6tables", Some("-D")) => CommandResult {
                     status: ProcessStatus::Exited(1),
                     stdout: String::new(),
@@ -379,7 +401,7 @@ mod tests {
     }
 
     #[test]
-    fn sync_orders_firewall_before_remote_fetch_and_restores_ipv6_first() {
+    fn sync_prepares_artifacts_before_fetch_and_activates_after_swaps() {
         let temp = TempDir::new().expect("tempdir");
         let paths = test_paths(temp.path());
 
@@ -440,13 +462,22 @@ mod tests {
             .expect("http event");
         let iptables_create = events
             .iter()
-            .position(|entry| entry.contains("cmd:iptables -N kidobo-input"))
+            .position(|entry| entry.contains("cmd:iptables -w 5 -N kidobo-input"))
             .expect("iptables chain creation event");
 
         assert!(
             iptables_create < first_http,
-            "firewall wiring must happen before remote fetch"
+            "firewall artifacts must be prepared before remote fetch"
         );
+        let last_restore = events
+            .iter()
+            .rposition(|entry| entry.starts_with("cmd:ipset restore "))
+            .expect("restore event");
+        let firewall_activation = events
+            .iter()
+            .position(|entry| entry.contains("cmd:iptables -w 5 -A kidobo-input"))
+            .expect("firewall activation event");
+        assert!(last_restore < firewall_activation);
 
         let swap_targets = runner.swap_targets();
         assert_eq!(swap_targets, vec!["kidobo-v6", "kidobo"]);
@@ -459,7 +490,7 @@ mod tests {
     }
 
     #[test]
-    fn sync_completes_firewall_wiring_for_both_families_before_remote_fetch() {
+    fn sync_completes_firewall_wiring_for_both_families_after_remote_fetch() {
         let temp = TempDir::new().expect("tempdir");
         let paths = test_paths(temp.path());
 
@@ -505,7 +536,7 @@ mod tests {
             })
             .expect("firewall event");
 
-        assert!(last_firewall < first_http);
+        assert!(first_http < last_firewall);
     }
 
     #[test]
@@ -661,10 +692,13 @@ mod tests {
 
         let events = runner.events();
         assert!(events.iter().any(|entry| {
-            entry.contains("cmd:iptables -A kidobo-input -m set --match-set kidobo src -j DROP")
+            entry
+                .contains("cmd:iptables -w 5 -A kidobo-input -m set --match-set kidobo src -j DROP")
         }));
         assert!(events.iter().any(|entry| {
-            entry.contains("cmd:ip6tables -A kidobo-input -m set --match-set kidobo-v6 src -j DROP")
+            entry.contains(
+                "cmd:ip6tables -w 5 -A kidobo-input -m set --match-set kidobo-v6 src -j DROP",
+            )
         }));
     }
 
@@ -940,11 +974,13 @@ mod tests {
 
         let events = runner.events();
         assert!(events.iter().any(|entry| {
-            entry.contains("cmd:iptables -A kidobo-input -m set --match-set kidobo src -j REJECT")
+            entry.contains(
+                "cmd:iptables -w 5 -A kidobo-input -m set --match-set kidobo src -j REJECT",
+            )
         }));
         assert!(events.iter().any(|entry| {
             entry.contains(
-                "cmd:ip6tables -A kidobo-input -m set --match-set kidobo-v6 src -j REJECT",
+                "cmd:ip6tables -w 5 -A kidobo-input -m set --match-set kidobo-v6 src -j REJECT",
             )
         }));
     }
@@ -995,7 +1031,7 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|entry| entry == "cmd:ip6tables -D INPUT -j kidobo-input")
+                .any(|entry| entry == "cmd:ip6tables -w 5 -D INPUT -j kidobo-input")
         );
         assert!(
             events
@@ -1041,6 +1077,106 @@ mod tests {
             } if set_name == "kidobo"
         ));
         assert!(runner.swap_targets().is_empty());
+    }
+
+    #[test]
+    fn ipv4_capacity_failure_prevents_ipv6_swap_and_firewall_activation() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = test_paths(temp.path());
+        fs::create_dir_all(paths.blocklist_file.parent().expect("parent")).expect("mkdir data");
+        fs::create_dir_all(&paths.remote_cache_dir).expect("mkdir cache");
+        fs::write(
+            &paths.blocklist_file,
+            "10.0.0.0/24\n198.51.100.0/24\n2001:db8::/64\n",
+        )
+        .expect("write blocklist");
+
+        let mut config = test_config(Vec::new());
+        config.ipset.maxelem = MaxElem::new(1).expect("valid maxelem");
+        let events = Mutex::new(Vec::new());
+        let http_client = MockHttpClient::new(BTreeMap::new(), &events, 0);
+        let runner = MockCommandRunner::new(&events);
+
+        let err = run_sync_with_dependencies(
+            &paths,
+            &config,
+            &BTreeMap::new(),
+            &http_client,
+            &runner,
+            &runner,
+        )
+        .expect_err("sync must fail");
+
+        assert!(matches!(
+            err,
+            KidoboError::IpsetCapacityExceeded { family: "ipv4", .. }
+        ));
+        assert!(runner.swap_targets().is_empty());
+        assert!(runner.events().iter().all(|entry| {
+            !entry.contains(" -A kidobo-input ") && !entry.contains(" -I INPUT 1 ")
+        }));
+    }
+
+    #[test]
+    fn hard_local_source_failure_does_not_activate_new_set_name() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = test_paths(temp.path());
+        fs::create_dir_all(paths.blocklist_file.parent().expect("parent")).expect("mkdir data");
+        fs::create_dir_all(&paths.remote_cache_dir).expect("mkdir cache");
+        fs::write(&paths.blocklist_file, "not-a-network\n").expect("write blocklist");
+
+        let mut config = test_config(Vec::new());
+        config.ipset.set_name = "kidobo-new".to_string();
+        let events = Mutex::new(Vec::new());
+        let http_client = MockHttpClient::new(BTreeMap::new(), &events, 0);
+        let runner = MockCommandRunner::new(&events);
+
+        run_sync_with_dependencies(
+            &paths,
+            &config,
+            &BTreeMap::new(),
+            &http_client,
+            &runner,
+            &runner,
+        )
+        .expect_err("sync must fail");
+
+        assert!(runner.swap_targets().is_empty());
+        assert!(runner.events().iter().all(|entry| {
+            !entry.contains("--match-set kidobo-new") && !entry.contains(" -I INPUT 1 ")
+        }));
+    }
+
+    #[test]
+    fn disabled_ipv6_cleanup_never_destroys_ipv4_set_name() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = test_paths(temp.path());
+        fs::create_dir_all(paths.blocklist_file.parent().expect("parent")).expect("mkdir data");
+        fs::create_dir_all(&paths.remote_cache_dir).expect("mkdir cache");
+        fs::write(&paths.blocklist_file, "10.0.0.0/24\n").expect("write blocklist");
+
+        let mut config = test_config_with_ipv6(Vec::new(), false);
+        config.ipset.set_name_v6 = config.ipset.set_name.clone();
+        let events = Mutex::new(Vec::new());
+        let http_client = MockHttpClient::new(BTreeMap::new(), &events, 0);
+        let runner = MockCommandRunner::new(&events);
+
+        run_sync_with_dependencies(
+            &paths,
+            &config,
+            &BTreeMap::new(),
+            &http_client,
+            &runner,
+            &runner,
+        )
+        .expect("sync");
+
+        assert!(
+            runner
+                .events()
+                .iter()
+                .all(|entry| entry != "cmd:ipset destroy kidobo")
+        );
     }
 
     #[test]

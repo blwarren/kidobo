@@ -91,6 +91,9 @@ pub enum KidoboError {
     #[error("failed to clear remote cache at {path}: {reason}")]
     FlushCacheIo { path: PathBuf, reason: String },
 
+    #[error("flush cleanup incomplete ({failures} failure(s)): {details}")]
+    FlushIncomplete { failures: usize, details: String },
+
     #[error(
         "effective entry count exceeds ipset maxelem for {family} set `{set_name}`: entries={entries} maxelem={maxelem}"
     )]
@@ -165,5 +168,13 @@ mod tests {
     #[test]
     fn non_interrupted_maps_to_1() {
         assert_eq!(KidoboError::DoctorFailed.exit_code(), 1);
+        assert_eq!(
+            KidoboError::FlushIncomplete {
+                failures: 1,
+                details: "test".to_string(),
+            }
+            .exit_code(),
+            1
+        );
     }
 }

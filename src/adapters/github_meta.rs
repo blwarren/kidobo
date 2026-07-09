@@ -282,7 +282,7 @@ fn handle_network_response(
     }
 
     let Some(networks) = parse_and_extract_networks(&response.body, selection) else {
-        warn!("github meta fetch failed: response body is not valid JSON");
+        warn!("github meta fetch failed: response body has invalid JSON or category data");
         return Ok(cache_fallback(
             cached.raw,
             cached.networks,
@@ -392,7 +392,40 @@ fn parse_and_extract_networks(
     selection: &CategorySelection,
 ) -> Option<Vec<CanonicalCidr>> {
     let value: Value = serde_json::from_slice(raw).ok()?;
-    Some(extract_networks(&value, selection))
+    let selected_values = match selection {
+        CategorySelection::All => None,
+        CategorySelection::Selected(categories) => {
+            let Value::Object(root) = &value else {
+                return None;
+            };
+            let values = categories
+                .iter()
+                .map(|category| root.get(category))
+                .collect::<Option<Vec<_>>>()?;
+            Some(values)
+        }
+    };
+
+    let networks = extract_networks(&value, selection);
+    if networks.is_empty() {
+        let intentionally_empty = selected_values.as_ref().map_or_else(
+            || is_empty_container_tree(&value),
+            |values| values.iter().all(|entry| is_empty_container_tree(entry)),
+        );
+        if !intentionally_empty {
+            return None;
+        }
+    }
+
+    Some(networks)
+}
+
+fn is_empty_container_tree(value: &Value) -> bool {
+    match value {
+        Value::Array(values) => values.iter().all(is_empty_container_tree),
+        Value::Object(values) => values.values().all(is_empty_container_tree),
+        _ => false,
+    }
 }
 
 fn extract_networks(value: &Value, selection: &CategorySelection) -> Vec<CanonicalCidr> {
@@ -647,6 +680,100 @@ mod tests {
     }
 
     #[test]
+    fn selected_mode_rejects_missing_category_without_overwriting_cache() {
+        let temp = TempDir::new().expect("tempdir");
+        let cached_raw = br#"{"hooks":["10.0.0.0/24"],"packages":[]}"#;
+        fs::write(temp.path().join(GITHUB_META_RAW_CACHE_FILE), cached_raw)
+            .expect("write raw cache");
+        fs::write(
+            temp.path().join(GITHUB_META_CATEGORY_CACHE_FILE),
+            serde_json::to_vec_pretty(&GithubMetaCategorySidecar {
+                mode: "selected".to_string(),
+                categories: vec!["hooks".to_string(), "packages".to_string()],
+            })
+            .expect("sidecar json"),
+        )
+        .expect("write sidecar");
+        let client = MockHttpClient::new(vec![Ok(network_response(
+            br#"{"hooks":["198.51.100.0/24"]}"#,
+        ))]);
+
+        let result = load_github_meta_safelist(
+            &client,
+            temp.path(),
+            TEST_GITHUB_META_URL,
+            &GithubMetaCategoryMode::Explicit(vec!["hooks".to_string(), "packages".to_string()]),
+            &BTreeMap::new(),
+        )
+        .expect("load");
+
+        assert_eq!(result.source, GithubMetaSource::FallbackCache);
+        assert_eq!(
+            read_bytes_with_limit(
+                &temp.path().join(GITHUB_META_RAW_CACHE_FILE),
+                super::GITHUB_META_CACHE_READ_LIMIT,
+            )
+            .expect("read cache"),
+            cached_raw
+        );
+    }
+
+    #[test]
+    fn selected_mode_accepts_present_empty_categories() {
+        let temp = TempDir::new().expect("tempdir");
+        let client =
+            MockHttpClient::new(vec![Ok(network_response(br#"{"hooks":[],"packages":{}}"#))]);
+
+        let result = load_github_meta_safelist(
+            &client,
+            temp.path(),
+            TEST_GITHUB_META_URL,
+            &GithubMetaCategoryMode::Explicit(vec!["hooks".to_string(), "packages".to_string()]),
+            &BTreeMap::new(),
+        )
+        .expect("load");
+
+        assert_eq!(result.source, GithubMetaSource::Network);
+        assert!(result.networks.is_empty());
+        assert!(temp.path().join(GITHUB_META_RAW_CACHE_FILE).exists());
+    }
+
+    #[test]
+    fn all_mode_distinguishes_empty_from_nonempty_invalid_trees() {
+        let empty_temp = TempDir::new().expect("tempdir");
+        let empty_client = MockHttpClient::new(vec![Ok(network_response(br#"{}"#))]);
+        let empty = load_github_meta_safelist(
+            &empty_client,
+            empty_temp.path(),
+            TEST_GITHUB_META_URL,
+            &GithubMetaCategoryMode::All,
+            &BTreeMap::new(),
+        )
+        .expect("load empty");
+        assert_eq!(empty.source, GithubMetaSource::Network);
+
+        let invalid_temp = TempDir::new().expect("tempdir");
+        let invalid_client = MockHttpClient::new(vec![Ok(network_response(
+            br#"{"nested":["not-a-network"]}"#,
+        ))]);
+        let invalid = load_github_meta_safelist(
+            &invalid_client,
+            invalid_temp.path(),
+            TEST_GITHUB_META_URL,
+            &GithubMetaCategoryMode::All,
+            &BTreeMap::new(),
+        )
+        .expect("load invalid");
+        assert_eq!(invalid.source, GithubMetaSource::Empty);
+        assert!(
+            !invalid_temp
+                .path()
+                .join(GITHUB_META_RAW_CACHE_FILE)
+                .exists()
+        );
+    }
+
+    #[test]
     fn all_mode_extracts_recursively() {
         let temp = TempDir::new().expect("tempdir");
         let client = MockHttpClient::new(vec![Ok(network_response(
@@ -728,7 +855,7 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         fs::write(
             temp.path().join(GITHUB_META_RAW_CACHE_FILE),
-            br#"{"api":["192.30.252.0/22"]}"#,
+            br#"{"api":["192.30.252.0/22"],"git":[],"hooks":[],"packages":[]}"#,
         )
         .expect("write raw cache");
         fs::write(
@@ -1028,12 +1155,9 @@ mod tests {
     #[test]
     fn status_304_uses_cache_when_compatible() {
         let temp = TempDir::new().expect("tempdir");
+        let raw = br#"{"api":["192.30.252.0/22"],"git":[],"hooks":[],"packages":[]}"#;
 
-        fs::write(
-            temp.path().join(GITHUB_META_RAW_CACHE_FILE),
-            br#"{"api":["192.30.252.0/22"]}"#,
-        )
-        .expect("write raw cache");
+        fs::write(temp.path().join(GITHUB_META_RAW_CACHE_FILE), raw).expect("write raw cache");
 
         fs::write(
             temp.path().join(GITHUB_META_META_CACHE_FILE),
@@ -1041,7 +1165,7 @@ mod tests {
                 url: TEST_GITHUB_META_URL.to_string(),
                 etag: Some("etag-1".to_string()),
                 last_modified: Some("Mon, 01 Jan 2024 00:00:00 GMT".to_string()),
-                sha256_raw: sha256_hex(br#"{"api":["192.30.252.0/22"]}"#),
+                sha256_raw: sha256_hex(raw),
             })
             .expect("meta json"),
         )
@@ -1098,7 +1222,9 @@ mod tests {
                 etag: None,
                 last_modified: None,
             }),
-            Ok(network_response(br#"{"api":["192.30.252.0/22"]}"#)),
+            Ok(network_response(
+                br#"{"api":["192.30.252.0/22"],"git":[],"hooks":[],"packages":[]}"#,
+            )),
         ]);
 
         let result = load_github_meta_safelist(

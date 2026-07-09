@@ -194,17 +194,17 @@ fn file_exists_check(check_name: &'static str, path: &Path) -> DoctorCheck {
 
 fn cache_writability_check(remote_cache_dir: &Path) -> DoctorCheck {
     match ensure_cache_path_ready(remote_cache_dir) {
-        Ok(CachePathReady::ExistingDirectory) => ok_check(
+        Ok(CachePathReady::ExistingDirectory) => skip_check(
             "cache_writable",
             format!(
-                "remote cache directory exists and has write permission bits: {}",
+                "remote cache directory has plausible write and traversal bits, but effective access was not mutated to verify it: {}",
                 remote_cache_dir.display()
             ),
         ),
-        Ok(CachePathReady::CreatableFromParent { parent }) => ok_check(
+        Ok(CachePathReady::CreatableFromParent { parent }) => skip_check(
             "cache_writable",
             format!(
-                "remote cache can be created under parent with write permission bits: {}",
+                "remote cache parent has plausible write and traversal bits, but creation was not attempted: {}",
                 parent.display()
             ),
         ),
@@ -230,8 +230,8 @@ enum CacheWritableError {
     #[error("path exists but is not a directory: {path}")]
     NotDirectory { path: PathBuf },
 
-    #[error("path has no write permission bits: {path}")]
-    ReadOnly { path: PathBuf },
+    #[error("path lacks write or directory traversal permission bits: {path}")]
+    InsufficientMode { path: PathBuf },
 
     #[error("no existing parent directory found for {path}")]
     MissingParent { path: PathBuf },
@@ -271,24 +271,71 @@ fn ensure_directory_is_writable(path: &Path) -> Result<(), CacheWritableError> {
             path: path.to_path_buf(),
         });
     }
-    if !directory_has_write_permission_bits(&metadata) {
-        return Err(CacheWritableError::ReadOnly {
+    if !directory_has_mutation_permission_bits(&metadata) {
+        return Err(CacheWritableError::InsufficientMode {
             path: path.to_path_buf(),
         });
     }
     Ok(())
 }
 
-fn directory_has_write_permission_bits(metadata: &fs::Metadata) -> bool {
+fn directory_has_mutation_permission_bits(metadata: &fs::Metadata) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
 
-        metadata.permissions().mode() & 0o222 != 0
+        let mode = metadata.permissions().mode();
+        mode & 0o222 != 0 && mode & 0o111 != 0
     }
 
     #[cfg(not(unix))]
     {
         !metadata.permissions().readonly()
+    }
+}
+
+#[cfg(all(test, unix))]
+mod cache_permission_tests {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    use tempfile::TempDir;
+
+    use super::cache_writability_check;
+    use crate::cli::doctor::DoctorCheckStatus;
+
+    #[test]
+    fn cache_check_fails_without_write_or_traversal_bits() {
+        for mode in [0o222, 0o555] {
+            let temp = TempDir::new().expect("tempdir");
+            let cache = temp.path().join("cache");
+            fs::create_dir(&cache).expect("mkdir");
+            fs::set_permissions(&cache, fs::Permissions::from_mode(mode)).expect("chmod");
+
+            let check = cache_writability_check(&cache);
+            assert_eq!(check.status, DoctorCheckStatus::Fail, "mode {mode:o}");
+        }
+    }
+
+    #[test]
+    fn cache_check_skips_when_mode_is_plausible_but_unproven() {
+        let temp = TempDir::new().expect("tempdir");
+        let cache = temp.path().join("cache");
+        fs::create_dir(&cache).expect("mkdir");
+        fs::set_permissions(&cache, fs::Permissions::from_mode(0o777)).expect("chmod");
+
+        let check = cache_writability_check(&cache);
+        assert_eq!(check.status, DoctorCheckStatus::Skip);
+        assert_eq!(check.name, "cache_writable");
+    }
+
+    #[test]
+    fn cache_check_fails_for_existing_non_directory() {
+        let temp = TempDir::new().expect("tempdir");
+        let cache = temp.path().join("cache");
+        fs::write(&cache, "not a directory").expect("write file");
+
+        let check = cache_writability_check(&cache);
+        assert_eq!(check.status, DoctorCheckStatus::Fail);
     }
 }

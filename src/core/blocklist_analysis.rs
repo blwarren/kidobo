@@ -322,4 +322,32 @@ mod tests {
         assert_eq!(overlap.ipv4.overlapping, 1);
         assert_eq!(overlap.ipv4.fully_covered, 1);
     }
+
+    #[test]
+    fn overlap_counts_each_ipv6_local_covered_by_one_supernet() {
+        let base = 0x20010db8000000000000000000000000_u128;
+        let local = collapse_by_family(&[
+            CanonicalCidr::V6(Ipv6Cidr::from_parts(base, 66)),
+            CanonicalCidr::V6(Ipv6Cidr::from_parts(base + (1_u128 << 63), 66)),
+        ]);
+        let remote = collapse_by_family(&[CanonicalCidr::V6(Ipv6Cidr::from_parts(base, 64))]);
+
+        let overlap = overlap_counts(&local, &remote);
+        assert_eq!(overlap.ipv6.overlapping, 2);
+        assert_eq!(overlap.ipv6.fully_covered, 2);
+    }
+
+    #[test]
+    fn ipv6_coverage_skips_disjoint_remote_before_covering_entry() {
+        let target = 0x20010db8000000000000000000000000_u128;
+        let local = collapse_by_family(&[CanonicalCidr::V6(Ipv6Cidr::from_parts(target, 64))]);
+        let remote = collapse_by_family(&[
+            CanonicalCidr::V6(Ipv6Cidr::from_parts(0x20010db7000000000000000000000000, 64)),
+            CanonicalCidr::V6(Ipv6Cidr::from_parts(target, 64)),
+        ]);
+
+        let overlap = overlap_counts(&local, &remote);
+        assert_eq!(overlap.ipv6.overlapping, 1);
+        assert_eq!(overlap.ipv6.fully_covered, 1);
+    }
 }

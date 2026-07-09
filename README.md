@@ -119,6 +119,10 @@ sudo kidobo flush
 sudo kidobo flush --cache-only
 ```
 
+`flush` attempts every cleanup step and exits with status `1` if any live
+firewall, ipset, or cache artifact could not be removed. The installer preserves
+runtime files when uninstall cleanup cannot be confirmed.
+
 ## Minimal Config
 
 `/etc/kidobo/config.toml`:
@@ -155,6 +159,9 @@ Useful options:
 - `asn.cache_stale_after_secs`: ASN prefix cache refresh threshold
   (default `86400`, range `[1, 604800]`)
 
+Unknown configuration keys are rejected at every level so misspellings cannot
+silently select defaults. IPv4 and IPv6 set names must always be distinct.
+
 ## Defaults
 
 - Config file: `/etc/kidobo/config.toml`
@@ -184,10 +191,16 @@ an arbitrary build or `cargo run` path.
 - `sync` canonicalizes a valid local blocklist, preserving only the leading
   comment/header section before canonical entries. Invalid non-header local
   lines now fail `sync`; they are not silently dropped or rewritten away.
+- Remote responses containing only whitespace or comments are treated as an
+  intentional empty feed. A non-empty response with no valid CIDRs, or GitHub
+  metadata missing a selected category, is treated as a soft fetch failure and
+  does not replace the last usable cache.
 - `analyze overlap` is offline-only and warns when cached remote
   `.iplist` files are older than `remote.cache_stale_after_secs`.
 - `doctor` is read-only by default. It checks whether the remote cache path is
-  usable without creating directories or writing probe files.
+  structurally plausible without creating directories or writing probe files;
+  plausible permissions are reported as `SKIP` because effective access is not
+  mutated to prove writability.
 - `KIDOBO_ROOT` relocates config/data/cache paths under a custom root.
 
 ## Development

@@ -1,8 +1,6 @@
 use std::fs;
 use std::path::Path;
 
-use log::warn;
-
 use crate::adapters::command_common::display_command;
 use crate::adapters::command_runner::{CommandResult, CommandRunnerError, SudoCommandRunner};
 use crate::adapters::config::load_config_from_file;
@@ -30,8 +28,7 @@ pub fn run_flush_command(cache_only: bool) -> Result<(), KidoboError> {
 
     let config = load_config_from_file(&paths.config_file)?;
     let sudo_runner = SudoCommandRunner::default();
-    run_flush_with_runner(&config, &sudo_runner, &sudo_runner, &paths.remote_cache_dir);
-    Ok(())
+    run_flush_with_runner(&config, &sudo_runner, &sudo_runner, &paths.remote_cache_dir)
 }
 
 pub(crate) fn run_flush_with_runner(
@@ -39,51 +36,69 @@ pub(crate) fn run_flush_with_runner(
     firewall_runner: &dyn FirewallCommandRunner,
     ipset_runner: &dyn IpsetCommandRunner,
     remote_cache_dir: &Path,
-) {
-    cleanup_firewall_family(firewall_runner, FirewallFamily::Ipv4);
-    cleanup_firewall_family(firewall_runner, FirewallFamily::Ipv6);
+) -> Result<(), KidoboError> {
+    let mut failures = Vec::new();
+    cleanup_firewall_family(firewall_runner, FirewallFamily::Ipv4, &mut failures);
+    cleanup_firewall_family(firewall_runner, FirewallFamily::Ipv6, &mut failures);
 
-    best_effort_ipset_destroy(ipset_runner, &config.ipset.set_name);
-    best_effort_ipset_destroy(ipset_runner, &config.ipset.set_name_v6);
+    destroy_ipset(ipset_runner, &config.ipset.set_name, &mut failures);
+    if config.ipset.set_name_v6 != config.ipset.set_name {
+        destroy_ipset(ipset_runner, &config.ipset.set_name_v6, &mut failures);
+    }
 
-    best_effort_clear_remote_cache_dir(remote_cache_dir);
-}
+    if let Err(err) = clear_remote_cache_dir(remote_cache_dir) {
+        failures.push(err.to_string());
+    }
 
-fn cleanup_firewall_family(runner: &dyn FirewallCommandRunner, family: FirewallFamily) {
-    if let Err(err) = cleanup_firewall_wiring(runner, family) {
-        warn!("best-effort flush firewall cleanup failed for {family:?}: {err}");
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(KidoboError::FlushIncomplete {
+            failures: failures.len(),
+            details: failures.join("; "),
+        })
     }
 }
 
-fn best_effort_command<F>(command: &str, args: &[&str], run: F)
+fn cleanup_firewall_family(
+    runner: &dyn FirewallCommandRunner,
+    family: FirewallFamily,
+    failures: &mut Vec<String>,
+) {
+    if let Err(err) = cleanup_firewall_wiring(runner, family) {
+        failures.push(format!("firewall cleanup failed for {family:?}: {err}"));
+    }
+}
+
+fn run_cleanup_command<F>(command: &str, args: &[&str], run: F) -> Result<(), String>
 where
     F: FnOnce(&str, &[&str]) -> Result<CommandResult, CommandRunnerError>,
 {
     let rendered = display_command(command, args);
     match run(command, args) {
-        Ok(result) if result.status.success() => {}
-        Ok(result) => warn!(
-            "best-effort flush command failed: {} (status={:?} stderr={})",
-            rendered, result.status, result.stderr
-        ),
-        Err(err) => warn!("best-effort flush command execution failed: {rendered} ({err})"),
+        Ok(result) if result.status.success() || is_missing_ipset_result(&result) => Ok(()),
+        Ok(result) => Err(format!(
+            "{rendered} failed (status={:?} stderr={})",
+            result.status, result.stderr
+        )),
+        Err(err) => Err(format!("{rendered} execution failed ({err})")),
     }
 }
 
-fn best_effort_ipset_destroy(runner: &dyn IpsetCommandRunner, set_name: &str) {
-    best_effort_command("ipset", &["destroy", set_name], |command, args| {
+fn destroy_ipset(runner: &dyn IpsetCommandRunner, set_name: &str, failures: &mut Vec<String>) {
+    if let Err(err) = run_cleanup_command("ipset", &["destroy", set_name], |command, args| {
         runner.run(command, args)
-    });
+    }) {
+        failures.push(err);
+    }
 }
 
-fn best_effort_clear_remote_cache_dir(remote_cache_dir: &Path) {
-    if let Err(err) = clear_remote_cache_dir(remote_cache_dir) {
-        warn!(
-            "best-effort flush cache cleanup failed for {} ({})",
-            remote_cache_dir.display(),
-            err
-        );
-    }
+fn is_missing_ipset_result(result: &CommandResult) -> bool {
+    result.status.code() == Some(1)
+        && result
+            .stderr
+            .to_ascii_lowercase()
+            .contains("does not exist")
 }
 
 fn clear_remote_cache_dir(remote_cache_dir: &Path) -> Result<(), KidoboError> {
@@ -107,7 +122,7 @@ mod tests {
     use std::fs;
     use std::path::Path;
 
-    use super::{clear_remote_cache_dir, run_flush_with_runner};
+    use super::{clear_remote_cache_dir, run_cleanup_command, run_flush_with_runner};
     use crate::adapters::command_runner::{CommandResult, CommandRunnerError, ProcessStatus};
     use crate::adapters::ipset::IpsetCommandRunner;
     use crate::adapters::iptables::FirewallCommandRunner;
@@ -146,7 +161,13 @@ mod tests {
                 args.iter().map(|value| (*value).to_string()).collect(),
             ));
 
-            if args == ["-D", "INPUT", "-j", "kidobo-input"] {
+            let effective_args = if args.starts_with(&["-w", "5"]) {
+                &args[2..]
+            } else {
+                args
+            };
+
+            if effective_args == ["-D", "INPUT", "-j", "kidobo-input"] {
                 let mut budget = self.jump_budget.borrow_mut();
                 let remaining = budget.get_mut(command).expect("jump budget");
                 if *remaining > 0 {
@@ -163,8 +184,9 @@ mod tests {
 
             if self.fail_cleanup
                 && ((command == "iptables" || command == "ip6tables")
-                    && (args.first() == Some(&"-F") || args.first() == Some(&"-X"))
-                    || (command == "ipset" && args.first() == Some(&"destroy")))
+                    && (effective_args.first() == Some(&"-F")
+                        || effective_args.first() == Some(&"-X"))
+                    || (command == "ipset" && effective_args.first() == Some(&"destroy")))
             {
                 return CommandResult {
                     status: ProcessStatus::Exited(1),
@@ -236,14 +258,14 @@ mod tests {
         let remote_cache_dir = temp.path().join("remote");
         fs::create_dir_all(&remote_cache_dir).expect("mkdir remote cache");
 
-        run_flush_with_runner(&config, &runner, &runner, &remote_cache_dir);
+        run_flush_with_runner(&config, &runner, &runner, &remote_cache_dir).expect("flush");
 
         let invocations = runner.invocations();
 
         let v4_jump_deletes = invocations
             .iter()
             .filter(|(cmd, args)| {
-                cmd == "iptables" && args == &["-D", "INPUT", "-j", "kidobo-input"]
+                cmd == "iptables" && args == &["-w", "5", "-D", "INPUT", "-j", "kidobo-input"]
             })
             .count();
         assert_eq!(v4_jump_deletes, 3);
@@ -251,7 +273,7 @@ mod tests {
         let v6_jump_deletes = invocations
             .iter()
             .filter(|(cmd, args)| {
-                cmd == "ip6tables" && args == &["-D", "INPUT", "-j", "kidobo-input"]
+                cmd == "ip6tables" && args == &["-w", "5", "-D", "INPUT", "-j", "kidobo-input"]
             })
             .count();
         assert_eq!(v6_jump_deletes, 2);
@@ -259,22 +281,22 @@ mod tests {
         assert!(
             invocations
                 .iter()
-                .any(|(cmd, args)| cmd == "iptables" && args == &["-F", "kidobo-input"])
+                .any(|(cmd, args)| cmd == "iptables" && args == &["-w", "5", "-F", "kidobo-input"])
         );
         assert!(
             invocations
                 .iter()
-                .any(|(cmd, args)| cmd == "iptables" && args == &["-X", "kidobo-input"])
+                .any(|(cmd, args)| cmd == "iptables" && args == &["-w", "5", "-X", "kidobo-input"])
         );
         assert!(
             invocations
                 .iter()
-                .any(|(cmd, args)| cmd == "ip6tables" && args == &["-F", "kidobo-input"])
+                .any(|(cmd, args)| cmd == "ip6tables" && args == &["-w", "5", "-F", "kidobo-input"])
         );
         assert!(
             invocations
                 .iter()
-                .any(|(cmd, args)| cmd == "ip6tables" && args == &["-X", "kidobo-input"])
+                .any(|(cmd, args)| cmd == "ip6tables" && args == &["-w", "5", "-X", "kidobo-input"])
         );
         assert!(
             invocations
@@ -297,7 +319,7 @@ mod tests {
         let remote_cache_dir = temp.path().join("remote");
         fs::create_dir_all(&remote_cache_dir).expect("mkdir remote cache");
 
-        run_flush_with_runner(&config, &runner, &runner, &remote_cache_dir);
+        run_flush_with_runner(&config, &runner, &runner, &remote_cache_dir).expect("flush");
 
         let invocations = runner.invocations();
         assert!(invocations.iter().any(|(cmd, _)| cmd == "ip6tables"));
@@ -311,13 +333,13 @@ mod tests {
     #[test]
     fn flush_is_idempotent_under_missing_artifacts() {
         let config = test_config(true);
-        let runner = MockRunner::new(0, 0, true);
+        let runner = MockRunner::new(0, 0, false);
         let temp = TempDir::new().expect("tempdir");
         let remote_cache_dir = temp.path().join("remote");
         fs::create_dir_all(&remote_cache_dir).expect("mkdir remote cache");
 
-        run_flush_with_runner(&config, &runner, &runner, &remote_cache_dir);
-        run_flush_with_runner(&config, &runner, &runner, &remote_cache_dir);
+        run_flush_with_runner(&config, &runner, &runner, &remote_cache_dir).expect("first flush");
+        run_flush_with_runner(&config, &runner, &runner, &remote_cache_dir).expect("second flush");
 
         let invocations = runner.invocations();
         let destroy_calls = invocations
@@ -341,7 +363,12 @@ mod tests {
         fs::write(remote_cache_dir.join("one.iplist"), "10.0.0.0/24").expect("write iplist");
         fs::write(remote_cache_dir.join("nested/two.raw"), "raw").expect("write raw");
 
-        run_flush_with_runner(&config, &runner, &runner, &remote_cache_dir);
+        let err = run_flush_with_runner(&config, &runner, &runner, &remote_cache_dir)
+            .expect_err("cleanup failures must be reported");
+        assert!(matches!(
+            err,
+            crate::error::KidoboError::FlushIncomplete { .. }
+        ));
 
         assert!(remote_cache_dir.exists());
         let entries = fs::read_dir(&remote_cache_dir)
@@ -379,5 +406,18 @@ mod tests {
         clear_remote_cache_dir(&remote_cache_dir).expect("clear cache");
 
         assert!(remote_cache_dir.exists());
+    }
+
+    #[test]
+    fn missing_ipset_is_an_idempotent_cleanup_success() {
+        let result = run_cleanup_command("ipset", &["destroy", "kidobo"], |_, _| {
+            Ok(CommandResult {
+                status: ProcessStatus::Exited(1),
+                stdout: String::new(),
+                stderr: "The set with the given name does not exist".to_string(),
+            })
+        });
+
+        assert!(result.is_ok());
     }
 }
