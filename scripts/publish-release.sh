@@ -89,7 +89,7 @@ cd "${release_worktree}"
 
 sed -i "0,/^version = \"${current_version}\"$/s//version = \"${release_version}\"/" Cargo.toml
 echo "[release] updating Cargo.lock"
-cargo metadata --no-deps --format-version 1 >/dev/null
+cargo update --package kidobo --precise "${release_version}"
 
 readme_old="--version v${current_version}"
 readme_new="--version ${release_tag}"

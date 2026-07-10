@@ -1,5 +1,7 @@
 ### Changed
 
+- `just publish-release` now refreshes the package version in `Cargo.lock`
+  before staging and validating a release.
 - Remote blocklist loading now accepts IP addresses and CIDRs in the first
   column of CSV feeds, and expected absent temporary ipsets no longer produce
   warnings during atomic replacement.
