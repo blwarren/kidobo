@@ -203,16 +203,13 @@ fn prepare_targets<S: AsRef<str>>(targets: &[S]) -> (Vec<PreparedTarget<'_>>, Ve
     )
 }
 
-fn emit_target_matches<F>(
+fn target_matches<'a>(
     target: PreparedTarget<'_>,
-    sources: &[LookupSourceEntry],
+    sources: &'a [LookupSourceEntry],
     v4_index: &IntervalIndexV4,
     v6_index: &IntervalIndexV6,
-    mut emit: F,
-) where
-    F: FnMut(&str, &LookupSourceEntry),
-{
-    let mut matched_sources = Vec::<&LookupSourceEntry>::new();
+) -> Vec<&'a LookupSourceEntry> {
+    let mut matched_sources = Vec::new();
 
     match target.parsed {
         CanonicalCidr::V4(cidr) => {
@@ -234,9 +231,28 @@ fn emit_target_matches<F>(
     matched_sources.sort_unstable_by(|left, right| compare_source_entries(left, right));
     matched_sources.dedup_by(|left, right| same_source_entry(left, right));
 
-    for source in matched_sources {
-        emit(target.raw, source);
+    matched_sources
+}
+
+pub fn run_lookup_by_target<S, F>(
+    targets: &[S],
+    sources: &[LookupSourceEntry],
+    mut emit: F,
+) -> Vec<String>
+where
+    S: AsRef<str>,
+    F: FnMut(&str, &[&LookupSourceEntry]),
+{
+    let v4_index = IntervalIndexV4::from_sources(sources);
+    let v6_index = IntervalIndexV6::from_sources(sources);
+    let (prepared_targets, invalid_targets) = prepare_targets(targets);
+
+    for target in prepared_targets {
+        let matched_sources = target_matches(target, sources, &v4_index, &v6_index);
+        emit(target.raw, &matched_sources);
     }
+
+    invalid_targets
 }
 
 pub fn run_lookup_streaming<S, F>(
@@ -248,15 +264,11 @@ where
     S: AsRef<str>,
     F: FnMut(&str, &LookupSourceEntry),
 {
-    let v4_index = IntervalIndexV4::from_sources(sources);
-    let v6_index = IntervalIndexV6::from_sources(sources);
-    let (prepared_targets, invalid_targets) = prepare_targets(targets);
-
-    for target in prepared_targets {
-        emit_target_matches(target, sources, &v4_index, &v6_index, &mut emit);
-    }
-
-    invalid_targets
+    run_lookup_by_target(targets, sources, |target, matched_sources| {
+        for source in matched_sources {
+            emit(target, source);
+        }
+    })
 }
 
 pub fn run_lookup<S: AsRef<str>>(targets: &[S], sources: &[LookupSourceEntry]) -> LookupReport {
@@ -280,7 +292,7 @@ pub fn run_lookup<S: AsRef<str>>(targets: &[S], sources: &[LookupSourceEntry]) -
 mod tests {
     use super::{
         LookupSourceEntry, LookupTargetParseError, cidr_overlaps, parse_target_strict, run_lookup,
-        run_lookup_streaming,
+        run_lookup_by_target, run_lookup_streaming,
     };
     use crate::core::network::{CanonicalCidr, Ipv4Cidr, Ipv6Cidr};
 
@@ -436,6 +448,17 @@ mod tests {
         assert_eq!(emitted[0].0, "10.0.0.7");
         assert_eq!(emitted[0].1, "source:a");
         assert_eq!(emitted[0].2, "10.0.0.0/24");
+    }
+
+    #[test]
+    fn lookup_by_target_emits_empty_matches_for_valid_target() {
+        let mut emitted = Vec::new();
+        let invalid = run_lookup_by_target(&["198.51.100.9"], &[], |target, matches| {
+            emitted.push((target.to_string(), matches.len()));
+        });
+
+        assert!(invalid.is_empty());
+        assert_eq!(emitted, vec![("198.51.100.9".to_string(), 0)]);
     }
 
     #[test]

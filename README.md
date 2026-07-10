@@ -106,6 +106,7 @@ Check whether targets match (offline):
 ```bash
 kidobo lookup 203.0.113.7
 kidobo lookup --file targets.txt
+kidobo lookup --file targets.txt --format tsv
 # analyze overlap vs cached remote sources only (offline)
 kidobo analyze overlap
 # print optional reduction candidate lists
@@ -194,6 +195,11 @@ an arbitrary build or `cargo run` path.
   config still permits lookup against the local blocklist and cached remote
   sources. Lookup warns on stderr when config-backed coverage or a configured
   GitHub/ASN cache is unavailable.
+- Lookup prints a readable results table by default, including explicit match
+  status and summary counts for both single targets and files. Long source URLs
+  wrap without being truncated. Use `--format tsv` for the legacy tab-separated
+  output intended for scripts; color is limited to interactive terminals and
+  disabled when `NO_COLOR` is set.
 - `sync` canonicalizes a valid local blocklist, preserving only the leading
   comment/header section before canonical entries. Invalid non-header local
   lines now fail `sync`; they are not silently dropped or rewritten away.

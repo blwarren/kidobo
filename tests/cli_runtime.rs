@@ -271,7 +271,7 @@ fn usage_error_exits_with_two() {
 #[test]
 fn lookup_uses_local_sources_and_exits_zero() {
     let root = create_lookup_root("203.0.113.7\n");
-    let output = run_kidobo_with_root(root.path(), &["lookup", "203.0.113.7"]);
+    let output = run_kidobo_with_root(root.path(), &["lookup", "203.0.113.7", "--format", "tsv"]);
 
     assert_eq!(output.status.code(), Some(0));
 
@@ -280,6 +280,15 @@ fn lookup_uses_local_sources_and_exits_zero() {
         stdout.contains("203.0.113.7\tinternal:blocklist\t203.0.113.7"),
         "unexpected lookup output: {stdout}"
     );
+}
+
+#[test]
+fn lookup_tsv_single_no_match_preserves_empty_legacy_output() {
+    let root = create_lookup_root("");
+    let output = run_kidobo_with_root(root.path(), &["lookup", "198.51.100.9", "--format", "tsv"]);
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stdout.is_empty(), "legacy stdout changed");
 }
 
 #[test]
@@ -324,14 +333,15 @@ fn lookup_reports_every_matching_source_without_refreshing_caches() {
 
     let fake_bgpq4 = write_fake_bgpq4_script(&root);
     let marker = root.path().join("bgpq4-touched");
-    let output = kidobo_with_root_command(root.path(), &["lookup", "203.0.113.7"])
-        .env(
-            "PATH",
-            path_with_bin_prefix(fake_bgpq4.parent().expect("fake binary parent")),
-        )
-        .env("KIDOBO_TEST_BGPQ4_TOUCHED", &marker)
-        .output()
-        .expect("run lookup");
+    let output =
+        kidobo_with_root_command(root.path(), &["lookup", "203.0.113.7", "--format", "tsv"])
+            .env(
+                "PATH",
+                path_with_bin_prefix(fake_bgpq4.parent().expect("fake binary parent")),
+            )
+            .env("KIDOBO_TEST_BGPQ4_TOUCHED", &marker)
+            .output()
+            .expect("run lookup");
 
     assert_eq!(output.status.code(), Some(0));
     assert!(!marker.exists(), "lookup must not invoke bgpq4");
@@ -360,7 +370,7 @@ fn lookup_file_mode_uses_local_sources_and_exits_zero() {
     let targets = root.path().join("targets.txt");
     fs::write(&targets, "203.0.113.7\n198.51.100.9\n").expect("write lookup targets");
     let target_path = targets.display().to_string();
-    let args = vec!["lookup", "--file", target_path.as_str()];
+    let args = vec!["lookup", "--file", target_path.as_str(), "--format", "tsv"];
     let output = run_kidobo_with_root(root.path(), &args);
 
     assert_eq!(output.status.code(), Some(0));
@@ -401,7 +411,10 @@ fn lookup_file_mode_counts_safelist_and_asn_matches() {
     let targets = root.path().join("targets.txt");
     fs::write(&targets, "192.0.2.7\n198.51.100.9\n203.0.113.11\n").expect("write lookup targets");
     let target_path = targets.display().to_string();
-    let output = run_kidobo_with_root(root.path(), &["lookup", "--file", target_path.as_str()]);
+    let output = run_kidobo_with_root(
+        root.path(),
+        &["lookup", "--file", target_path.as_str(), "--format", "tsv"],
+    );
 
     assert_eq!(output.status.code(), Some(0));
 
@@ -415,6 +428,82 @@ fn lookup_file_mode_counts_safelist_and_asn_matches() {
             "203.0.113.11\tNO_MATCH",
             "summary: total_ips=3 matched_ips=2 matched_pct=66%",
         ]
+    );
+}
+
+#[test]
+fn lookup_human_output_shows_matches_no_matches_and_summary() {
+    let root = create_lookup_root("203.0.113.7\n");
+    let targets = root.path().join("targets.txt");
+    fs::write(&targets, "203.0.113.7\n198.51.100.9\n").expect("write lookup targets");
+    let target_path = targets.display().to_string();
+    let output = run_kidobo_with_root(root.path(), &["lookup", "--file", &target_path]);
+
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("│ Target"),
+        "missing table header: {stdout}"
+    );
+    assert!(
+        stdout.contains("203.0.113.7")
+            && stdout.contains("MATCH")
+            && stdout.contains("internal:blocklist"),
+        "missing match row: {stdout}"
+    );
+    assert!(
+        stdout.contains("198.51.100.9") && stdout.contains("NO MATCH"),
+        "missing no-match row: {stdout}"
+    );
+    assert!(stdout.contains("Summary"), "missing summary: {stdout}");
+    assert!(stdout.contains("Targets:    2"), "wrong total: {stdout}");
+    assert!(stdout.contains("Matched:    1"), "wrong matches: {stdout}");
+    assert!(stdout.contains("Unmatched:  1"), "wrong misses: {stdout}");
+    assert!(stdout.contains("Match rate: 50%"), "wrong rate: {stdout}");
+    assert!(
+        !stdout.contains("\x1b["),
+        "redirected human output must not contain ANSI escapes: {stdout:?}"
+    );
+}
+
+#[test]
+fn lookup_human_single_no_match_is_explicit() {
+    let root = create_lookup_root("");
+    let output = run_kidobo_with_root(root.path(), &["lookup", "198.51.100.9"]);
+
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("198.51.100.9"), "missing target: {stdout}");
+    assert!(stdout.contains("NO MATCH"), "missing status: {stdout}");
+    assert!(stdout.contains("Targets:    1"), "missing total: {stdout}");
+    assert!(
+        stdout.contains("Unmatched:  1"),
+        "missing miss count: {stdout}"
+    );
+}
+
+#[test]
+fn lookup_human_wraps_long_source_without_losing_it() {
+    let root = create_lookup_root("");
+    let source_url = "https://example.com/a/very/long/path/to/a/blocklist/source/feed.txt";
+    fs::write(
+        root.path().join("cache/remote/feed.iplist"),
+        "203.0.113.0/24\n",
+    )
+    .expect("write remote cache");
+    fs::write(
+        root.path().join("cache/remote/feed.meta.json"),
+        format!(r#"{{"url":"{source_url}"}}"#),
+    )
+    .expect("write remote metadata");
+
+    let output = run_kidobo_with_root(root.path(), &["lookup", "203.0.113.7"]);
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("https://example.com/a/very/long/path/to/a/bl")
+            && stdout.contains("ocklist/source/feed.txt"),
+        "wrapped source must remain complete: {stdout}"
     );
 }
 
@@ -439,7 +528,7 @@ fn lookup_invalid_target_exits_with_one() {
 #[test]
 fn lookup_succeeds_without_config_file() {
     let root = create_lookup_root_without_config("203.0.113.7\n");
-    let output = run_kidobo_with_root(root.path(), &["lookup", "203.0.113.7"]);
+    let output = run_kidobo_with_root(root.path(), &["lookup", "203.0.113.7", "--format", "tsv"]);
 
     assert_eq!(output.status.code(), Some(0));
 
@@ -485,7 +574,7 @@ fn lookup_succeeds_when_config_is_invalid() {
     )
     .expect("write ASN cache");
 
-    let output = run_kidobo_with_root(root.path(), &["lookup", "203.0.113.7"]);
+    let output = run_kidobo_with_root(root.path(), &["lookup", "203.0.113.7", "--format", "tsv"]);
 
     assert_eq!(output.status.code(), Some(0));
 

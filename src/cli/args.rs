@@ -33,6 +33,12 @@ pub enum LogLevel {
     Error,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum LookupFormat {
+    Human,
+    Tsv,
+}
+
 impl From<LogLevel> for LevelFilter {
     fn from(value: LogLevel) -> Self {
         match value {
@@ -169,6 +175,14 @@ pub enum Command {
             help = "File with one target IP/CIDR per line"
         )]
         file: Option<PathBuf>,
+
+        #[arg(
+            long,
+            value_enum,
+            default_value_t = LookupFormat::Human,
+            help = "Select readable table or legacy tab-separated output"
+        )]
+        format: LookupFormat,
     },
 
     #[command(
@@ -206,7 +220,7 @@ pub enum AnalyzeCommand {
 mod tests {
     use std::path::PathBuf;
 
-    use super::{AnalyzeCommand, Cli, Command, LogLevel};
+    use super::{AnalyzeCommand, Cli, Command, LogLevel, LookupFormat};
     use clap::Parser;
     use log::LevelFilter;
 
@@ -337,9 +351,10 @@ mod tests {
     fn lookup_command_parses_ip_mode() {
         let cli = Cli::try_parse_from(["kidobo", "lookup", "203.0.113.7"]).expect("lookup parse");
         match cli.command {
-            Command::Lookup { ip, file } => {
+            Command::Lookup { ip, file, format } => {
                 assert_eq!(ip, Some("203.0.113.7".to_string()));
                 assert!(file.is_none());
+                assert_eq!(format, LookupFormat::Human);
             }
             _ => panic!("unexpected command variant"),
         }
@@ -350,12 +365,30 @@ mod tests {
         let cli =
             Cli::try_parse_from(["kidobo", "lookup", "--file", "targets.txt"]).expect("parse");
         match cli.command {
-            Command::Lookup { ip, file } => {
+            Command::Lookup { ip, file, format } => {
                 assert!(ip.is_none());
                 assert_eq!(file, Some(PathBuf::from("targets.txt")));
+                assert_eq!(format, LookupFormat::Human);
             }
             _ => panic!("unexpected command variant"),
         }
+    }
+
+    #[test]
+    fn lookup_command_parses_tsv_format() {
+        let cli = Cli::try_parse_from(["kidobo", "lookup", "203.0.113.7", "--format", "tsv"])
+            .expect("lookup parse");
+        match cli.command {
+            Command::Lookup { format, .. } => assert_eq!(format, LookupFormat::Tsv),
+            _ => panic!("unexpected command variant"),
+        }
+    }
+
+    #[test]
+    fn lookup_command_rejects_unknown_format() {
+        let err = Cli::try_parse_from(["kidobo", "lookup", "203.0.113.7", "--format", "csv"])
+            .expect_err("unknown lookup format must fail");
+        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue);
     }
 
     #[test]

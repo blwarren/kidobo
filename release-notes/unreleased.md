@@ -30,6 +30,10 @@
 
 ### Changed
 
+- `kidobo lookup` now defaults to a readable, wrapped results table with
+  explicit match statuses and summary counts. TTY output highlights statuses,
+  `NO_COLOR` disables styling, and `--format tsv` preserves the previous
+  tab-separated output for scripts.
 - `kidobo lookup` now reports raw overlaps with configured safelist entries,
   compatible cached GitHub meta safelist data, and cached prefixes for
   configured ASN bans, in addition to the local blocklist and cached remote
