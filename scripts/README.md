@@ -11,6 +11,7 @@ cargo install --locked just --version 1.55.1
 
 - `Justfile`: validation, CI, release-note, udeps, and mutation-test recipes.
 - `scripts/install.sh`: public install/uninstall flow used by operators.
+- `scripts/publish-release.sh`: guarded, transactional release preparation and publication.
 - `scripts/changelog/*`: release-notes normalization and changelog generation.
 - `scripts/perf/*`: benchmark and lookup RSS regression tooling.
 - `.cargo/mutants.toml`: cargo-mutants mutation-testing configuration.
@@ -23,5 +24,6 @@ cargo install --locked just --version 1.55.1
 - `just gates-minimum`
 - `just gates-extended`
 - `just release-notes-check`
+- `just publish-release v0.11.0`
 - `just mutants`
 - `just mutants --shard 1/4`

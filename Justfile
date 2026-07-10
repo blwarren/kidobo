@@ -35,6 +35,10 @@ mutants *args:
     @printf '[mutants] cargo mutants -vV %s\n' "{{args}}"
     @env CARGO_MUTANTS_JOBS="${CARGO_MUTANTS_JOBS:-4}" cargo mutants -vV {{args}}
 
+# Prepare, validate, commit, tag, and atomically publish a release.
+publish-release version:
+    @./scripts/publish-release.sh "{{version}}"
+
 # Normalize release notes, regenerate the changelog, and verify the diff.
 release-notes-check: _release-notes-format _release-notes-generate
     #!/usr/bin/env bash

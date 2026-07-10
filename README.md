@@ -226,6 +226,16 @@ just pre-push-tests
 just release-notes-check
 ```
 
+Publish a release from a clean, synchronized `main` branch:
+
+```bash
+just publish-release v0.11.0
+```
+
+The command prepares the release in a temporary worktree, runs the extended
+validation gates, displays the complete release diff, and asks for confirmation
+before atomically pushing the release commit and annotated tag.
+
 Use `just --list` to see all available local and CI recipes.
 
 ## License
