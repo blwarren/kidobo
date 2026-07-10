@@ -3,7 +3,7 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use tempfile::TempDir;
 
@@ -18,6 +18,22 @@ fn write_executable(path: &Path, contents: &str) {
     fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
     fs::write(path, contents).expect("write executable");
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("chmod");
+}
+
+#[test]
+fn installer_runs_when_read_from_standard_input() {
+    let installer = fs::File::open(installer_path()).expect("open installer");
+    let output = Command::new("bash")
+        .arg("-s")
+        .arg("--")
+        .arg("--help")
+        .stdin(Stdio::from(installer))
+        .output()
+        .expect("run installer from stdin");
+
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Usage:"));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("BASH_SOURCE"));
 }
 
 #[test]
