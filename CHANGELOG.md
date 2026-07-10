@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+
+## [0.11.1] - 2026-07-10
+
 ### Changed
 
 - `just publish-release` now refreshes the package version in `Cargo.lock`
