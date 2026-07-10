@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+
+## [0.11.0] - 2026-07-10
+
 ### Fixed
 
 - Config validation now rejects malformed `http://`/`https://` remote and
