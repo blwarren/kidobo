@@ -26,13 +26,13 @@ release_version="${release_tag#v}"
 repo_root="$(git rev-parse --show-toplevel)"
 cd "${repo_root}"
 
-if [[ "$(git branch --show-current)" != "main" ]]; then
-    echo "publish-release must run from the main branch" >&2
-    exit 1
-fi
 if [[ -n "$(git status --porcelain)" ]]; then
     echo "publish-release requires a clean worktree" >&2
     exit 1
+fi
+if [[ "$(git branch --show-current)" != "main" ]]; then
+    echo "[release] switching to main"
+    git switch main
 fi
 
 echo "[release] refreshing origin/main and tags"
