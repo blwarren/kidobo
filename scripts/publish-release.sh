@@ -89,7 +89,7 @@ cd "${release_worktree}"
 
 sed -i "0,/^version = \"${current_version}\"$/s//version = \"${release_version}\"/" Cargo.toml
 echo "[release] updating Cargo.lock"
-cargo check --quiet
+cargo metadata --no-deps --format-version 1 >/dev/null
 
 readme_old="--version v${current_version}"
 readme_new="--version ${release_tag}"
@@ -122,8 +122,8 @@ just _release-notes-format _release-notes-generate
 git add Cargo.toml Cargo.lock README.md CHANGELOG.md release-notes
 just release-notes-check
 
-echo "[release] running extended validation gates"
-just gates-extended
+echo "[release] running release quality gates"
+just ci-quality
 git diff --check --cached
 if ! git diff --quiet || [[ -n "$(git ls-files --others --exclude-standard)" ]]; then
     echo "validation produced uncommitted changes outside the staged release update" >&2

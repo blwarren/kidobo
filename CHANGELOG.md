@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Changed
+
+- `just publish-release` now runs the local test suite once using the same
+  quality gate as the GitHub release workflow, instead of repeating it under
+  coverage before GitHub performs its independent post-push verification.
 
 ## [0.11.0] - 2026-07-10
 

@@ -233,9 +233,9 @@ automatically and verifies that it is not behind or diverged from `origin/main`:
 just publish-release 0.11.0
 ```
 
-The command prepares the release in a temporary worktree, runs the extended
-validation gates, displays the complete release diff, and asks for confirmation
-before atomically pushing the release commit and annotated tag.
+The command prepares the release in a temporary worktree, runs the same quality
+gate used by the GitHub release workflow, displays the complete release diff,
+and asks for confirmation before atomically pushing the release commit and tag.
 After publication, the working tree remains on the updated `main` branch.
 
 Use `just --list` to see all available local and CI recipes.
