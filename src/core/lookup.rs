@@ -489,6 +489,48 @@ mod tests {
     }
 
     #[test]
+    fn lookup_target_supernets_keep_nested_source_matches() {
+        let sources = vec![
+            LookupSourceEntry {
+                source_label: "source:v6-nested".into(),
+                source_line: "2001:db8:0:1::/64".to_string(),
+                cidr: CanonicalCidr::V6(Ipv6Cidr::from_parts(
+                    0x20010db8000000010000000000000000,
+                    64,
+                )),
+            },
+            LookupSourceEntry {
+                source_label: "source:v4-outside".into(),
+                source_line: "10.2.0.0/24".to_string(),
+                cidr: CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a020000, 24)),
+            },
+            LookupSourceEntry {
+                source_label: "source:v4-nested".into(),
+                source_line: "10.1.2.0/24".to_string(),
+                cidr: CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a010200, 24)),
+            },
+        ];
+
+        let report = run_lookup(
+            &["10.1.0.0/16".to_string(), "2001:db8::/48".to_string()],
+            &sources,
+        );
+        let matches = report
+            .matches
+            .iter()
+            .map(|entry| (entry.target.as_str(), entry.source_label.as_str()))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            matches,
+            vec![
+                ("10.1.0.0/16", "source:v4-nested"),
+                ("2001:db8::/48", "source:v6-nested"),
+            ]
+        );
+    }
+
+    #[test]
     fn lookup_index_keeps_same_start_nested_matches() {
         let sources = vec![
             LookupSourceEntry {

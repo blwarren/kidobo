@@ -185,9 +185,15 @@ an arbitrary build or `cargo run` path.
   blocklist entries for IP/CIDR targets and config `[asn].banned` for ASN targets.
   `--file` accepts one strict IP/CIDR target per line.
   Run `sync` to apply changes to firewall/ipset runtime state.
-- `lookup` is offline-only and uses the local blocklist plus cached remote
-  sources. It does not require a valid config file, but you still need cached
-  remote data if you want matches beyond the local blocklist.
+- `lookup` is offline-only and reports raw overlaps with the local blocklist,
+  cached remote sources, configured `safe.ips`, compatible cached GitHub meta
+  safelist data, and cached prefixes for currently configured ASN bans. It
+  never fetches sources or invokes `bgpq4`.
+- Safelist lookup rows identify exemptions; lookup does not inspect live ipset
+  state or calculate the final post-safelist firewall set. Missing or invalid
+  config still permits lookup against the local blocklist and cached remote
+  sources. Lookup warns on stderr when config-backed coverage or a configured
+  GitHub/ASN cache is unavailable.
 - `sync` canonicalizes a valid local blocklist, preserving only the leading
   comment/header section before canonical entries. Invalid non-header local
   lines now fail `sync`; they are not silently dropped or rewritten away.

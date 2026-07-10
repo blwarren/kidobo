@@ -186,6 +186,14 @@ pub fn load_asn_prefixes_with_cache(
     }
 }
 
+pub fn load_cached_asn_prefixes(
+    asn: u32,
+    cache_dir: &Path,
+) -> Result<Option<Vec<CanonicalCidr>>, AsnError> {
+    let cache_file = asn_cache_file(cache_dir, asn);
+    Ok(read_asn_cache_file(&cache_file)?.map(|state| state.prefixes))
+}
+
 pub fn delete_asn_cache_file(asn: u32, cache_dir: &Path) -> Result<bool, AsnError> {
     let path = asn_cache_file(cache_dir, asn);
     if !path.exists() {

@@ -76,7 +76,19 @@ fn run_lookup_command(ip: Option<String>, file: Option<PathBuf>) -> Result<(), K
 
     let path_input = PathResolutionInput::from_process(None);
     let paths = resolve_paths_without_config(&path_input)?;
-    let sources = load_lookup_sources(&paths)?;
+    // Config-backed lookup sources are additive. Preserve lookup's compatibility
+    // path when config is missing or invalid so local and remote cache inspection
+    // remains available during config recovery.
+    let config = match load_config_from_file(&paths.config_file) {
+        Ok(config) => Some(config),
+        Err(err) => {
+            warn!(
+                "lookup config-backed sources unavailable; checking only local and cached remote sources: {err}"
+            );
+            None
+        }
+    };
+    let sources = load_lookup_sources(&paths, config.as_ref())?;
 
     let mut matched_targets = BTreeSet::new();
     let invalid_targets = run_lookup_streaming(&targets, &sources, |target, source| {

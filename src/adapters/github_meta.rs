@@ -149,6 +149,17 @@ pub fn load_github_meta_safelist(
     }
 }
 
+pub fn load_cached_github_meta_safelist(
+    cache_dir: &Path,
+    github_meta_url: &str,
+    category_mode: &GithubMetaCategoryMode,
+) -> Option<Vec<CanonicalCidr>> {
+    let selection = CategorySelection::from_mode(category_mode);
+    let paths = CachePaths::from_cache_dir(cache_dir);
+
+    read_github_meta_cache(&paths, &selection, github_meta_url).networks
+}
+
 fn read_github_meta_cache(
     paths: &CachePaths,
     selection: &CategorySelection,

@@ -283,6 +283,78 @@ fn lookup_uses_local_sources_and_exits_zero() {
 }
 
 #[test]
+fn lookup_reports_every_matching_source_without_refreshing_caches() {
+    let root = create_root(
+        "[ipset]\n\
+         set_name = 'kidobo'\n\
+         [safe]\n\
+         ips = ['198.51.100.0/24', '203.0.113.0/26']\n\
+         include_github_meta = true\n\
+         github_meta_categories = ['api']\n\
+         [asn]\n\
+         banned = [64512, 64513]\n",
+        "203.0.113.7\n",
+    );
+    fs::write(
+        root.path().join("cache/remote/feed.iplist"),
+        "203.0.113.0/25\n",
+    )
+    .expect("write remote cache");
+    fs::write(
+        root.path().join("cache/remote/feed.meta.json"),
+        r#"{"url":"https://example.com/feed.txt"}"#,
+    )
+    .expect("write remote metadata");
+    fs::write(
+        root.path().join("cache/remote/github-meta.raw.json"),
+        r#"{"api":["203.0.113.0/27"]}"#,
+    )
+    .expect("write GitHub cache");
+    fs::write(
+        root.path().join("cache/remote/github-meta.categories.json"),
+        r#"{"mode":"selected","categories":["api"]}"#,
+    )
+    .expect("write GitHub category cache");
+    fs::create_dir_all(root.path().join("cache/asn")).expect("create ASN cache dir");
+    fs::write(
+        root.path().join("cache/asn/as64513.iplist"),
+        "# kidobo-asn-cache-v1\n203.0.113.0/28\n",
+    )
+    .expect("write ASN cache");
+
+    let fake_bgpq4 = write_fake_bgpq4_script(&root);
+    let marker = root.path().join("bgpq4-touched");
+    let output = kidobo_with_root_command(root.path(), &["lookup", "203.0.113.7"])
+        .env(
+            "PATH",
+            path_with_bin_prefix(fake_bgpq4.parent().expect("fake binary parent")),
+        )
+        .env("KIDOBO_TEST_BGPQ4_TOUCHED", &marker)
+        .output()
+        .expect("run lookup");
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(!marker.exists(), "lookup must not invoke bgpq4");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("lookup ASN cache unavailable for AS64512"),
+        "missing incomplete ASN coverage warning: {stderr}"
+    );
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec![
+            "203.0.113.7\tasn:AS64513\t203.0.113.0/28",
+            "203.0.113.7\thttps://example.com/feed.txt\t203.0.113.0/25",
+            "203.0.113.7\tinternal:blocklist\t203.0.113.7",
+            "203.0.113.7\tsafelist:config\t203.0.113.0/26",
+            "203.0.113.7\tsafelist:github-meta\t203.0.113.0/27",
+        ]
+    );
+}
+
+#[test]
 fn lookup_file_mode_uses_local_sources_and_exits_zero() {
     let root = create_lookup_root("203.0.113.7\n");
     let targets = root.path().join("targets.txt");
@@ -305,6 +377,44 @@ fn lookup_file_mode_uses_local_sources_and_exits_zero() {
     assert!(
         stdout.contains("summary: total_ips=2 matched_ips=1 matched_pct=50%"),
         "missing lookup summary output: {stdout}"
+    );
+}
+
+#[test]
+fn lookup_file_mode_counts_safelist_and_asn_matches() {
+    let root = create_root(
+        "[ipset]\n\
+         set_name = 'kidobo'\n\
+         [safe]\n\
+         ips = ['192.0.2.0/24', '198.51.100.0/25']\n\
+         include_github_meta = false\n\
+         [asn]\n\
+         banned = [64512]\n",
+        "",
+    );
+    fs::create_dir_all(root.path().join("cache/asn")).expect("create ASN cache dir");
+    fs::write(
+        root.path().join("cache/asn/as64512.iplist"),
+        "# kidobo-asn-cache-v1\n198.51.100.0/24\n",
+    )
+    .expect("write ASN cache");
+    let targets = root.path().join("targets.txt");
+    fs::write(&targets, "192.0.2.7\n198.51.100.9\n203.0.113.11\n").expect("write lookup targets");
+    let target_path = targets.display().to_string();
+    let output = run_kidobo_with_root(root.path(), &["lookup", "--file", target_path.as_str()]);
+
+    assert_eq!(output.status.code(), Some(0));
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec![
+            "192.0.2.7\tsafelist:config\t192.0.2.0/24",
+            "198.51.100.9\tasn:AS64512\t198.51.100.0/24",
+            "198.51.100.9\tsafelist:config\t198.51.100.0/25",
+            "203.0.113.11\tNO_MATCH",
+            "summary: total_ips=3 matched_ips=2 matched_pct=66%",
+        ]
     );
 }
 
@@ -334,6 +444,11 @@ fn lookup_succeeds_without_config_file() {
     assert_eq!(output.status.code(), Some(0));
 
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("lookup config-backed sources unavailable"),
+        "missing config coverage warning: {stderr}"
+    );
     assert!(
         stdout.contains("203.0.113.7\tinternal:blocklist\t203.0.113.7"),
         "unexpected lookup output: {stdout}"
@@ -343,14 +458,50 @@ fn lookup_succeeds_without_config_file() {
 #[test]
 fn lookup_succeeds_when_config_is_invalid() {
     let root = create_root("not valid = [", "203.0.113.7\n");
+    fs::write(
+        root.path().join("cache/remote/feed.iplist"),
+        "203.0.113.0/25\n",
+    )
+    .expect("write remote cache");
+    fs::write(
+        root.path().join("cache/remote/feed.meta.json"),
+        r#"{"url":"https://example.com/feed.txt"}"#,
+    )
+    .expect("write remote metadata");
+    fs::write(
+        root.path().join("cache/remote/github-meta.raw.json"),
+        r#"{"api":["203.0.113.0/27"]}"#,
+    )
+    .expect("write GitHub cache");
+    fs::write(
+        root.path().join("cache/remote/github-meta.categories.json"),
+        r#"{"mode":"selected","categories":["api"]}"#,
+    )
+    .expect("write GitHub category cache");
+    fs::create_dir_all(root.path().join("cache/asn")).expect("create ASN cache dir");
+    fs::write(
+        root.path().join("cache/asn/as64512.iplist"),
+        "203.0.113.0/28\n",
+    )
+    .expect("write ASN cache");
+
     let output = run_kidobo_with_root(root.path(), &["lookup", "203.0.113.7"]);
 
     assert_eq!(output.status.code(), Some(0));
 
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stdout.contains("203.0.113.7\tinternal:blocklist\t203.0.113.7"),
-        "unexpected lookup output: {stdout}"
+        stderr.contains("lookup config-backed sources unavailable"),
+        "missing config coverage warning: {stderr}"
+    );
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec![
+            "203.0.113.7\thttps://example.com/feed.txt\t203.0.113.0/25",
+            "203.0.113.7\tinternal:blocklist\t203.0.113.7",
+        ],
+        "invalid config must not gate legacy sources or activate config-backed caches"
     );
 }
 

@@ -150,8 +150,8 @@ pub enum Command {
         yes: bool,
     },
     #[command(
-        about = "Offline lookup against local blocklist + cached remote sources",
-        long_about = "Lookup candidate targets against local blocklist and cached remote sources.\n\nLookup runs offline only and never fetches remote sources.",
+        about = "Offline lookup across blocklist, safelist, and ASN sources",
+        long_about = "Lookup candidate targets against the local blocklist, cached remote sources, configured safelist entries, cached GitHub safelist entries, and cached prefixes for configured ASN bans.\n\nLookup reports source overlaps, runs offline only, and never fetches or refreshes source data. Config-backed sources are included when the config is valid; local and cached remote lookup remains available without a valid config. Warnings identify config-backed sources that could not be evaluated.",
         group(
             ArgGroup::new("lookup_input")
                 .args(["ip", "file"])

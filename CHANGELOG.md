@@ -32,6 +32,15 @@
 - The unchecked integer `from_parts` CIDR constructors are no longer public;
   callers must use the prefix-validating `Ipv4Cidr::new` and `Ipv6Cidr::new` APIs.
 
+### Changed
+
+- `kidobo lookup` now reports raw overlaps with configured safelist entries,
+  compatible cached GitHub meta safelist data, and cached prefixes for
+  configured ASN bans, in addition to the local blocklist and cached remote
+  sources. Lookup remains offline-only and retains its local/remote fallback
+  when config is missing or invalid, with warnings when config-backed cache
+  coverage is unavailable.
+
 ## [0.10.1] - 2026-04-15
 
 ### Changed
