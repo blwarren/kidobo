@@ -31,10 +31,10 @@ fn publisher_requires_exactly_one_version() {
 #[test]
 fn publisher_rejects_invalid_version_before_repository_changes() {
     let output = Command::new(publisher_path())
-        .arg("0.11.0")
+        .arg("release-0.11.0")
         .output()
         .expect("run publisher with invalid version");
 
     assert_eq!(output.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("expected vX.Y.Z"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("expected X.Y.Z or vX.Y.Z"));
 }

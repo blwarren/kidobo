@@ -24,6 +24,6 @@ cargo install --locked just --version 1.55.1
 - `just gates-minimum`
 - `just gates-extended`
 - `just release-notes-check`
-- `just publish-release v0.11.0`
+- `just publish-release 0.11.0` (a leading `v` is also accepted)
 - `just mutants`
 - `just mutants --shard 1/4`

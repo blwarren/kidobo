@@ -229,7 +229,7 @@ just release-notes-check
 Publish a release from a clean, synchronized `main` branch:
 
 ```bash
-just publish-release v0.11.0
+just publish-release 0.11.0
 ```
 
 The command prepares the release in a temporary worktree, runs the extended

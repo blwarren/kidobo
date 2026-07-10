@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
     cat <<'EOF'
-Usage: just publish-release vX.Y.Z
+Usage: just publish-release [v]X.Y.Z
 
 Prepares and validates a release in a temporary worktree, asks for confirmation,
 then creates the release commit and annotated tag and atomically pushes both.
@@ -15,12 +15,13 @@ if [[ $# -ne 1 ]]; then
     exit 2
 fi
 
-release_tag="$1"
-if [[ ! "${release_tag}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z][0-9A-Za-z.-]*)?$ ]]; then
-    echo "invalid release version: ${release_tag} (expected vX.Y.Z)" >&2
+requested_version="$1"
+if [[ ! "${requested_version}" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z][0-9A-Za-z.-]*)?$ ]]; then
+    echo "invalid release version: ${requested_version} (expected X.Y.Z or vX.Y.Z)" >&2
     exit 2
 fi
 
+release_tag="v${requested_version#v}"
 release_version="${release_tag#v}"
 repo_root="$(git rev-parse --show-toplevel)"
 cd "${repo_root}"
