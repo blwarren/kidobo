@@ -226,7 +226,8 @@ just pre-push-tests
 just release-notes-check
 ```
 
-Publish a release from a clean, synchronized `main` branch:
+Publish a release from a clean `main` branch that is not behind or diverged
+from `origin/main`:
 
 ```bash
 just publish-release 0.11.0

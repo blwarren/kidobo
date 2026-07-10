@@ -36,7 +36,8 @@
 
 - Releases can now be prepared, validated, committed, tagged, and atomically
   pushed with `just publish-release X.Y.Z`; an optional leading `v` is accepted,
-  and the command uses a temporary worktree with confirmation before publication.
+  local commits ahead of `origin/main` are included, and the command uses a
+  temporary worktree with confirmation before publication.
 - `kidobo lookup` now defaults to a readable, wrapped results table with
   explicit match statuses and summary counts. TTY output highlights statuses,
   `NO_COLOR` disables styling, and `--format tsv` preserves the previous

@@ -39,8 +39,8 @@ echo "[release] refreshing origin/main and tags"
 git fetch --quiet origin main --tags
 base_commit="$(git rev-parse HEAD)"
 remote_main="$(git rev-parse refs/remotes/origin/main)"
-if [[ "${base_commit}" != "${remote_main}" ]]; then
-    echo "local main must exactly match origin/main before publishing" >&2
+if ! git merge-base --is-ancestor "${remote_main}" "${base_commit}"; then
+    echo "local main must not be behind or diverged from origin/main before publishing" >&2
     exit 1
 fi
 if git rev-parse --verify --quiet "refs/tags/${release_tag}" >/dev/null; then
@@ -157,7 +157,7 @@ fi
 
 echo "[release] confirming origin/main has not changed"
 git fetch --quiet origin main
-if [[ "$(git rev-parse refs/remotes/origin/main)" != "${base_commit}" ]]; then
+if [[ "$(git rev-parse refs/remotes/origin/main)" != "${remote_main}" ]]; then
     echo "origin/main changed during release validation; publication cancelled" >&2
     exit 1
 fi
