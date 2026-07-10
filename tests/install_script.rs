@@ -1,6 +1,7 @@
 #![cfg(unix)]
 
 use std::fs;
+use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -34,6 +35,20 @@ fn installer_runs_when_read_from_standard_input() {
     assert!(output.status.success());
     assert!(String::from_utf8_lossy(&output.stdout).contains("Usage:"));
     assert!(!String::from_utf8_lossy(&output.stderr).contains("BASH_SOURCE"));
+}
+
+#[test]
+fn installer_entrypoint_does_not_depend_on_bash_source() {
+    const MAX_INSTALLER_BYTES: u64 = 1024 * 1024;
+    let installer_file = fs::File::open(installer_path()).expect("open installer");
+    let mut installer = String::new();
+    installer_file
+        .take(MAX_INSTALLER_BYTES + 1)
+        .read_to_string(&mut installer)
+        .expect("read installer");
+
+    assert!(installer.len() as u64 <= MAX_INSTALLER_BYTES);
+    assert!(!installer.contains("BASH_SOURCE"));
 }
 
 #[test]
