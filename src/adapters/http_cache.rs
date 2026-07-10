@@ -228,7 +228,12 @@ fn parse_remote_cidrs(raw: &[u8]) -> ParsedRemoteCidrs {
 
         data_lines += 1;
 
-        let Some(token) = without_bom.split_whitespace().next() else {
+        let Some(token) = without_bom
+            .split_once(',')
+            .map_or(without_bom, |(first_column, _)| first_column)
+            .split_whitespace()
+            .next()
+        else {
             continue;
         };
 
@@ -570,6 +575,43 @@ mod tests {
         let raw = b"\xEF\xBB\xBF 10.0.0.5 \n# comment\ninvalid\n2001:db8::1 trailing\n";
         let normalized = normalize_remote_text(raw);
         assert_eq!(normalized, "10.0.0.5/32\n2001:db8::1/128");
+    }
+
+    #[test]
+    fn normalization_accepts_networks_in_first_csv_column() {
+        let raw =
+            b"ip,score\n161.117.138.100,0.164985\n2001:db8::1/64,0.125\ninvalid,203.0.113.7\n";
+
+        let normalized = normalize_remote_text(raw);
+
+        assert_eq!(normalized, "161.117.138.100/32\n2001:db8::/64");
+    }
+
+    #[test]
+    fn csv_network_response_replaces_existing_cache() {
+        let temp = TempDir::new().expect("tempdir");
+        let url = "https://example.com/feed.csv";
+        let paths = cache_paths_for_url(temp.path(), url);
+        fs::write(&paths.iplist_path, "10.0.0.0/24\n").expect("write cache");
+
+        let body = b"ip,score\n161.117.138.100,0.164985\n";
+        let client = MockHttpClient::new(vec![Ok(network_response_for_test(body))]);
+
+        let result =
+            fetch_iplist_with_cache(&client, url, temp.path(), &BTreeMap::new()).expect("fetch");
+
+        assert_eq!(result.source, CacheSource::Network);
+        assert_eq!(result.networks.len(), 1);
+        assert_eq!(
+            read_to_string_with_limit(&paths.iplist_path, super::MAX_IPLIST_READ_BYTES)
+                .expect("read cache"),
+            "161.117.138.100/32"
+        );
+        assert_eq!(
+            read_bytes_with_limit(&paths.raw_path, super::DEFAULT_MAX_HTTP_BODY_BYTES)
+                .expect("read raw"),
+            body
+        );
     }
 
     #[test]

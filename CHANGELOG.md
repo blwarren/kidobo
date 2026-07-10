@@ -4,6 +4,9 @@
 
 ### Changed
 
+- Remote blocklist loading now accepts IP addresses and CIDRs in the first
+  column of CSV feeds, and expected absent temporary ipsets no longer produce
+  warnings during atomic replacement.
 - The documented curl-pipe installer now runs correctly on older Bash releases
   when Bash reads it from standard input.
 - `just publish-release` now runs the local test suite once using the same

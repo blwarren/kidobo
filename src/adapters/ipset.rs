@@ -267,7 +267,7 @@ fn run_checked(
 fn best_effort_destroy_set(runner: &dyn IpsetCommandRunner, set_name: &str) {
     let args = ["destroy", set_name];
     match runner.run("ipset", &args) {
-        Ok(result) if result.status.success() => {}
+        Ok(result) if result.status.success() || is_missing_set_result(&result) => {}
         Ok(result) => warn!(
             "best-effort {} failed with status {:?}: {}",
             display_command("ipset", &args),
@@ -690,7 +690,11 @@ mod tests {
     #[test]
     fn atomic_replace_runs_restore_swap_and_destroy_paths() {
         let runner = MockRunner::new(vec![
-            Ok(ok(1)), // best-effort stale temp destroy
+            Ok(CommandResult {
+                status: ProcessStatus::Exited(1),
+                stdout: String::new(),
+                stderr: "The set with the given name does not exist".to_string(),
+            }), // expected absent temporary set
             Ok(ok(0)), // restore
             Ok(ok(0)), // final destroy
         ]);
