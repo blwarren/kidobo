@@ -7,7 +7,6 @@ description = "One-shot Linux firewall blocklist manager with atomic ipset updat
 readme = "README.md"
 repository = "https://github.com/blwarren/kidobo"
 homepage = "https://github.com/blwarren/kidobo"
-documentation = "https://docs.rs/kidobo"
 keywords = ["firewall", "ipset", "iptables", "blocklist", "cli"]
 categories = ["command-line-utilities", "network-programming"]
 rust-version = "1.93.1"
