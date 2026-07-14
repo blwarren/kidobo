@@ -138,8 +138,8 @@ impl CommandExecutor for SystemCommandExecutor {
                 }
                 Ok(None) => {
                     if started.elapsed() >= request.timeout {
-                        let _ = child.kill();
-                        let _ = child.wait();
+                        let _kill_result = child.kill();
+                        let _wait_result = child.wait();
                         best_effort_join_output_reader(stdout_reader);
                         best_effort_join_output_reader(stderr_reader);
 
@@ -152,8 +152,8 @@ impl CommandExecutor for SystemCommandExecutor {
                     thread::sleep(Duration::from_millis(10));
                 }
                 Err(err) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    let _kill_result = child.kill();
+                    let _wait_result = child.wait();
                     best_effort_join_output_reader(stdout_reader);
                     best_effort_join_output_reader(stderr_reader);
 
@@ -194,7 +194,7 @@ fn join_output_reader(
 }
 
 fn best_effort_join_output_reader(handle: thread::JoinHandle<std::io::Result<Vec<u8>>>) {
-    let _ = handle.join();
+    let _join_result = handle.join();
 }
 
 #[derive(Debug)]

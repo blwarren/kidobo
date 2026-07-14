@@ -38,7 +38,11 @@ struct FileUnbanRequest {
     plan: UnbanPlan,
 }
 
-#[allow(clippy::print_stdout, clippy::print_stderr)]
+#[allow(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    reason = "CLI command writes results and diagnostics to the terminal"
+)]
 pub(super) fn run_ban_file_command(
     blocklist_path: &Path,
     target_file: &Path,
@@ -63,7 +67,10 @@ pub(super) fn run_ban_file_command(
     Ok(())
 }
 
-#[allow(clippy::print_stdout)]
+#[allow(
+    clippy::print_stdout,
+    reason = "CLI command writes its result to standard output"
+)]
 pub(super) fn run_ban_target_command(
     blocklist_path: &Path,
     target: &str,
@@ -79,7 +86,10 @@ pub(super) fn run_ban_target_command(
     Ok(())
 }
 
-#[allow(clippy::print_stdout)]
+#[allow(
+    clippy::print_stdout,
+    reason = "CLI command writes its result to standard output"
+)]
 pub(super) fn run_unban_file_command(
     blocklist_path: &Path,
     lock_path: &Path,
@@ -145,7 +155,10 @@ pub(super) fn run_unban_file_command(
     Ok(())
 }
 
-#[allow(clippy::print_stdout)]
+#[allow(
+    clippy::print_stdout,
+    reason = "CLI command writes its result to standard output"
+)]
 pub(super) fn run_unban_target_command(
     blocklist_path: &Path,
     lock_path: &Path,
@@ -295,7 +308,10 @@ pub(super) fn read_blocklist_target_lines(path: &Path) -> Result<Vec<String>, Ki
     Ok(contents.lines().map(ToString::to_string).collect())
 }
 
-#[allow(clippy::print_stderr)]
+#[allow(
+    clippy::print_stderr,
+    reason = "CLI parser reports invalid targets to standard error"
+)]
 fn parse_blocklist_targets_or_report(inputs: &[String]) -> Result<Vec<CanonicalCidr>, KidoboError> {
     let mut targets = Vec::with_capacity(inputs.len());
     let mut invalid_inputs = Vec::new();

@@ -16,7 +16,10 @@ use crate::core::blocklist::exact_match_indexes;
 use crate::core::network::CanonicalCidr;
 use crate::error::KidoboError;
 
-#[allow(clippy::print_stdout)]
+#[allow(
+    clippy::print_stdout,
+    reason = "CLI command writes its result to standard output"
+)]
 pub(super) fn run_ban_asn_command(
     config_path: &Path,
     blocklist_path: &Path,
@@ -63,7 +66,10 @@ pub(super) fn run_ban_asn_command(
     Ok(())
 }
 
-#[allow(clippy::print_stdout)]
+#[allow(
+    clippy::print_stdout,
+    reason = "CLI command writes its result to standard output"
+)]
 pub(super) fn run_unban_asn_command(
     config_path: &Path,
     cache_dir: &Path,

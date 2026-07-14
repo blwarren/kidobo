@@ -1,6 +1,12 @@
 #![forbid(unsafe_code)]
 #![deny(dead_code)]
 #![deny(clippy::all)]
+#![deny(
+    clippy::allow_attributes_without_reason,
+    clippy::assertions_on_result_states,
+    clippy::cargo_common_metadata,
+    clippy::wildcard_dependencies
+)]
 #![warn(clippy::pedantic)]
 #![allow(
     clippy::match_same_arms,
@@ -9,7 +15,8 @@
     clippy::missing_errors_doc,
     clippy::single_match_else,
     clippy::struct_field_names,
-    clippy::unreadable_literal
+    clippy::unreadable_literal,
+    reason = "These pedantic lints conflict with the repository's established style"
 )]
 #![cfg_attr(
     not(test),
@@ -31,7 +38,13 @@
         clippy::uninlined_format_args,
         clippy::inefficient_to_string,
         clippy::to_string_in_format_args,
-        clippy::implicit_clone
+        clippy::implicit_clone,
+        clippy::as_conversions,
+        clippy::iter_over_hash_type,
+        clippy::large_stack_frames,
+        clippy::let_underscore_must_use,
+        clippy::path_buf_push_overwrite,
+        clippy::redundant_clone
     )
 )]
 

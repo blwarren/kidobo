@@ -17,7 +17,10 @@ use self::checks::{
 use self::probes::push_sudo_probe_checks;
 pub(crate) use self::report::{DoctorCheckStatus, DoctorOverall, DoctorReport};
 
-#[allow(clippy::print_stdout)]
+#[allow(
+    clippy::print_stdout,
+    reason = "CLI command writes its report to standard output"
+)]
 pub fn run_doctor_command() -> Result<(), KidoboError> {
     let path_input = PathResolutionInput::from_process(None);
     let binary_locator = SystemBinaryLocator;

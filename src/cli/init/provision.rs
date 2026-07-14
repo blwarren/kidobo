@@ -28,17 +28,17 @@ impl InitSummary {
 
 pub(super) fn render_init_summary(summary: &InitSummary) -> String {
     let mut output = String::new();
-    let _ = writeln!(
+    let _header_write = writeln!(
         &mut output,
         "init completed: created={} unchanged={}",
         summary.created.len(),
         summary.unchanged.len()
     );
     for path in &summary.created {
-        let _ = writeln!(&mut output, "created: {}", path.display());
+        let _created_write = writeln!(&mut output, "created: {}", path.display());
     }
     for path in &summary.unchanged {
-        let _ = writeln!(&mut output, "unchanged: {}", path.display());
+        let _unchanged_write = writeln!(&mut output, "unchanged: {}", path.display());
     }
     output
 }

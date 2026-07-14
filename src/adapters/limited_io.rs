@@ -78,7 +78,7 @@ pub fn write_bytes_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
                 })();
 
                 if let Err(err) = write_result {
-                    let _ = fs::remove_file(&temp_path);
+                    let _cleanup_result = fs::remove_file(&temp_path);
                     return Err(err);
                 }
 

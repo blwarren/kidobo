@@ -14,7 +14,10 @@ use clap::error::ErrorKind;
 
 use crate::error::KidoboError;
 
-#[allow(clippy::print_stderr)]
+#[allow(
+    clippy::print_stderr,
+    reason = "CLI entry point writes operator-facing diagnostics"
+)]
 pub fn run() -> ExitCode {
     if let Err(err) = interrupt::install_handler() {
         eprintln!("{err}");
@@ -25,7 +28,7 @@ pub fn run() -> ExitCode {
         Ok(cli) => cli,
         Err(err) => {
             let exit = clap_error_exit_code(&err);
-            let _ = err.print();
+            let _print_result = err.print();
             return ExitCode::from(exit);
         }
     };

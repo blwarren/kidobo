@@ -418,6 +418,6 @@ mod tests {
             })
         });
 
-        assert!(result.is_ok());
+        result.expect("missing ipset should be treated as successful cleanup");
     }
 }

@@ -71,7 +71,11 @@ pub fn dispatch(command: Command) -> Result<(), KidoboError> {
     }
 }
 
-#[allow(clippy::print_stdout, clippy::print_stderr)]
+#[allow(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    reason = "CLI command writes results and diagnostics to the terminal"
+)]
 fn run_lookup_command(
     ip: Option<String>,
     file: Option<PathBuf>,
@@ -119,7 +123,10 @@ const LOOKUP_STATUS_WIDTH: usize = 8;
 const LOOKUP_SOURCE_WIDTH: usize = 44;
 const LOOKUP_ENTRY_WIDTH: usize = 30;
 
-#[allow(clippy::print_stdout)]
+#[allow(
+    clippy::print_stdout,
+    reason = "CLI command writes its report to standard output"
+)]
 fn print_human_lookup(
     targets: &[String],
     sources: &[crate::core::lookup::LookupSourceEntry],
@@ -166,7 +173,10 @@ fn print_human_lookup(
     invalid_targets
 }
 
-#[allow(clippy::print_stdout)]
+#[allow(
+    clippy::print_stdout,
+    reason = "CLI command writes its report to standard output"
+)]
 fn print_tsv_lookup(
     targets: &[String],
     sources: &[crate::core::lookup::LookupSourceEntry],
@@ -203,7 +213,10 @@ fn should_color_lookup(stdout_is_terminal: bool, no_color_set: bool) -> bool {
     stdout_is_terminal && !no_color_set
 }
 
-#[allow(clippy::print_stdout)]
+#[allow(
+    clippy::print_stdout,
+    reason = "CLI table renderer writes directly to standard output"
+)]
 fn print_lookup_table_border(left: char, junction: char, right: char) {
     println!(
         "{left}{}{junction}{}{junction}{}{junction}{}{right}",
@@ -214,7 +227,10 @@ fn print_lookup_table_border(left: char, junction: char, right: char) {
     );
 }
 
-#[allow(clippy::print_stdout)]
+#[allow(
+    clippy::print_stdout,
+    reason = "CLI table renderer writes directly to standard output"
+)]
 fn print_lookup_table_row(cells: [&str; 4], color_status: bool) {
     let [target, status, source, entry] = cells;
     let wrapped_target = wrap_lookup_cell(target, LOOKUP_TARGET_WIDTH);
@@ -282,7 +298,11 @@ fn collect_unique_valid_lookup_targets<S: AsRef<str>>(targets: &[S]) -> BTreeSet
         .collect()
 }
 
-#[allow(clippy::print_stdout, clippy::print_stderr)]
+#[allow(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    reason = "CLI command writes results and diagnostics to the terminal"
+)]
 fn run_analyze_overlap_command(
     print_fully_covered_local: bool,
     print_reduced_local: bool,
@@ -363,7 +383,10 @@ fn run_analyze_overlap_command(
     Ok(())
 }
 
-#[allow(clippy::print_stdout)]
+#[allow(
+    clippy::print_stdout,
+    reason = "CLI command writes its report to standard output"
+)]
 fn print_overlap_summary(
     local: &crate::core::network::FamilyCidrs,
     remote_union: &crate::core::network::FamilyCidrs,
@@ -475,7 +498,10 @@ fn build_remote_overlap_rows<'a>(
     rows
 }
 
-#[allow(clippy::print_stdout)]
+#[allow(
+    clippy::print_stdout,
+    reason = "CLI command writes its report to standard output"
+)]
 fn print_remote_overlap_rows(rows: &[RemoteOverlapRow<'_>], local_total: usize) {
     let displayed = rows
         .iter()

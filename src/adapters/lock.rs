@@ -30,7 +30,7 @@ pub struct FileLock {
 
 impl Drop for FileLock {
     fn drop(&mut self) {
-        let _ = self.file.unlock();
+        let _unlock_result = self.file.unlock();
     }
 }
 

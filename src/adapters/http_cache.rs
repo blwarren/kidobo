@@ -115,7 +115,7 @@ impl ReqwestHttpClient {
 
 fn ensure_rustls_provider_installed() {
     RUSTLS_PROVIDER_INIT.call_once(|| {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _install_result = rustls::crypto::ring::default_provider().install_default();
     });
 }
 

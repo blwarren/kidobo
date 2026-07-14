@@ -127,7 +127,7 @@ pub fn load_github_meta_safelist(
                 Ok(GithubMetaLoadResult {
                     networks,
                     source: GithubMetaSource::CacheNotModified,
-                    metadata: cache.meta.clone(),
+                    metadata: cache.meta,
                 })
             } else {
                 Ok(cache.fallback(None, &selection, GithubMetaSource::FallbackCache))

@@ -415,7 +415,9 @@ fn radix_sort_intervals_u32_by_start(intervals: &mut [IntervalU32]) -> bool {
         counts.fill(0);
 
         for interval in &src {
-            let bucket = ((interval.start >> shift) & 0xFFFF) as usize;
+            let Ok(bucket) = usize::try_from((interval.start >> shift) & 0xFFFF) else {
+                return false;
+            };
             let Some(count) = counts.get_mut(bucket) else {
                 return false;
             };
@@ -430,7 +432,9 @@ fn radix_sort_intervals_u32_by_start(intervals: &mut [IntervalU32]) -> bool {
         }
 
         for interval in &src {
-            let bucket = ((interval.start >> shift) & 0xFFFF) as usize;
+            let Ok(bucket) = usize::try_from((interval.start >> shift) & 0xFFFF) else {
+                return false;
+            };
             let Some(out_idx) = counts.get(bucket).copied() else {
                 return false;
             };

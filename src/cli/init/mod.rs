@@ -24,7 +24,10 @@ use self::templates::{
     resolve_systemd_dir,
 };
 
-#[allow(clippy::print_stdout)]
+#[allow(
+    clippy::print_stdout,
+    reason = "CLI command writes its result to standard output"
+)]
 pub fn run_init_command() -> Result<(), KidoboError> {
     let path_input = PathResolutionInput::from_process(None);
     let paths = resolve_paths_without_config(&path_input)?;
@@ -127,7 +130,10 @@ fn infer_kido_root_override(paths: &ResolvedPaths) -> Option<PathBuf> {
     Some(root)
 }
 
-#[allow(clippy::print_stdout)]
+#[allow(
+    clippy::print_stdout,
+    reason = "CLI command writes its summary to standard output"
+)]
 fn print_init_summary(summary: &InitSummary) {
     print!("{}", provision::render_init_summary(summary));
 }

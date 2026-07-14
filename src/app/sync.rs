@@ -283,7 +283,7 @@ pub(crate) fn ensure_within_maxelem(
     spec: &IpsetSetSpec,
     entries: usize,
 ) -> Result<(), KidoboError> {
-    if entries <= spec.maxelem as usize {
+    if entries <= usize::try_from(spec.maxelem).unwrap_or(usize::MAX) {
         return Ok(());
     }
 

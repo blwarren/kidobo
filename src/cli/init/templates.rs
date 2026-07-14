@@ -62,11 +62,12 @@ Wants=network-online.target\n\
 Type=oneshot\n",
     );
 
-    let _ = writeln!(&mut output, "Environment=\"KIDOBO_LOG_FORMAT=journal\"");
+    let _journal_environment_write =
+        writeln!(&mut output, "Environment=\"KIDOBO_LOG_FORMAT=journal\"");
 
     if let Some(root) = kido_root_override {
         let root_value = root.to_string_lossy();
-        let _ = writeln!(
+        let _root_environment_write = writeln!(
             &mut output,
             "Environment=\"KIDOBO_ROOT={}\"",
             escape_systemd_value(root_value.as_ref())
@@ -74,7 +75,7 @@ Type=oneshot\n",
     }
 
     let executable = executable_path.to_string_lossy();
-    let _ = writeln!(
+    let _exec_start_write = writeln!(
         &mut output,
         "ExecStart=\"{}\" sync",
         escape_systemd_value(executable.as_ref())

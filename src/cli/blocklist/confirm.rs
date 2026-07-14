@@ -61,7 +61,10 @@ fn partial_entry_strings(partial_matches: &[PartialMatch]) -> Vec<String> {
     entries
 }
 
-#[allow(clippy::print_stdout)]
+#[allow(
+    clippy::print_stdout,
+    reason = "Interactive CLI prompt writes directly to standard output"
+)]
 fn prompt_confirmation() -> Result<bool, KidoboError> {
     print!("Remove these entries as well? [y/N]: ");
     io::stdout()
@@ -81,7 +84,10 @@ fn prompt_confirmation() -> Result<bool, KidoboError> {
     Ok(matches!(response.as_str(), "y" | "yes"))
 }
 
-#[allow(clippy::print_stdout)]
+#[allow(
+    clippy::print_stdout,
+    reason = "Interactive CLI confirmation writes directly to standard output"
+)]
 pub(super) fn confirm_partial_matches(
     heading: &str,
     partial_matches: &[PartialMatch],

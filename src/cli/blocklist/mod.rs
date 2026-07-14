@@ -12,7 +12,11 @@ use crate::adapters::lock::acquire_non_blocking;
 use crate::adapters::path::{PathResolutionInput, resolve_paths};
 use crate::error::KidoboError;
 
-#[allow(clippy::print_stdout, clippy::print_stderr)]
+#[allow(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    reason = "CLI command writes results and diagnostics to the terminal"
+)]
 pub fn run_ban_command(
     target: Option<&str>,
     file: Option<&Path>,
@@ -43,7 +47,11 @@ pub fn run_ban_command(
     targets::run_ban_target_command(&paths.blocklist_file, target)
 }
 
-#[allow(clippy::print_stdout, clippy::print_stderr)]
+#[allow(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    reason = "CLI command writes results and diagnostics to the terminal"
+)]
 pub fn run_unban_command(
     target: Option<&str>,
     file: Option<&Path>,
