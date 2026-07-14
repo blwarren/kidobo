@@ -221,8 +221,8 @@ Development commands are defined in `Justfile`.
 
 ```bash
 cargo install --locked just --version 1.55.1
-just pre-commit-fast
-just pre-push-tests
+just check
+just ci
 just release-notes-check
 ```
 

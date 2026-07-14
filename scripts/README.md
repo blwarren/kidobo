@@ -18,11 +18,11 @@ cargo install --locked just --version 1.55.1
 
 ## Common Commands
 
-- `just pre-commit-fast`
-- `just pre-push-tests`
-- `just post-coding-gates`
-- `just gates-minimum`
-- `just gates-extended`
+- `just check`
+- `just ci`
+- `just coverage`
+- `just update`
+- `just udeps`
 - `just release-notes-check`
 - `just publish-release 0.11.0` (a leading `v` is also accepted; branch switching is automatic)
 - `just mutants`

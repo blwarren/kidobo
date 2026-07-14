@@ -31,24 +31,8 @@ jobs:
       - name: Install just
         run: cargo install --locked just --version "${JUST_VERSION}"
 
-      - name: Run quality gates
-        run: just ci-quality
+      - name: Install CI audit tools
+        run: just _install-deny _install-audit
 
-  supply-chain:
-    name: supply-chain
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.93.1
-
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
-
-      - name: Install just
-        run: cargo install --locked just --version "${JUST_VERSION}"
-
-      - name: Run supply-chain checks
-        run: just ci-supply-chain
+      - name: Run CI checks
+        run: just release-notes-check ci

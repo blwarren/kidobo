@@ -38,6 +38,9 @@ jobs:
       - name: Install just
         run: cargo install --locked just --version "${JUST_VERSION}"
 
+      - name: Install CI audit tools
+        run: just _install-deny _install-audit
+
       - name: Validate release tag format
         shell: bash
         run: |
@@ -73,10 +76,7 @@ jobs:
           fi
 
       - name: Run quality gates
-        run: just ci-quality
-
-      - name: Build release binary
-        run: cargo build --release --locked --bin kidobo
+        run: just release-notes-check ci
 
       - name: Package artifacts
         shell: bash

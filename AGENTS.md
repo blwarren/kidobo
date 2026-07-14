@@ -87,14 +87,14 @@ in new scripts or documentation.
 After Rust, test, or executable-script changes, run:
 
 ```bash
-just gates-minimum
+just check
 ```
 
 When runtime behavior, dependencies, the toolchain, CI, or release policy changes, run the extended
 gate instead:
 
 ```bash
-just gates-extended
+just ci coverage
 ```
 
 Documentation-only changes do not require Rust gates unless they affect executable examples, generated

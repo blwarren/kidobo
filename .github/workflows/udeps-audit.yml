@@ -31,4 +31,4 @@ jobs:
         run: cargo install --locked just --version "${JUST_VERSION}"
 
       - name: Run udeps checks
-        run: just ci-udeps
+        run: just udeps

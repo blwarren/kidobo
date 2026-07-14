@@ -123,7 +123,7 @@ git add Cargo.toml Cargo.lock README.md CHANGELOG.md release-notes
 just release-notes-check
 
 echo "[release] running release quality gates"
-just ci-quality
+just _install-deny _install-audit ci
 git diff --check --cached
 if ! git diff --quiet || [[ -n "$(git ls-files --others --exclude-standard)" ]]; then
     echo "validation produced uncommitted changes outside the staged release update" >&2
