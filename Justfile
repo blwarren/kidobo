@@ -16,7 +16,7 @@ lint:
 
 # Run the workspace test suite, including documentation tests.
 test:
-    @cargo test --workspace --locked
+    @cargo test --workspace --locked --quiet
 
 # Format Rust sources.
 format:
