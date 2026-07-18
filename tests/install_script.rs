@@ -290,12 +290,19 @@ fn installer_staging_failure_preserves_the_existing_binary() {
         &temp.path().join("fake-bin/install"),
         "#!/usr/bin/env bash\nexit 41\n",
     );
+    write_executable(
+        &temp.path().join("fake-bin/sudo"),
+        "#!/usr/bin/env bash\nexit 42\n",
+    );
 
     let output = installer_command(&temp, &release_dir, &install_dir)
         .output()
         .expect("run installer");
 
     assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("failed to stage kidobo for installation")
+    );
     assert_old_binary_and_no_staging_files(&install_dir, &old_binary);
 }
 
