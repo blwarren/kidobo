@@ -34,14 +34,15 @@ impl OfflineLookupProvider for LocalBlocklistLookupProvider {
         "local-blocklist"
     }
 
-    fn load_offline(
+    fn append_offline(
         &self,
         context: &OfflineLookupContext<'_>,
-    ) -> Result<Vec<LookupSourceEntry>, AppError> {
+        entries: &mut Vec<LookupSourceEntry>,
+    ) -> Result<(), AppError> {
         if !context.paths.blocklist_file.exists() {
-            return Ok(Vec::new());
+            return Ok(());
         }
-        read_source_file(&context.paths.blocklist_file, "internal:blocklist")
+        append_source_file(&context.paths.blocklist_file, "internal:blocklist", entries)
             .map_err(|error| map_lookup_error(&error))
     }
 }
@@ -54,13 +55,19 @@ impl OfflineLookupProvider for RemoteCacheLookupProvider {
         "remote-cache"
     }
 
-    fn load_offline(
+    fn append_offline(
         &self,
         context: &OfflineLookupContext<'_>,
-    ) -> Result<Vec<LookupSourceEntry>, AppError> {
+        entries: &mut Vec<LookupSourceEntry>,
+    ) -> Result<(), AppError> {
         let remote_sources = load_remote_sources(&context.paths.remote_cache_dir)
             .map_err(|error| map_lookup_error(&LookupSourceLoadError::from(error)))?;
-        let mut entries = Vec::new();
+        entries.reserve(
+            remote_sources
+                .iter()
+                .map(|source| source.entries.len())
+                .sum(),
+        );
         for source in remote_sources {
             let source_label: Arc<str> = Arc::from(source.label);
             entries.extend(source.entries.into_iter().map(|entry| LookupSourceEntry {
@@ -69,7 +76,7 @@ impl OfflineLookupProvider for RemoteCacheLookupProvider {
                 cidr: entry.cidr,
             }));
         }
-        Ok(entries)
+        Ok(())
     }
 }
 
@@ -81,19 +88,15 @@ impl OfflineLookupProvider for ConfigSafelistLookupProvider {
         "config-safelist"
     }
 
-    fn load_offline(
+    fn append_offline(
         &self,
         context: &OfflineLookupContext<'_>,
-    ) -> Result<Vec<LookupSourceEntry>, AppError> {
-        let mut entries = Vec::new();
+        entries: &mut Vec<LookupSourceEntry>,
+    ) -> Result<(), AppError> {
         if let Some(config) = context.config {
-            append_canonical_entries(
-                &mut entries,
-                "safelist:config",
-                config.safe.ips.iter().copied(),
-            );
+            append_canonical_entries(entries, "safelist:config", config.safe.ips.iter().copied());
         }
-        Ok(entries)
+        Ok(())
     }
 }
 
@@ -105,15 +108,16 @@ impl OfflineLookupProvider for GithubMetaLookupProvider {
         "github-meta-cache"
     }
 
-    fn load_offline(
+    fn append_offline(
         &self,
         context: &OfflineLookupContext<'_>,
-    ) -> Result<Vec<LookupSourceEntry>, AppError> {
+        entries: &mut Vec<LookupSourceEntry>,
+    ) -> Result<(), AppError> {
         let Some(config) = context
             .config
             .filter(|config| config.safe.include_github_meta)
         else {
-            return Ok(Vec::new());
+            return Ok(());
         };
         let Some(networks) = load_cached_github_meta_safelist(
             &context.paths.remote_cache_dir,
@@ -123,11 +127,10 @@ impl OfflineLookupProvider for GithubMetaLookupProvider {
             warn!(
                 "lookup GitHub meta safelist cache unavailable; GitHub safelist was not evaluated"
             );
-            return Ok(Vec::new());
+            return Ok(());
         };
-        let mut entries = Vec::new();
-        append_canonical_entries(&mut entries, "safelist:github-meta", networks);
-        Ok(entries)
+        append_canonical_entries(entries, "safelist:github-meta", networks);
+        Ok(())
     }
 }
 
@@ -139,27 +142,27 @@ impl OfflineLookupProvider for AsnCacheLookupProvider {
         "asn-cache"
     }
 
-    fn load_offline(
+    fn append_offline(
         &self,
         context: &OfflineLookupContext<'_>,
-    ) -> Result<Vec<LookupSourceEntry>, AppError> {
+        entries: &mut Vec<LookupSourceEntry>,
+    ) -> Result<(), AppError> {
         let Some(config) = context.config else {
-            return Ok(Vec::new());
+            return Ok(());
         };
         let cache_dir = context.paths.cache_dir.join("asn");
-        let mut entries = Vec::new();
         for asn in &config.asn.banned {
             let prefixes = load_cached_asn_prefixes(*asn, &cache_dir)
                 .map_err(|error| map_lookup_error(&LookupSourceLoadError::from(error)))?;
             if let Some(prefixes) = prefixes {
-                append_canonical_entries(&mut entries, &format!("asn:AS{asn}"), prefixes);
+                append_canonical_entries(entries, &format!("asn:AS{asn}"), prefixes);
             } else {
                 warn!(
                     "lookup ASN cache unavailable for AS{asn}; this configured ASN was not evaluated"
                 );
             }
         }
-        Ok(entries)
+        Ok(())
     }
 }
 
@@ -191,10 +194,11 @@ where
     }));
 }
 
-fn read_source_file(
+fn append_source_file(
     path: &Path,
     source_label: &str,
-) -> Result<Vec<LookupSourceEntry>, LookupSourceLoadError> {
+    entries: &mut Vec<LookupSourceEntry>,
+) -> Result<(), LookupSourceLoadError> {
     let contents = read_to_string_with_limit(path, SOURCE_FILE_READ_LIMIT).map_err(|err| {
         LookupSourceLoadError::from(SourceLoadError::Source {
             path: path.to_path_buf(),
@@ -203,15 +207,17 @@ fn read_source_file(
     })?;
 
     let source_label: Arc<str> = Arc::from(source_label);
-    Ok(contents
-        .lines()
-        .filter_map(parse_cidr_source_line)
-        .map(|(cidr, token)| LookupSourceEntry {
-            source_label: Arc::clone(&source_label),
-            source_line: token.to_string(),
-            cidr,
-        })
-        .collect())
+    entries.extend(
+        contents
+            .lines()
+            .filter_map(parse_cidr_source_line)
+            .map(|(cidr, token)| LookupSourceEntry {
+                source_label: Arc::clone(&source_label),
+                source_line: token.to_string(),
+                cidr,
+            }),
+    );
+    Ok(())
 }
 
 #[cfg(test)]

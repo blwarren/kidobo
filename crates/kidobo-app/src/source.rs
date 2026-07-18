@@ -116,10 +116,11 @@ pub struct OfflineLookupContext<'a> {
 pub trait OfflineLookupProvider: Send + Sync {
     fn id(&self) -> &'static str;
 
-    fn load_offline(
+    fn append_offline(
         &self,
         context: &OfflineLookupContext<'_>,
-    ) -> Result<Vec<LookupSourceEntry>, AppError>;
+        entries: &mut Vec<LookupSourceEntry>,
+    ) -> Result<(), AppError>;
 }
 
 #[derive(Default)]
@@ -151,7 +152,7 @@ impl OfflineLookupRegistry {
     ) -> Result<Vec<LookupSourceEntry>, AppError> {
         let mut entries = Vec::new();
         for provider in &self.providers {
-            entries.extend(provider.load_offline(context)?);
+            provider.append_offline(context, &mut entries)?;
         }
         entries.sort_by(|a, b| {
             (&a.source_label, &a.source_line).cmp(&(&b.source_label, &b.source_line))
@@ -199,11 +200,12 @@ mod tests {
             self.0
         }
 
-        fn load_offline(
+        fn append_offline(
             &self,
             _context: &super::OfflineLookupContext<'_>,
-        ) -> Result<Vec<kidobo_core::lookup::LookupSourceEntry>, AppError> {
-            Ok(Vec::new())
+            _entries: &mut Vec<kidobo_core::lookup::LookupSourceEntry>,
+        ) -> Result<(), AppError> {
+            Ok(())
         }
     }
 

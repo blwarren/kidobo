@@ -22,7 +22,8 @@ case "$#" in
     cargo bench --bench core_perf -- --save-baseline "$1"
     ;;
   2)
-    cargo bench --bench core_perf -- --baseline "$1" --save-baseline "$2"
+    cargo bench --bench core_perf -- --baseline "$1"
+    cargo bench --bench core_perf -- --save-baseline "$2"
     ;;
   *)
     usage

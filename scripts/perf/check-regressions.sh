@@ -16,8 +16,8 @@ Usage:
 Options:
   --baseline <name>            Criterion baseline name to compare against (default: main)
   --max-slowdown-pct <value>   Allowed slowdown percentage for benchmark mean point estimate (default: 10)
-  --max-rss-kib <value>        Optional max RSS threshold (KiB) for lookup probe
-  --max-elapsed-s <value>      Optional max elapsed seconds threshold for lookup probe
+  --max-rss-kib <value>        Optional per-format max RSS threshold (KiB) for lookup probe
+  --max-elapsed-s <value>      Optional per-format max elapsed seconds threshold for lookup probe
   --skip-rss-probe             Skip lookup RSS/time probe checks
   --bench-name <name>          Cargo bench target name (default: core_perf)
   -h, --help                   Show this help
@@ -116,18 +116,26 @@ if [[ "${run_rss_probe}" == "1" ]]; then
   rss_output="$(scripts/perf/measure-lookup-rss.sh)"
   echo "${rss_output}"
 
-  rss_kib="$(awk -F= '$1=="max_rss_kib"{print $2}' <<< "${rss_output}")"
-  elapsed_s="$(awk -F= '$1=="elapsed_s"{print $2}' <<< "${rss_output}")"
+  for format in human tsv; do
+    rss_kib="$(awk -F= -v key="${format}_max_rss_kib" '$1==key{print $2}' <<< "${rss_output}")"
+    elapsed_s="$(awk -F= -v key="${format}_elapsed_s" '$1==key{print $2}' <<< "${rss_output}")"
 
-  if [[ -n "${max_rss_kib}" ]] && awk -v v="${rss_kib}" -v t="${max_rss_kib}" 'BEGIN { exit !(v > t) }'; then
-    regressions=$((regressions + 1))
-    echo "[perf-check] FAIL lookup max_rss_kib=${rss_kib} exceeds threshold ${max_rss_kib}"
-  fi
+    if [[ -z "${rss_kib}" || -z "${elapsed_s}" ]]; then
+      regressions=$((regressions + 1))
+      echo "[perf-check] FAIL lookup ${format}: probe metrics are incomplete"
+      continue
+    fi
 
-  if [[ -n "${max_elapsed_s}" ]] && awk -v v="${elapsed_s}" -v t="${max_elapsed_s}" 'BEGIN { exit !(v > t) }'; then
-    regressions=$((regressions + 1))
-    echo "[perf-check] FAIL lookup elapsed_s=${elapsed_s} exceeds threshold ${max_elapsed_s}"
-  fi
+    if [[ -n "${max_rss_kib}" ]] && awk -v v="${rss_kib}" -v t="${max_rss_kib}" 'BEGIN { exit !(v > t) }'; then
+      regressions=$((regressions + 1))
+      echo "[perf-check] FAIL lookup ${format}_max_rss_kib=${rss_kib} exceeds threshold ${max_rss_kib}"
+    fi
+
+    if [[ -n "${max_elapsed_s}" ]] && awk -v v="${elapsed_s}" -v t="${max_elapsed_s}" 'BEGIN { exit !(v > t) }'; then
+      regressions=$((regressions + 1))
+      echo "[perf-check] FAIL lookup ${format}_elapsed_s=${elapsed_s} exceeds threshold ${max_elapsed_s}"
+    fi
+  done
 fi
 
 if [[ ${regressions} -gt 0 ]]; then

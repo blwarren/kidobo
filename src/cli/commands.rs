@@ -1,5 +1,3 @@
-use std::collections::BTreeSet;
-use std::fmt::Write as _;
 use std::path::PathBuf;
 
 use log::warn;
@@ -75,16 +73,14 @@ fn run_lookup_command(
         warn!("{}", notice.message);
     }
 
-    let rendered = match format {
-        LookupFormat::Human => render_human_lookup(
+    match format {
+        LookupFormat::Human => write_human_lookup(
             &outcome,
             should_color_lookup(io.stdout_is_terminal, io.no_color),
+            io.stdout,
         ),
-        LookupFormat::Tsv => render_tsv_lookup(&outcome),
-    };
-    io.stdout
-        .write_all(rendered.as_bytes())
-        .map_err(cli_io_error)?;
+        LookupFormat::Tsv => write_tsv_lookup(&outcome, io.stdout),
+    }?;
 
     for invalid in &outcome.invalid_targets {
         writeln!(io.stderr, "invalid target: {invalid}").map_err(cli_io_error)?;
@@ -105,85 +101,90 @@ const LOOKUP_STATUS_WIDTH: usize = 8;
 const LOOKUP_SOURCE_WIDTH: usize = 44;
 const LOOKUP_ENTRY_WIDTH: usize = 30;
 
-fn render_human_lookup(outcome: &LookupOutcome, color: bool) -> String {
-    let mut output = String::new();
-    let _top = writeln!(&mut output, "{}", lookup_table_border('┌', '┬', '┐'));
+fn write_human_lookup(
+    outcome: &LookupOutcome,
+    color: bool,
+    output: &mut dyn std::io::Write,
+) -> Result<(), KidoboError> {
+    writeln!(output, "{}", lookup_table_border('┌', '┬', '┐')).map_err(cli_io_error)?;
     for row in format_lookup_table_row(["Target", "Status", "Source", "Matched Entry"], false) {
-        let _row = writeln!(&mut output, "{row}");
+        writeln!(output, "{row}").map_err(cli_io_error)?;
     }
-    let _separator = writeln!(&mut output, "{}", lookup_table_border('├', '┼', '┤'));
+    writeln!(output, "{}", lookup_table_border('├', '┼', '┤')).map_err(cli_io_error)?;
 
-    let mut total_count = 0_usize;
-    let mut matched_count = 0_usize;
-    for target in &outcome.valid_targets {
-        total_count += 1;
-        let matches = outcome
-            .matches
-            .iter()
-            .filter(|source| source.target == *target)
-            .collect::<Vec<_>>();
-        if matches.is_empty() {
-            for row in format_lookup_table_row([target, "NO MATCH", "—", "—"], color) {
-                let _row = writeln!(&mut output, "{row}");
+    let total_count = outcome.targets.len();
+    let matched_count = outcome
+        .targets
+        .iter()
+        .filter(|target| !target.matches.is_empty())
+        .count();
+    for target in &outcome.targets {
+        if target.matches.is_empty() {
+            for row in format_lookup_table_row([&target.target, "NO MATCH", "—", "—"], color) {
+                writeln!(output, "{row}").map_err(cli_io_error)?;
             }
         } else {
-            matched_count += 1;
-            for source in matches {
+            for source in &target.matches {
                 for row in format_lookup_table_row(
                     [
-                        target,
+                        &target.target,
                         "MATCH",
-                        &source.source_label,
+                        source.source_label.as_ref(),
                         &source.matched_source_entry,
                     ],
                     color,
                 ) {
-                    let _row = writeln!(&mut output, "{row}");
+                    writeln!(output, "{row}").map_err(cli_io_error)?;
                 }
             }
         }
     }
 
-    let _bottom = writeln!(&mut output, "{}", lookup_table_border('└', '┴', '┘'));
+    writeln!(output, "{}", lookup_table_border('└', '┴', '┘')).map_err(cli_io_error)?;
     let unmatched_count = total_count.saturating_sub(matched_count);
-    let _summary = writeln!(
-        &mut output,
+    writeln!(
+        output,
         "\nSummary\n  Targets:    {total_count}\n  Matched:    {matched_count}\n  Unmatched:  {unmatched_count}\n  Match rate: {}",
         percent_str(matched_count, total_count)
-    );
-    output
+    )
+    .map_err(cli_io_error)
 }
 
-fn render_tsv_lookup(outcome: &LookupOutcome) -> String {
-    let mut output = String::new();
-    let mut matched_targets = BTreeSet::new();
-    for source in &outcome.matches {
-        matched_targets.insert(source.target.clone());
-        let _match = writeln!(
-            &mut output,
-            "{}\t{}\t{}",
-            source.target, source.source_label, source.matched_source_entry
-        );
+fn write_tsv_lookup(
+    outcome: &LookupOutcome,
+    output: &mut dyn std::io::Write,
+) -> Result<(), KidoboError> {
+    for target in &outcome.targets {
+        for source in &target.matches {
+            writeln!(
+                output,
+                "{}\t{}\t{}",
+                target.target, source.source_label, source.matched_source_entry
+            )
+            .map_err(cli_io_error)?;
+        }
     }
 
     if outcome.file_mode {
-        for target in &outcome.valid_targets {
-            if !matched_targets.contains(target) {
-                let _no_match = writeln!(&mut output, "{target}\tNO_MATCH");
+        for target in &outcome.targets {
+            if target.matches.is_empty() {
+                writeln!(output, "{}\tNO_MATCH", target.target).map_err(cli_io_error)?;
             }
         }
-        let matched_count = matched_targets
+        let matched_count = outcome
+            .targets
             .iter()
-            .filter(|target| outcome.valid_targets.contains(*target))
+            .filter(|target| !target.matches.is_empty())
             .count();
-        let _summary = writeln!(
-            &mut output,
+        writeln!(
+            output,
             "summary: total_ips={} matched_ips={matched_count} matched_pct={}",
-            outcome.valid_targets.len(),
-            percent_str(matched_count, outcome.valid_targets.len())
-        );
+            outcome.targets.len(),
+            percent_str(matched_count, outcome.targets.len())
+        )
+        .map_err(cli_io_error)?;
     }
-    output
+    Ok(())
 }
 
 fn should_color_lookup(stdout_is_terminal: bool, no_color_set: bool) -> bool {

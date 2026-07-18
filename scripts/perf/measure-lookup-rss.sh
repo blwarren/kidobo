@@ -40,14 +40,25 @@ tmp_root="$(mktemp -d)"
 trap 'rm -rf "${tmp_root}"' EXIT
 
 export KIDOBO_ROOT="${tmp_root}/root"
-binary="target/release/kidobo"
+binary="${KIDOBO_PERF_BINARY:-target/release/kidobo}"
 blocklist_path="${KIDOBO_ROOT}/data/blocklist.txt"
 targets_path="${tmp_root}/targets.txt"
-lookup_output_path="${tmp_root}/lookup.out"
-time_output_path="${tmp_root}/time.out"
 
-cargo build --release --locked --bin kidobo >/dev/null
-"${binary}" init >/dev/null
+if [[ -z "${KIDOBO_PERF_BINARY:-}" ]]; then
+  cargo build --release --locked --bin kidobo >/dev/null
+fi
+if [[ ! -x "${binary}" ]]; then
+  echo "error: lookup probe binary is not executable: ${binary}" >&2
+  exit 1
+fi
+
+mkdir -p "${KIDOBO_ROOT}/config" "${KIDOBO_ROOT}/data" "${KIDOBO_ROOT}/cache/remote"
+printf '%s\n' \
+  '[ipset]' \
+  "set_name = 'kidobo'" \
+  '[safe]' \
+  'include_github_meta = false' \
+  > "${KIDOBO_ROOT}/config/config.toml"
 
 awk -v count="${blocks}" 'BEGIN {
   for (i = 0; i < count; i++) {
@@ -71,24 +82,34 @@ awk -v count="${half_targets}" 'BEGIN {
   }
 }' > "${targets_path}"
 
-/usr/bin/time -f 'elapsed_s=%e
-max_rss_kib=%M' \
-  bash -lc '
-    set -euo pipefail
-    lookup_cmd=("$1" lookup --file "$2")
-    if [[ -n "$4" ]]; then
-      ulimit -Sv "$4"
-    fi
-    if [[ -n "$3" ]]; then
-      exec taskset -c "$3" "${lookup_cmd[@]}"
-    fi
-    exec "${lookup_cmd[@]}"
-  ' -- "${binary}" "${targets_path}" "${cpu_core}" "${mem_limit_kib}" \
-  > "${lookup_output_path}" 2> "${time_output_path}"
+run_probe() {
+  local format="$1"
+  local lookup_output_path="${tmp_root}/lookup-${format}.out"
+  local time_output_path="${tmp_root}/time-${format}.out"
+
+  /usr/bin/time -f "${format}_elapsed_s=%e
+${format}_max_rss_kib=%M" \
+    bash -lc '
+      set -euo pipefail
+      lookup_cmd=("$1" lookup --file "$2" --format "$5")
+      if [[ -n "$4" ]]; then
+        ulimit -Sv "$4"
+      fi
+      if [[ -n "$3" ]]; then
+        exec taskset -c "$3" "${lookup_cmd[@]}"
+      fi
+      exec "${lookup_cmd[@]}"
+    ' -- "${binary}" "${targets_path}" "${cpu_core}" "${mem_limit_kib}" "${format}" \
+    > "${lookup_output_path}" 2> "${time_output_path}"
+
+  printf '%s_output_lines=%s\n' \
+    "${format}" \
+    "$(wc -l < "${lookup_output_path}" | tr -d ' ')"
+  cat "${time_output_path}"
+}
 
 printf 'blocklist_entries=%s\n' "${blocks}"
 printf 'target_entries=%s\n' "$((half_targets * 2))"
-printf 'lookup_matches=%s\n' "$(wc -l < "${lookup_output_path}" | tr -d ' ')"
 if [[ -n "${cpu_core}" ]]; then
   printf 'cpu_core=%s\n' "${cpu_core}"
 else
@@ -99,4 +120,5 @@ if [[ -n "${mem_limit_kib}" ]]; then
 else
   printf 'mem_limit_kib=unconstrained\n'
 fi
-cat "${time_output_path}"
+run_probe human
+run_probe tsv

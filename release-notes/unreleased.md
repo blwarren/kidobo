@@ -8,6 +8,9 @@
   extraction, staging, or verification fails.
 - Cancelling `just publish-release`, or encountering a validation failure,
   restores the branch from which the release command was started.
+- Large offline lookups now group matches per target, stream rendered output,
+  and avoid duplicate source buffers, reducing high-match runtime and peak
+  memory use without changing human or TSV output.
 
 ### Changed
 

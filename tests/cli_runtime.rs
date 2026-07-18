@@ -549,17 +549,14 @@ fn lookup_file_mode_uses_local_sources_and_exits_zero() {
     assert_eq!(output.status.code(), Some(0));
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("203.0.113.7\tinternal:blocklist\t203.0.113.7"),
-        "unexpected lookup output: {stdout}"
-    );
-    assert!(
-        stdout.contains("198.51.100.9\tNO_MATCH"),
-        "missing no-match output: {stdout}"
-    );
-    assert!(
-        stdout.contains("summary: total_ips=2 matched_ips=1 matched_pct=50%"),
-        "missing lookup summary output: {stdout}"
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        vec![
+            "203.0.113.7\tinternal:blocklist\t203.0.113.7",
+            "198.51.100.9\tNO_MATCH",
+            "summary: total_ips=2 matched_ips=1 matched_pct=50%",
+        ],
+        "file lookup ordering changed: {stdout}"
     );
 }
 

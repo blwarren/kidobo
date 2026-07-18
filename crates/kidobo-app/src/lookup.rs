@@ -1,7 +1,8 @@
-use std::collections::BTreeSet;
 use std::path::PathBuf;
+use std::sync::Arc;
 
-use kidobo_core::lookup::{LookupMatch, parse_target_strict, run_lookup};
+use kidobo_core::lookup::run_lookup_by_target;
+use kidobo_core::network::CanonicalCidr;
 
 use crate::AppError;
 use crate::paths::{ConfigRequirement, PathResolutionInput};
@@ -21,10 +22,21 @@ pub struct LookupRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LookupSourceMatch {
+    pub source_label: Arc<str>,
+    pub matched_source_entry: String,
+    pub matched_cidr: CanonicalCidr,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LookupTargetOutcome {
+    pub target: String,
+    pub matches: Vec<LookupSourceMatch>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LookupOutcome {
-    pub targets: Vec<String>,
-    pub valid_targets: BTreeSet<String>,
-    pub matches: Vec<LookupMatch>,
+    pub targets: Vec<LookupTargetOutcome>,
     pub invalid_targets: Vec<String>,
     pub file_mode: bool,
     pub notices: Vec<Notice>,
@@ -65,17 +77,24 @@ pub fn execute(
     };
     let source_entries = dependencies.sources.load(&context)?;
 
-    let report = run_lookup(&targets, &source_entries);
-    let valid_targets = targets
-        .iter()
-        .filter_map(|target| parse_target_strict(target).ok().map(|_| target.clone()))
-        .collect::<BTreeSet<_>>();
+    let mut target_outcomes = Vec::with_capacity(targets.len());
+    let invalid_targets = run_lookup_by_target(&targets, &source_entries, |target, matches| {
+        target_outcomes.push(LookupTargetOutcome {
+            target: target.to_string(),
+            matches: matches
+                .iter()
+                .map(|source| LookupSourceMatch {
+                    source_label: Arc::clone(&source.source_label),
+                    matched_source_entry: source.source_line.clone(),
+                    matched_cidr: source.cidr,
+                })
+                .collect(),
+        });
+    });
 
     Ok(LookupOutcome {
-        targets,
-        valid_targets,
-        matches: report.matches,
-        invalid_targets: report.invalid_targets,
+        targets: target_outcomes,
+        invalid_targets,
         file_mode,
         notices,
     })
@@ -142,15 +161,17 @@ mod tests {
             "cached"
         }
 
-        fn load_offline(
+        fn append_offline(
             &self,
             _context: &OfflineLookupContext<'_>,
-        ) -> Result<Vec<LookupSourceEntry>, AppError> {
-            Ok(vec![LookupSourceEntry {
+            entries: &mut Vec<LookupSourceEntry>,
+        ) -> Result<(), AppError> {
+            entries.push(LookupSourceEntry {
                 source_label: Arc::from("cache:test"),
                 source_line: "198.51.100.0/24".to_string(),
                 cidr: parse_ip_cidr_token("198.51.100.0/24").expect("cidr"),
-            }])
+            });
+            Ok(())
         }
     }
 
@@ -181,10 +202,16 @@ mod tests {
         .expect("lookup");
 
         assert!(outcome.file_mode);
-        assert_eq!(outcome.matches.len(), 1);
-        assert_eq!(outcome.matches[0].target, "198.51.100.8");
+        assert_eq!(outcome.targets.len(), 2);
+        assert_eq!(outcome.targets[0].target, "198.51.100.8");
+        assert_eq!(outcome.targets[0].matches.len(), 1);
+        assert_eq!(
+            outcome.targets[0].matches[0].source_label.as_ref(),
+            "cache:test"
+        );
+        assert_eq!(outcome.targets[1].target, "203.0.113.8");
+        assert!(outcome.targets[1].matches.is_empty());
         assert_eq!(outcome.invalid_targets, ["invalid"]);
-        assert_eq!(outcome.valid_targets.len(), 2);
         assert_eq!(outcome.notices.len(), 1);
         assert!(
             outcome.notices[0]
