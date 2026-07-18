@@ -939,6 +939,24 @@ dependencies = [
  "ctrlc",
  "env_logger",
  "fs2",
+ "kidobo-adapters",
+ "kidobo-app",
+ "kidobo-core",
+ "log",
+ "reqwest",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
+name = "kidobo-adapters"
+version = "0.0.0"
+dependencies = [
+ "fs2",
+ "kidobo-app",
+ "kidobo-core",
  "log",
  "nix",
  "reqwest",
@@ -947,6 +965,25 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
+ "thiserror",
+ "toml_edit",
+]
+
+[[package]]
+name = "kidobo-app"
+version = "0.0.0"
+dependencies = [
+ "kidobo-core",
+ "serde",
+ "thiserror",
+]
+
+[[package]]
+name = "kidobo-core"
+version = "0.0.0"
+dependencies = [
+ "reqwest",
+ "serde",
  "thiserror",
  "toml_edit",
 ]

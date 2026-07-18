@@ -7,13 +7,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use kidobo::core::config::Config;
-use kidobo::core::lookup::{LookupSourceEntry, run_lookup};
-use kidobo::core::network::{
+use kidobo_core::config::Config;
+use kidobo_core::lookup::{LookupSourceEntry, run_lookup};
+use kidobo_core::network::{
     CanonicalCidr, Ipv4Cidr, Ipv6Cidr, collapse_ipv4, parse_ip_cidr_strict, subtract_safelist_ipv4,
     subtract_safelist_ipv6,
 };
-use kidobo::core::sync::compute_effective_blocklists;
+use kidobo_core::sync::compute_effective_blocklists;
 
 const BENCH_BLOCKLIST_READ_LIMIT: usize = 8 * 1024 * 1024;
 const BENCH_REMOTE_IPLIST_READ_LIMIT: usize = 16 * 1024 * 1024;

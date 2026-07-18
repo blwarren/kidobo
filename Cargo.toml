@@ -1,3 +1,44 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/kidobo-adapters",
+    "crates/kidobo-app",
+    "crates/kidobo-core",
+]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+rust-version = "1.93.1"
+
+[workspace.dependencies]
+clap = { version = "4.5", features = ["derive"] }
+criterion = "0.8"
+ctrlc = "3.4"
+env_logger = "0.11"
+fs2 = "0.4"
+kidobo-adapters = { path = "crates/kidobo-adapters" }
+kidobo-app = { path = "crates/kidobo-app" }
+kidobo-core = { path = "crates/kidobo-core" }
+log = "0.4"
+nix = { version = "0.31", default-features = false, features = ["process", "signal"] }
+reqwest = { version = "0.13", default-features = false }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+tempfile = "3"
+thiserror = "2"
+toml_edit = { version = "0.25", features = ["serde"] }
+
+[workspace.lints.rust]
+dead_code = "deny"
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "deny"
+pedantic = "warn"
+
 [package]
 name = "kidobo"
 version = "0.11.1"
@@ -16,23 +57,22 @@ name = "kidobo"
 path = "src/main.rs"
 
 [dependencies]
-clap = { version = "4.5", features = ["derive"] }
-ctrlc = "3.4"
-env_logger = "0.11"
-fs2 = "0.4"
-log = "0.4"
-nix = { version = "0.31", default-features = false, features = ["process", "signal"] }
-reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls-no-provider"] }
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-sha2 = "0.11"
-thiserror = "2"
-toml_edit = { version = "0.25", features = ["serde"] }
+clap.workspace = true
+ctrlc.workspace = true
+env_logger.workspace = true
+kidobo-adapters.workspace = true
+kidobo-app.workspace = true
+log.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
 
 [dev-dependencies]
-criterion = "0.8"
-tempfile = "3"
+criterion.workspace = true
+fs2.workspace = true
+kidobo-core.workspace = true
+reqwest = { workspace = true, features = ["blocking", "rustls-no-provider"] }
+sha2.workspace = true
+tempfile.workspace = true
 
 [[bench]]
 name = "core_perf"

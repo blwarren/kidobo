@@ -1,12 +1,6 @@
 #![forbid(unsafe_code)]
 #![deny(dead_code)]
 #![deny(clippy::all)]
-#![deny(
-    clippy::allow_attributes_without_reason,
-    clippy::assertions_on_result_states,
-    clippy::cargo_common_metadata,
-    clippy::wildcard_dependencies
-)]
 #![warn(clippy::pedantic)]
 #![allow(
     clippy::match_same_arms,
@@ -48,12 +42,17 @@
     )
 )]
 
-mod cli;
+//! Application use cases and ports for Kidobo.
+
+pub mod blocklist;
+pub mod doctor;
 pub mod error;
-pub mod logging;
+pub mod flush;
+pub mod init;
+pub mod lookup;
+pub mod paths;
+pub mod ports;
+pub mod source;
+pub mod sync;
 
-use std::process::ExitCode;
-
-pub fn run() -> ExitCode {
-    cli::run()
-}
+pub use error::AppError;

@@ -1,12 +1,6 @@
 #![forbid(unsafe_code)]
 #![deny(dead_code)]
 #![deny(clippy::all)]
-#![deny(
-    clippy::allow_attributes_without_reason,
-    clippy::assertions_on_result_states,
-    clippy::cargo_common_metadata,
-    clippy::wildcard_dependencies
-)]
 #![warn(clippy::pedantic)]
 #![allow(
     clippy::match_same_arms,
@@ -48,12 +42,34 @@
     )
 )]
 
-mod cli;
-pub mod error;
-pub mod logging;
+//! System adapter implementations for Kidobo.
 
-use std::process::ExitCode;
-
-pub fn run() -> ExitCode {
-    cli::run()
-}
+pub mod asn;
+pub mod blocklist_file;
+pub mod blocklist_operations;
+pub mod cached_fetch;
+pub mod cached_sources;
+pub mod command_common;
+pub mod command_runner;
+pub mod config;
+pub mod config_edit;
+pub mod doctor;
+pub mod enforcement;
+pub mod flush;
+pub mod github_meta;
+pub mod hash;
+pub mod http_cache;
+pub mod http_fetch;
+pub mod init;
+pub mod ipset;
+pub mod iptables;
+pub mod limited_io;
+pub mod lock;
+pub mod lookup_sources;
+pub mod path;
+mod remote_parse;
+pub mod source_files;
+pub mod source_load;
+pub mod sync_observer;
+pub mod sync_sources;
+pub mod target_file;

@@ -1,0 +1,53 @@
+use std::path::Path;
+
+fn manifest(path: &str) -> String {
+    kidobo_adapters::limited_io::read_to_string_with_limit(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join(path),
+        128 * 1024,
+    )
+    .unwrap_or_else(|error| panic!("failed to read {path}: {error}"))
+}
+
+#[test]
+fn dependency_direction_points_inward() {
+    let core = manifest("crates/kidobo-core/Cargo.toml");
+    assert!(!core.contains("kidobo-app"));
+    assert!(!core.contains("kidobo-adapters"));
+    assert!(!core.contains("clap"));
+
+    let app = manifest("crates/kidobo-app/Cargo.toml");
+    assert!(app.contains("kidobo-core.workspace = true"));
+    assert!(!app.contains("kidobo-adapters"));
+    assert!(!app.contains("clap"));
+
+    let adapters = manifest("crates/kidobo-adapters/Cargo.toml");
+    assert!(adapters.contains("kidobo-app.workspace = true"));
+    assert!(adapters.contains("kidobo-core.workspace = true"));
+    assert!(!adapters.contains("clap"));
+}
+
+#[test]
+fn internal_crates_remain_unpublished_and_unversioned() {
+    for path in [
+        "crates/kidobo-core/Cargo.toml",
+        "crates/kidobo-app/Cargo.toml",
+        "crates/kidobo-adapters/Cargo.toml",
+    ] {
+        let contents = manifest(path);
+        assert!(contents.contains("version = \"0.0.0\""), "{path}");
+        assert!(contents.contains("publish = false"), "{path}");
+    }
+}
+
+#[test]
+fn root_manifest_keeps_direct_release_version() {
+    let root = manifest("Cargo.toml");
+    let package = root
+        .split_once("[package]")
+        .map(|(_, package)| package)
+        .expect("root package table");
+    assert!(package.starts_with(&format!(
+        "\nname = \"kidobo\"\nversion = \"{}\"",
+        env!("CARGO_PKG_VERSION")
+    )));
+}

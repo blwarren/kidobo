@@ -1,39 +1,32 @@
-mod checks;
-mod probes;
-mod report;
-
-#[cfg(test)]
-mod tests;
-
 use log::info;
 
-use crate::adapters::command_runner::SudoCommandRunner;
-use crate::adapters::path::PathResolutionInput;
+use crate::cli::CliIo;
 use crate::error::KidoboError;
-
-use self::checks::{
-    SystemBinaryLocator, collect_binary_checks, collect_doctor_context, push_path_checks,
+use kidobo_adapters::config::FileConfigRepository;
+use kidobo_adapters::doctor::SystemDoctorProbe;
+use kidobo_adapters::path::{SystemPathResolver, path_resolution_input_from_process};
+use kidobo_app::doctor::{
+    self, DoctorCheckStatus, DoctorDependencies, DoctorOverall, DoctorReport,
 };
-use self::probes::push_sudo_probe_checks;
-pub(crate) use self::report::{DoctorCheckStatus, DoctorOverall, DoctorReport};
 
-#[allow(
-    clippy::print_stdout,
-    reason = "CLI command writes its report to standard output"
-)]
-pub fn run_doctor_command() -> Result<(), KidoboError> {
-    let path_input = PathResolutionInput::from_process(None);
-    let binary_locator = SystemBinaryLocator;
-    let sudo_runner = SudoCommandRunner::default();
-
-    let report = build_doctor_report(&path_input, &binary_locator, &sudo_runner);
-    let json = serde_json::to_string_pretty(&report).map_err(|err| {
-        KidoboError::DoctorReportSerialize {
-            reason: err.to_string(),
-        }
+#[allow(clippy::print_stdout, reason = "CLI renders the doctor report")]
+pub fn run_doctor_command(io: &mut CliIo<'_>) -> Result<(), KidoboError> {
+    let paths = SystemPathResolver;
+    let configs = FileConfigRepository;
+    let probes = SystemDoctorProbe::default();
+    let report = doctor::execute(
+        &path_resolution_input_from_process(None),
+        &DoctorDependencies {
+            paths: &paths,
+            configs: &configs,
+            probes: &probes,
+        },
+    );
+    let json = render_report(&report)?;
+    writeln!(io.stdout, "{json}").map_err(|error| KidoboError::CliIo {
+        reason: error.to_string(),
     })?;
 
-    println!("{json}");
     let failed_count = report
         .checks
         .iter()
@@ -55,7 +48,6 @@ pub fn run_doctor_command() -> Result<(), KidoboError> {
         failed_count,
         skipped_count
     );
-
     if report.overall == DoctorOverall::Ok {
         Ok(())
     } else {
@@ -63,21 +55,32 @@ pub fn run_doctor_command() -> Result<(), KidoboError> {
     }
 }
 
-fn build_doctor_report(
-    path_input: &PathResolutionInput,
-    binary_locator: &dyn checks::BinaryLocator,
-    sudo_probe_runner: &dyn probes::SudoProbeRunner,
-) -> DoctorReport {
-    let mut checks = Vec::new();
-    let context = collect_doctor_context(path_input, &mut checks);
-    let binary_available = collect_binary_checks(&mut checks, binary_locator, context.ipv6_mode);
-    push_path_checks(&mut checks, &context.paths_result);
-    push_sudo_probe_checks(
-        &mut checks,
-        context.ipv6_mode,
-        &binary_available,
-        sudo_probe_runner,
-    );
+fn render_report(report: &DoctorReport) -> Result<String, KidoboError> {
+    serde_json::to_string_pretty(report).map_err(|error| KidoboError::DoctorReportSerialize {
+        reason: error.to_string(),
+    })
+}
 
-    DoctorReport::from_checks(checks)
+#[cfg(test)]
+mod tests {
+    use kidobo_app::doctor::{DoctorCheck, DoctorCheckStatus, DoctorOverall, DoctorReport};
+
+    use super::render_report;
+
+    #[test]
+    fn report_renderer_preserves_machine_readable_shape() {
+        let rendered = render_report(&DoctorReport {
+            overall: DoctorOverall::Fail,
+            checks: vec![DoctorCheck {
+                name: "binary_ipset".to_string(),
+                status: DoctorCheckStatus::Skip,
+                detail: "unavailable".to_string(),
+            }],
+        })
+        .expect("render");
+        assert_eq!(
+            rendered,
+            "{\n  \"overall\": \"FAIL\",\n  \"checks\": [\n    {\n      \"name\": \"binary_ipset\",\n      \"status\": \"SKIP\",\n      \"detail\": \"unavailable\"\n    }\n  ]\n}"
+        );
+    }
 }

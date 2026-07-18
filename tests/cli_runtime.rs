@@ -1333,7 +1333,7 @@ fn ban_asn_cleanup_failure_warns_without_reverting_config_update() {
         BLOCKLIST_READ_LIMIT,
     )
     .expect("read config");
-    let config = kidobo::core::config::Config::from_toml_str(&config_text).expect("parse config");
+    let config = kidobo_core::config::Config::from_toml_str(&config_text).expect("parse config");
     assert_eq!(config.asn.banned, vec![64512], "config was not updated");
 }
 
@@ -1363,7 +1363,7 @@ fn unban_asn_cleanup_failure_warns_without_reverting_config_update() {
         BLOCKLIST_READ_LIMIT,
     )
     .expect("read config");
-    let config = kidobo::core::config::Config::from_toml_str(&config_text).expect("parse config");
+    let config = kidobo_core::config::Config::from_toml_str(&config_text).expect("parse config");
     assert!(
         config.asn.banned.is_empty(),
         "config update was reverted or not written: {config_text}"

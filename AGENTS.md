@@ -43,7 +43,7 @@ No silent behavioral changes.
 
 ## 3. Architecture Boundaries
 
-`core` owns pure, deterministic domain computation with no filesystem, network, process, clock, or
+`kidobo-core` owns pure, deterministic domain computation with no filesystem, network, process, clock, or
 terminal I/O:
 
 * canonicalization
@@ -54,16 +54,17 @@ terminal I/O:
 * lookup
 * configuration parsing and validation from in-memory text
 
-`adapters` own bounded filesystem, HTTP, cache, locking, ipset, iptables, and subprocess I/O.
+`kidobo-adapters` owns bounded filesystem, HTTP, cache, locking, ipset, iptables, and subprocess I/O.
 
-`app` currently owns the ordered, safety-critical sync workflow and accepts replaceable I/O boundaries
-where tests need safe substitutes.
+`kidobo-app` owns command requests, typed outcomes, focused ports, provider registries, failure policy, and
+ordered workflows. It accepts replaceable I/O boundaries where tests need safe substitutes.
 
-`cli` owns argument parsing, dispatch, command-specific orchestration not extracted into `app`, prompts,
-reports, logging setup, and exit-code mapping.
+The root `kidobo` package owns argument parsing, dependency composition, prompts, rendering, logging and
+interrupt setup, and exit-code mapping. It contains no domain or workflow decisions.
 
-Dependencies point inward: `core` must not import outer layers. Keep reusable computation out of
-adapters and CLI code; keep side effects out of `core`.
+Dependencies point inward: `kidobo-core` imports no outer layer; `kidobo-app` imports neither adapters nor
+the root CLI. Keep reusable computation out of adapters and CLI code; keep side effects out of core. See
+`docs/architecture.md` for the command and source extension recipes.
 
 ## 4. Determinism and Error Model
 

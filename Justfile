@@ -8,11 +8,11 @@ update: && test
 
 # Build the release binary.
 build-release:
-    @cargo build --release --locked
+    @cargo build --release --locked --package kidobo --bin kidobo
 
 # Run clippy with the repository lint policy.
 lint:
-    @cargo clippy --all-targets --all-features -- -D warnings
+    @cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 # Run the workspace test suite, including documentation tests.
 test:
@@ -34,7 +34,7 @@ audit:
 udeps:
     @rustup toolchain install nightly --component rust-src
     @cargo +nightly install --locked cargo-udeps --version "${CARGO_UDEPS_VERSION:-0.1.60}"
-    @cargo +nightly udeps --all-targets --all-features
+    @cargo +nightly udeps --workspace --all-targets --all-features
 
 # Format, test, and lint local changes.
 check: format test lint
@@ -45,7 +45,7 @@ ci: && build-release lint deny audit test
 
 # Run the stable llvm-cov region, function, and line coverage gates.
 coverage:
-    @cargo llvm-cov --all-features --fail-under-regions 90 --fail-under-functions 90 --fail-under-lines 90
+    @cargo llvm-cov --workspace --all-features --fail-under-regions 90 --fail-under-functions 90 --fail-under-lines 90
 
 # Run local mutation tests. Agents must not run this recipe.
 mutants *args:

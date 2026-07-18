@@ -1,0 +1,27 @@
+[package]
+name = "kidobo-adapters"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+fs2.workspace = true
+kidobo-app.workspace = true
+kidobo-core.workspace = true
+log.workspace = true
+nix.workspace = true
+reqwest = { workspace = true, features = ["blocking", "rustls-no-provider"] }
+rustls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+toml_edit.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

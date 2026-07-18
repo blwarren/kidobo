@@ -7,12 +7,22 @@ mod init;
 mod interrupt;
 mod sync;
 
+use std::env;
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::process::ExitCode;
 
 use clap::Parser;
 use clap::error::ErrorKind;
 
 use crate::error::KidoboError;
+
+pub struct CliIo<'a> {
+    pub input: &'a mut dyn BufRead,
+    pub stdout: &'a mut dyn Write,
+    pub stderr: &'a mut dyn Write,
+    pub stdout_is_terminal: bool,
+    pub no_color: bool,
+}
 
 #[allow(
     clippy::print_stderr,
@@ -42,7 +52,23 @@ pub fn run() -> ExitCode {
         return ExitCode::from(130);
     }
 
-    let dispatch_result = commands::dispatch(cli.command);
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let stdout_is_terminal = stdout.is_terminal();
+    let stderr = io::stderr();
+    let mut input = stdin.lock();
+    let mut output = stdout.lock();
+    let mut errors = stderr.lock();
+    let dispatch_result = commands::dispatch_with(
+        cli.command,
+        &mut CliIo {
+            input: &mut input,
+            stdout: &mut output,
+            stderr: &mut errors,
+            stdout_is_terminal,
+            no_color: env::var_os("NO_COLOR").is_some(),
+        },
+    );
 
     if interrupt::was_interrupted() {
         return ExitCode::from(130);

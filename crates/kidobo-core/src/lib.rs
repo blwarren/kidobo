@@ -1,12 +1,6 @@
 #![forbid(unsafe_code)]
 #![deny(dead_code)]
 #![deny(clippy::all)]
-#![deny(
-    clippy::allow_attributes_without_reason,
-    clippy::assertions_on_result_states,
-    clippy::cargo_common_metadata,
-    clippy::wildcard_dependencies
-)]
 #![warn(clippy::pedantic)]
 #![allow(
     clippy::match_same_arms,
@@ -48,12 +42,16 @@
     )
 )]
 
-mod cli;
-pub mod error;
-pub mod logging;
+pub mod blocklist;
+pub mod config;
+mod config_validation;
+pub mod lookup;
+pub mod network;
+mod network_types;
+pub mod sync;
 
-use std::process::ExitCode;
-
-pub fn run() -> ExitCode {
-    cli::run()
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AddressFamily {
+    Ipv4,
+    Ipv6,
 }

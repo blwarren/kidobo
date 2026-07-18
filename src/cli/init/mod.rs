@@ -1,139 +1,98 @@
-mod provision;
-mod systemd;
-mod templates;
+use std::fmt::Write;
+use std::path::PathBuf;
 
-#[cfg(test)]
-mod tests;
-
-use std::path::{Path, PathBuf};
-
-use crate::adapters::command_runner::SudoCommandRunner;
-use crate::adapters::path::{
-    ENV_KIDOBO_ROOT, PathResolutionInput, ResolvedPaths, resolve_paths_without_config,
-};
+use crate::cli::CliIo;
 use crate::error::KidoboError;
-
-use self::provision::{InitSummary, ensure_dir, ensure_file_if_missing};
-use self::systemd::{
-    DEFAULT_KIDOBO_BINARY_PATH, FALLBACK_KIDOBO_BINARY_PATH, InitCommandRunner,
-    ensure_systemd_timer_enabled, resolve_installed_executable_path,
+use kidobo_adapters::init::SystemInitProvisioner;
+use kidobo_adapters::path::{
+    ENV_KIDOBO_ROOT, SystemPathResolver, path_resolution_input_from_process,
 };
-use self::templates::{
-    DEFAULT_BLOCKLIST_TEMPLATE, DEFAULT_CONFIG_TEMPLATE, DEFAULT_SYSTEMD_TIMER_TEMPLATE,
-    KIDOBO_SYNC_SERVICE_FILE, KIDOBO_SYNC_TIMER_FILE, build_systemd_service_template,
-    resolve_systemd_dir,
+use kidobo_app::init::{
+    self, DEFAULT_KIDOBO_BINARY_PATH, FALLBACK_KIDOBO_BINARY_PATH, InitDependencies, InitOutcome,
+    InitRequest, ProvisionState,
 };
 
-#[allow(
-    clippy::print_stdout,
-    reason = "CLI command writes its result to standard output"
-)]
-pub fn run_init_command() -> Result<(), KidoboError> {
-    let path_input = PathResolutionInput::from_process(None);
-    let paths = resolve_paths_without_config(&path_input)?;
-    let executable_path = resolve_installed_executable_path(&[
-        PathBuf::from(DEFAULT_KIDOBO_BINARY_PATH),
-        PathBuf::from(FALLBACK_KIDOBO_BINARY_PATH),
-    ])?;
-    let kido_root_override = path_input.env.get(ENV_KIDOBO_ROOT).map(PathBuf::from);
-    let sudo_runner = SudoCommandRunner::default();
-    let summary = run_init_with_context(
-        &paths,
-        &executable_path,
-        kido_root_override.as_deref(),
-        &sudo_runner,
+#[allow(clippy::print_stdout, reason = "CLI renders the typed init outcome")]
+pub fn run_init_command(io: &mut CliIo<'_>) -> Result<(), KidoboError> {
+    let paths_input = path_resolution_input_from_process(None);
+    let root_override = paths_input.env.get(ENV_KIDOBO_ROOT).map(PathBuf::from);
+    let paths = SystemPathResolver;
+    let provisioner = SystemInitProvisioner::default();
+    let outcome = init::execute(
+        &InitRequest {
+            paths: paths_input,
+            root_override,
+            executable_candidates: vec![
+                PathBuf::from(DEFAULT_KIDOBO_BINARY_PATH),
+                PathBuf::from(FALLBACK_KIDOBO_BINARY_PATH),
+            ],
+        },
+        &InitDependencies {
+            paths: &paths,
+            provisioner: &provisioner,
+        },
     )?;
-    print_init_summary(&summary);
+    io.stdout
+        .write_all(render_init_outcome(&outcome).as_bytes())
+        .map_err(|error| KidoboError::CliIo {
+            reason: error.to_string(),
+        })?;
     Ok(())
 }
 
-#[cfg(test)]
-pub(crate) fn run_init_with_paths(paths: &ResolvedPaths) -> Result<(), KidoboError> {
-    let _ = run_init_with_paths_with_summary(paths)?;
-    Ok(())
+fn render_init_outcome(outcome: &InitOutcome) -> String {
+    let created = outcome
+        .artifacts
+        .iter()
+        .filter(|artifact| artifact.state == ProvisionState::Created)
+        .collect::<Vec<_>>();
+    let preserved = outcome
+        .artifacts
+        .iter()
+        .filter(|artifact| artifact.state == ProvisionState::Preserved)
+        .collect::<Vec<_>>();
+    let mut output = String::new();
+    let _header = writeln!(
+        &mut output,
+        "init completed: created={} unchanged={}",
+        created.len(),
+        preserved.len()
+    );
+    for artifact in created {
+        let _created = writeln!(&mut output, "created: {}", artifact.path.display());
+    }
+    for artifact in preserved {
+        let _preserved = writeln!(&mut output, "unchanged: {}", artifact.path.display());
+    }
+    output
 }
 
 #[cfg(test)]
-fn run_init_with_paths_with_summary(paths: &ResolvedPaths) -> Result<InitSummary, KidoboError> {
-    let kido_root_override = infer_kido_root_override(paths);
-    run_init_with_paths_and_runner(
-        paths,
-        &systemd::NoopInitCommandRunner,
-        kido_root_override.as_deref(),
-    )
-}
+mod tests {
+    use std::path::PathBuf;
 
-#[cfg(test)]
-fn run_init_with_paths_and_runner(
-    paths: &ResolvedPaths,
-    runner: &dyn InitCommandRunner,
-    kido_root_override: Option<&Path>,
-) -> Result<InitSummary, KidoboError> {
-    let executable_path = PathBuf::from(DEFAULT_KIDOBO_BINARY_PATH);
-    run_init_with_context(paths, &executable_path, kido_root_override, runner)
-}
+    use kidobo_app::init::{InitOutcome, ProvisionState, ProvisionedArtifact};
 
-fn run_init_with_context(
-    paths: &ResolvedPaths,
-    executable_path: &Path,
-    kido_root_override: Option<&Path>,
-    runner: &dyn InitCommandRunner,
-) -> Result<InitSummary, KidoboError> {
-    let mut summary = InitSummary::default();
-    let systemd_dir = resolve_systemd_dir(kido_root_override);
-    let systemd_service = systemd_dir.join(KIDOBO_SYNC_SERVICE_FILE);
-    let systemd_timer = systemd_dir.join(KIDOBO_SYNC_TIMER_FILE);
+    use super::render_init_outcome;
 
-    for dir in [
-        &paths.config_dir,
-        &paths.data_dir,
-        &paths.remote_cache_dir,
-        &systemd_dir,
-    ] {
-        summary.record(dir, ensure_dir(dir)?);
+    #[test]
+    fn renderer_groups_created_before_preserved_artifacts() {
+        let rendered = render_init_outcome(&InitOutcome {
+            artifacts: vec![
+                ProvisionedArtifact {
+                    path: PathBuf::from("/unchanged"),
+                    state: ProvisionState::Preserved,
+                },
+                ProvisionedArtifact {
+                    path: PathBuf::from("/created"),
+                    state: ProvisionState::Created,
+                },
+            ],
+            systemd_enabled: false,
+        });
+        assert_eq!(
+            rendered,
+            "init completed: created=1 unchanged=1\ncreated: /created\nunchanged: /unchanged\n"
+        );
     }
-
-    let service_template = build_systemd_service_template(executable_path, kido_root_override);
-    for (file_path, contents) in [
-        (&paths.config_file, DEFAULT_CONFIG_TEMPLATE),
-        (&paths.blocklist_file, DEFAULT_BLOCKLIST_TEMPLATE),
-        (&paths.lock_file, ""),
-        (&systemd_service, service_template.as_str()),
-        (&systemd_timer, DEFAULT_SYSTEMD_TIMER_TEMPLATE),
-    ] {
-        summary.record(file_path, ensure_file_if_missing(file_path, contents)?);
-    }
-
-    if kido_root_override.is_none() {
-        ensure_systemd_timer_enabled(runner)?;
-    }
-
-    Ok(summary)
-}
-
-#[cfg(test)]
-fn infer_kido_root_override(paths: &ResolvedPaths) -> Option<PathBuf> {
-    let root = paths.config_dir.parent()?.to_path_buf();
-    if paths.config_dir != root.join("config") {
-        return None;
-    }
-
-    if paths.data_dir != root.join("data")
-        || paths.blocklist_file != root.join("data/blocklist.txt")
-        || paths.cache_dir != root.join("cache")
-        || paths.remote_cache_dir != root.join("cache/remote")
-        || paths.lock_file != root.join("cache/sync.lock")
-    {
-        return None;
-    }
-
-    Some(root)
-}
-
-#[allow(
-    clippy::print_stdout,
-    reason = "CLI command writes its summary to standard output"
-)]
-fn print_init_summary(summary: &InitSummary) {
-    print!("{}", provision::render_init_summary(summary));
 }
