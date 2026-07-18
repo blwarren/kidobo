@@ -614,6 +614,41 @@ fn lookup_human_output_shows_matches_no_matches_and_summary() {
 
     assert_eq!(output.status.code(), Some(0));
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let expected_borders = [
+        format!(
+            "┌{}┬{}┬{}┬{}┐",
+            "─".repeat(32),
+            "─".repeat(10),
+            "─".repeat(46),
+            "─".repeat(32)
+        ),
+        format!(
+            "├{}┼{}┼{}┼{}┤",
+            "─".repeat(32),
+            "─".repeat(10),
+            "─".repeat(46),
+            "─".repeat(32)
+        ),
+        format!(
+            "└{}┴{}┴{}┴{}┘",
+            "─".repeat(32),
+            "─".repeat(10),
+            "─".repeat(46),
+            "─".repeat(32)
+        ),
+    ];
+    let actual_borders = stdout
+        .lines()
+        .filter(|line| matches!(line.chars().next(), Some('┌' | '├' | '└')))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        actual_borders,
+        expected_borders
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        "lookup table borders changed: {stdout}"
+    );
     assert!(
         stdout.contains("│ Target"),
         "missing table header: {stdout}"

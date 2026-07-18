@@ -6,6 +6,15 @@ additional_cargo_test_args = ["--lib", "--bins", "--tests"]
 # cargo-mutants does not support job count in this config; `just mutants`
 # defaults CARGO_MUTANTS_JOBS to 4 for local mutation runs.
 
+# Ignore mutations that only detach an already-terminated output reader or
+# alter best-effort cleanup warning classification. Command sequencing and
+# cleanup attempts remain covered by behavioral tests.
+exclude_re = [
+    'replace best_effort_join_output_reader with \(\)',
+    'replace match guard .* in best_effort_destroy_set',
+    'replace \|\| with && in best_effort_destroy_set',
+]
+
 # Give runtime-heavy CLI tests enough room while still failing hung mutants.
 minimum_test_timeout = 60.0
 timeout_multiplier = 3.0

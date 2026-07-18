@@ -232,6 +232,12 @@ fn print_lookup_table_border(left: char, junction: char, right: char) {
     reason = "CLI table renderer writes directly to standard output"
 )]
 fn print_lookup_table_row(cells: [&str; 4], color_status: bool) {
+    for line in format_lookup_table_row(cells, color_status) {
+        println!("{line}");
+    }
+}
+
+fn format_lookup_table_row(cells: [&str; 4], color_status: bool) -> Vec<String> {
     let [target, status, source, entry] = cells;
     let wrapped_target = wrap_lookup_cell(target, LOOKUP_TARGET_WIDTH);
     let wrapped_status = wrap_lookup_cell(status, LOOKUP_STATUS_WIDTH);
@@ -246,6 +252,7 @@ fn print_lookup_table_row(cells: [&str; 4], color_status: bool) {
     .into_iter()
     .max()
     .unwrap_or(1);
+    let mut rows = Vec::with_capacity(height);
 
     for line_idx in 0..height {
         let displayed_target =
@@ -258,10 +265,12 @@ fn print_lookup_table_row(cells: [&str; 4], color_status: bool) {
         if color_status && line_idx == 0 {
             displayed_status = color_lookup_status(status, &displayed_status);
         }
-        println!(
+        rows.push(format!(
             "│ {displayed_target} │ {displayed_status} │ {displayed_source} │ {displayed_entry} │"
-        );
+        ));
     }
+
+    rows
 }
 
 fn format_lookup_cell_line(lines: &[String], line_idx: usize, width: usize) -> String {
@@ -596,7 +605,8 @@ mod tests {
 
     use super::{
         collect_lookup_targets, collect_unique_valid_lookup_targets, color_lookup_status,
-        format_family_cidrs, read_target_lines, should_color_lookup, wrap_lookup_cell,
+        format_family_cidrs, format_lookup_table_row, read_target_lines, should_color_lookup,
+        wrap_lookup_cell,
     };
     use crate::core::network::CanonicalCidr;
     use crate::error::KidoboError;
@@ -686,6 +696,24 @@ mod tests {
             colored.replace("\x1b[1;36m", "").replace("\x1b[0m", ""),
             "MATCH   "
         );
+    }
+
+    #[test]
+    fn lookup_no_match_color_is_dimmed() {
+        assert_eq!(
+            color_lookup_status("NO MATCH", "NO MATCH"),
+            "\x1b[2mNO MATCH\x1b[0m"
+        );
+    }
+
+    #[test]
+    fn lookup_table_colors_only_the_first_status_line() {
+        let long_source = "s".repeat(super::LOOKUP_SOURCE_WIDTH + 1);
+        let rows = format_lookup_table_row(["198.51.100.9", "NO MATCH", &long_source, "—"], true);
+
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].contains("\x1b[2mNO MATCH\x1b[0m"));
+        assert!(!rows[1].contains("\x1b["));
     }
 
     #[test]
