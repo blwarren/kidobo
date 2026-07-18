@@ -68,5 +68,8 @@ cargo-mutants can classify the failure, so they are excluded narrowly by
 function name. The 76 unviable mutants remain inconclusive and are not a reason
 for score-driven production changes.
 
-A user-run mutation rerun is still needed to confirm that the remaining
-safety-critical mutants are caught or excluded as intended.
+The 2026-07-18 user-run confirmation rerun evaluated 246 selected mutants. The
+unmutated baseline passed; 170 mutants were caught, 76 were unviable, and none
+were missed or timed out. This confirms that all viable selected mutants are
+either behaviorally covered or intentionally excluded. The safety-critical
+triage is complete, and the unviable results require no score-driven follow-up.
