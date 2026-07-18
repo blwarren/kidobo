@@ -33,3 +33,9 @@ missing temporary ipset destroy emits a warning; the destroy command and
 best-effort return behavior are unchanged. Narrow `exclude_re` entries keep
 future mutation runs focused without suppressing command sequencing or cleanup
 attempt coverage.
+
+The focused rerun confirmed the remediation: 74 mutants were evaluated, with
+41 caught, 33 unviable, no missed mutants, and no timeouts. The three lookup
+mutants are now caught, and the four documented non-behavioral mutations are
+excluded. This incremental triage is complete; the unviable results remain
+inconclusive and do not justify score-driven test changes.
