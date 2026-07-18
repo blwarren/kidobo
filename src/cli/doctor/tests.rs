@@ -48,6 +48,10 @@ impl MockProbeRunner {
             invocations: RefCell::new(Vec::new()),
         }
     }
+
+    fn invocations(&self) -> Vec<(String, Vec<String>)> {
+        self.invocations.borrow().clone()
+    }
 }
 
 impl SudoProbeRunner for MockProbeRunner {
@@ -140,6 +144,14 @@ fn build_doctor_report_preserves_json_status_shape() {
             .iter()
             .any(|check| check.name == "config_parse" && check.status == DoctorCheckStatus::Ok)
     );
+    assert_eq!(
+        runner.invocations(),
+        vec![
+            ("ipset".to_string(), vec!["list".to_string()]),
+            ("iptables".to_string(), vec!["-S".to_string()]),
+            ("ip6tables".to_string(), vec!["-S".to_string()]),
+        ]
+    );
     assert!(
         !report
             .checks
@@ -178,6 +190,13 @@ fn build_doctor_report_preserves_json_fail_and_skip_status_shape() {
             .iter()
             .any(|check| check.name == "binary_bgpq4" && check.status == DoctorCheckStatus::Fail)
     );
+    assert_eq!(
+        runner.invocations(),
+        vec![
+            ("ipset".to_string(), vec!["list".to_string()]),
+            ("iptables".to_string(), vec!["-S".to_string()]),
+        ]
+    );
     assert!(
         report.checks.iter().any(
             |check| check.name == "binary_ip6tables" && check.status == DoctorCheckStatus::Skip
@@ -197,6 +216,21 @@ fn build_doctor_report_preserves_json_fail_and_skip_status_shape() {
             .iter()
             .any(|check| check["name"] == "binary_ip6tables" && check["status"] == "SKIP")
     );
+}
+
+#[test]
+fn unavailable_probe_binaries_are_never_invoked() {
+    let temp = TempDir::new().expect("tempdir");
+    write_config(temp.path(), true);
+    write_blocklist(temp.path());
+    fs::create_dir_all(temp.path().join("cache/remote")).expect("mkdir cache");
+
+    let input = path_input_for_root(temp.path());
+    let locator = MockBinaryLocator::new(&["sudo"]);
+    let runner = MockProbeRunner::new(Vec::new());
+
+    let _report = build_doctor_report(&input, &locator, &runner);
+    assert!(runner.invocations().is_empty());
 }
 
 fn success() -> CommandResult {

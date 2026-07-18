@@ -1,9 +1,14 @@
 use std::io::Read;
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use thiserror::Error;
+
+#[cfg(unix)]
+use nix::sys::signal::{Signal, killpg};
+#[cfg(unix)]
+use nix::unistd::Pid;
 
 use crate::adapters::command_common::display_command;
 use crate::adapters::limited_io::read_to_end_with_limit;
@@ -94,11 +99,20 @@ pub struct SystemCommandExecutor;
 impl CommandExecutor for SystemCommandExecutor {
     fn execute(&self, request: &CommandRequest) -> Result<CommandResult, CommandRunnerError> {
         let command = display_command(&request.program, &request.args);
-        let mut child = Command::new(&request.program)
+        let mut child_command = Command::new(&request.program);
+        child_command
             .args(&request.args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::piped());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+
+            child_command.process_group(0);
+        }
+
+        let mut child = child_command
             .spawn()
             .map_err(|err| CommandRunnerError::Spawn {
                 command: command.clone(),
@@ -138,8 +152,7 @@ impl CommandExecutor for SystemCommandExecutor {
                 }
                 Ok(None) => {
                     if started.elapsed() >= request.timeout {
-                        let _kill_result = child.kill();
-                        let _wait_result = child.wait();
+                        terminate_child_process_tree(&mut child);
                         best_effort_join_output_reader(stdout_reader);
                         best_effort_join_output_reader(stderr_reader);
 
@@ -152,8 +165,7 @@ impl CommandExecutor for SystemCommandExecutor {
                     thread::sleep(Duration::from_millis(10));
                 }
                 Err(err) => {
-                    let _kill_result = child.kill();
-                    let _wait_result = child.wait();
+                    terminate_child_process_tree(&mut child);
                     best_effort_join_output_reader(stdout_reader);
                     best_effort_join_output_reader(stderr_reader);
 
@@ -165,6 +177,16 @@ impl CommandExecutor for SystemCommandExecutor {
             }
         }
     }
+}
+
+fn terminate_child_process_tree(child: &mut Child) {
+    #[cfg(unix)]
+    if let Ok(raw_pid) = i32::try_from(child.id()) {
+        let _group_kill_result = killpg(Pid::from_raw(raw_pid), Signal::SIGKILL);
+    }
+
+    let _direct_kill_result = child.kill();
+    let _wait_result = child.wait();
 }
 
 fn spawn_output_reader<R>(mut reader: R) -> thread::JoinHandle<std::io::Result<Vec<u8>>>
@@ -251,6 +273,8 @@ mod tests {
     use std::cell::RefCell;
     use std::collections::VecDeque;
     use std::time::Duration;
+
+    use tempfile::TempDir;
 
     use super::{
         CommandExecutor, CommandRequest, CommandResult, CommandRunnerError,
@@ -440,5 +464,37 @@ mod tests {
             }
             _ => panic!("expected timeout error"),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn system_executor_timeout_terminates_descendant_processes() {
+        let temp = TempDir::new().expect("tempdir");
+        let marker = temp.path().join("descendant-finished");
+        let executor = SystemCommandExecutor;
+        let started = std::time::Instant::now();
+        let err = executor
+            .execute(&CommandRequest {
+                program: "sh".to_string(),
+                args: vec![
+                    "-c".to_string(),
+                    "(sleep 1; touch \"$1\") & wait".to_string(),
+                    "sh".to_string(),
+                    marker.display().to_string(),
+                ],
+                timeout: Duration::from_millis(20),
+            })
+            .expect_err("process tree must time out");
+
+        assert!(matches!(err, CommandRunnerError::Timeout { .. }));
+        assert!(
+            started.elapsed() < Duration::from_millis(750),
+            "timeout waited for the descendant process"
+        );
+        std::thread::sleep(Duration::from_millis(1_100));
+        assert!(
+            !marker.exists(),
+            "descendant survived the process-group kill"
+        );
     }
 }

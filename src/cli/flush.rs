@@ -365,10 +365,23 @@ mod tests {
 
         let err = run_flush_with_runner(&config, &runner, &runner, &remote_cache_dir)
             .expect_err("cleanup failures must be reported");
-        assert!(matches!(
-            err,
-            crate::error::KidoboError::FlushIncomplete { .. }
-        ));
+        match err {
+            crate::error::KidoboError::FlushIncomplete { failures, details } => {
+                assert_eq!(failures, 4);
+                for expected in [
+                    "Ipv4",
+                    "Ipv6",
+                    "ipset destroy kidobo",
+                    "ipset destroy kidobo-v6",
+                ] {
+                    assert!(
+                        details.contains(expected),
+                        "missing `{expected}` in: {details}"
+                    );
+                }
+            }
+            _ => panic!("expected FlushIncomplete"),
+        }
 
         assert!(remote_cache_dir.exists());
         let entries = fs::read_dir(&remote_cache_dir)

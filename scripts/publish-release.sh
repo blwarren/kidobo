@@ -25,6 +25,36 @@ release_tag="v${requested_version#v}"
 release_version="${release_tag#v}"
 repo_root="$(git rev-parse --show-toplevel)"
 cd "${repo_root}"
+original_branch="$(git branch --show-current)"
+original_head="$(git rev-parse HEAD)"
+switched_to_main=false
+temporary_root=""
+release_worktree=""
+tag_created=false
+published=false
+
+cleanup() {
+    status=$?
+    trap - EXIT
+    if [[ "${tag_created}" == true && "${published}" == false ]]; then
+        git -C "${repo_root}" tag --delete "${release_tag}" >/dev/null 2>&1 || true
+    fi
+    if [[ -n "${release_worktree}" ]]; then
+        git -C "${repo_root}" worktree remove --force "${release_worktree}" >/dev/null 2>&1 || true
+    fi
+    if [[ -n "${temporary_root}" ]]; then
+        rm -rf "${temporary_root}"
+    fi
+    if [[ "${switched_to_main}" == true && "${published}" == false ]]; then
+        if [[ -n "${original_branch}" ]]; then
+            git -C "${repo_root}" switch --quiet "${original_branch}" >/dev/null 2>&1 || true
+        else
+            git -C "${repo_root}" switch --quiet --detach "${original_head}" >/dev/null 2>&1 || true
+        fi
+    fi
+    exit "${status}"
+}
+trap cleanup EXIT
 
 if [[ -n "$(git status --porcelain)" ]]; then
     echo "publish-release requires a clean worktree" >&2
@@ -33,6 +63,7 @@ fi
 if [[ "$(git branch --show-current)" != "main" ]]; then
     echo "[release] switching to main"
     git switch main
+    switched_to_main=true
 fi
 
 echo "[release] refreshing origin/main and tags"
@@ -68,20 +99,6 @@ fi
 
 temporary_root="$(mktemp -d)"
 release_worktree="${temporary_root}/worktree"
-tag_created=false
-published=false
-
-cleanup() {
-    status=$?
-    trap - EXIT
-    if [[ "${tag_created}" == true && "${published}" == false ]]; then
-        git tag --delete "${release_tag}" >/dev/null 2>&1 || true
-    fi
-    git worktree remove --force "${release_worktree}" >/dev/null 2>&1 || true
-    rm -rf "${temporary_root}"
-    exit "${status}"
-}
-trap cleanup EXIT
 
 echo "[release] preparing ${release_tag} in a temporary worktree"
 git worktree add --quiet --detach "${release_worktree}" "${base_commit}"

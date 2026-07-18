@@ -5,6 +5,8 @@ Install `just` before running development recipes:
 
 ```bash
 cargo install --locked just --version 1.55.1
+rustup component add llvm-tools-preview
+cargo install --locked cargo-llvm-cov --version 0.8.4
 ```
 
 ## Structure
@@ -20,10 +22,10 @@ cargo install --locked just --version 1.55.1
 
 - `just check`
 - `just ci`
-- `just coverage`
+- `just coverage` (90% minimum for stable region, function, and line metrics)
 - `just update`
 - `just udeps`
 - `just release-notes-check`
-- `just publish-release 0.11.0` (a leading `v` is also accepted; branch switching is automatic)
+- `just publish-release 0.11.0` (a leading `v` is also accepted; branch switching is automatic and is restored if publication does not complete)
 - `just mutants`
 - `just mutants --shard 1/4`

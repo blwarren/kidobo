@@ -43,9 +43,9 @@ check: format test lint
 ci: && build-release lint deny audit test
     @cargo fmt --all --check
 
-# Run the llvm-cov line coverage gate.
+# Run the stable llvm-cov region, function, and line coverage gates.
 coverage:
-    @cargo llvm-cov --all-features --fail-under-lines 85
+    @cargo llvm-cov --all-features --fail-under-regions 90 --fail-under-functions 90 --fail-under-lines 90
 
 # Run local mutation tests. Agents must not run this recipe.
 mutants *args:

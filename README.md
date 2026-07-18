@@ -49,6 +49,8 @@ curl -fsSL https://raw.githubusercontent.com/blwarren/kidobo/main/scripts/instal
 
 Security note: piping a script to `sudo bash` is convenient, but you should
 review the script (and pin a version) if you need a stricter install policy.
+The installer verifies the requested checksum and binary version in a staged
+file before atomically replacing an existing installation.
 
 ## Quick Start
 
@@ -221,8 +223,11 @@ Development commands are defined in `Justfile`.
 
 ```bash
 cargo install --locked just --version 1.55.1
+rustup component add llvm-tools-preview
+cargo install --locked cargo-llvm-cov --version 0.8.4
 just check
 just ci
+just coverage
 just release-notes-check
 ```
 
@@ -237,6 +242,8 @@ The command prepares the release in a temporary worktree, runs the same quality
 gate used by the GitHub release workflow, displays the complete release diff,
 and asks for confirmation before atomically pushing the release commit and tag.
 After publication, the working tree remains on the updated `main` branch.
+If validation fails or publication is cancelled, the command restores the
+branch from which it was started.
 
 Use `just --list` to see all available local and CI recipes.
 

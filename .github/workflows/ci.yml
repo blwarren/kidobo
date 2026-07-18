@@ -13,6 +13,7 @@ permissions:
 
 env:
   JUST_VERSION: 1.55.1
+  CARGO_LLVM_COV_VERSION: 0.8.4
 
 jobs:
   quality:
@@ -34,5 +35,10 @@ jobs:
       - name: Install CI audit tools
         run: just _install-deny _install-audit
 
+      - name: Install coverage tools
+        run: |
+          rustup component add llvm-tools-preview
+          cargo install --locked cargo-llvm-cov --version "${CARGO_LLVM_COV_VERSION}"
+
       - name: Run CI checks
-        run: just release-notes-check ci
+        run: just release-notes-check ci coverage

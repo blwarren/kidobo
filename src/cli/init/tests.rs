@@ -18,8 +18,9 @@ use super::{
     run_init_with_paths, run_init_with_paths_and_runner, run_init_with_paths_with_summary,
 };
 use crate::adapters::command_runner::{CommandResult, CommandRunnerError, ProcessStatus};
-use crate::adapters::limited_io::read_to_string_with_limit;
+use crate::adapters::limited_io::{read_bytes_with_limit, read_to_string_with_limit};
 use crate::adapters::path::ResolvedPaths;
+use crate::core::config::Config;
 use crate::error::KidoboError;
 
 const INIT_FILE_READ_LIMIT: usize = 256 * 1024;
@@ -88,9 +89,41 @@ fn resolve_systemd_dir_uses_default_or_root_override() {
 }
 
 #[test]
-fn build_systemd_service_template_includes_exec_start() {
+fn build_systemd_service_template_matches_the_complete_default_contract() {
     let template = build_systemd_service_template(Path::new("/usr/local/bin/kidobo"), None);
-    assert!(template.contains("ExecStart=\"/usr/local/bin/kidobo\" sync"));
+    assert_eq!(
+        template,
+        "[Unit]\n\
+Description=Kidobo firewall blocklist sync\n\
+After=network-online.target\n\
+Wants=network-online.target\n\
+\n\
+[Service]\n\
+Type=oneshot\n\
+Environment=\"KIDOBO_LOG_FORMAT=journal\"\n\
+ExecStart=\"/usr/local/bin/kidobo\" sync\n"
+    );
+}
+
+#[test]
+fn build_systemd_service_template_escapes_the_root_environment() {
+    let template = build_systemd_service_template(
+        Path::new("/opt/kidobo bin/kidobo"),
+        Some(Path::new("/srv/kidobo\"root\\state\nnext")),
+    );
+    assert_eq!(
+        template,
+        "[Unit]\n\
+Description=Kidobo firewall blocklist sync\n\
+After=network-online.target\n\
+Wants=network-online.target\n\
+\n\
+[Service]\n\
+Type=oneshot\n\
+Environment=\"KIDOBO_LOG_FORMAT=journal\"\n\
+Environment=\"KIDOBO_ROOT=/srv/kidobo\\\"root\\\\state\\nnext\"\n\
+ExecStart=\"/opt/kidobo bin/kidobo\" sync\n"
+    );
 }
 
 #[test]
@@ -164,6 +197,22 @@ fn run_init_with_paths_creates_expected_files() {
             .expect("read blocklist"),
         DEFAULT_BLOCKLIST_TEMPLATE
     );
+    assert_eq!(
+        read_to_string_with_limit(
+            &temp.path().join("systemd/system/kidobo-sync.service"),
+            INIT_FILE_READ_LIMIT
+        )
+        .expect("read service"),
+        build_systemd_service_template(Path::new("/usr/local/bin/kidobo"), Some(temp.path()))
+    );
+    assert_eq!(
+        read_to_string_with_limit(
+            &temp.path().join("systemd/system/kidobo-sync.timer"),
+            INIT_FILE_READ_LIMIT
+        )
+        .expect("read timer"),
+        DEFAULT_SYSTEMD_TIMER_TEMPLATE
+    );
 }
 
 #[test]
@@ -204,11 +253,64 @@ fn run_init_with_paths_and_runner_skips_systemd_commands_for_root_override() {
 }
 
 #[test]
-fn init_writes_default_timer_template() {
-    assert!(DEFAULT_SYSTEMD_TIMER_TEMPLATE.contains("OnUnitActiveSec=1h"));
+fn init_default_timer_template_matches_the_complete_contract() {
+    assert_eq!(
+        DEFAULT_SYSTEMD_TIMER_TEMPLATE,
+        "[Unit]\n\
+Description=Run kidobo sync periodically\n\
+\n\
+[Timer]\n\
+OnBootSec=2min\n\
+OnUnitActiveSec=1h\n\
+Persistent=true\n\
+Unit=kidobo-sync.service\n\
+\n\
+[Install]\n\
+WantedBy=timers.target\n"
+    );
 }
 
 #[test]
-fn init_default_config_includes_remote_cache_staleness() {
-    assert!(DEFAULT_CONFIG_TEMPLATE.contains("cache_stale_after_secs = 86400\nurls = []"));
+fn init_default_config_is_accepted_by_the_production_parser() {
+    let config = Config::from_toml_str(DEFAULT_CONFIG_TEMPLATE).expect("parse default config");
+    assert_eq!(config.ipset.set_name, "kidobo");
+    assert_eq!(config.remote.cache_stale_after_secs.get(), 86_400);
+}
+
+#[test]
+fn rerunning_init_preserves_every_existing_managed_file_byte_for_byte() {
+    let temp = TempDir::new().expect("tempdir");
+    let paths = test_paths(temp.path());
+    let managed_files = [
+        (&paths.config_file, "custom config bytes"),
+        (&paths.blocklist_file, "custom blocklist bytes"),
+        (&paths.lock_file, "custom lock bytes"),
+        (
+            &temp.path().join("systemd/system/kidobo-sync.service"),
+            "custom service bytes",
+        ),
+        (
+            &temp.path().join("systemd/system/kidobo-sync.timer"),
+            "custom timer bytes",
+        ),
+    ];
+    for (path, contents) in &managed_files {
+        fs::create_dir_all(path.parent().expect("managed file parent")).expect("mkdir parent");
+        fs::write(path, contents).expect("write managed file");
+    }
+
+    let summary = run_init_with_paths_with_summary(&paths).expect("rerun init");
+    let rendered = render_init_summary(&summary);
+
+    for (path, contents) in &managed_files {
+        assert_eq!(
+            read_bytes_with_limit(path, INIT_FILE_READ_LIMIT).expect("read preserved file"),
+            contents.as_bytes()
+        );
+        assert!(
+            rendered.contains(&format!("unchanged: {}", path.display())),
+            "missing unchanged entry for {}: {rendered}",
+            path.display()
+        );
+    }
 }

@@ -3,8 +3,9 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use fs2::FileExt;
 use tempfile::TempDir;
@@ -32,6 +33,76 @@ fn run_kidobo_with_root(root: &Path, args: &[&str]) -> Output {
     kidobo_with_root_command(root, args)
         .output()
         .expect("run kidobo with root")
+}
+
+fn run_interactive_kidobo<F>(
+    root: &Path,
+    args: &[&str],
+    response: &str,
+    after_prompt: F,
+) -> (Option<i32>, String, String)
+where
+    F: FnOnce(),
+{
+    let mut child = kidobo_with_root_command(root, args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn interactive kidobo");
+    let mut stdout = child.stdout.take().expect("stdout pipe");
+    let mut stderr = child.stderr.take().expect("stderr pipe");
+    let (stdout_tx, stdout_rx) = mpsc::channel();
+    let stdout_reader = thread::spawn(move || {
+        let mut output = Vec::new();
+        let mut byte = [0_u8; 1];
+        loop {
+            match stdout.read(&mut byte) {
+                Ok(0) => break,
+                Ok(_) => {
+                    output.push(byte[0]);
+                    let _send_result = stdout_tx.send(byte[0]);
+                }
+                Err(err) => panic!("read child stdout: {err}"),
+            }
+        }
+        output
+    });
+    let stderr_reader = thread::spawn(move || {
+        let mut output = Vec::new();
+        stderr.read_to_end(&mut output).expect("read child stderr");
+        output
+    });
+
+    let prompt = b"Remove these entries as well? [y/N]: ";
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut observed = Vec::new();
+    while !observed.ends_with(prompt) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(!remaining.is_zero(), "timed out waiting for unban prompt");
+        observed.push(
+            stdout_rx
+                .recv_timeout(remaining)
+                .expect("interactive command ended before prompting"),
+        );
+    }
+
+    after_prompt();
+    let mut stdin = child.stdin.take().expect("stdin pipe");
+    use std::io::Write;
+    stdin
+        .write_all(response.as_bytes())
+        .expect("write prompt response");
+    drop(stdin);
+
+    let status = child.wait().expect("wait for interactive kidobo");
+    let stdout = stdout_reader.join().expect("join stdout reader");
+    let stderr = stderr_reader.join().expect("join stderr reader");
+    (
+        status.code(),
+        String::from_utf8(stdout).expect("UTF-8 stdout"),
+        String::from_utf8(stderr).expect("UTF-8 stderr"),
+    )
 }
 
 fn create_root(config_contents: &str, blocklist_contents: &str) -> TempDir {
@@ -117,6 +188,11 @@ set -euo pipefail
 
 if [[ -n "${KIDOBO_TEST_SUDO_TOUCHED:-}" ]]; then
   : > "${KIDOBO_TEST_SUDO_TOUCHED}"
+fi
+
+if [[ "${KIDOBO_TEST_FAIL_SUDO:-0}" == "1" ]]; then
+  echo "injected sudo failure" >&2
+  exit 9
 fi
 
 if [[ "${KIDOBO_TEST_SLEEP_ONCE:-0}" == "1" ]]; then
@@ -242,6 +318,103 @@ esac
     }
 
     script_path
+}
+
+#[test]
+fn flush_cache_only_succeeds_without_config_and_never_invokes_sudo() {
+    let root = TempDir::new().expect("tempdir");
+    let remote_cache = root.path().join("cache/remote");
+    fs::create_dir_all(&remote_cache).expect("mkdir remote cache");
+    fs::write(remote_cache.join("cached.iplist"), "198.51.100.0/24\n").expect("write cache");
+    let fake_sudo = write_fake_sudo_script(&root);
+    let sudo_marker = root.path().join("sudo-touched");
+
+    let mut command = kidobo_with_root_command(root.path(), &["flush", "--cache-only"]);
+    command
+        .env(
+            "PATH",
+            path_with_bin_prefix(fake_sudo.parent().expect("sudo parent")),
+        )
+        .env("KIDOBO_TEST_SUDO_TOUCHED", &sudo_marker);
+    let output = command.output().expect("run cache-only flush");
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(!sudo_marker.exists());
+    assert!(
+        fs::read_dir(&remote_cache)
+            .expect("read remote cache")
+            .next()
+            .is_none()
+    );
+}
+
+#[test]
+fn flush_cache_only_ignores_invalid_config() {
+    let root = create_root("this is not toml", "");
+    let remote_cache = root.path().join("cache/remote");
+    fs::write(remote_cache.join("cached.raw"), "raw").expect("write cache");
+
+    let output = run_kidobo_with_root(root.path(), &["flush", "--cache-only"]);
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "cache-only flush unexpectedly parsed config: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        fs::read_dir(&remote_cache)
+            .expect("read remote cache")
+            .next()
+            .is_none()
+    );
+}
+
+#[test]
+fn flush_cache_only_respects_the_nonblocking_lock() {
+    let root = create_root("[ipset]\nset_name='kidobo'\n", "");
+    let remote_cache = root.path().join("cache/remote");
+    let cached = remote_cache.join("cached.iplist");
+    fs::write(&cached, "198.51.100.0/24\n").expect("write cache");
+    let _lock = hold_lock(&root.path().join("cache/sync.lock"));
+
+    let output = run_kidobo_with_root(root.path(), &["flush", "--cache-only"]);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(cached.exists(), "lock failure must leave cache untouched");
+}
+
+#[test]
+fn flush_command_failure_maps_to_one_after_attempting_cache_cleanup() {
+    let root = create_root("[ipset]\nset_name='kidobo'\n", "");
+    let remote_cache = root.path().join("cache/remote");
+    fs::write(remote_cache.join("cached.iplist"), "198.51.100.0/24\n").expect("write cache");
+    let fake_sudo = write_fake_sudo_script(&root);
+    let sudo_marker = root.path().join("sudo-touched");
+
+    let mut command = kidobo_with_root_command(root.path(), &["flush"]);
+    command
+        .env(
+            "PATH",
+            path_with_bin_prefix(fake_sudo.parent().expect("sudo parent")),
+        )
+        .env("KIDOBO_TEST_SUDO_TOUCHED", &sudo_marker)
+        .env("KIDOBO_TEST_FAIL_SUDO", "1");
+    let output = command.output().expect("run flush");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(sudo_marker.exists());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("flush cleanup incomplete"),
+        "unexpected stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        fs::read_dir(&remote_cache)
+            .expect("read remote cache")
+            .next()
+            .is_none()
+    );
 }
 
 #[test]
@@ -1249,6 +1422,92 @@ fn unban_yes_removes_overlapping_entries_without_prompt() {
     let contents =
         read_to_string_with_limit(&blocklist, BLOCKLIST_READ_LIMIT).expect("read blocklist");
     assert_eq!(contents, "198.51.100.0/24\n");
+}
+
+#[test]
+fn interactive_unban_decline_removes_exact_but_preserves_partial_matches() {
+    let root = create_root(
+        "[ipset]\nset_name='kidobo'\n",
+        "203.0.113.7/32\n203.0.113.0/24\n198.51.100.0/24\n",
+    );
+    let blocklist = root.path().join("data/blocklist.txt");
+
+    let (code, stdout, stderr) =
+        run_interactive_kidobo(root.path(), &["unban", "203.0.113.7"], "n\n", || {});
+
+    assert_eq!(code, Some(0), "interactive unban failed: {stderr}");
+    assert!(stdout.contains("removed 1 blocklist entries for 203.0.113.7/32"));
+    assert_eq!(
+        read_to_string_with_limit(&blocklist, BLOCKLIST_READ_LIMIT).expect("read blocklist"),
+        "203.0.113.0/24\n198.51.100.0/24\n"
+    );
+}
+
+#[test]
+fn interactive_unban_accept_removes_exact_and_partial_matches() {
+    let root = create_root(
+        "[ipset]\nset_name='kidobo'\n",
+        "203.0.113.7/32\n203.0.113.0/24\n198.51.100.0/24\n",
+    );
+    let blocklist = root.path().join("data/blocklist.txt");
+
+    let (code, stdout, stderr) =
+        run_interactive_kidobo(root.path(), &["unban", "203.0.113.7"], "yes\n", || {});
+
+    assert_eq!(code, Some(0), "interactive unban failed: {stderr}");
+    assert!(stdout.contains("removed 2 blocklist entries for 203.0.113.7/32"));
+    assert_eq!(
+        read_to_string_with_limit(&blocklist, BLOCKLIST_READ_LIMIT).expect("read blocklist"),
+        "198.51.100.0/24\n"
+    );
+}
+
+#[test]
+fn interactive_unban_target_detects_blocklist_change_after_preview() {
+    let root = create_root("[ipset]\nset_name='kidobo'\n", "203.0.113.0/24\n");
+    let blocklist = root.path().join("data/blocklist.txt");
+    let externally_updated = "203.0.112.0/23\n198.51.100.0/24\n";
+
+    let (code, _stdout, stderr) =
+        run_interactive_kidobo(root.path(), &["unban", "203.0.113.7"], "y\n", || {
+            fs::write(&blocklist, externally_updated).expect("external blocklist update");
+        });
+
+    assert_eq!(code, Some(1));
+    assert!(stderr.contains("blocklist changed while preparing the update"));
+    assert_eq!(
+        read_to_string_with_limit(&blocklist, BLOCKLIST_READ_LIMIT).expect("read blocklist"),
+        externally_updated
+    );
+}
+
+#[test]
+fn interactive_unban_file_detects_blocklist_change_after_preview() {
+    let root = create_root(
+        "[ipset]\nset_name='kidobo'\n",
+        "203.0.113.0/24\n198.51.100.0/24\n",
+    );
+    let blocklist = root.path().join("data/blocklist.txt");
+    let targets = root.path().join("targets.txt");
+    fs::write(&targets, "203.0.113.7\n198.51.100.0/24\n").expect("write targets");
+    let target_path = targets.display().to_string();
+    let externally_updated = "203.0.112.0/23\n198.51.100.0/24\n192.0.2.0/24\n";
+
+    let (code, _stdout, stderr) = run_interactive_kidobo(
+        root.path(),
+        &["unban", "--file", target_path.as_str()],
+        "y\n",
+        || {
+            fs::write(&blocklist, externally_updated).expect("external blocklist update");
+        },
+    );
+
+    assert_eq!(code, Some(1));
+    assert!(stderr.contains("blocklist changed while preparing the update"));
+    assert_eq!(
+        read_to_string_with_limit(&blocklist, BLOCKLIST_READ_LIMIT).expect("read blocklist"),
+        externally_updated
+    );
 }
 
 #[test]

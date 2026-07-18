@@ -12,6 +12,7 @@ INIT_AFTER_INSTALL=0
 UNINSTALL_ONLY=0
 VERSION=""
 TARGET_PATH="${INSTALL_DIR}/${BINARY_NAME}"
+STAGED_INSTALL_PATH=""
 
 usage() {
     cat <<'EOF'
@@ -152,18 +153,50 @@ resolve_latest_tag() {
     echo "${tag}"
 }
 
-install_file() {
-    local source_file="$1"
-    local target_file="$2"
+create_install_staging_path() {
+    local target_file="$1"
+    local template="${target_file}.tmp.XXXXXX"
 
     if [[ -w "$(dirname "${target_file}")" ]]; then
-        install -m 0755 "${source_file}" "${target_file}"
-    elif command -v sudo >/dev/null 2>&1; then
-        sudo install -m 0755 "${source_file}" "${target_file}"
+        mktemp "${template}"
+    elif has_cmd sudo; then
+        sudo -n mktemp "${template}"
     else
         echo "no write access to $(dirname "${target_file}") and sudo is unavailable" >&2
         exit 1
     fi
+}
+
+stage_install_file() {
+    local source_file="$1"
+    local target_file="$2"
+    STAGED_INSTALL_PATH="$(create_install_staging_path "${target_file}")"
+
+    if ! run_with_optional_sudo install -m 0755 "${source_file}" "${STAGED_INSTALL_PATH}"; then
+        echo "failed to stage ${BINARY_NAME} for installation" >&2
+        exit 1
+    fi
+}
+
+activate_staged_install() {
+    local target_file="$1"
+    if ! run_with_optional_sudo mv -f -- "${STAGED_INSTALL_PATH}" "${target_file}"; then
+        echo "failed to atomically install ${BINARY_NAME} at ${target_file}" >&2
+        exit 1
+    fi
+    STAGED_INSTALL_PATH=""
+}
+
+cleanup_install_temporary_files() {
+    local status=$?
+    trap - EXIT
+    if [[ -n "${STAGED_INSTALL_PATH}" ]]; then
+        run_with_optional_sudo rm -f -- "${STAGED_INSTALL_PATH}" >/dev/null 2>&1 || true
+    fi
+    if [[ -n "${workdir:-}" ]]; then
+        rm -rf -- "${workdir}"
+    fi
+    exit "${status}"
 }
 
 remove_path() {
@@ -412,6 +445,8 @@ require_cmd curl
 require_cmd tar
 require_cmd sha256sum
 require_cmd install
+require_cmd mktemp
+require_cmd mv
 
 if [[ -z "${VERSION}" ]]; then
     VERSION="$(resolve_latest_tag)"
@@ -426,7 +461,7 @@ ARCHIVE="kidobo-${VERSION}-linux-x86_64.tar.gz"
 BASE_URL="https://github.com/${REPO_SLUG}/releases/download/${VERSION}"
 
 workdir="$(mktemp -d)"
-trap 'rm -rf "${workdir}"' EXIT
+trap cleanup_install_temporary_files EXIT
 
 echo "installing ${BINARY_NAME} ${VERSION} from ${REPO_SLUG}"
 curl -fsSL -o "${workdir}/${ARCHIVE}" "${BASE_URL}/${ARCHIVE}"
@@ -434,23 +469,35 @@ curl -fsSL -o "${workdir}/SHA256SUMS" "${BASE_URL}/SHA256SUMS"
 
 (
     cd "${workdir}"
-    expected_line="$(
-        awk -v archive="${ARCHIVE}" \
-            '$2 == archive { print; found = 1; exit } END { exit (found ? 0 : 1) }' \
-            SHA256SUMS || true
-    )"
-    if [[ -z "${expected_line}" ]]; then
+    mapfile -t expected_lines < <(awk -v archive="${ARCHIVE}" '$2 == archive { print }' SHA256SUMS)
+    if [[ "${#expected_lines[@]}" -eq 0 ]]; then
         echo "checksum entry not found for ${ARCHIVE}" >&2
         exit 1
     fi
-    echo "${expected_line}" | sha256sum -c -
+    if [[ "${#expected_lines[@]}" -ne 1 ]]; then
+        echo "multiple checksum entries found for ${ARCHIVE}" >&2
+        exit 1
+    fi
+    printf '%s\n' "${expected_lines[0]}" | sha256sum -c -
 )
 
 tar -xzf "${workdir}/${ARCHIVE}" -C "${workdir}"
-install_file "${workdir}/kidobo-${VERSION}-linux-x86_64/${BINARY_NAME}" "${TARGET_PATH}"
+stage_install_file "${workdir}/kidobo-${VERSION}-linux-x86_64/${BINARY_NAME}" "${TARGET_PATH}"
+
+expected_version="${BINARY_NAME} ${VERSION#v}"
+if ! installed_version="$("${STAGED_INSTALL_PATH}" --version)"; then
+    echo "downloaded ${BINARY_NAME} failed version verification" >&2
+    exit 1
+fi
+if [[ "${installed_version}" != "${expected_version}" ]]; then
+    echo "downloaded ${BINARY_NAME} reported unexpected version: ${installed_version}" >&2
+    exit 1
+fi
+
+activate_staged_install "${TARGET_PATH}"
 
 echo "installed ${BINARY_NAME} to ${TARGET_PATH}"
-"${TARGET_PATH}" --version
+printf '%s\n' "${installed_version}"
 
 if [[ "${INIT_AFTER_INSTALL}" -eq 1 ]]; then
     echo "running ${BINARY_NAME} init"

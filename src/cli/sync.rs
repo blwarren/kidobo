@@ -158,6 +158,8 @@ mod tests {
     struct MockCommandRunner<'a> {
         events: &'a Mutex<Vec<String>>,
         restore_scripts: Mutex<Vec<String>>,
+        fail_restore_target: Option<String>,
+        fail_firewall_append: bool,
     }
 
     impl<'a> MockCommandRunner<'a> {
@@ -165,7 +167,19 @@ mod tests {
             Self {
                 events,
                 restore_scripts: Mutex::new(Vec::new()),
+                fail_restore_target: None,
+                fail_firewall_append: false,
             }
+        }
+
+        fn failing_restore_for(mut self, target: &str) -> Self {
+            self.fail_restore_target = Some(target.to_string());
+            self
+        }
+
+        fn failing_firewall_append(mut self) -> Self {
+            self.fail_firewall_append = true;
+            self
         }
 
         fn events(&self) -> Vec<String> {
@@ -233,6 +247,13 @@ mod tests {
                 let script =
                     read_to_string_with_limit(Path::new(args[2]), RESTORE_SCRIPT_READ_LIMIT)
                         .expect("restore script readable");
+                let target = script
+                    .lines()
+                    .find(|line| line.starts_with("swap "))
+                    .and_then(|line| line.split_whitespace().nth(2));
+                if target == self.fail_restore_target.as_deref() {
+                    return failure("injected restore failure");
+                }
                 self.restore_scripts
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -245,6 +266,13 @@ mod tests {
             } else {
                 args
             };
+
+            if self.fail_firewall_append
+                && matches!(command, "iptables" | "ip6tables")
+                && effective_args.first() == Some(&"-A")
+            {
+                return failure("injected firewall append failure");
+            }
 
             match (command, effective_args.first().copied()) {
                 ("ipset", Some("list")) => CommandResult {
@@ -305,6 +333,14 @@ mod tests {
             status: ProcessStatus::Exited(0),
             stdout: String::new(),
             stderr: String::new(),
+        }
+    }
+
+    fn failure(stderr: &str) -> CommandResult {
+        CommandResult {
+            status: ProcessStatus::Exited(1),
+            stdout: String::new(),
+            stderr: stderr.to_string(),
         }
     }
 
@@ -1115,6 +1151,196 @@ mod tests {
         assert!(runner.events().iter().all(|entry| {
             !entry.contains(" -A kidobo-input ") && !entry.contains(" -I INPUT 1 ")
         }));
+    }
+
+    #[test]
+    fn ipv6_capacity_failure_prevents_all_swaps_and_firewall_activation() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = test_paths(temp.path());
+        fs::create_dir_all(paths.blocklist_file.parent().expect("parent")).expect("mkdir data");
+        fs::create_dir_all(&paths.remote_cache_dir).expect("mkdir cache");
+        fs::write(
+            &paths.blocklist_file,
+            "10.0.0.0/24\n2001:db8::/64\n2001:db8:1::/64\n",
+        )
+        .expect("write blocklist");
+
+        let mut config = test_config(Vec::new());
+        config.ipset.maxelem = MaxElem::new(1).expect("valid maxelem");
+        let events = Mutex::new(Vec::new());
+        let http_client = MockHttpClient::new(BTreeMap::new(), &events, 0);
+        let runner = MockCommandRunner::new(&events);
+
+        let err = run_sync_with_dependencies(
+            &paths,
+            &config,
+            &BTreeMap::new(),
+            &http_client,
+            &runner,
+            &runner,
+        )
+        .expect_err("sync must fail");
+
+        assert!(matches!(
+            err,
+            KidoboError::IpsetCapacityExceeded {
+                family: "ipv6",
+                ref set_name,
+                entries: 2,
+                maxelem: 1
+            } if set_name == "kidobo-v6"
+        ));
+        assert!(runner.swap_targets().is_empty());
+        assert!(runner.events().iter().all(|entry| {
+            !entry.contains(" -A kidobo-input ") && !entry.contains(" -I INPUT 1 ")
+        }));
+    }
+
+    #[test]
+    fn ipv6_restore_failure_stops_before_ipv4_restore_and_firewall_activation() {
+        let (temp, paths) = populated_dual_stack_paths();
+        let config = test_config(Vec::new());
+        let events = Mutex::new(Vec::new());
+        let http_client = MockHttpClient::new(BTreeMap::new(), &events, 0);
+        let runner = MockCommandRunner::new(&events).failing_restore_for("kidobo-v6");
+
+        run_sync_with_dependencies(
+            &paths,
+            &config,
+            &BTreeMap::new(),
+            &http_client,
+            &runner,
+            &runner,
+        )
+        .expect_err("IPv6 restore must fail");
+
+        let events = runner.events();
+        assert!(runner.swap_targets().is_empty());
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.starts_with("cmd:ipset restore "))
+                .count(),
+            1
+        );
+        assert!(events.iter().all(|event| {
+            !event.contains(" -A kidobo-input ") && !event.contains(" -I INPUT 1 ")
+        }));
+        drop(temp);
+    }
+
+    #[test]
+    fn ipv4_restore_failure_after_ipv6_swap_still_prevents_firewall_activation() {
+        let (temp, paths) = populated_dual_stack_paths();
+        let config = test_config(Vec::new());
+        let events = Mutex::new(Vec::new());
+        let http_client = MockHttpClient::new(BTreeMap::new(), &events, 0);
+        let runner = MockCommandRunner::new(&events).failing_restore_for("kidobo");
+
+        run_sync_with_dependencies(
+            &paths,
+            &config,
+            &BTreeMap::new(),
+            &http_client,
+            &runner,
+            &runner,
+        )
+        .expect_err("IPv4 restore must fail");
+
+        let events = runner.events();
+        assert_eq!(runner.swap_targets(), vec!["kidobo-v6"]);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.starts_with("cmd:ipset restore "))
+                .count(),
+            2
+        );
+        assert!(events.iter().all(|event| {
+            !event.contains(" -A kidobo-input ") && !event.contains(" -I INPUT 1 ")
+        }));
+        drop(temp);
+    }
+
+    #[test]
+    fn firewall_append_failure_never_inserts_an_input_jump() {
+        let (temp, paths) = populated_dual_stack_paths();
+        let config = test_config(Vec::new());
+        let events = Mutex::new(Vec::new());
+        let http_client = MockHttpClient::new(BTreeMap::new(), &events, 0);
+        let runner = MockCommandRunner::new(&events).failing_firewall_append();
+
+        run_sync_with_dependencies(
+            &paths,
+            &config,
+            &BTreeMap::new(),
+            &http_client,
+            &runner,
+            &runner,
+        )
+        .expect_err("firewall append must fail");
+
+        assert_eq!(runner.swap_targets(), vec!["kidobo-v6", "kidobo"]);
+        let events = runner.events();
+        assert!(
+            events
+                .iter()
+                .any(|event| event.contains("cmd:iptables -w 5 -A "))
+        );
+        assert!(events.iter().all(|event| !event.contains(" -I INPUT 1 ")));
+        assert!(
+            events
+                .iter()
+                .all(|event| !event.contains("cmd:ip6tables -w 5 -A "))
+        );
+        drop(temp);
+    }
+
+    #[test]
+    fn github_metadata_failure_is_soft_and_local_sources_are_applied() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = test_paths(temp.path());
+        fs::create_dir_all(paths.blocklist_file.parent().expect("parent")).expect("mkdir data");
+        fs::create_dir_all(&paths.remote_cache_dir).expect("mkdir cache");
+        fs::write(&paths.blocklist_file, "198.51.100.0/24\n2001:db8::/64\n")
+            .expect("write blocklist");
+
+        let mut config = test_config(Vec::new());
+        config.safe.include_github_meta = true;
+        let metadata_url = config.safe.github_meta_url.clone();
+        let events = Mutex::new(Vec::new());
+        let responses = BTreeMap::from([(
+            metadata_url,
+            VecDeque::from([Err(HttpClientError::Request {
+                reason: "offline".to_string(),
+            })]),
+        )]);
+        let http_client = MockHttpClient::new(responses, &events, 0);
+        let runner = MockCommandRunner::new(&events);
+
+        let summary = run_sync_with_dependencies(
+            &paths,
+            &config,
+            &BTreeMap::new(),
+            &http_client,
+            &runner,
+            &runner,
+        )
+        .expect("GitHub metadata failure must be soft");
+
+        assert_eq!(summary.ipv4_entries, 1);
+        assert_eq!(summary.ipv6_entries, 1);
+        assert_eq!(runner.swap_targets(), vec!["kidobo-v6", "kidobo"]);
+    }
+
+    fn populated_dual_stack_paths() -> (TempDir, ResolvedPaths) {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = test_paths(temp.path());
+        fs::create_dir_all(paths.blocklist_file.parent().expect("parent")).expect("mkdir data");
+        fs::create_dir_all(&paths.remote_cache_dir).expect("mkdir cache");
+        fs::write(&paths.blocklist_file, "198.51.100.0/24\n2001:db8::/64\n")
+            .expect("write blocklist");
+        (temp, paths)
     }
 
     #[test]

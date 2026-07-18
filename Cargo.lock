@@ -952,6 +952,7 @@ dependencies = [
  "env_logger",
  "fs2",
  "log",
+ "nix",
  "reqwest",
  "rustls",
  "serde",

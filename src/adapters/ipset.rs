@@ -681,10 +681,46 @@ mod tests {
             Ok(ok(0)),
         ]);
 
-        ensure_ipset_exists(&runner, &test_spec(IpsetFamily::Inet)).expect("created");
+        let spec = IpsetSetSpec {
+            set_name: "kidobo-v6".to_string(),
+            set_type: "hash:net".to_string(),
+            family: IpsetFamily::Inet6,
+            hashsize: 65_536,
+            maxelem: 500_000,
+            timeout: 90,
+        };
+        ensure_ipset_exists(&runner, &spec).expect("created");
         let invocations = runner.invocations();
-        assert_eq!(invocations.len(), 2);
-        assert_eq!(invocations[1].1[0], "create");
+        assert_eq!(
+            invocations,
+            vec![
+                (
+                    "ipset".to_string(),
+                    vec![
+                        "list".to_string(),
+                        "kidobo-v6".to_string(),
+                        "-terse".to_string()
+                    ]
+                ),
+                (
+                    "ipset".to_string(),
+                    vec![
+                        "create".to_string(),
+                        "kidobo-v6".to_string(),
+                        "hash:net".to_string(),
+                        "family".to_string(),
+                        "inet6".to_string(),
+                        "hashsize".to_string(),
+                        "65536".to_string(),
+                        "maxelem".to_string(),
+                        "500000".to_string(),
+                        "timeout".to_string(),
+                        "90".to_string(),
+                        "-exist".to_string(),
+                    ]
+                ),
+            ]
+        );
     }
 
     #[test]
