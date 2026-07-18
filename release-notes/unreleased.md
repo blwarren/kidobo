@@ -8,3 +8,10 @@
   extraction, staging, or verification fails.
 - Cancelling `just publish-release`, or encountering a validation failure,
   restores the branch from which the release command was started.
+
+### Changed
+
+- Removed the `kidobo analyze overlap` command and its now-empty top-level
+  `analyze` command group. New default configs no longer include
+  `remote.cache_stale_after_secs`; existing configs that contain the setting
+  remain accepted for compatibility.

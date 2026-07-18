@@ -12,14 +12,13 @@ pub const DEFAULT_HASHSIZE: u32 = 65_536;
 pub const DEFAULT_MAXELEM: u32 = 500_000;
 pub const DEFAULT_TIMEOUT: u32 = 0;
 pub const DEFAULT_REMOTE_TIMEOUT_SECS: u32 = 30;
-pub const DEFAULT_REMOTE_CACHE_STALE_AFTER_SECS: u32 = 24 * 60 * 60;
 pub const DEFAULT_ASN_CACHE_STALE_AFTER_SECS: u32 = 24 * 60 * 60;
 pub const DEFAULT_INCLUDE_GITHUB_META: bool = true;
 pub const DEFAULT_GITHUB_META_CATEGORIES: [&str; 4] = ["api", "git", "hooks", "packages"];
 pub const DEFAULT_GITHUB_META_URL: &str = "https://api.github.com/meta";
 pub const REMOTE_TIMEOUT_SECS_MAX: u32 = 3600;
-pub const REMOTE_CACHE_STALE_AFTER_SECS_MAX: u32 = 7 * 24 * 60 * 60;
 pub const ASN_CACHE_STALE_AFTER_SECS_MAX: u32 = 7 * 24 * 60 * 60;
+const LEGACY_REMOTE_CACHE_STALE_AFTER_SECS_MAX: u32 = 7 * 24 * 60 * 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct HashsizePow2(NonZeroU32);
@@ -94,30 +93,6 @@ impl From<RemoteTimeoutSecs> for u32 {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct RemoteCacheStaleAfterSecs(NonZeroU32);
-
-impl RemoteCacheStaleAfterSecs {
-    pub fn new(value: u32) -> Option<Self> {
-        let non_zero = NonZeroU32::new(value)?;
-        if value <= REMOTE_CACHE_STALE_AFTER_SECS_MAX {
-            Some(Self(non_zero))
-        } else {
-            None
-        }
-    }
-
-    pub fn get(self) -> u32 {
-        self.0.get()
-    }
-}
-
-impl From<RemoteCacheStaleAfterSecs> for u32 {
-    fn from(value: RemoteCacheStaleAfterSecs) -> Self {
-        value.get()
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct AsnCacheStaleAfterSecs(NonZeroU32);
 
 impl AsnCacheStaleAfterSecs {
@@ -179,7 +154,6 @@ pub struct SafeConfig {
 pub struct RemoteConfig {
     pub urls: Vec<String>,
     pub timeout_secs: RemoteTimeoutSecs,
-    pub cache_stale_after_secs: RemoteCacheStaleAfterSecs,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -422,21 +396,18 @@ fn parse_remote(raw: RawRemoteConfig) -> Result<RemoteConfig, ConfigError> {
         RemoteTimeoutSecs::new,
     )?;
 
-    let cache_stale_after_secs = bounded_newtype(
-        raw.cache_stale_after_secs
-            .unwrap_or(i64::from(DEFAULT_REMOTE_CACHE_STALE_AFTER_SECS)),
-        "remote.cache_stale_after_secs",
-        1,
-        REMOTE_CACHE_STALE_AFTER_SECS_MAX,
-        format!("must be between 1 and {REMOTE_CACHE_STALE_AFTER_SECS_MAX}"),
-        RemoteCacheStaleAfterSecs::new,
-    )?;
+    // This overlap-analysis setting was removed from the runtime model, but is
+    // still validated when present so existing operator configs remain valid.
+    if let Some(value) = raw.cache_stale_after_secs {
+        bounded_u32(
+            value,
+            "remote.cache_stale_after_secs",
+            1,
+            LEGACY_REMOTE_CACHE_STALE_AFTER_SECS_MAX,
+        )?;
+    }
 
-    Ok(RemoteConfig {
-        urls,
-        timeout_secs,
-        cache_stale_after_secs,
-    })
+    Ok(RemoteConfig { urls, timeout_secs })
 }
 
 fn parse_asn(raw: RawAsnConfig) -> Result<AsnConfig, ConfigError> {
@@ -605,19 +576,15 @@ mod tests {
         ASN_CACHE_STALE_AFTER_SECS_MAX, AsnCacheStaleAfterSecs, Config, ConfigError,
         DEFAULT_ASN_CACHE_STALE_AFTER_SECS, DEFAULT_CHAIN_ACTION, DEFAULT_GITHUB_META_CATEGORIES,
         DEFAULT_GITHUB_META_URL, DEFAULT_HASHSIZE, DEFAULT_IPSET_TYPE, DEFAULT_MAXELEM,
-        DEFAULT_REMOTE_CACHE_STALE_AFTER_SECS, DEFAULT_REMOTE_TIMEOUT_SECS, DEFAULT_TIMEOUT,
-        FirewallAction, GithubMetaCategoryMode, HashsizePow2, MaxElem,
-        REMOTE_CACHE_STALE_AFTER_SECS_MAX, REMOTE_TIMEOUT_SECS_MAX, RemoteCacheStaleAfterSecs,
-        RemoteTimeoutSecs, validate_ipset_set_name,
+        DEFAULT_REMOTE_TIMEOUT_SECS, DEFAULT_TIMEOUT, FirewallAction, GithubMetaCategoryMode,
+        HashsizePow2, MaxElem, REMOTE_TIMEOUT_SECS_MAX, RemoteTimeoutSecs, validate_ipset_set_name,
     };
 
     #[test]
     fn time_defaults_and_limits_have_exact_values() {
         assert_eq!(DEFAULT_REMOTE_TIMEOUT_SECS, 30);
-        assert_eq!(DEFAULT_REMOTE_CACHE_STALE_AFTER_SECS, 86_400);
         assert_eq!(DEFAULT_ASN_CACHE_STALE_AFTER_SECS, 86_400);
         assert_eq!(REMOTE_TIMEOUT_SECS_MAX, 3_600);
-        assert_eq!(REMOTE_CACHE_STALE_AFTER_SECS_MAX, 604_800);
         assert_eq!(ASN_CACHE_STALE_AFTER_SECS_MAX, 604_800);
     }
 
@@ -634,10 +601,6 @@ mod tests {
         assert_eq!(
             u32::from(RemoteTimeoutSecs::new(45).expect("valid timeout")),
             45
-        );
-        assert_eq!(
-            u32::from(RemoteCacheStaleAfterSecs::new(7_200).expect("valid cache age")),
-            7_200
         );
         assert_eq!(
             u32::from(AsnCacheStaleAfterSecs::new(9_000).expect("valid ASN cache age")),
@@ -672,10 +635,6 @@ mod tests {
         assert_eq!(
             config.remote.timeout_secs.get(),
             DEFAULT_REMOTE_TIMEOUT_SECS
-        );
-        assert_eq!(
-            config.remote.cache_stale_after_secs.get(),
-            DEFAULT_REMOTE_CACHE_STALE_AFTER_SECS
         );
         assert!(config.asn.banned.is_empty());
         assert_eq!(
@@ -1113,12 +1072,11 @@ mod tests {
     }
 
     #[test]
-    fn remote_cache_stale_after_secs_can_be_overridden() {
-        let config = Config::from_toml_str(
+    fn legacy_remote_cache_stale_after_secs_is_accepted() {
+        Config::from_toml_str(
             "[ipset]\nset_name='kidobo'\n[remote]\ncache_stale_after_secs=7200\n",
         )
         .expect("parse");
-        assert_eq!(config.remote.cache_stale_after_secs.get(), 7200);
     }
 
     #[test]

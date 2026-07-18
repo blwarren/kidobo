@@ -109,10 +109,6 @@ Check whether targets match (offline):
 kidobo lookup 203.0.113.7
 kidobo lookup --file targets.txt
 kidobo lookup --file targets.txt --format tsv
-# analyze overlap vs cached remote sources only (offline)
-kidobo analyze overlap
-# print optional reduction candidate lists
-kidobo analyze overlap --print-fully-covered-local --print-reduced-local
 ```
 
 Remove kidobo firewall/ipset artifacts (optional):
@@ -141,7 +137,6 @@ github_meta_url = "https://api.github.com/meta"
 
 [remote]
 timeout_secs = 30
-cache_stale_after_secs = 86400
 urls = []
 
 [asn]
@@ -156,8 +151,6 @@ Useful options:
 - `ipset.chain_action`: `DROP` (default) or `REJECT`
 - `ipset.maxelem`: range `[1, 500000]`
 - `remote.timeout_secs`: range `[1, 3600]`
-- `remote.cache_stale_after_secs`: remote cache staleness threshold for overlap
-  analysis warnings (default `86400`, range `[1, 604800]`)
 - `asn.banned`: ASN bans that are resolved to prefixes during `sync`
 - `asn.cache_stale_after_secs`: ASN prefix cache refresh threshold
   (default `86400`, range `[1, 604800]`)
@@ -209,8 +202,6 @@ an arbitrary build or `cargo run` path.
   intentional empty feed. A non-empty response with no valid CIDRs, or GitHub
   metadata missing a selected category, is treated as a soft fetch failure and
   does not replace the last usable cache.
-- `analyze overlap` is offline-only and warns when cached remote
-  `.iplist` files are older than `remote.cache_stale_after_secs`.
 - `doctor` is read-only by default. It checks whether the remote cache path is
   structurally plausible without creating directories or writing probe files;
   plausible permissions are reported as `SKIP` because effective access is not

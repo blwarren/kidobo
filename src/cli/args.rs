@@ -184,44 +184,15 @@ pub enum Command {
         )]
         format: LookupFormat,
     },
-
-    #[command(
-        about = "Analyze local blocklist overlap against cached remote blocklists",
-        long_about = "Analyze overlap between local blocklist entries and cached remote blocklists without performing any remote fetch.\n\nUse this command to identify local entries already covered by remote cached sources and generate reduced local suggestions."
-    )]
-    Analyze {
-        #[command(subcommand)]
-        command: AnalyzeCommand,
-    },
-}
-
-#[derive(Debug, Subcommand)]
-pub enum AnalyzeCommand {
-    #[command(
-        about = "Analyze overlap between local blocklist and cached remote blocklists",
-        long_about = "Offline-only overlap analysis using local blocklist and cached remote `.iplist` sources.\n\n`ov*` means local entries that intersect a remote source.\n`covered*` means local entries fully contained by a remote source (safe removal candidates)."
-    )]
-    Overlap {
-        #[arg(
-            long,
-            help = "Print local entries fully covered by cached remote union"
-        )]
-        print_fully_covered_local: bool,
-
-        #[arg(
-            long,
-            help = "Print suggested reduced local blocklist (local minus cached remote union)"
-        )]
-        print_reduced_local: bool,
-    },
 }
 
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 
-    use super::{AnalyzeCommand, Cli, Command, LogLevel, LookupFormat};
+    use super::{Cli, Command, LogLevel, LookupFormat};
     use clap::Parser;
+    use clap::error::ErrorKind;
     use log::LevelFilter;
 
     #[test]
@@ -331,20 +302,10 @@ mod tests {
     }
 
     #[test]
-    fn analyze_overlap_mode_parses() {
-        let cli = Cli::try_parse_from(["kidobo", "analyze", "overlap"]).expect("analyze parse");
-        match cli.command {
-            Command::Analyze { command } => match command {
-                AnalyzeCommand::Overlap {
-                    print_fully_covered_local,
-                    print_reduced_local,
-                } => {
-                    assert!(!print_fully_covered_local);
-                    assert!(!print_reduced_local);
-                }
-            },
-            _ => panic!("unexpected command variant"),
-        }
+    fn analyze_umbrella_is_rejected() {
+        let err = Cli::try_parse_from(["kidobo", "analyze", "overlap"])
+            .expect_err("removed analyze command must fail");
+        assert_eq!(err.kind(), ErrorKind::InvalidSubcommand);
     }
 
     #[test]

@@ -803,72 +803,14 @@ fn lookup_succeeds_when_config_is_invalid() {
 }
 
 #[test]
-fn analyze_overlap_uses_cached_sources_only_and_exits_zero() {
-    let root = create_root(
-        "[ipset]\nset_name='kidobo'\n[remote]\ncache_stale_after_secs=86400\n",
-        "203.0.113.0/24\n198.51.100.7\n",
-    );
-    fs::write(
-        root.path().join("cache/remote/a.iplist"),
-        "203.0.113.0/25\n192.0.2.0/24\n",
-    )
-    .expect("write remote iplist");
-    fs::write(
-        root.path().join("cache/remote/a.meta.json"),
-        r#"{"url":"https://example.com/a.txt"}"#,
-    )
-    .expect("write remote meta");
-
-    let output = run_kidobo_with_root(root.path(), &["analyze", "overlap"]);
-    assert_eq!(output.status.code(), Some(0));
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("analyze overlap (offline cache only)"),
-        "unexpected analyze output: {stdout}"
-    );
-    assert!(
-        stdout.contains("per-remote overlap:"),
-        "missing per-remote overlap section: {stdout}"
-    );
-    assert!(
-        stdout.contains("metric") && stdout.contains("value"),
-        "missing summary table headers: {stdout}"
-    );
-    assert!(
-        stdout.contains("rank")
-            && stdout.contains("source")
-            && stdout.contains("covered_pct_local"),
-        "missing per-remote table headers: {stdout}"
-    );
-    assert!(
-        stdout.contains("https://example.com/a.txt"),
-        "missing remote source label: {stdout}"
-    );
-}
-
-#[test]
-fn analyze_overlap_apply_fully_covered_local_is_rejected() {
-    let root = create_root(
-        "[ipset]\nset_name='kidobo'\n[remote]\ncache_stale_after_secs=86400\n",
-        "# local blocklist\n203.0.113.7\n198.51.100.0/24\n",
-    );
-    fs::write(
-        root.path().join("cache/remote/a.iplist"),
-        "203.0.113.0/24\n",
-    )
-    .expect("write remote iplist");
-
-    let output = run_kidobo_with_root(
-        root.path(),
-        &["analyze", "overlap", "--apply-fully-covered-local"],
-    );
+fn analyze_umbrella_is_rejected_as_a_usage_error() {
+    let output = run_kidobo(&["analyze", "overlap"]);
     assert_eq!(output.status.code(), Some(2));
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("--apply-fully-covered-local"),
-        "missing unknown-flag error: {stderr}"
+        stderr.contains("unrecognized subcommand 'analyze'"),
+        "unexpected usage error: {stderr}"
     );
 }
 

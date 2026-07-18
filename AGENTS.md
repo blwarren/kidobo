@@ -36,7 +36,7 @@ redesigns. New commands, configuration surface, or runtime modes require explici
 * After a successful sync, each managed family has one `kidobo-input` chain, one set-match action rule,
   and exactly one `INPUT` jump at position 1. Preserve fail-closed replacement ordering: establish new
   enforcement before deleting old copies, even if a partial failure can leave duplicates.
-* `lookup` and `analyze overlap` remain offline-only; analysis and `doctor` remain read-only.
+* `lookup` remains offline-only; `doctor` remains read-only.
   `ban`/`unban` update source/config state only and never enforce changes before `sync`.
 
 No silent behavioral changes.
@@ -51,7 +51,7 @@ terminal I/O:
 * interval merge
 * safelist subtraction
 * minimal CIDR regeneration
-* lookup and overlap analysis
+* lookup
 * configuration parsing and validation from in-memory text
 
 `adapters` own bounded filesystem, HTTP, cache, locking, ipset, iptables, and subprocess I/O.

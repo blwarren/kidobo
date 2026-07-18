@@ -13,7 +13,6 @@ github_meta_url = "https://api.github.com/meta"
 
 [remote]
 timeout_secs = 30
-cache_stale_after_secs = 86400
 urls = []
 
 [asn]

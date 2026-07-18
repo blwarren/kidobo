@@ -36,17 +36,6 @@ pub fn collect_remote_cache_files(
     Ok(files)
 }
 
-pub fn read_cidrs_from_source_file(
-    path: &Path,
-    read_limit: usize,
-) -> io::Result<Vec<CanonicalCidr>> {
-    let contents = read_to_string_with_limit(path, read_limit)?;
-    Ok(contents
-        .lines()
-        .filter_map(|line| parse_cidr_source_line(line).map(|(cidr, _)| cidr))
-        .collect())
-}
-
 pub fn read_remote_cache_iplist_text(
     iplist_path: &Path,
     read_limit: usize,

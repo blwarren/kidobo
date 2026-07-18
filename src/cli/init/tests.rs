@@ -274,7 +274,6 @@ WantedBy=timers.target\n"
 fn init_default_config_is_accepted_by_the_production_parser() {
     let config = Config::from_toml_str(DEFAULT_CONFIG_TEMPLATE).expect("parse default config");
     assert_eq!(config.ipset.set_name, "kidobo");
-    assert_eq!(config.remote.cache_stale_after_secs.get(), 86_400);
 }
 
 #[test]

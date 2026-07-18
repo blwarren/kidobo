@@ -1,6 +1,4 @@
-use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
 
 use crate::adapters::source_files::{
     REMOTE_META_READ_LIMIT, RemoteCacheFilesError, SOURCE_FILE_READ_LIMIT,
@@ -21,7 +19,6 @@ pub struct CachedRemoteSource {
     pub path: PathBuf,
     pub label: String,
     pub entries: Vec<CachedRemoteEntry>,
-    pub age_secs: Option<u64>,
 }
 
 pub fn load_remote_sources(
@@ -65,7 +62,6 @@ pub fn load_remote_sources(
 
         sources.push(CachedRemoteSource {
             label: resolve_remote_source_label(&path, REMOTE_META_READ_LIMIT),
-            age_secs: cache_age_secs(&path),
             path,
             entries,
         });
@@ -79,16 +75,9 @@ pub fn load_remote_sources(
     Ok(sources)
 }
 
-fn cache_age_secs(path: &Path) -> Option<u64> {
-    let modified = fs::metadata(path).ok()?.modified().ok()?;
-    let duration = SystemTime::now().duration_since(modified).ok()?;
-    Some(duration.as_secs())
-}
-
 #[cfg(test)]
 mod tests {
-    use std::fs::{self, File, FileTimes};
-    use std::time::{Duration, SystemTime};
+    use std::fs;
 
     use tempfile::TempDir;
 
@@ -156,24 +145,5 @@ mod tests {
             }
             _ => panic!("unexpected error variant"),
         }
-    }
-
-    #[test]
-    fn reports_elapsed_cache_age_when_metadata_is_available() {
-        let temp = TempDir::new().expect("tempdir");
-        let remote_cache_dir = temp.path().join("remote");
-        fs::create_dir_all(&remote_cache_dir).expect("mkdir remote");
-        let iplist_path = remote_cache_dir.join("a.iplist");
-        fs::write(&iplist_path, "203.0.113.0/24\n").expect("write a");
-        let old_mtime = SystemTime::now() - Duration::from_secs(30);
-        File::open(&iplist_path)
-            .expect("open iplist")
-            .set_times(FileTimes::new().set_modified(old_mtime))
-            .expect("set mtime");
-
-        let sources = load_remote_sources(&remote_cache_dir).expect("load");
-        assert_eq!(sources.len(), 1);
-        let age_secs = sources[0].age_secs.expect("age");
-        assert!(age_secs >= 30, "expected age >= 30s, got {age_secs}s");
     }
 }
