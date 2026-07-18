@@ -602,12 +602,48 @@ mod tests {
     use crate::core::network::{CanonicalCidr, Ipv4Cidr};
 
     use super::{
-        ASN_CACHE_STALE_AFTER_SECS_MAX, Config, ConfigError, DEFAULT_ASN_CACHE_STALE_AFTER_SECS,
-        DEFAULT_CHAIN_ACTION, DEFAULT_GITHUB_META_CATEGORIES, DEFAULT_GITHUB_META_URL,
-        DEFAULT_HASHSIZE, DEFAULT_IPSET_TYPE, DEFAULT_MAXELEM,
+        ASN_CACHE_STALE_AFTER_SECS_MAX, AsnCacheStaleAfterSecs, Config, ConfigError,
+        DEFAULT_ASN_CACHE_STALE_AFTER_SECS, DEFAULT_CHAIN_ACTION, DEFAULT_GITHUB_META_CATEGORIES,
+        DEFAULT_GITHUB_META_URL, DEFAULT_HASHSIZE, DEFAULT_IPSET_TYPE, DEFAULT_MAXELEM,
         DEFAULT_REMOTE_CACHE_STALE_AFTER_SECS, DEFAULT_REMOTE_TIMEOUT_SECS, DEFAULT_TIMEOUT,
-        FirewallAction, GithubMetaCategoryMode,
+        FirewallAction, GithubMetaCategoryMode, HashsizePow2, MaxElem,
+        REMOTE_CACHE_STALE_AFTER_SECS_MAX, REMOTE_TIMEOUT_SECS_MAX, RemoteCacheStaleAfterSecs,
+        RemoteTimeoutSecs, validate_ipset_set_name,
     };
+
+    #[test]
+    fn time_defaults_and_limits_have_exact_values() {
+        assert_eq!(DEFAULT_REMOTE_TIMEOUT_SECS, 30);
+        assert_eq!(DEFAULT_REMOTE_CACHE_STALE_AFTER_SECS, 86_400);
+        assert_eq!(DEFAULT_ASN_CACHE_STALE_AFTER_SECS, 86_400);
+        assert_eq!(REMOTE_TIMEOUT_SECS_MAX, 3_600);
+        assert_eq!(REMOTE_CACHE_STALE_AFTER_SECS_MAX, 604_800);
+        assert_eq!(ASN_CACHE_STALE_AFTER_SECS_MAX, 604_800);
+    }
+
+    #[test]
+    fn validated_numeric_types_convert_without_losing_values() {
+        assert_eq!(
+            u32::from(HashsizePow2::new(8_192).expect("valid hashsize")),
+            8_192
+        );
+        assert_eq!(
+            u32::from(MaxElem::new(123_456).expect("valid maxelem")),
+            123_456
+        );
+        assert_eq!(
+            u32::from(RemoteTimeoutSecs::new(45).expect("valid timeout")),
+            45
+        );
+        assert_eq!(
+            u32::from(RemoteCacheStaleAfterSecs::new(7_200).expect("valid cache age")),
+            7_200
+        );
+        assert_eq!(
+            u32::from(AsnCacheStaleAfterSecs::new(9_000).expect("valid ASN cache age")),
+            9_000
+        );
+    }
 
     #[test]
     fn parses_minimal_config_and_applies_defaults() {
@@ -962,6 +998,20 @@ mod tests {
                 reason: "must be 31 characters or fewer".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn set_name_accepts_exactly_31_characters() {
+        validate_ipset_set_name(&"a".repeat(31), "ipset.set_name").expect("31-character set name");
+        assert!(validate_ipset_set_name(&"a".repeat(32), "ipset.set_name").is_err());
+    }
+
+    #[test]
+    fn set_type_accepts_explicit_supported_punctuation() {
+        let config = Config::from_toml_str("[ipset]\nset_name='kidobo'\nset_type='hash:net'\n")
+            .expect("valid set type");
+
+        assert_eq!(config.ipset.set_type, "hash:net");
     }
 
     #[test]

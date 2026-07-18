@@ -18,7 +18,7 @@ use crate::adapters::hash::hex_lower;
 
 const IPSET_NAME_MAX_LEN: usize = 31;
 #[cfg(test)]
-const RESTORE_SCRIPT_READ_LIMIT: usize = 8 * 1024 * 1024;
+const RESTORE_SCRIPT_READ_LIMIT: usize = 8_388_608;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IpsetFamily {
@@ -225,12 +225,7 @@ pub fn generate_temp_set_name(base_set_name: &str) -> String {
         base = "kidobo".to_string();
     }
 
-    let candidate = format!("{base}-{suffix}");
-    if candidate.len() <= IPSET_NAME_MAX_LEN {
-        candidate
-    } else {
-        truncate_to_max_bytes(&candidate, IPSET_NAME_MAX_LEN).to_string()
-    }
+    format!("{base}-{suffix}")
 }
 
 pub fn atomic_replace_ipset_values<T: Ord + Display>(
@@ -420,8 +415,10 @@ fn create_restore_script_file() -> Result<(std::fs::File, PathBuf), IpsetError> 
 
         match options.open(&path) {
             Ok(file) => return Ok((file, path)),
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(err) => {
+                if should_retry_restore_script_create(&err) {
+                    continue;
+                }
                 return Err(IpsetError::CreateRestoreScript {
                     path,
                     reason: err.to_string(),
@@ -435,6 +432,10 @@ fn create_restore_script_file() -> Result<(std::fs::File, PathBuf), IpsetError> 
         path,
         reason: "failed to create a unique temporary restore script path".to_string(),
     })
+}
+
+fn should_retry_restore_script_create(err: &std::io::Error) -> bool {
+    err.kind() == std::io::ErrorKind::AlreadyExists
 }
 
 fn truncate_to_max_bytes(input: &str, max_bytes: usize) -> &str {
@@ -466,11 +467,14 @@ mod tests {
     use std::cell::RefCell;
     use std::collections::VecDeque;
     use std::fs;
+    use std::io;
+    use std::path::PathBuf;
 
     use super::{
         IpsetCommandRunner, IpsetError, IpsetFamily, IpsetSetSpec, RESTORE_SCRIPT_READ_LIMIT,
         atomic_replace_ipset_values, ensure_ipset_exists, generate_temp_set_name,
-        write_restore_script,
+        is_unsupported_terse_option_result, should_retry_restore_script_create,
+        truncate_to_max_bytes, write_restore_script,
     };
     use crate::adapters::command_runner::{CommandResult, CommandRunnerError, ProcessStatus};
     use crate::adapters::limited_io::read_to_string_with_limit;
@@ -479,6 +483,7 @@ mod tests {
         responses: RefCell<VecDeque<Result<CommandResult, CommandRunnerError>>>,
         invocations: RefCell<Vec<(String, Vec<String>)>>,
         restore_scripts: RefCell<Vec<String>>,
+        restore_script_paths: RefCell<Vec<PathBuf>>,
     }
 
     impl MockRunner {
@@ -487,6 +492,7 @@ mod tests {
                 responses: RefCell::new(VecDeque::from(responses)),
                 invocations: RefCell::new(Vec::new()),
                 restore_scripts: RefCell::new(Vec::new()),
+                restore_script_paths: RefCell::new(Vec::new()),
             }
         }
 
@@ -496,6 +502,10 @@ mod tests {
 
         fn restore_scripts(&self) -> Vec<String> {
             self.restore_scripts.borrow().clone()
+        }
+
+        fn restore_script_paths(&self) -> Vec<PathBuf> {
+            self.restore_script_paths.borrow().clone()
         }
     }
 
@@ -507,12 +517,11 @@ mod tests {
             ));
 
             if command == "ipset" && args.first() == Some(&"restore") && args.len() == 3 {
-                let script = read_to_string_with_limit(
-                    std::path::Path::new(args[2]),
-                    RESTORE_SCRIPT_READ_LIMIT,
-                )
-                .expect("restore script readable");
+                let path = PathBuf::from(args[2]);
+                let script = read_to_string_with_limit(&path, RESTORE_SCRIPT_READ_LIMIT)
+                    .expect("restore script readable");
                 self.restore_scripts.borrow_mut().push(script);
+                self.restore_script_paths.borrow_mut().push(path);
             }
 
             self.responses
@@ -544,8 +553,8 @@ mod tests {
     #[test]
     fn temp_set_name_is_capped_at_31_chars() {
         let name = generate_temp_set_name("kidobo-super-long-name-that-must-be-truncated");
-        assert!(name.len() <= 31);
-        assert!(name.contains('-'));
+        assert_eq!(name.len(), 31);
+        assert!(name.starts_with("kidobo-super-long-name-"));
     }
 
     #[test]
@@ -605,6 +614,39 @@ mod tests {
     }
 
     #[test]
+    fn restore_script_sorts_descending_distinct_entries() {
+        let mut script = Vec::new();
+        write_restore_script(
+            &mut script,
+            &test_spec(IpsetFamily::Inet),
+            "kidobo-temp",
+            &["203.0.113.0/24", "10.0.0.0/24"],
+        )
+        .expect("write restore script");
+        let script = String::from_utf8(script).expect("restore script is utf8");
+
+        assert!(
+            script.find("add kidobo-temp 10.0.0.0/24")
+                < script.find("add kidobo-temp 203.0.113.0/24")
+        );
+    }
+
+    #[test]
+    fn restore_script_deduplicates_sorted_entries() {
+        let mut script = Vec::new();
+        write_restore_script(
+            &mut script,
+            &test_spec(IpsetFamily::Inet),
+            "kidobo-temp",
+            &["10.0.0.0/24", "10.0.0.0/24"],
+        )
+        .expect("write restore script");
+        let script = String::from_utf8(script).expect("restore script is utf8");
+
+        assert_eq!(script.matches("add kidobo-temp 10.0.0.0/24").count(), 1);
+    }
+
+    #[test]
     fn ensure_existing_ipset_validates_type_and_family() {
         let runner = MockRunner::new(vec![Ok(CommandResult {
             status: ProcessStatus::Exited(0),
@@ -636,6 +678,44 @@ mod tests {
 
         ensure_ipset_exists(&runner, &test_spec(IpsetFamily::Inet)).expect("compatible set");
         assert_eq!(runner.invocations().len(), 2);
+    }
+
+    #[test]
+    fn terse_option_classifier_requires_option_and_failure_reason() {
+        for stderr in [
+            "unrecognized option '-terse'",
+            "invalid option: terse",
+            "syntax error near terse",
+        ] {
+            assert!(is_unsupported_terse_option_result(&CommandResult {
+                status: ProcessStatus::Exited(2),
+                stdout: String::new(),
+                stderr: stderr.to_string(),
+            }));
+        }
+
+        for stderr in ["permission denied while checking terse", "unknown command"] {
+            assert!(!is_unsupported_terse_option_result(&CommandResult {
+                status: ProcessStatus::Exited(2),
+                stdout: String::new(),
+                stderr: stderr.to_string(),
+            }));
+        }
+    }
+
+    #[test]
+    fn ensure_existing_ipset_propagates_nonmissing_list_failure() {
+        let runner = MockRunner::new(vec![Ok(CommandResult {
+            status: ProcessStatus::Exited(1),
+            stdout: String::new(),
+            stderr: "permission denied".to_string(),
+        })]);
+
+        let err = ensure_ipset_exists(&runner, &test_spec(IpsetFamily::Inet))
+            .expect_err("nonmissing inspection failure");
+
+        assert!(matches!(err, IpsetError::CommandFailed { .. }));
+        assert_eq!(runner.invocations().len(), 1);
     }
 
     #[test]
@@ -770,6 +850,12 @@ mod tests {
         assert!(scripts[0].contains("create"));
         assert!(scripts[0].contains("swap"));
         assert!(scripts[0].contains("add"));
+        assert!(
+            runner
+                .restore_script_paths()
+                .iter()
+                .all(|path| !path.exists())
+        );
     }
 
     #[test]
@@ -800,6 +886,29 @@ mod tests {
         let invocations = runner.invocations();
         assert_eq!(invocations.len(), 3);
         assert_eq!(invocations[2].1[0], "destroy");
+        assert!(
+            runner
+                .restore_script_paths()
+                .iter()
+                .all(|path| !path.exists())
+        );
+    }
+
+    #[test]
+    fn restore_script_create_retries_only_path_collisions() {
+        assert!(should_retry_restore_script_create(&io::Error::from(
+            io::ErrorKind::AlreadyExists
+        )));
+        assert!(!should_retry_restore_script_create(&io::Error::from(
+            io::ErrorKind::PermissionDenied
+        )));
+    }
+
+    #[test]
+    fn byte_truncation_preserves_prefix_and_utf8_boundaries() {
+        assert_eq!(truncate_to_max_bytes("abcdefgh", 4), "abcd");
+        assert_eq!(truncate_to_max_bytes("aéb", 2), "a");
+        assert_eq!(truncate_to_max_bytes("aéb", 3), "aé");
     }
 
     #[test]

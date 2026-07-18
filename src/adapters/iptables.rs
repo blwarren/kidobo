@@ -319,7 +319,7 @@ mod tests {
     use super::{
         ChainAction, FirewallCommandRunner, FirewallError, FirewallFamily, KIDOBO_CHAIN_NAME,
         chain_exists, cleanup_firewall_wiring, ensure_firewall_wiring,
-        ensure_firewall_wiring_for_families,
+        ensure_firewall_wiring_for_families, remove_all_input_jumps_for_chain,
     };
     use crate::adapters::command_runner::{CommandResult, CommandRunnerError, ProcessStatus};
 
@@ -377,6 +377,28 @@ mod tests {
             runner.invocations()[0].1,
             vec!["-w", "5", "-S", KIDOBO_CHAIN_NAME]
         );
+    }
+
+    #[test]
+    fn firewall_family_selects_exact_binary() {
+        assert_eq!(FirewallFamily::Ipv4.binary(), "iptables");
+        assert_eq!(FirewallFamily::Ipv6.binary(), "ip6tables");
+    }
+
+    #[test]
+    fn jump_cleanup_propagates_nonmissing_delete_failure() {
+        let runner = MockRunner::new(vec![Ok(CommandResult {
+            status: ProcessStatus::Exited(1),
+            stdout: String::new(),
+            stderr: "permission denied".to_string(),
+        })]);
+
+        let err =
+            remove_all_input_jumps_for_chain(&runner, FirewallFamily::Ipv4, KIDOBO_CHAIN_NAME)
+                .expect_err("nonmissing delete failure");
+
+        assert!(matches!(err, FirewallError::CommandFailed { .. }));
+        assert_eq!(runner.invocations().len(), 1);
     }
 
     #[test]

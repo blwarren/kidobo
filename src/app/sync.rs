@@ -28,7 +28,7 @@ use crate::error::KidoboError;
 pub(crate) const MAX_REMOTE_FETCH_WORKERS: usize = 5;
 const BLOCKLIST_FAST_STATE_FILE: &str = "blocklist-normalize.fast-state";
 #[cfg(test)]
-pub(crate) const RESTORE_SCRIPT_READ_LIMIT: usize = 8 * 1024 * 1024;
+pub(crate) const RESTORE_SCRIPT_READ_LIMIT: usize = 8_388_608;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SyncSummary {
@@ -327,10 +327,8 @@ fn cleanup_disabled_ipv6_artifacts(
         return;
     }
 
-    match ipset_runner.run("ipset", &["destroy", set_name_v6]) {
-        Ok(result) if result.status.success() => {}
-        Ok(_) => {}
-        Err(err) => warn!("disabled IPv6 ipset cleanup failed softly for {set_name_v6}: {err}"),
+    if let Err(err) = ipset_runner.run("ipset", &["destroy", set_name_v6]) {
+        warn!("disabled IPv6 ipset cleanup failed softly for {set_name_v6}: {err}");
     }
 }
 

@@ -279,6 +279,7 @@ mod tests {
     use super::{
         CommandExecutor, CommandRequest, CommandResult, CommandRunnerError,
         DEFAULT_COMMAND_TIMEOUT, ProcessStatus, SudoCommandRunner, SystemCommandExecutor,
+        duration_millis_u64,
     };
 
     struct MockExecutor {
@@ -307,6 +308,11 @@ mod tests {
                 .pop_front()
                 .expect("queued response")
         }
+    }
+
+    #[test]
+    fn duration_millis_preserves_nontrivial_values() {
+        assert_eq!(duration_millis_u64(Duration::from_millis(1_234)), 1_234);
     }
 
     #[test]

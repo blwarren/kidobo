@@ -90,10 +90,19 @@ fn enforce_mode_0600(path: &Path) -> Result<(), LockError> {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::io;
 
     use tempfile::TempDir;
 
-    use super::{LockError, acquire_non_blocking};
+    use super::{LockError, acquire_non_blocking, is_would_block};
+
+    #[test]
+    fn would_block_classifier_rejects_other_io_errors() {
+        assert!(is_would_block(&io::Error::from(io::ErrorKind::WouldBlock)));
+        assert!(!is_would_block(&io::Error::from(
+            io::ErrorKind::PermissionDenied
+        )));
+    }
 
     #[test]
     fn acquires_non_blocking_lock() {

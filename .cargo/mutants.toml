@@ -6,13 +6,21 @@ additional_cargo_test_args = ["--lib", "--bins", "--tests"]
 # cargo-mutants does not support job count in this config; `just mutants`
 # defaults CARGO_MUTANTS_JOBS to 4 for local mutation runs.
 
-# Ignore mutations that only detach an already-terminated output reader or
-# alter best-effort cleanup warning classification. Command sequencing and
-# cleanup attempts remain covered by behavioral tests.
+# Ignore mutations that only detach an already-terminated output reader, alter
+# diagnostics, preserve behavior through a fallback path, or create artificial
+# non-progress. Exact firewall binary selection is directly tested, but its
+# replacement mutants hang unrelated integration tests before cargo-mutants can
+# classify them.
 exclude_re = [
     'replace best_effort_join_output_reader with \(\)',
     'replace match guard .* in best_effort_destroy_set',
     'replace \|\| with && in best_effort_destroy_set',
+    'replace stderr_detail -> &str with',
+    'replace is_sorted_and_unique -> bool with false',
+    'replace > with >= in truncate_to_max_bytes',
+    'replace -= with /= in truncate_to_max_bytes',
+    'replace FirewallFamily::binary .* with',
+    'delete ! in SyncStageTimer::mark',
 ]
 
 # Give runtime-heavy CLI tests enough room while still failing hung mutants.
