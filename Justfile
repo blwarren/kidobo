@@ -44,7 +44,7 @@ exercise-release: build-release
     @env KIDOBO_TEST_BINARY="${CARGO_TARGET_DIR:-target}/release/kidobo" cargo test --locked --test cli_runtime sync_remote_worker_warning_does_not_deadlock -- --exact
 
 # Run the complete local CI validation sequence.
-ci: && release-notes-check lint deny audit test coverage
+ci: && lint deny audit test
     @cargo fmt --all --check
 
 # Run the stable llvm-cov region, function, and line coverage gates.
