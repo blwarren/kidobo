@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+
+## [0.12.0] - 2026-07-19
+
 ### Fixed
 
 - Timed-out external commands now terminate their descendant process group, so
