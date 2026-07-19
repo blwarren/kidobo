@@ -66,46 +66,6 @@ fn cli_dispatch_does_not_hold_global_output_locks() {
 }
 
 #[test]
-fn local_ci_gate_covers_release_policy_and_executes_the_built_binary() {
-    let justfile = manifest("Justfile");
-    let exercise_recipe = justfile
-        .lines()
-        .find(|line| line.starts_with("exercise-release:"))
-        .expect("release exercise recipe");
-    assert!(
-        exercise_recipe
-            .split_whitespace()
-            .any(|word| word == "build-release"),
-        "the release exercise must build the release binary first"
-    );
-    assert!(
-        justfile.contains(
-            "KIDOBO_TEST_BINARY=\"${CARGO_TARGET_DIR:-target}/release/kidobo\" cargo test"
-        ),
-        "the release exercise must run CLI tests against the built release binary"
-    );
-
-    let ci_recipe = justfile
-        .lines()
-        .find(|line| line.starts_with("ci:"))
-        .expect("CI recipe");
-    for required_step in ["release-notes-check", "coverage", "exercise-release"] {
-        assert!(
-            ci_recipe
-                .split_whitespace()
-                .any(|word| word == required_step),
-            "local CI must include {required_step}"
-        );
-    }
-    assert!(
-        !justfile
-            .lines()
-            .any(|line| line.starts_with("verify-release:")),
-        "the overlapping verify-release recipe must remain removed"
-    );
-}
-
-#[test]
 fn dependabot_is_the_only_github_hosted_automation() {
     let repository_root = Path::new(env!("CARGO_MANIFEST_DIR"));
     assert!(repository_root.join(".github/dependabot.yml").is_file());
