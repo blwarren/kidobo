@@ -932,7 +932,7 @@ dependencies = [
 
 [[package]]
 name = "kidobo"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "clap",
  "criterion",

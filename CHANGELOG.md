@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+
+## [0.12.1] - 2026-07-19
+
 ### Fixed
 
 - Sync no longer deadlocks when a remote-source worker logs a warning while the
