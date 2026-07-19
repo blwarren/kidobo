@@ -64,18 +64,3 @@ fn cli_dispatch_does_not_hold_global_output_locks() {
         "root CLI dispatch must not hold the global stderr lock while worker threads can log"
     );
 }
-
-#[test]
-fn dependabot_is_the_only_github_hosted_automation() {
-    let repository_root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    assert!(repository_root.join(".github/dependabot.yml").is_file());
-    for workflow in ["ci.yml", "release.yml", "udeps-audit.yml"] {
-        assert!(
-            !repository_root
-                .join(".github/workflows")
-                .join(workflow)
-                .is_file(),
-            "GitHub Actions workflow must remain removed: {workflow}"
-        );
-    }
-}

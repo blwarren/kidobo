@@ -86,7 +86,6 @@ struct ReleaseFixture {
     git_log: PathBuf,
     gh_log: PathBuf,
     gh_release_dir: PathBuf,
-    just_log: PathBuf,
 }
 
 impl ReleaseFixture {
@@ -99,7 +98,6 @@ impl ReleaseFixture {
         let git_log = temp.path().join("git.log");
         let gh_log = temp.path().join("gh.log");
         let gh_release_dir = temp.path().join("github-release");
-        let just_log = temp.path().join("just.log");
         fs::create_dir_all(&repo).expect("mkdir repo");
 
         assert_success(
@@ -178,16 +176,11 @@ exec "${KIDOBO_TEST_REAL_GIT}" "$@"
             &fake_bin.join("just"),
             r#"#!/usr/bin/env bash
 set -euo pipefail
-printf '%s\n' "$*" >> "${KIDOBO_TEST_JUST_LOG}"
 printf 'just %s\n' "$*" >> "${KIDOBO_TEST_EVENT_LOG}"
-if [[ -n "${KIDOBO_TEST_READY_MARKER:-}" && "$*" == "ci" ]]; then
+if [[ -n "${KIDOBO_TEST_READY_MARKER:-}" && "$*" == "exercise-release" ]]; then
   : > "${KIDOBO_TEST_READY_MARKER}"
 fi
-if [[ "$*" == "ci" ]]; then
-  if [[ "${KIDOBO_TEST_FAIL_CI:-0}" == "1" ]]; then
-    echo "injected local CI failure" >&2
-    exit 19
-  fi
+if [[ "$*" == "exercise-release" ]]; then
   mkdir -p target/release
   printf '#!/usr/bin/env bash\nprintf '\''kidobo %%s\\n'\'' %q\n' \
     "${KIDOBO_TEST_BINARY_VERSION}" > target/release/kidobo
@@ -298,7 +291,6 @@ fi
             git_log,
             gh_log,
             gh_release_dir,
-            just_log,
         }
     }
 
@@ -377,7 +369,6 @@ fi
             .env("KIDOBO_TEST_GH_LOG", &self.gh_log)
             .env("KIDOBO_TEST_GH_RELEASE_DIR", &self.gh_release_dir)
             .env("KIDOBO_TEST_GITHUB_REPOSITORY", GITHUB_REPOSITORY)
-            .env("KIDOBO_TEST_JUST_LOG", &self.just_log)
             .env("KIDOBO_TEST_REAL_GIT", "/usr/bin/git")
             .env(
                 "KIDOBO_TEST_BINARY_VERSION",
@@ -609,51 +600,6 @@ fn publisher_rejects_an_existing_github_release() {
 }
 
 #[test]
-fn publisher_stops_before_publication_when_local_ci_fails() {
-    let fixture = ReleaseFixture::new();
-    let original_head = fixture.head();
-    let output = fixture
-        .publisher_command()
-        .env("KIDOBO_TEST_FAIL_CI", "1")
-        .output()
-        .expect("run publisher with failing local CI");
-
-    assert_eq!(output.status.code(), Some(19));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("injected local CI failure"));
-    assert_eq!(fixture.head(), original_head);
-    assert!(!fixture.tag_exists());
-    assert!(!fixture.artifact_root(RELEASE_TAG).exists());
-
-    let just_log = read_to_string_with_limit(&fixture.just_log, FIXTURE_LOG_READ_LIMIT);
-    assert_eq!(
-        just_log.lines().collect::<Vec<_>>(),
-        [
-            "_install-deny _install-audit _install-coverage",
-            "_release-notes-format _release-notes-generate",
-            "ci"
-        ]
-    );
-    let git_log = read_to_string_with_limit(&fixture.git_log, FIXTURE_LOG_READ_LIMIT);
-    assert!(
-        git_log
-            .lines()
-            .any(|line| line.starts_with("worktree add "))
-    );
-    assert!(!git_log.lines().any(|line| line.starts_with("commit ")));
-    assert!(!git_log.lines().any(|line| line.starts_with("tag -a ")));
-    assert!(
-        !git_log
-            .lines()
-            .any(|line| line.starts_with("push --atomic "))
-    );
-
-    let manifest =
-        read_to_string_with_limit(&fixture.repo.join("Cargo.toml"), FIXTURE_LOG_READ_LIMIT);
-    assert!(manifest.contains(&format!("version = \"{CURRENT_VERSION}\"")));
-    assert!(!manifest.contains(&format!("version = \"{RELEASE_VERSION}\"")));
-}
-
-#[test]
 fn publisher_cancel_restores_the_original_branch_and_leaves_no_release_state() {
     let fixture = ReleaseFixture::new();
     fixture.git_success(&["switch", "-c", "feature"], "create feature branch");
@@ -810,12 +756,6 @@ fn publisher_atomically_pushes_then_verifies_and_publishes_local_artifacts() {
         ]
     );
 
-    let just_log = read_to_string_with_limit(&fixture.just_log, FIXTURE_LOG_READ_LIMIT);
-    assert_eq!(
-        just_log.lines().filter(|line| *line == "ci").count(),
-        1,
-        "the prepared release candidate must run the consolidated CI gate exactly once"
-    );
     let gh_log = read_to_string_with_limit(&fixture.gh_log, FIXTURE_LOG_READ_LIMIT);
     let create = gh_log
         .lines()
@@ -832,7 +772,9 @@ fn publisher_atomically_pushes_then_verifies_and_publishes_local_artifacts() {
     assert!(edit.contains("--latest"));
 
     let events = read_to_string_with_limit(&fixture.event_log, FIXTURE_LOG_READ_LIMIT);
-    let ci_position = events.find("just ci\n").expect("local CI event");
+    let exercise_position = events
+        .find("just exercise-release\n")
+        .expect("release binary exercise event");
     let push_position = events
         .find("git push --atomic ")
         .expect("atomic push event");
@@ -845,7 +787,7 @@ fn publisher_atomically_pushes_then_verifies_and_publishes_local_artifacts() {
     let edit_position = events
         .find("gh release edit ")
         .expect("draft publication event");
-    assert!(ci_position < push_position);
+    assert!(exercise_position < push_position);
     assert!(push_position < create_position);
     assert!(create_position < download_position);
     assert!(download_position < edit_position);

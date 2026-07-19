@@ -1,12 +1,13 @@
 # Development Commands
 
 `Justfile` is the canonical entrypoint for local validation and publication.
-Install `just` and the pinned analysis tools before running local CI, and
-authenticate GitHub CLI before publishing:
+Install `just` and the pinned CI tools before running local CI, and authenticate
+GitHub CLI before publishing. The publisher installs the coverage tool when it
+is needed:
 
 ```bash
 cargo install --locked just --version 1.55.1
-just _install-deny _install-audit _install-coverage
+just _install-deny _install-audit
 gh auth login
 ```
 
@@ -22,12 +23,12 @@ gh auth login
 ## Common Commands
 
 - `just check`
-- `just ci` (complete local gate, including release notes and 90% coverage thresholds)
-- `just coverage` (90% minimum for stable region, function, and line metrics)
-- `just exercise-release` (build and safely exercise the release binary with isolated runtime fixtures)
+- `just ci` (local formatting, lint, dependency-policy, audit, and test gate)
+- `just coverage` (release-only 90% minimum for stable region, function, and line metrics)
+- `just exercise-release` (release-only build and isolated binary exercise)
 - `just update`
 - `just udeps` (manual nightly-toolchain dependency-usage audit)
-- `just release-notes-check`
+- `just release-notes-check` (required after repository changes and during release validation)
 - `just publish-release 0.11.0` (complete local release preparation, validation, upload, verification, and publication)
 - `just mutants`
 - `just mutants --shard 1/4`

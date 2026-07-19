@@ -243,8 +243,12 @@ echo "[release] regenerating release notes and changelog"
 just _release-notes-format _release-notes-generate
 git add Cargo.toml Cargo.lock README.md CHANGELOG.md release-notes
 
-echo "[release] running complete local CI on the prepared candidate"
+echo "[release] running local CI on the prepared candidate"
 just ci
+echo "[release] running release-only validation"
+just release-notes-check
+just coverage
+just exercise-release
 git diff --check --cached
 if ! git diff --quiet || [[ -n "$(git ls-files --others --exclude-standard)" ]]; then
     echo "validation produced uncommitted changes outside the staged release update" >&2

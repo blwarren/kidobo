@@ -214,7 +214,7 @@ Development commands are defined in `Justfile`.
 
 ```bash
 cargo install --locked just --version 1.55.1
-just _install-deny _install-audit _install-coverage
+just _install-deny _install-audit
 gh auth login
 just check
 just ci
@@ -222,10 +222,12 @@ just ci
 
 `just check` is the fast development loop. Run `just ci` explicitly before every
 push; GitHub does not run project CI for pushes or tags. The complete local gate
-checks release-note generation, formatting, lints, dependency policy, tests,
-coverage, and the release build. It also runs the built binary through an
-isolated sync scenario with a temporary `KIDOBO_ROOT`, a loopback HTTP feed,
-and fake privileged commands, never the development host's firewall or systemd.
+checks formatting, lints, dependency policy, audits, and tests. Run
+`just release-notes-check` separately after repository changes. Coverage and
+the release build and isolated binary exercise run only as part of
+`just publish-release`, which installs the coverage tool when needed. The
+exercise uses a temporary `KIDOBO_ROOT`, a loopback HTTP feed, and fake
+privileged commands, never the development host's firewall or systemd.
 Dependabot update PRs are the only GitHub-hosted automation retained.
 
 Publish from any clean branch; the command switches to `main` automatically and
@@ -235,11 +237,13 @@ verifies that it is not behind or diverged from `origin/main`:
 just publish-release 0.11.0
 ```
 
-The command prepares the release in a temporary worktree, runs `just ci` once on
-the candidate, and packages the tested Linux x86_64 binary. After confirmation,
-it atomically pushes the release commit and annotated tag, uploads a draft with
-GitHub CLI, downloads and verifies the assets, and only then publishes the
-release. Stable versions become Latest; suffixed versions are prereleases.
+The command prepares the release in a temporary worktree, runs `just ci`,
+repeats the release-note check, then performs the release-only coverage, build,
+and binary-exercise gates before packaging the tested Linux x86_64 binary.
+After confirmation, it atomically pushes the release commit and annotated tag,
+uploads a draft with GitHub CLI, downloads and verifies the assets, and only
+then publishes the release. Stable versions become Latest; suffixed versions
+are prereleases.
 
 Artifacts remain under `target/release-artifacts/vX.Y.Z/`. If a GitHub operation
 fails after the refs are pushed, the draft and local artifacts are retained and

@@ -87,9 +87,10 @@ scripted command runners; development validation must never invoke live firewall
 
 ## Validation and release
 
-Use `just check` at each implementation checkpoint and `just ci` for final integration. The complete local
-CI recipe checks release-note generation, formatting, lints, dependency policy, tests, coverage, and the
-release build. It also exercises that binary through an isolated sync scenario using a temporary runtime
-root, loopback feed, and fake privileged commands. `just publish-release X.Y.Z` prepares the candidate in a
-temporary worktree, runs that gate once, packages the tested Linux x86_64 binary, and uses GitHub CLI to
-upload, verify, and publish the release. Run `just release-notes-check` after every repository change.
+Use `just check` at each implementation checkpoint and `just ci` for final integration. The local CI recipe
+checks formatting, lints, dependency policy, audits, and tests. `just publish-release X.Y.Z` prepares the
+candidate in a temporary worktree, runs that gate, repeats the release-note check, then performs the
+release-only coverage, build, and isolated binary-exercise gates. The exercise uses a temporary runtime
+root, loopback feed, and fake privileged commands. The publisher packages the tested Linux x86_64 binary
+and uses GitHub CLI to upload, verify, and publish the release. Run `just release-notes-check` after every
+repository change.
