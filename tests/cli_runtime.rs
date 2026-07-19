@@ -13,15 +13,21 @@ use tempfile::TempDir;
 
 const BLOCKLIST_READ_LIMIT: usize = 16 * 1024 * 1024;
 
+fn kidobo_binary() -> PathBuf {
+    env::var_os("KIDOBO_TEST_BINARY")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_kidobo")))
+}
+
 fn run_kidobo(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_kidobo"))
+    Command::new(kidobo_binary())
         .args(args)
         .output()
         .expect("run kidobo")
 }
 
 fn kidobo_with_root_command(root: &Path, args: &[&str]) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_kidobo"));
+    let mut command = Command::new(kidobo_binary());
     command
         .args(args)
         .env("KIDOBO_ROOT", root)

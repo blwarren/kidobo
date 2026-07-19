@@ -39,8 +39,12 @@ udeps:
 # Format, test, and lint local changes.
 check: format test lint
 
+# Exercise the locally built release binary with isolated runtime fixtures.
+exercise-release: build-release
+    @env KIDOBO_TEST_BINARY="${CARGO_TARGET_DIR:-target}/release/kidobo" cargo test --locked --test cli_runtime sync_remote_worker_warning_does_not_deadlock -- --exact
+
 # Run the full CI validation sequence.
-ci: && build-release lint deny audit test
+ci: && build-release lint deny audit test exercise-release
     @cargo fmt --all --check
 
 # Run the stable llvm-cov region, function, and line coverage gates.

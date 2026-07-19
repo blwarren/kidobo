@@ -219,9 +219,15 @@ cargo install --locked cargo-llvm-cov --version 0.8.4
 just check
 just ci
 just coverage
+just exercise-release
 just release-notes-check
 just verify-release
 ```
+
+`just exercise-release` builds `target/release/kidobo` and runs it through an
+isolated sync scenario with a temporary `KIDOBO_ROOT`, a loopback HTTP feed,
+and fake privileged commands. It never invokes the development host's firewall
+or systemd. `just ci` includes this release-binary exercise.
 
 Run `just verify-release` before initiating a release. The publisher enforces
 the same gate before preparing release state. Publish from any clean branch;

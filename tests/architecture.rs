@@ -64,3 +64,35 @@ fn cli_dispatch_does_not_hold_global_output_locks() {
         "root CLI dispatch must not hold the global stderr lock while worker threads can log"
     );
 }
+
+#[test]
+fn release_quality_gate_executes_the_built_binary() {
+    let justfile = manifest("Justfile");
+    let exercise_recipe = justfile
+        .lines()
+        .find(|line| line.starts_with("exercise-release:"))
+        .expect("release exercise recipe");
+    assert!(
+        exercise_recipe
+            .split_whitespace()
+            .any(|word| word == "build-release"),
+        "the release exercise must build the release binary first"
+    );
+    assert!(
+        justfile.contains(
+            "KIDOBO_TEST_BINARY=\"${CARGO_TARGET_DIR:-target}/release/kidobo\" cargo test"
+        ),
+        "the release exercise must run CLI tests against the built release binary"
+    );
+
+    let ci_recipe = justfile
+        .lines()
+        .find(|line| line.starts_with("ci:"))
+        .expect("CI recipe");
+    assert!(
+        ci_recipe
+            .split_whitespace()
+            .any(|word| word == "exercise-release"),
+        "CI must include the release-binary exercise"
+    );
+}

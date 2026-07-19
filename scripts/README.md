@@ -23,6 +23,7 @@ cargo install --locked cargo-llvm-cov --version 0.8.4
 - `just check`
 - `just ci`
 - `just coverage` (90% minimum for stable region, function, and line metrics)
+- `just exercise-release` (build and safely exercise the release binary with isolated runtime fixtures)
 - `just verify-release` (release notes, full CI, and coverage in one required pre-release gate)
 - `just update`
 - `just udeps`
