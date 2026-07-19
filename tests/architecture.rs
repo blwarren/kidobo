@@ -66,7 +66,7 @@ fn cli_dispatch_does_not_hold_global_output_locks() {
 }
 
 #[test]
-fn release_quality_gate_executes_the_built_binary() {
+fn local_ci_gate_covers_release_policy_and_executes_the_built_binary() {
     let justfile = manifest("Justfile");
     let exercise_recipe = justfile
         .lines()
@@ -89,10 +89,33 @@ fn release_quality_gate_executes_the_built_binary() {
         .lines()
         .find(|line| line.starts_with("ci:"))
         .expect("CI recipe");
+    for required_step in ["release-notes-check", "coverage", "exercise-release"] {
+        assert!(
+            ci_recipe
+                .split_whitespace()
+                .any(|word| word == required_step),
+            "local CI must include {required_step}"
+        );
+    }
     assert!(
-        ci_recipe
-            .split_whitespace()
-            .any(|word| word == "exercise-release"),
-        "CI must include the release-binary exercise"
+        !justfile
+            .lines()
+            .any(|line| line.starts_with("verify-release:")),
+        "the overlapping verify-release recipe must remain removed"
     );
+}
+
+#[test]
+fn dependabot_is_the_only_github_hosted_automation() {
+    let repository_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    assert!(repository_root.join(".github/dependabot.yml").is_file());
+    for workflow in ["ci.yml", "release.yml", "udeps-audit.yml"] {
+        assert!(
+            !repository_root
+                .join(".github/workflows")
+                .join(workflow)
+                .is_file(),
+            "GitHub Actions workflow must remain removed: {workflow}"
+        );
+    }
 }

@@ -1,17 +1,18 @@
 # Development Commands
 
-`Justfile` is the canonical entrypoint for local and CI tooling gates.
-Install `just` before running development recipes:
+`Justfile` is the canonical entrypoint for local validation and publication.
+Install `just` and the pinned analysis tools before running local CI, and
+authenticate GitHub CLI before publishing:
 
 ```bash
 cargo install --locked just --version 1.55.1
-rustup component add llvm-tools-preview
-cargo install --locked cargo-llvm-cov --version 0.8.4
+just _install-deny _install-audit _install-coverage
+gh auth login
 ```
 
 ## Structure
 
-- `Justfile`: validation, CI, release-note, udeps, and mutation-test recipes.
+- `Justfile`: local validation, release-note, udeps, publication, and mutation-test recipes.
 - `scripts/install.sh`: public install/uninstall flow used by operators.
 - `scripts/publish-release.sh`: guarded, transactional release preparation and publication.
 - `scripts/changelog/*`: release-notes normalization and changelog generation.
@@ -21,13 +22,86 @@ cargo install --locked cargo-llvm-cov --version 0.8.4
 ## Common Commands
 
 - `just check`
-- `just ci`
+- `just ci` (complete local gate, including release notes and 90% coverage thresholds)
 - `just coverage` (90% minimum for stable region, function, and line metrics)
 - `just exercise-release` (build and safely exercise the release binary with isolated runtime fixtures)
-- `just verify-release` (release notes, full CI, and coverage in one required pre-release gate)
 - `just update`
-- `just udeps`
+- `just udeps` (manual nightly-toolchain dependency-usage audit)
 - `just release-notes-check`
-- `just publish-release 0.11.0` (a leading `v` is also accepted; branch switching is automatic and is restored if publication does not complete)
+- `just publish-release 0.11.0` (complete local release preparation, validation, upload, verification, and publication)
 - `just mutants`
 - `just mutants --shard 1/4`
+
+## GitHub Automation
+
+Kidobo does not use checked-in GitHub Actions workflows. Run `just ci` before
+ordinary pushes and `just publish-release X.Y.Z` for releases. Dependabot update
+PRs remain enabled as the sole GitHub-hosted automation exception.
+
+After the commit removing the old workflows reaches `main`, disable the existing
+CodeQL default setup and verify the remaining workflow list:
+
+```bash
+gh api --method PATCH repos/blwarren/kidobo/code-scanning/default-setup \
+    -f state=not-configured
+gh workflow list --repo blwarren/kidobo
+```
+
+The second command should list only `Dependabot Updates`.
+
+## Release Recovery
+
+The publisher retains the archive, checksum, and release notes under
+`target/release-artifacts/<tag>/` whenever Git refs have been pushed but the
+GitHub release was not confirmed published. It prints commands specialized for
+that release. The equivalent manual recovery flow is:
+
+```bash
+release_tag=v0.12.2
+release_artifacts="target/release-artifacts/${release_tag}"
+release_archive="kidobo-${release_tag}-linux-x86_64.tar.gz"
+
+gh release view "${release_tag}" --repo blwarren/kidobo
+
+# Use this only when no draft exists.
+gh release create "${release_tag}" \
+    "${release_artifacts}/${release_archive}" \
+    "${release_artifacts}/SHA256SUMS" \
+    --repo blwarren/kidobo \
+    --draft \
+    --verify-tag \
+    --title "${release_tag}" \
+    --notes-file "${release_artifacts}/release-notes.md"
+
+# Use this instead when the draft already exists.
+gh release upload "${release_tag}" \
+    "${release_artifacts}/${release_archive}" \
+    "${release_artifacts}/SHA256SUMS" \
+    --repo blwarren/kidobo \
+    --clobber
+
+release_downloads="${release_artifacts}/downloaded"
+mkdir -p "${release_downloads}"
+gh release download "${release_tag}" \
+    --repo blwarren/kidobo \
+    --dir "${release_downloads}" \
+    --clobber \
+    --pattern "${release_archive}" \
+    --pattern SHA256SUMS
+cmp "${release_artifacts}/SHA256SUMS" "${release_downloads}/SHA256SUMS"
+(cd "${release_downloads}" && sha256sum --check SHA256SUMS)
+tar -tzf "${release_downloads}/${release_archive}"
+release_extract="${release_downloads}/extracted"
+mkdir -p "${release_extract}"
+tar -C "${release_extract}" -xzf "${release_downloads}/${release_archive}"
+"${release_extract}/kidobo-${release_tag}-linux-x86_64/kidobo" --version
+gh release edit "${release_tag}" \
+    --repo blwarren/kidobo \
+    --draft=false \
+    --latest
+```
+
+Before the final edit, confirm that the archive listing contains only the binary,
+README, and license under the expected top-level directory, and that the version
+output matches the tag. For a suffixed prerelease, add `--prerelease` when
+creating the draft and omit `--latest` when publishing it.

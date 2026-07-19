@@ -43,22 +43,19 @@ check: format test lint
 exercise-release: build-release
     @env KIDOBO_TEST_BINARY="${CARGO_TARGET_DIR:-target}/release/kidobo" cargo test --locked --test cli_runtime sync_remote_worker_warning_does_not_deadlock -- --exact
 
-# Run the full CI validation sequence.
-ci: && build-release lint deny audit test exercise-release
+# Run the complete local CI validation sequence.
+ci: && release-notes-check lint deny audit test coverage exercise-release
     @cargo fmt --all --check
 
 # Run the stable llvm-cov region, function, and line coverage gates.
 coverage:
     @cargo llvm-cov --workspace --all-features --fail-under-regions 90 --fail-under-functions 90 --fail-under-lines 90
 
-# Verify that the current revision is ready to become a release candidate.
-verify-release: && release-notes-check ci coverage
-
 # Run local mutation tests. Agents must not run this recipe.
 mutants *args:
     @env CARGO_MUTANTS_JOBS="${CARGO_MUTANTS_JOBS:-4}" cargo mutants -vV {{ args }}
 
-# Prepare, validate, commit, tag, and atomically publish a release.
+# Prepare, validate, package, and publish a release locally.
 publish-release version:
     @./scripts/publish-release.sh "{{ version }}"
 

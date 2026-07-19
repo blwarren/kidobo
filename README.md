@@ -214,36 +214,39 @@ Development commands are defined in `Justfile`.
 
 ```bash
 cargo install --locked just --version 1.55.1
-rustup component add llvm-tools-preview
-cargo install --locked cargo-llvm-cov --version 0.8.4
+just _install-deny _install-audit _install-coverage
+gh auth login
 just check
 just ci
-just coverage
-just exercise-release
-just release-notes-check
-just verify-release
 ```
 
-`just exercise-release` builds `target/release/kidobo` and runs it through an
+`just check` is the fast development loop. Run `just ci` explicitly before every
+push; GitHub does not run project CI for pushes or tags. The complete local gate
+checks release-note generation, formatting, lints, dependency policy, tests,
+coverage, and the release build. It also runs the built binary through an
 isolated sync scenario with a temporary `KIDOBO_ROOT`, a loopback HTTP feed,
-and fake privileged commands. It never invokes the development host's firewall
-or systemd. `just ci` includes this release-binary exercise.
+and fake privileged commands, never the development host's firewall or systemd.
+Dependabot update PRs are the only GitHub-hosted automation retained.
 
-Run `just verify-release` before initiating a release. The publisher enforces
-the same gate before preparing release state. Publish from any clean branch;
-the command switches to `main`
-automatically and verifies that it is not behind or diverged from `origin/main`:
+Publish from any clean branch; the command switches to `main` automatically and
+verifies that it is not behind or diverged from `origin/main`:
 
 ```bash
 just publish-release 0.11.0
 ```
 
-The command verifies release readiness, prepares the release in a temporary
-worktree, validates the candidate, displays the complete release diff, and asks
-for confirmation before atomically pushing the release commit and tag.
-After publication, the working tree remains on the updated `main` branch.
-If validation fails or publication is cancelled, the command restores the
-branch from which it was started.
+The command prepares the release in a temporary worktree, runs `just ci` once on
+the candidate, and packages the tested Linux x86_64 binary. After confirmation,
+it atomically pushes the release commit and annotated tag, uploads a draft with
+GitHub CLI, downloads and verifies the assets, and only then publishes the
+release. Stable versions become Latest; suffixed versions are prereleases.
+
+Artifacts remain under `target/release-artifacts/vX.Y.Z/`. If a GitHub operation
+fails after the refs are pushed, the draft and local artifacts are retained and
+the publisher prints exact recovery commands. If validation fails or publication
+is cancelled before the push, the command restores the original branch and
+removes the unpublished artifacts. After a successful publication, the working
+tree remains on the updated `main` branch.
 
 Use `just --list` to see all available local and CI recipes.
 

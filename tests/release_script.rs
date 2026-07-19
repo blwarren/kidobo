@@ -13,6 +13,10 @@ use tempfile::TempDir;
 const CURRENT_VERSION: &str = "0.11.1";
 const RELEASE_VERSION: &str = "0.12.0";
 const RELEASE_TAG: &str = "v0.12.0";
+const PRERELEASE_VERSION: &str = "0.12.0-rc.1";
+const PRERELEASE_TAG: &str = "v0.12.0-rc.1";
+const GITHUB_REPOSITORY: &str = "blwarren/kidobo";
+const GITHUB_REMOTE_URL: &str = "https://github.com/blwarren/kidobo.git";
 const FIXTURE_LOG_READ_LIMIT: usize = 1024 * 1024;
 const REPOSITORY_LOCAL_GIT_ENV_VARS: [&str; 9] = [
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",
@@ -78,7 +82,10 @@ struct ReleaseFixture {
     repo: PathBuf,
     remote: PathBuf,
     fake_bin: PathBuf,
+    event_log: PathBuf,
     git_log: PathBuf,
+    gh_log: PathBuf,
+    gh_release_dir: PathBuf,
     just_log: PathBuf,
 }
 
@@ -88,7 +95,10 @@ impl ReleaseFixture {
         let repo = temp.path().join("repo");
         let remote = temp.path().join("origin.git");
         let fake_bin = temp.path().join("fake-bin");
+        let event_log = temp.path().join("events.log");
         let git_log = temp.path().join("git.log");
+        let gh_log = temp.path().join("gh.log");
+        let gh_release_dir = temp.path().join("github-release");
         let just_log = temp.path().join("just.log");
         fs::create_dir_all(&repo).expect("mkdir repo");
 
@@ -121,6 +131,7 @@ impl ReleaseFixture {
             format!("install --version v{CURRENT_VERSION}\n"),
         )
         .expect("write README");
+        fs::write(repo.join("LICENSE"), "fixture license\n").expect("write license");
         fs::write(
             repo.join("release-notes/unreleased.md"),
             "- Test release behavior.\n",
@@ -128,6 +139,7 @@ impl ReleaseFixture {
         .expect("write unreleased notes");
         fs::write(repo.join("release-notes/dates.tsv"), "").expect("write dates");
         fs::write(repo.join("CHANGELOG.md"), "# Changelog\n").expect("write changelog");
+        fs::write(repo.join(".gitignore"), "/target\n").expect("write gitignore");
         fs::copy(publisher_path(), repo.join("publish-release.sh")).expect("copy publisher");
 
         assert_success(&run_git_at(&repo, &["add", "."]), "stage fixture");
@@ -136,16 +148,13 @@ impl ReleaseFixture {
             "commit fixture",
         );
         assert_success(
-            &run_git_at(
-                &repo,
-                &[
-                    "remote",
-                    "add",
-                    "origin",
-                    remote.to_str().expect("remote path"),
-                ],
-            ),
+            &run_git_at(&repo, &["remote", "add", "origin", GITHUB_REMOTE_URL]),
             "add origin",
+        );
+        let rewrite_key = format!("url.{}.insteadOf", remote.display());
+        assert_success(
+            &run_git_at(&repo, &["config", &rewrite_key, GITHUB_REMOTE_URL]),
+            "configure GitHub URL rewrite",
         );
         assert_success(
             &run_git_at(&repo, &["push", "-u", "origin", "main"]),
@@ -157,6 +166,7 @@ impl ReleaseFixture {
             r#"#!/usr/bin/env bash
 set -euo pipefail
 printf '%s\n' "$*" >> "${KIDOBO_TEST_GIT_LOG}"
+printf 'git %s\n' "$*" >> "${KIDOBO_TEST_EVENT_LOG}"
 exec "${KIDOBO_TEST_REAL_GIT}" "$@"
 "#,
         );
@@ -169,14 +179,113 @@ exec "${KIDOBO_TEST_REAL_GIT}" "$@"
             r#"#!/usr/bin/env bash
 set -euo pipefail
 printf '%s\n' "$*" >> "${KIDOBO_TEST_JUST_LOG}"
-if [[ "${KIDOBO_TEST_FAIL_VERIFY_RELEASE:-0}" == "1" && "$*" == "verify-release" ]]; then
-  echo "injected release readiness failure" >&2
-  exit 19
-fi
+printf 'just %s\n' "$*" >> "${KIDOBO_TEST_EVENT_LOG}"
 if [[ -n "${KIDOBO_TEST_READY_MARKER:-}" && "$*" == "ci" ]]; then
   : > "${KIDOBO_TEST_READY_MARKER}"
 fi
+if [[ "$*" == "ci" ]]; then
+  if [[ "${KIDOBO_TEST_FAIL_CI:-0}" == "1" ]]; then
+    echo "injected local CI failure" >&2
+    exit 19
+  fi
+  mkdir -p target/release
+  printf '#!/usr/bin/env bash\nprintf '\''kidobo %%s\\n'\'' %q\n' \
+    "${KIDOBO_TEST_BINARY_VERSION}" > target/release/kidobo
+  chmod 0755 target/release/kidobo
+fi
 exit 0
+"#,
+        );
+        write_executable(
+            &fake_bin.join("gh"),
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "${KIDOBO_TEST_GH_LOG}"
+printf 'gh %s\n' "$*" >> "${KIDOBO_TEST_EVENT_LOG}"
+
+if [[ "$1" == "auth" && "$2" == "status" ]]; then
+  [[ "${KIDOBO_TEST_FAIL_GH_AUTH:-0}" != "1" ]]
+  exit
+fi
+if [[ "$1" == "repo" && "$2" == "view" ]]; then
+  printf '%s\n' "${KIDOBO_TEST_GITHUB_REPOSITORY}"
+  exit 0
+fi
+if [[ "$1" == "release" && "$2" == "view" ]]; then
+  if [[ "${KIDOBO_TEST_EXISTING_RELEASE:-0}" == "1" \
+      || -e "${KIDOBO_TEST_GH_RELEASE_DIR}/draft" \
+      || -e "${KIDOBO_TEST_GH_RELEASE_DIR}/published" ]]; then
+    printf 'https://github.com/%s/releases/tag/%s\n' \
+      "${KIDOBO_TEST_GITHUB_REPOSITORY}" "$3"
+    exit 0
+  fi
+  exit 1
+fi
+if [[ "$1" == "release" && "$2" == "create" ]]; then
+  if [[ "${KIDOBO_TEST_FAIL_GH_CREATE:-0}" == "1" ]]; then
+    echo "injected GitHub release creation failure" >&2
+    exit 41
+  fi
+  mkdir -p "${KIDOBO_TEST_GH_RELEASE_DIR}"
+  for argument in "$@"; do
+    if [[ -f "${argument}" ]]; then
+      case "$(basename "${argument}")" in
+        *.tar.gz|SHA256SUMS)
+          cp "${argument}" "${KIDOBO_TEST_GH_RELEASE_DIR}/"
+          ;;
+      esac
+    fi
+  done
+  : > "${KIDOBO_TEST_GH_RELEASE_DIR}/draft"
+  exit 0
+fi
+if [[ "$1" == "release" && "$2" == "download" ]]; then
+  if [[ "${KIDOBO_TEST_FAIL_GH_DOWNLOAD:-0}" == "1" ]]; then
+    echo "injected GitHub release download failure" >&2
+    exit 42
+  fi
+  destination=""
+  while [[ $# -gt 0 ]]; do
+    if [[ "$1" == "--dir" ]]; then
+      destination="$2"
+      shift 2
+      continue
+    fi
+    shift
+  done
+  mkdir -p "${destination}"
+  cp "${KIDOBO_TEST_GH_RELEASE_DIR}"/*.tar.gz \
+    "${KIDOBO_TEST_GH_RELEASE_DIR}/SHA256SUMS" "${destination}/"
+  if [[ "${KIDOBO_TEST_CORRUPT_DOWNLOAD:-0}" == "1" ]]; then
+    printf 'corrupt\n' >> "${destination}"/*.tar.gz
+  fi
+  exit 0
+fi
+if [[ "$1" == "release" && "$2" == "edit" ]]; then
+  if [[ "${KIDOBO_TEST_FAIL_GH_EDIT:-0}" == "1" ]]; then
+    echo "injected GitHub release publication failure" >&2
+    exit 43
+  fi
+  rm -f "${KIDOBO_TEST_GH_RELEASE_DIR}/draft"
+  : > "${KIDOBO_TEST_GH_RELEASE_DIR}/published"
+  exit 0
+fi
+
+echo "unexpected gh invocation: $*" >&2
+exit 44
+"#,
+        );
+        write_executable(
+            &fake_bin.join("uname"),
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$1" == "-s" ]]; then
+  printf 'Linux\n'
+elif [[ "$1" == "-m" ]]; then
+  printf '%s\n' "${KIDOBO_TEST_UNAME_MACHINE:-x86_64}"
+else
+  exec /usr/bin/uname "$@"
+fi
 "#,
         );
 
@@ -185,7 +294,10 @@ exit 0
             repo,
             remote,
             fake_bin,
+            event_log,
             git_log,
+            gh_log,
+            gh_release_dir,
             just_log,
         }
     }
@@ -217,12 +329,38 @@ exit 0
     }
 
     fn tag_exists(&self) -> bool {
-        self.git(&["rev-parse", "--verify", "--quiet", RELEASE_TAG])
+        self.local_tag_exists(RELEASE_TAG)
+    }
+
+    fn local_tag_exists(&self, tag: &str) -> bool {
+        self.git(&["rev-parse", "--verify", "--quiet", tag])
             .status
             .success()
     }
 
+    fn remote_tag_exists(&self, tag: &str) -> bool {
+        run_git_at(
+            &self.remote,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("refs/tags/{tag}"),
+            ],
+        )
+        .status
+        .success()
+    }
+
+    fn artifact_root(&self, tag: &str) -> PathBuf {
+        self.repo.join("target/release-artifacts").join(tag)
+    }
+
     fn publisher_command(&self) -> Command {
+        self.publisher_command_for(RELEASE_VERSION)
+    }
+
+    fn publisher_command_for(&self, version: &str) -> Command {
         let mut command = Command::new(self.repo.join("publish-release.sh"));
         let path = match std::env::var("PATH") {
             Ok(existing) if !existing.is_empty() => {
@@ -231,19 +369,31 @@ exit 0
             _ => self.fake_bin.display().to_string(),
         };
         command
-            .arg(RELEASE_VERSION)
+            .arg(version)
             .current_dir(&self.repo)
             .env("PATH", path)
+            .env("KIDOBO_TEST_EVENT_LOG", &self.event_log)
             .env("KIDOBO_TEST_GIT_LOG", &self.git_log)
+            .env("KIDOBO_TEST_GH_LOG", &self.gh_log)
+            .env("KIDOBO_TEST_GH_RELEASE_DIR", &self.gh_release_dir)
+            .env("KIDOBO_TEST_GITHUB_REPOSITORY", GITHUB_REPOSITORY)
             .env("KIDOBO_TEST_JUST_LOG", &self.just_log)
-            .env("KIDOBO_TEST_REAL_GIT", "/usr/bin/git");
+            .env("KIDOBO_TEST_REAL_GIT", "/usr/bin/git")
+            .env(
+                "KIDOBO_TEST_BINARY_VERSION",
+                version.strip_prefix('v').unwrap_or(version),
+            );
         clear_repository_local_git_env(&mut command);
         command
     }
 
     fn run_publisher(&self, confirmation: &str) -> Output {
+        self.run_publisher_for(RELEASE_VERSION, confirmation)
+    }
+
+    fn run_publisher_for(&self, version: &str, confirmation: &str) -> Output {
         let mut child = self
-            .publisher_command()
+            .publisher_command_for(version)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -376,6 +526,61 @@ fn publisher_rejects_invalid_version_before_repository_changes() {
 }
 
 #[test]
+fn publisher_requires_github_cli() {
+    let output = Command::new("/usr/bin/bash")
+        .arg(publisher_path())
+        .arg(RELEASE_VERSION)
+        .env("PATH", "/missing")
+        .output()
+        .expect("run publisher without GitHub CLI");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("missing required command: gh"));
+}
+
+#[test]
+fn publisher_requires_github_authentication_before_repository_changes() {
+    let fixture = ReleaseFixture::new();
+    let output = fixture
+        .publisher_command()
+        .env("KIDOBO_TEST_FAIL_GH_AUTH", "1")
+        .output()
+        .expect("run publisher without GitHub authentication");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("gh auth login"));
+    assert!(!fixture.git_log.exists());
+}
+
+#[test]
+fn publisher_rejects_a_github_repository_that_does_not_match_origin() {
+    let fixture = ReleaseFixture::new();
+    let output = fixture
+        .publisher_command()
+        .env("KIDOBO_TEST_GITHUB_REPOSITORY", "someone/else")
+        .output()
+        .expect("run publisher with mismatched GitHub repository");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("does not match origin"));
+    assert!(!fixture.tag_exists());
+}
+
+#[test]
+fn publisher_rejects_non_x86_64_hosts_before_repository_changes() {
+    let fixture = ReleaseFixture::new();
+    let output = fixture
+        .publisher_command()
+        .env("KIDOBO_TEST_UNAME_MACHINE", "aarch64")
+        .output()
+        .expect("run publisher on unsupported architecture");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Linux x86_64 host"));
+    assert!(!fixture.git_log.exists());
+}
+
+#[test]
 fn publisher_rejects_a_dirty_worktree_before_switching_or_fetching() {
     let fixture = ReleaseFixture::new();
     fs::write(fixture.repo.join("dirty"), "dirty").expect("dirty worktree");
@@ -390,31 +595,47 @@ fn publisher_rejects_a_dirty_worktree_before_switching_or_fetching() {
 }
 
 #[test]
-fn publisher_stops_before_release_preparation_when_readiness_fails() {
+fn publisher_rejects_an_existing_github_release() {
+    let fixture = ReleaseFixture::new();
+    let output = fixture
+        .publisher_command()
+        .env("KIDOBO_TEST_EXISTING_RELEASE", "1")
+        .output()
+        .expect("run publisher with existing GitHub release");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("GitHub release already exists"));
+    assert!(!fixture.tag_exists());
+}
+
+#[test]
+fn publisher_stops_before_publication_when_local_ci_fails() {
     let fixture = ReleaseFixture::new();
     let original_head = fixture.head();
     let output = fixture
         .publisher_command()
-        .env("KIDOBO_TEST_FAIL_VERIFY_RELEASE", "1")
+        .env("KIDOBO_TEST_FAIL_CI", "1")
         .output()
-        .expect("run publisher with failing readiness gate");
+        .expect("run publisher with failing local CI");
 
     assert_eq!(output.status.code(), Some(19));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("injected release readiness failure"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("injected local CI failure"));
     assert_eq!(fixture.head(), original_head);
     assert!(!fixture.tag_exists());
+    assert!(!fixture.artifact_root(RELEASE_TAG).exists());
 
     let just_log = read_to_string_with_limit(&fixture.just_log, FIXTURE_LOG_READ_LIMIT);
     assert_eq!(
         just_log.lines().collect::<Vec<_>>(),
         [
             "_install-deny _install-audit _install-coverage",
-            "verify-release"
+            "_release-notes-format _release-notes-generate",
+            "ci"
         ]
     );
     let git_log = read_to_string_with_limit(&fixture.git_log, FIXTURE_LOG_READ_LIMIT);
     assert!(
-        !git_log
+        git_log
             .lines()
             .any(|line| line.starts_with("worktree add "))
     );
@@ -444,6 +665,7 @@ fn publisher_cancel_restores_the_original_branch_and_leaves_no_release_state() {
     assert_eq!(fixture.branch(), "feature");
     assert_eq!(fixture.head(), original_head);
     assert!(!fixture.tag_exists());
+    assert!(!fixture.artifact_root(RELEASE_TAG).exists());
     assert!(fixture.git(&["status", "--porcelain"]).stdout.is_empty());
     let log = read_to_string_with_limit(&fixture.git_log, FIXTURE_LOG_READ_LIMIT);
     assert!(log.contains("switch main"));
@@ -523,7 +745,7 @@ fn publisher_rolls_back_the_tag_when_origin_changes_during_validation() {
 }
 
 #[test]
-fn publisher_pushes_main_and_tag_with_one_exact_atomic_refspec() {
+fn publisher_atomically_pushes_then_verifies_and_publishes_local_artifacts() {
     let fixture = ReleaseFixture::new();
     let original_head = fixture.head();
 
@@ -537,6 +759,7 @@ fn publisher_pushes_main_and_tag_with_one_exact_atomic_refspec() {
     let release_head = fixture.head();
     assert_ne!(release_head, original_head);
     assert!(fixture.tag_exists());
+    assert!(fixture.remote_tag_exists(RELEASE_TAG));
     let log = read_to_string_with_limit(&fixture.git_log, FIXTURE_LOG_READ_LIMIT);
     let expected_push = format!(
         "push --atomic origin {release_head}:refs/heads/main refs/tags/{RELEASE_TAG}:refs/tags/{RELEASE_TAG}"
@@ -553,4 +776,158 @@ fn publisher_pushes_main_and_tag_with_one_exact_atomic_refspec() {
             .trim(),
         release_head
     );
+
+    let artifact_root = fixture.artifact_root(RELEASE_TAG);
+    let archive_name = format!("kidobo-{RELEASE_TAG}-linux-x86_64.tar.gz");
+    let archive = artifact_root.join(&archive_name);
+    assert!(archive.is_file());
+    assert!(artifact_root.join("SHA256SUMS").is_file());
+    assert!(artifact_root.join("release-notes.md").is_file());
+    let checksum = Command::new("sha256sum")
+        .args(["--check", "SHA256SUMS"])
+        .current_dir(&artifact_root)
+        .output()
+        .expect("verify retained release checksum");
+    assert_success(&checksum, "verify retained release checksum");
+    let listing = Command::new("tar")
+        .args(["-tzf", archive.to_str().expect("archive path")])
+        .output()
+        .expect("list retained release archive");
+    assert_success(&listing, "list retained release archive");
+    let mut entries = String::from_utf8(listing.stdout)
+        .expect("UTF-8 archive listing")
+        .lines()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    entries.sort();
+    assert_eq!(
+        entries,
+        [
+            format!("kidobo-{RELEASE_TAG}-linux-x86_64/"),
+            format!("kidobo-{RELEASE_TAG}-linux-x86_64/LICENSE"),
+            format!("kidobo-{RELEASE_TAG}-linux-x86_64/README.md"),
+            format!("kidobo-{RELEASE_TAG}-linux-x86_64/kidobo"),
+        ]
+    );
+
+    let just_log = read_to_string_with_limit(&fixture.just_log, FIXTURE_LOG_READ_LIMIT);
+    assert_eq!(
+        just_log.lines().filter(|line| *line == "ci").count(),
+        1,
+        "the prepared release candidate must run the consolidated CI gate exactly once"
+    );
+    let gh_log = read_to_string_with_limit(&fixture.gh_log, FIXTURE_LOG_READ_LIMIT);
+    let create = gh_log
+        .lines()
+        .find(|line| line.starts_with("release create "))
+        .expect("draft release creation");
+    assert!(create.contains("--draft"));
+    assert!(create.contains("--verify-tag"));
+    assert!(!create.contains("--prerelease"));
+    let edit = gh_log
+        .lines()
+        .find(|line| line.starts_with("release edit "))
+        .expect("release publication");
+    assert!(edit.contains("--draft=false"));
+    assert!(edit.contains("--latest"));
+
+    let events = read_to_string_with_limit(&fixture.event_log, FIXTURE_LOG_READ_LIMIT);
+    let ci_position = events.find("just ci\n").expect("local CI event");
+    let push_position = events
+        .find("git push --atomic ")
+        .expect("atomic push event");
+    let create_position = events
+        .find("gh release create ")
+        .expect("draft creation event");
+    let download_position = events
+        .find("gh release download ")
+        .expect("asset download event");
+    let edit_position = events
+        .find("gh release edit ")
+        .expect("draft publication event");
+    assert!(ci_position < push_position);
+    assert!(push_position < create_position);
+    assert!(create_position < download_position);
+    assert!(download_position < edit_position);
+    assert!(fixture.gh_release_dir.join("published").is_file());
+}
+
+#[test]
+fn publisher_marks_suffixed_versions_as_prereleases_without_changing_latest() {
+    let fixture = ReleaseFixture::new();
+
+    let output = fixture.run_publisher_for(PRERELEASE_VERSION, "y\n");
+
+    assert!(
+        output.status.success(),
+        "publisher failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(fixture.local_tag_exists(PRERELEASE_TAG));
+    assert!(fixture.remote_tag_exists(PRERELEASE_TAG));
+    let gh_log = read_to_string_with_limit(&fixture.gh_log, FIXTURE_LOG_READ_LIMIT);
+    let create = gh_log
+        .lines()
+        .find(|line| line.starts_with("release create "))
+        .expect("prerelease draft creation");
+    assert!(create.contains("--prerelease"));
+    let edit = gh_log
+        .lines()
+        .find(|line| line.starts_with("release edit "))
+        .expect("prerelease publication");
+    assert!(edit.contains("--draft=false"));
+    assert!(!edit.contains("--latest"));
+}
+
+#[test]
+fn publisher_retains_recovery_state_after_post_push_failures() {
+    for (failure_variable, failure_value, expected_status) in [
+        ("KIDOBO_TEST_FAIL_GH_CREATE", "1", 41),
+        ("KIDOBO_TEST_FAIL_GH_DOWNLOAD", "1", 42),
+        ("KIDOBO_TEST_CORRUPT_DOWNLOAD", "1", 1),
+        ("KIDOBO_TEST_BINARY_VERSION", "9.9.9", 1),
+        ("KIDOBO_TEST_FAIL_GH_EDIT", "1", 43),
+    ] {
+        let fixture = ReleaseFixture::new();
+        let output = fixture
+            .publisher_command()
+            .env(failure_variable, failure_value)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                child
+                    .stdin
+                    .take()
+                    .expect("publisher stdin")
+                    .write_all(b"y\n")?;
+                child.wait_with_output()
+            })
+            .expect("run publisher with post-push failure");
+
+        assert_eq!(
+            output.status.code(),
+            Some(expected_status),
+            "unexpected status for {failure_variable}: stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(fixture.tag_exists());
+        assert!(fixture.remote_tag_exists(RELEASE_TAG));
+        assert!(fixture.artifact_root(RELEASE_TAG).is_dir());
+        assert!(!fixture.gh_release_dir.join("published").exists());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("Local recovery artifacts were retained"));
+        assert!(stderr.contains("gh release upload"));
+        assert!(stderr.contains("gh release download"));
+        assert!(stderr.contains("gh release edit"));
+
+        let gh_log = read_to_string_with_limit(&fixture.gh_log, FIXTURE_LOG_READ_LIMIT);
+        if failure_variable != "KIDOBO_TEST_FAIL_GH_EDIT" {
+            assert!(
+                !gh_log.lines().any(|line| line.starts_with("release edit ")),
+                "failed validation must not attempt publication: {failure_variable}"
+            );
+        }
+    }
 }

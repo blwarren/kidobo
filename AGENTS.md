@@ -17,7 +17,7 @@ redesigns. New commands, configuration surface, or runtime modes require explici
 ## 2. Hard Invariants (Non-Negotiable)
 
 * Use the pinned stable toolchain in `rust-toolchain.toml`; keep it synchronized with
-  `package.rust-version` and explicit CI/release workflow pins.
+  `package.rust-version`.
 * The process remains one-shot. The supported systemd timer may invoke the existing `Type=oneshot`
   sync service; do not add a resident daemon, watcher, or internal scheduler.
 * Keep the public command surface and exit meanings stable: `0` for success/help/version, `1` for
@@ -82,7 +82,7 @@ the root CLI. Keep reusable computation out of adapters and CLI code; keep side 
 
 ## 5. Validation and Testing
 
-`Justfile` is the canonical interface for local and CI validation. Do not duplicate its Cargo commands
+`Justfile` is the canonical interface for local validation. Do not duplicate its Cargo commands
 in new scripts or documentation.
 
 After Rust, test, or executable-script changes, run:
@@ -91,11 +91,11 @@ After Rust, test, or executable-script changes, run:
 just check
 ```
 
-When runtime behavior, dependencies, the toolchain, CI, or release policy changes, run the extended
-gate instead:
+When runtime behavior, dependencies, the toolchain, CI, or release policy changes, run the complete
+local gate instead:
 
 ```bash
-just ci coverage
+just ci
 ```
 
 Documentation-only changes do not require Rust gates unless they affect executable examples, generated
@@ -191,9 +191,11 @@ If a missed mutant affects important behavior that is difficult to test with uni
 
 For `timeout` results, first determine whether the mutant exposes an actual termination, retry, or lock-release risk. If the timeout is an uninteresting mutation that predictably hangs and cannot produce a useful test, suppress it with the narrowest practical `#[mutants::skip]`, `--exclude`, or `--exclude-re` rule and document the reason. Preview persistent filters with `cargo mutants --list`.
 
-## 7. CI and Release Discipline
+## 7. Local CI and Release Discipline
 
-* Required workflows must pass before merge.
+* `just ci` must pass locally before merge.
+* CI/CD remains local. Do not add GitHub Actions workflows without explicit approval; Dependabot version
+  updates are the sole GitHub-hosted automation exception.
 * Release notes only for user-visible production impact.
 * `CHANGELOG.md` is generated only. Do not hand-edit it.
 * Update `release-notes/unreleased.md` only when the change has user-visible production impact.
