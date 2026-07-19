@@ -1,6 +1,7 @@
 use std::env;
 use std::fs::{self, OpenOptions};
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::mpsc;
@@ -899,6 +900,114 @@ fn sync_sigint_exits_with_130() {
         touched.exists(),
         "test did not reach command execution before SIGINT"
     );
+}
+
+#[test]
+fn sync_remote_worker_warning_does_not_deadlock() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind remote feed listener");
+    listener
+        .set_nonblocking(true)
+        .expect("set remote feed listener nonblocking");
+    let address = listener.local_addr().expect("remote feed listener address");
+    let server = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let (mut socket, _) = loop {
+            match listener.accept() {
+                Ok(connection) => break connection,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "timed out waiting for remote feed request"
+                    );
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("accept remote feed request: {error}"),
+            }
+        };
+        let mut request = [0_u8; 1024];
+        let _bytes_read = socket.read(&mut request).expect("read remote feed request");
+        let body = b"ip,score\n161.117.138.100,0.164985\n";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        socket
+            .write_all(response.as_bytes())
+            .and_then(|()| socket.write_all(body))
+            .expect("write remote feed response");
+    });
+    let root = create_sync_root(&format!(
+        "[ipset]\n\
+         set_name='kidobo'\n\
+         enable_ipv6=false\n\
+         [remote]\n\
+         urls=['http://{address}/feed.csv']\n\
+         timeout_secs=5\n\
+         [safe]\n\
+         include_github_meta=false\n"
+    ));
+    let fake_sudo = write_fake_sudo_script(&root);
+
+    let mut command = kidobo_with_root_command(root.path(), &["sync"]);
+    command
+        .env(
+            "PATH",
+            path_with_bin_prefix(fake_sudo.parent().expect("sudo parent")),
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().expect("spawn sync with warning feed");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if child
+            .try_wait()
+            .expect("poll sync with warning feed")
+            .is_some()
+        {
+            break;
+        }
+        if Instant::now() >= deadline {
+            child.kill().expect("kill deadlocked sync");
+            let output = child.wait_with_output().expect("reap deadlocked sync");
+            panic!(
+                "sync did not finish within five seconds: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let output = child.wait_with_output().expect("collect warning-feed sync");
+    server.join().expect("join remote feed server");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "warning-feed sync failed: {stderr}"
+    );
+    assert!(
+        stderr.contains("ignored 1 invalid line(s)"),
+        "missing remote parser warning: {stderr}"
+    );
+    assert!(
+        stderr.contains("sync completed: ipv4_entries=1 ipv6_entries=0"),
+        "missing sync completion: {stderr}"
+    );
+
+    let remote_cache = root.path().join("cache/remote");
+    let cached_iplist = fs::read_dir(&remote_cache)
+        .expect("read remote cache")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "iplist")
+        })
+        .expect("cached remote iplist");
+    let cached = read_to_string_with_limit(&cached_iplist, BLOCKLIST_READ_LIMIT)
+        .expect("read cached remote iplist");
+    assert_eq!(cached, "161.117.138.100/32");
 }
 
 #[test]

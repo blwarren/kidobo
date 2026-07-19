@@ -97,6 +97,11 @@ if [[ ! -s release-notes/unreleased.md ]]; then
     exit 1
 fi
 
+echo "[release] installing pinned validation tools"
+just _install-deny _install-audit _install-coverage
+echo "[release] verifying release readiness"
+just verify-release
+
 temporary_root="$(mktemp -d)"
 release_worktree="${temporary_root}/worktree"
 
@@ -140,7 +145,7 @@ git add Cargo.toml Cargo.lock README.md CHANGELOG.md release-notes
 just release-notes-check
 
 echo "[release] running release quality gates"
-just _install-deny _install-audit ci
+just ci
 git diff --check --cached
 if ! git diff --quiet || [[ -n "$(git ls-files --others --exclude-standard)" ]]; then
     echo "validation produced uncommitted changes outside the staged release update" >&2

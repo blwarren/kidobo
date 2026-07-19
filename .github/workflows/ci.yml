@@ -32,13 +32,8 @@ jobs:
       - name: Install just
         run: cargo install --locked just --version "${JUST_VERSION}"
 
-      - name: Install CI audit tools
-        run: just _install-deny _install-audit
-
-      - name: Install coverage tools
-        run: |
-          rustup component add llvm-tools-preview
-          cargo install --locked cargo-llvm-cov --version "${CARGO_LLVM_COV_VERSION}"
+      - name: Install CI tools
+        run: just _install-deny _install-audit _install-coverage
 
       - name: Run CI checks
-        run: just release-notes-check ci coverage
+        run: just verify-release

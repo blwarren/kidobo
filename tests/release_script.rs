@@ -79,6 +79,7 @@ struct ReleaseFixture {
     remote: PathBuf,
     fake_bin: PathBuf,
     git_log: PathBuf,
+    just_log: PathBuf,
 }
 
 impl ReleaseFixture {
@@ -88,6 +89,7 @@ impl ReleaseFixture {
         let remote = temp.path().join("origin.git");
         let fake_bin = temp.path().join("fake-bin");
         let git_log = temp.path().join("git.log");
+        let just_log = temp.path().join("just.log");
         fs::create_dir_all(&repo).expect("mkdir repo");
 
         assert_success(
@@ -166,7 +168,12 @@ exec "${KIDOBO_TEST_REAL_GIT}" "$@"
             &fake_bin.join("just"),
             r#"#!/usr/bin/env bash
 set -euo pipefail
-if [[ -n "${KIDOBO_TEST_READY_MARKER:-}" && "$*" == "_install-deny _install-audit ci" ]]; then
+printf '%s\n' "$*" >> "${KIDOBO_TEST_JUST_LOG}"
+if [[ "${KIDOBO_TEST_FAIL_VERIFY_RELEASE:-0}" == "1" && "$*" == "verify-release" ]]; then
+  echo "injected release readiness failure" >&2
+  exit 19
+fi
+if [[ -n "${KIDOBO_TEST_READY_MARKER:-}" && "$*" == "ci" ]]; then
   : > "${KIDOBO_TEST_READY_MARKER}"
 fi
 exit 0
@@ -179,6 +186,7 @@ exit 0
             remote,
             fake_bin,
             git_log,
+            just_log,
         }
     }
 
@@ -227,6 +235,7 @@ exit 0
             .current_dir(&self.repo)
             .env("PATH", path)
             .env("KIDOBO_TEST_GIT_LOG", &self.git_log)
+            .env("KIDOBO_TEST_JUST_LOG", &self.just_log)
             .env("KIDOBO_TEST_REAL_GIT", "/usr/bin/git");
         clear_repository_local_git_env(&mut command);
         command
@@ -378,6 +387,49 @@ fn publisher_rejects_a_dirty_worktree_before_switching_or_fetching() {
     let log = read_to_string_with_limit(&fixture.git_log, FIXTURE_LOG_READ_LIMIT);
     assert!(!log.contains("switch main"));
     assert!(!log.contains("fetch --quiet"));
+}
+
+#[test]
+fn publisher_stops_before_release_preparation_when_readiness_fails() {
+    let fixture = ReleaseFixture::new();
+    let original_head = fixture.head();
+    let output = fixture
+        .publisher_command()
+        .env("KIDOBO_TEST_FAIL_VERIFY_RELEASE", "1")
+        .output()
+        .expect("run publisher with failing readiness gate");
+
+    assert_eq!(output.status.code(), Some(19));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("injected release readiness failure"));
+    assert_eq!(fixture.head(), original_head);
+    assert!(!fixture.tag_exists());
+
+    let just_log = read_to_string_with_limit(&fixture.just_log, FIXTURE_LOG_READ_LIMIT);
+    assert_eq!(
+        just_log.lines().collect::<Vec<_>>(),
+        [
+            "_install-deny _install-audit _install-coverage",
+            "verify-release"
+        ]
+    );
+    let git_log = read_to_string_with_limit(&fixture.git_log, FIXTURE_LOG_READ_LIMIT);
+    assert!(
+        !git_log
+            .lines()
+            .any(|line| line.starts_with("worktree add "))
+    );
+    assert!(!git_log.lines().any(|line| line.starts_with("commit ")));
+    assert!(!git_log.lines().any(|line| line.starts_with("tag -a ")));
+    assert!(
+        !git_log
+            .lines()
+            .any(|line| line.starts_with("push --atomic "))
+    );
+
+    let manifest =
+        read_to_string_with_limit(&fixture.repo.join("Cargo.toml"), FIXTURE_LOG_READ_LIMIT);
+    assert!(manifest.contains(&format!("version = \"{CURRENT_VERSION}\"")));
+    assert!(!manifest.contains(&format!("version = \"{RELEASE_VERSION}\"")));
 }
 
 #[test]

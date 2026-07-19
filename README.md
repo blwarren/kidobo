@@ -220,18 +220,21 @@ just check
 just ci
 just coverage
 just release-notes-check
+just verify-release
 ```
 
-Publish a release from any clean branch. The command switches to `main`
+Run `just verify-release` before initiating a release. The publisher enforces
+the same gate before preparing release state. Publish from any clean branch;
+the command switches to `main`
 automatically and verifies that it is not behind or diverged from `origin/main`:
 
 ```bash
 just publish-release 0.11.0
 ```
 
-The command prepares the release in a temporary worktree, runs the same quality
-gate used by the GitHub release workflow, displays the complete release diff,
-and asks for confirmation before atomically pushing the release commit and tag.
+The command verifies release readiness, prepares the release in a temporary
+worktree, validates the candidate, displays the complete release diff, and asks
+for confirmation before atomically pushing the release commit and tag.
 After publication, the working tree remains on the updated `main` branch.
 If validation fails or publication is cancelled, the command restores the
 branch from which it was started.

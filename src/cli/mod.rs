@@ -53,18 +53,16 @@ pub fn run() -> ExitCode {
     }
 
     let stdin = io::stdin();
-    let stdout = io::stdout();
+    let mut stdout = io::stdout();
     let stdout_is_terminal = stdout.is_terminal();
-    let stderr = io::stderr();
+    let mut stderr = io::stderr();
     let mut input = stdin.lock();
-    let mut output = stdout.lock();
-    let mut errors = stderr.lock();
     let dispatch_result = commands::dispatch_with(
         cli.command,
         &mut CliIo {
             input: &mut input,
-            stdout: &mut output,
-            stderr: &mut errors,
+            stdout: &mut stdout,
+            stderr: &mut stderr,
             stdout_is_terminal,
             no_color: env::var_os("NO_COLOR").is_some(),
         },

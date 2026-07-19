@@ -94,6 +94,7 @@ jobs:
         with:
           tag_name: ${{ env.RELEASE_TAG }}
           body_path: release-notes/${{ env.RELEASE_TAG }}.md
+          make_latest: ${{ env.RELEASE_TAG == 'v0.12.1' && 'false' || 'legacy' }}
           files: |
             kidobo-${{ env.RELEASE_TAG }}-linux-x86_64.tar.gz
             SHA256SUMS

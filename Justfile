@@ -47,6 +47,9 @@ ci: && build-release lint deny audit test
 coverage:
     @cargo llvm-cov --workspace --all-features --fail-under-regions 90 --fail-under-functions 90 --fail-under-lines 90
 
+# Verify that the current revision is ready to become a release candidate.
+verify-release: && release-notes-check ci coverage
+
 # Run local mutation tests. Agents must not run this recipe.
 mutants *args:
     @env CARGO_MUTANTS_JOBS="${CARGO_MUTANTS_JOBS:-4}" cargo mutants -vV {{ args }}
@@ -80,3 +83,8 @@ _install-deny:
 # Install cargo-audit for CI and release validation.
 _install-audit:
     @cargo install --locked cargo-audit --version "${CARGO_AUDIT_VERSION:-0.22.1}"
+
+# Install cargo-llvm-cov for CI and release validation.
+_install-coverage:
+    @rustup component add llvm-tools-preview
+    @cargo install --locked cargo-llvm-cov --version "${CARGO_LLVM_COV_VERSION:-0.8.4}"

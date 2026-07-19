@@ -51,3 +51,16 @@ fn root_manifest_keeps_direct_release_version() {
         env!("CARGO_PKG_VERSION")
     )));
 }
+
+#[test]
+fn cli_dispatch_does_not_hold_global_output_locks() {
+    let root_cli = manifest("src/cli/mod.rs");
+    assert!(
+        !root_cli.contains("stdout.lock()"),
+        "root CLI dispatch must not hold the global stdout lock while worker threads can log"
+    );
+    assert!(
+        !root_cli.contains("stderr.lock()"),
+        "root CLI dispatch must not hold the global stderr lock while worker threads can log"
+    );
+}
