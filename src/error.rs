@@ -41,6 +41,14 @@ impl KidoboError {
     }
 }
 
+impl From<std::io::Error> for KidoboError {
+    fn from(error: std::io::Error) -> Self {
+        Self::CliIo {
+            reason: error.to_string(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::KidoboError;
@@ -53,5 +61,15 @@ mod tests {
     #[test]
     fn non_interrupted_maps_to_1() {
         assert_eq!(KidoboError::DoctorFailed.exit_code(), 1);
+    }
+
+    #[test]
+    fn io_error_converts_without_losing_its_message() {
+        let error = std::io::Error::other("write failed");
+
+        match KidoboError::from(error) {
+            KidoboError::CliIo { reason } => assert_eq!(reason, "write failed"),
+            other => panic!("expected CLI I/O error, got {other:?}"),
+        }
     }
 }

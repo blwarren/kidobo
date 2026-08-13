@@ -53,11 +53,27 @@ impl EnforcementPlan {
 }
 
 pub trait EnforcementBackend {
+    /// Ensures inactive managed sets and chains exist without enabling new wiring.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when any required firewall or ipset artifact cannot be prepared.
     fn ensure_artifacts(&self, plan: &EnforcementPlan) -> Result<(), AppError>;
 
+    /// Atomically replaces one managed set with the supplied family-specific entries.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the temporary set cannot be created, restored, swapped, or cleaned
+    /// up according to the backend contract.
     fn replace_set(&self, spec: &ManagedSetSpec, entries: &[CanonicalCidr])
     -> Result<(), AppError>;
 
+    /// Activates and normalizes firewall wiring for the prepared sets.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when fail-closed wiring cannot be established or normalized.
     fn activate(&self, plan: &EnforcementPlan) -> Result<(), AppError>;
 
     fn cleanup_disabled_ipv6(&self, plan: &EnforcementPlan) -> Vec<Notice>;
@@ -93,10 +109,19 @@ pub struct SyncDependencies<'a> {
     pub observer: &'a dyn SyncObserver,
 }
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "the explicit sequence is the audited fail-closed sync contract"
-)]
+struct LoadedSources {
+    candidates: Vec<CanonicalCidr>,
+    safelist: Vec<CanonicalCidr>,
+    summaries: Vec<SourceSummary>,
+}
+
+/// Runs one complete fail-closed synchronization.
+///
+/// # Errors
+///
+/// Returns an error when required paths, configuration, locking, sources, capacity preflight,
+/// atomic set replacement, or firewall activation fails. Best-effort source and disabled-family
+/// cleanup failures are reported as notices instead.
 pub fn execute(
     request: &PathResolutionInput,
     dependencies: &SyncDependencies<'_>,
@@ -125,44 +150,11 @@ pub fn execute(
         config: &config,
         env: &request.env,
     };
-    let mut candidates = Vec::new();
-    let mut safelist = Vec::new();
-    let mut summaries = Vec::new();
-
-    for provider in dependencies.sources.providers() {
-        let descriptor = provider.descriptor();
-        match provider.load(&source_context) {
-            Ok(batch) => {
-                let entry_count = batch.networks.len();
-                match descriptor.role {
-                    SourceRole::Candidate => candidates.extend(batch.networks),
-                    SourceRole::Safelist => safelist.extend(batch.networks),
-                }
-                for notice in &batch.notices {
-                    dependencies.observer.notice(notice);
-                }
-                summaries.push(SourceSummary {
-                    id: descriptor.id,
-                    role: descriptor.role,
-                    entries: entry_count,
-                    loaded: true,
-                });
-            }
-            Err(error) if descriptor.failure_policy == FailurePolicy::BestEffort => {
-                dependencies.observer.notice(&Notice::warning(format!(
-                    "source provider `{}` failed softly: {error}",
-                    descriptor.id
-                )));
-                summaries.push(SourceSummary {
-                    id: descriptor.id,
-                    role: descriptor.role,
-                    entries: 0,
-                    loaded: false,
-                });
-            }
-            Err(error) => return Err(error),
-        }
-    }
+    let LoadedSources {
+        mut candidates,
+        mut safelist,
+        summaries,
+    } = load_sources(dependencies.sources, &source_context, dependencies.observer)?;
     dependencies.observer.stage_completed("load_sources");
 
     candidates.sort_unstable();
@@ -220,6 +212,57 @@ pub fn execute(
         ipv4_entries: effective.ipv4.len(),
         ipv6_entries: effective.ipv6.len(),
         sources: summaries,
+    })
+}
+
+fn load_sources(
+    registry: &SyncSourceRegistry,
+    context: &SyncSourceContext<'_>,
+    observer: &dyn SyncObserver,
+) -> Result<LoadedSources, AppError> {
+    let mut candidates = Vec::new();
+    let mut safelist = Vec::new();
+    let mut summaries = Vec::new();
+
+    for provider in registry.providers() {
+        let descriptor = provider.descriptor();
+        match provider.load(context) {
+            Ok(batch) => {
+                let entry_count = batch.networks.len();
+                match descriptor.role {
+                    SourceRole::Candidate => candidates.extend(batch.networks),
+                    SourceRole::Safelist => safelist.extend(batch.networks),
+                }
+                for notice in &batch.notices {
+                    observer.notice(notice);
+                }
+                summaries.push(SourceSummary {
+                    id: descriptor.id,
+                    role: descriptor.role,
+                    entries: entry_count,
+                    loaded: true,
+                });
+            }
+            Err(error) if descriptor.failure_policy == FailurePolicy::BestEffort => {
+                observer.notice(&Notice::warning(format!(
+                    "source provider `{}` failed softly: {error}",
+                    descriptor.id
+                )));
+                summaries.push(SourceSummary {
+                    id: descriptor.id,
+                    role: descriptor.role,
+                    entries: 0,
+                    loaded: false,
+                });
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    Ok(LoadedSources {
+        candidates,
+        safelist,
+        summaries,
     })
 }
 

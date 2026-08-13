@@ -200,6 +200,11 @@ impl SyncSourceProvider for AsnBansSyncProvider {
     }
 }
 
+/// Builds the complete registry of synchronization source providers.
+///
+/// # Errors
+///
+/// Returns [`AppError::DuplicateSourceProvider`] if the built-in provider IDs are not unique.
 pub fn build_sync_source_registry(product_version: &str) -> Result<SyncSourceRegistry, AppError> {
     let user_agent = format!("kidobo/{product_version}");
     let mut registry = SyncSourceRegistry::new();

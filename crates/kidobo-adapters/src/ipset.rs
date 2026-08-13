@@ -90,6 +90,11 @@ pub enum IpsetError {
 }
 
 pub trait IpsetCommandRunner {
+    /// Runs one bounded ipset command.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CommandRunnerError`] when command execution fails.
     fn run(&self, command: &str, args: &[&str]) -> Result<CommandResult, CommandRunnerError>;
 }
 
@@ -99,6 +104,12 @@ impl<E: CommandExecutor> IpsetCommandRunner for SudoCommandRunner<E> {
     }
 }
 
+/// Ensures a compatible managed set exists without changing its contents.
+///
+/// # Errors
+///
+/// Returns [`IpsetError`] when inspection or creation fails, inspection output is malformed, or an
+/// existing set has an incompatible type or family.
 pub fn ensure_ipset_exists(
     runner: &dyn IpsetCommandRunner,
     spec: &IpsetSetSpec,
@@ -189,6 +200,11 @@ fn parse_ipset_info(stdout: &str) -> Result<IpsetSetInfo, String> {
     })
 }
 
+/// Creates a managed set idempotently from its full specification.
+///
+/// # Errors
+///
+/// Returns [`IpsetError`] when the ipset command cannot execute or exits unsuccessfully.
 pub fn create_ipset(
     runner: &dyn IpsetCommandRunner,
     spec: &IpsetSetSpec,
@@ -219,6 +235,7 @@ pub fn create_ipset(
     Ok(())
 }
 
+#[must_use]
 pub fn generate_temp_set_name(base_set_name: &str) -> String {
     let suffix = random_hex_suffix(8);
     let max_base_len = IPSET_NAME_MAX_LEN.saturating_sub(suffix.len() + 1);
@@ -230,6 +247,12 @@ pub fn generate_temp_set_name(base_set_name: &str) -> String {
     format!("{base}-{suffix}")
 }
 
+/// Atomically restores entries into a temporary set and swaps it with the managed set.
+///
+/// # Errors
+///
+/// Returns [`IpsetError`] when the restore script cannot be created or written, a required ipset
+/// command fails, or the final swap cannot complete. Temporary-set destruction remains best effort.
 pub fn atomic_replace_ipset_values<T: Ord + Display>(
     runner: &dyn IpsetCommandRunner,
     spec: &IpsetSetSpec,
@@ -591,7 +614,7 @@ mod tests {
             set_type: "hash:net".to_string(),
             family: IpsetFamily::Inet,
             hashsize: 65536,
-            maxelem: 500000,
+            maxelem: 500_000,
             timeout: 0,
         };
 
@@ -822,7 +845,7 @@ mod tests {
             set_type: "hash:net".to_string(),
             family: IpsetFamily::Inet,
             hashsize: 65536,
-            maxelem: 500000,
+            maxelem: 500_000,
             timeout: 0,
         };
 
@@ -877,7 +900,7 @@ mod tests {
             set_type: "hash:net".to_string(),
             family: IpsetFamily::Inet,
             hashsize: 65536,
-            maxelem: 500000,
+            maxelem: 500_000,
             timeout: 0,
         };
 

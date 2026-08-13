@@ -49,6 +49,12 @@ pub struct LookupDependencies<'a> {
     pub sources: &'a OfflineLookupRegistry,
 }
 
+/// Performs deterministic offline lookup against local and cached source registries.
+///
+/// # Errors
+///
+/// Returns an error when paths cannot be resolved, a target file cannot be read, or a required
+/// offline source cannot be loaded. Configuration-loading failures remain soft notices.
 pub fn execute(
     request: &LookupRequest,
     dependencies: &LookupDependencies<'_>,

@@ -9,6 +9,7 @@ pub enum CanonicalCidr {
 }
 
 impl CanonicalCidr {
+    #[must_use]
     pub fn family(self) -> AddressFamily {
         match self {
             Self::V4(_) => AddressFamily::Ipv4,
@@ -33,6 +34,7 @@ pub struct Ipv4Cidr {
 }
 
 impl Ipv4Cidr {
+    #[must_use]
     pub fn new(address: Ipv4Addr, prefix: u8) -> Option<Self> {
         if prefix > 32 {
             return None;
@@ -41,6 +43,7 @@ impl Ipv4Cidr {
     }
 
     #[doc(hidden)]
+    #[must_use]
     pub fn from_parts(network: u32, prefix: u8) -> Self {
         debug_assert!(prefix <= 32);
         Self {
@@ -49,10 +52,12 @@ impl Ipv4Cidr {
         }
     }
 
+    #[must_use]
     pub fn network(self) -> Ipv4Addr {
         Ipv4Addr::from(self.network)
     }
 
+    #[must_use]
     pub fn prefix(self) -> u8 {
         self.prefix
     }
@@ -71,6 +76,7 @@ pub struct Ipv6Cidr {
 }
 
 impl Ipv6Cidr {
+    #[must_use]
     pub fn new(address: Ipv6Addr, prefix: u8) -> Option<Self> {
         if prefix > 128 {
             return None;
@@ -79,6 +85,7 @@ impl Ipv6Cidr {
     }
 
     #[doc(hidden)]
+    #[must_use]
     pub fn from_parts(network: u128, prefix: u8) -> Self {
         debug_assert!(prefix <= 128);
         Self {
@@ -87,10 +94,12 @@ impl Ipv6Cidr {
         }
     }
 
+    #[must_use]
     pub fn network(self) -> Ipv6Addr {
         Ipv6Addr::from(self.network)
     }
 
+    #[must_use]
     pub fn prefix(self) -> u8 {
         self.prefix
     }

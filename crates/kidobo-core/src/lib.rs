@@ -2,16 +2,6 @@
 #![deny(dead_code)]
 #![deny(clippy::all)]
 #![warn(clippy::pedantic)]
-#![allow(
-    clippy::match_same_arms,
-    clippy::must_use_candidate,
-    clippy::needless_raw_string_hashes,
-    clippy::missing_errors_doc,
-    clippy::single_match_else,
-    clippy::struct_field_names,
-    clippy::unreadable_literal,
-    reason = "These pedantic lints conflict with the repository's established style"
-)]
 #![cfg_attr(
     not(test),
     deny(

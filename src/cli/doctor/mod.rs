@@ -9,7 +9,6 @@ use kidobo_app::doctor::{
     self, DoctorCheckStatus, DoctorDependencies, DoctorOverall, DoctorReport,
 };
 
-#[allow(clippy::print_stdout, reason = "CLI renders the doctor report")]
 pub fn run_doctor_command(io: &mut CliIo<'_>) -> Result<(), KidoboError> {
     let paths = SystemPathResolver;
     let configs = FileConfigRepository;

@@ -57,6 +57,11 @@ pub enum FirewallError {
 }
 
 pub trait FirewallCommandRunner {
+    /// Runs one bounded iptables-family command.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CommandRunnerError`] when command execution fails.
     fn run(&self, command: &str, args: &[&str]) -> Result<CommandResult, CommandRunnerError>;
 }
 
@@ -66,6 +71,12 @@ impl<E: CommandExecutor> FirewallCommandRunner for SudoCommandRunner<E> {
     }
 }
 
+/// Checks whether a named chain exists for one address family.
+///
+/// # Errors
+///
+/// Returns [`FirewallError`] when the inspection command cannot execute or fails for a reason
+/// other than a missing chain.
 pub fn chain_exists(
     runner: &dyn FirewallCommandRunner,
     family: FirewallFamily,
@@ -89,6 +100,12 @@ pub fn chain_exists(
     })
 }
 
+/// Establishes and normalizes fail-closed wiring for one family.
+///
+/// # Errors
+///
+/// Returns [`FirewallError`] when the chain, set-match action, or position-one input jump cannot be
+/// established or normalized.
 pub fn ensure_firewall_wiring(
     runner: &dyn FirewallCommandRunner,
     family: FirewallFamily,
@@ -107,6 +124,11 @@ pub fn ensure_firewall_wiring(
     Ok(())
 }
 
+/// Establishes IPv4 and optionally IPv6 managed firewall wiring.
+///
+/// # Errors
+///
+/// Returns the first [`FirewallError`] encountered while wiring an enabled family.
 pub fn ensure_firewall_wiring_for_families(
     runner: &dyn FirewallCommandRunner,
     set_name_v4: &str,
@@ -123,6 +145,11 @@ pub fn ensure_firewall_wiring_for_families(
     Ok(())
 }
 
+/// Ensures managed chains exist without activating new input jumps.
+///
+/// # Errors
+///
+/// Returns the first [`FirewallError`] encountered while preparing an enabled family.
 pub fn ensure_firewall_artifacts_for_families(
     runner: &dyn FirewallCommandRunner,
     enable_ipv6: bool,
@@ -134,6 +161,12 @@ pub fn ensure_firewall_artifacts_for_families(
     Ok(())
 }
 
+/// Removes every managed input jump, then flushes and deletes the managed chain.
+///
+/// # Errors
+///
+/// Returns [`FirewallError`] when any required cleanup command fails for a reason other than an
+/// already-missing rule or chain.
 pub fn cleanup_firewall_wiring(
     runner: &dyn FirewallCommandRunner,
     family: FirewallFamily,
@@ -161,6 +194,12 @@ fn ensure_chain_exists(
     run_checked(runner, family.binary(), &["-N", chain_name]).map(|_| ())
 }
 
+/// Repeatedly removes exact input jumps to a named chain until none remain.
+///
+/// # Errors
+///
+/// Returns [`FirewallError`] when inspection or deletion fails for a reason other than a missing
+/// rule.
 pub fn remove_all_input_jumps_for_chain(
     runner: &dyn FirewallCommandRunner,
     family: FirewallFamily,

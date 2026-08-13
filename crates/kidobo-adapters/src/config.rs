@@ -9,6 +9,12 @@ use kidobo_core::config::Config;
 
 const CONFIG_READ_LIMIT: usize = 64 * 1024;
 
+/// Boundedly reads and validates required configuration.
+///
+/// # Errors
+///
+/// Returns an error when the file is missing, cannot be read within its bound, or fails parsing or
+/// domain validation.
 pub fn load_config_from_file(path: &Path) -> Result<Config, AppError> {
     if !path.exists() {
         return Err(AppError::MissingConfigFile {

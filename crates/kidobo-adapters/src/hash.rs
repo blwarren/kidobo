@@ -2,11 +2,13 @@
 
 use sha2::{Digest, Sha256};
 
+#[must_use]
 pub fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     hex_lower(&digest)
 }
 
+#[must_use]
 pub fn hex_lower(bytes: &[u8]) -> String {
     let mut output = String::with_capacity(bytes.len() * 2);
 

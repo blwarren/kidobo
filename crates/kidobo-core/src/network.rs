@@ -29,6 +29,7 @@ impl From<Ipv6Cidr> for IntervalU128 {
     }
 }
 
+#[must_use]
 pub fn parse_ip_cidr_non_strict(input: &str) -> Option<CanonicalCidr> {
     let token = input.split_whitespace().next()?.trim();
     if token.is_empty() {
@@ -38,6 +39,7 @@ pub fn parse_ip_cidr_non_strict(input: &str) -> Option<CanonicalCidr> {
     parse_ip_cidr_token(token)
 }
 
+#[must_use]
 pub fn parse_ip_cidr_strict(input: &str) -> Option<CanonicalCidr> {
     let normalized = input.trim();
     if normalized.is_empty() {
@@ -80,6 +82,7 @@ where
         .collect()
 }
 
+#[must_use]
 pub fn split_by_family(cidrs: &[CanonicalCidr]) -> FamilyCidrs {
     let mut separated = FamilyCidrs::default();
 
@@ -183,6 +186,7 @@ pub(crate) fn intervals_to_ipv6_cidrs(intervals: &[IntervalU128]) -> Vec<Ipv6Cid
     intervals_to_ipv6_cidrs_from_merged(&merged)
 }
 
+#[must_use]
 pub fn cidr_overlaps(a: CanonicalCidr, b: CanonicalCidr) -> bool {
     match (a, b) {
         (CanonicalCidr::V4(left), CanonicalCidr::V4(right)) => {
@@ -789,13 +793,13 @@ mod tests {
         let host = parse_ip_cidr_non_strict("10.0.0.1").expect("parse host");
         assert_eq!(
             host,
-            CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a000001, 32))
+            CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a00_0001, 32))
         );
 
         let cidr = parse_ip_cidr_non_strict("10.0.0.42/24").expect("parse cidr");
         assert_eq!(
             cidr,
-            CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a000000, 24))
+            CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a00_0000, 24))
         );
 
         assert!(parse_ip_cidr_non_strict("not-an-ip").is_none());
@@ -819,47 +823,50 @@ mod tests {
     #[test]
     fn collapse_ipv4_merges_overlap_and_adjacency() {
         let collapsed = collapse_ipv4(&[
-            Ipv4Cidr::from_parts(0x0a000000, 25),
-            Ipv4Cidr::from_parts(0x0a000080, 25),
-            Ipv4Cidr::from_parts(0x0a000000, 24),
+            Ipv4Cidr::from_parts(0x0a00_0000, 25),
+            Ipv4Cidr::from_parts(0x0a00_0080, 25),
+            Ipv4Cidr::from_parts(0x0a00_0000, 24),
         ]);
 
-        assert_eq!(collapsed, vec![Ipv4Cidr::from_parts(0x0a000000, 24)]);
+        assert_eq!(collapsed, vec![Ipv4Cidr::from_parts(0x0a00_0000, 24)]);
     }
 
     #[test]
     fn collapse_ipv6_merges_adjacent_networks() {
         let collapsed = collapse_ipv6(&[
-            Ipv6Cidr::from_parts(0x20010db8000000000000000000000000, 65),
-            Ipv6Cidr::from_parts(0x20010db8000000008000000000000000, 65),
+            Ipv6Cidr::from_parts(0x2001_0db8_0000_0000_0000_0000_0000_0000, 65),
+            Ipv6Cidr::from_parts(0x2001_0db8_0000_0000_8000_0000_0000_0000, 65),
         ]);
 
         assert_eq!(
             collapsed,
-            vec![Ipv6Cidr::from_parts(0x20010db8000000000000000000000000, 64)]
+            vec![Ipv6Cidr::from_parts(
+                0x2001_0db8_0000_0000_0000_0000_0000_0000,
+                64
+            )]
         );
     }
 
     #[test]
     fn interval_conversion_is_correct_for_ipv4_and_ipv6() {
-        let v4_interval = ipv4_to_interval(Ipv4Cidr::from_parts(0xc0000200, 24));
+        let v4_interval = ipv4_to_interval(Ipv4Cidr::from_parts(0xc000_0200, 24));
         assert_eq!(
             v4_interval,
             IntervalU32 {
-                start: 0xc0000200,
-                end: 0xc00002ff,
+                start: 0xc000_0200,
+                end: 0xc000_02ff,
             }
         );
 
         let v6_interval = ipv6_to_interval(Ipv6Cidr::from_parts(
-            0x20010db8000000000000000000000000,
+            0x2001_0db8_0000_0000_0000_0000_0000_0000,
             126,
         ));
         assert_eq!(
             v6_interval,
             IntervalU128 {
-                start: 0x20010db8000000000000000000000000,
-                end: 0x20010db8000000000000000000000003,
+                start: 0x2001_0db8_0000_0000_0000_0000_0000_0000,
+                end: 0x2001_0db8_0000_0000_0000_0000_0000_0003,
             }
         );
     }
@@ -1388,22 +1395,22 @@ mod tests {
     #[test]
     fn safelist_subtraction_carves_ipv4_ranges() {
         let carved = subtract_safelist_ipv4(
-            &[Ipv4Cidr::from_parts(0x0a000000, 24)],
-            &[Ipv4Cidr::from_parts(0x0a000000, 25)],
+            &[Ipv4Cidr::from_parts(0x0a00_0000, 24)],
+            &[Ipv4Cidr::from_parts(0x0a00_0000, 25)],
         );
 
-        assert_eq!(carved, vec![Ipv4Cidr::from_parts(0x0a000080, 25)]);
+        assert_eq!(carved, vec![Ipv4Cidr::from_parts(0x0a00_0080, 25)]);
     }
 
     #[test]
     fn safelist_subtraction_carves_ipv6_ranges() {
         let carved = subtract_safelist_ipv6(
             &[Ipv6Cidr::from_parts(
-                0x20010db8000000000000000000000000,
+                0x2001_0db8_0000_0000_0000_0000_0000_0000,
                 127,
             )],
             &[Ipv6Cidr::from_parts(
-                0x20010db8000000000000000000000000,
+                0x2001_0db8_0000_0000_0000_0000_0000_0000,
                 128,
             )],
         );
@@ -1411,7 +1418,7 @@ mod tests {
         assert_eq!(
             carved,
             vec![Ipv6Cidr::from_parts(
-                0x20010db8000000000000000000000001,
+                0x2001_0db8_0000_0000_0000_0000_0000_0001,
                 128
             )]
         );
@@ -1439,7 +1446,7 @@ mod tests {
 
     #[test]
     fn exhaustive_ipv6_subtraction_matches_bruteforce_on_small_space() {
-        let base = 0x20010db8000000000000000000000000_u128;
+        let base = 0x2001_0db8_0000_0000_0000_0000_0000_0000_u128;
         let width = 6_u32;
         let forms = build_ipv6_forms(base, width);
 
@@ -1460,26 +1467,26 @@ mod tests {
     #[test]
     fn minimal_cidr_regeneration_from_intervals() {
         let cidrs = intervals_to_ipv4_cidrs(&[IntervalU32 {
-            start: 0x0a000002,
-            end: 0x0a000005,
+            start: 0x0a00_0002,
+            end: 0x0a00_0005,
         }]);
 
         assert_eq!(
             cidrs,
             vec![
-                Ipv4Cidr::from_parts(0x0a000002, 31),
-                Ipv4Cidr::from_parts(0x0a000004, 31),
+                Ipv4Cidr::from_parts(0x0a00_0002, 31),
+                Ipv4Cidr::from_parts(0x0a00_0004, 31),
             ]
         );
 
         let cidrs_v6 = intervals_to_ipv6_cidrs(&[IntervalU128 {
-            start: 0x20010db8000000000000000000000002,
-            end: 0x20010db8000000000000000000000003,
+            start: 0x2001_0db8_0000_0000_0000_0000_0000_0002,
+            end: 0x2001_0db8_0000_0000_0000_0000_0000_0003,
         }]);
         assert_eq!(
             cidrs_v6,
             vec![Ipv6Cidr::from_parts(
-                0x20010db8000000000000000000000002,
+                0x2001_0db8_0000_0000_0000_0000_0000_0002,
                 127
             )]
         );
@@ -1594,21 +1601,21 @@ mod tests {
     fn interval_regeneration_merges_adjacent_input_intervals() {
         let cidrs = intervals_to_ipv4_cidrs(&[
             IntervalU32 {
-                start: 0x0a000000,
-                end: 0x0a000000,
+                start: 0x0a00_0000,
+                end: 0x0a00_0000,
             },
             IntervalU32 {
-                start: 0x0a000001,
-                end: 0x0a000001,
+                start: 0x0a00_0001,
+                end: 0x0a00_0001,
             },
         ]);
 
-        assert_eq!(cidrs, vec![Ipv4Cidr::from_parts(0x0a000000, 31)]);
+        assert_eq!(cidrs, vec![Ipv4Cidr::from_parts(0x0a00_0000, 31)]);
     }
 
     #[test]
     fn interval_regeneration_sorts_unsorted_ipv6_input_intervals() {
-        let base = 0x20010db8000000000000000000000000_u128;
+        let base = 0x2001_0db8_0000_0000_0000_0000_0000_0000_u128;
         let cidrs = intervals_to_ipv6_cidrs(&[
             IntervalU128 {
                 start: base + 4,

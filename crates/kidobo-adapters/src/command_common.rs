@@ -16,6 +16,7 @@ pub fn display_command<S: AsRef<str>>(command: &str, args: &[S]) -> String {
     }
 }
 
+#[must_use]
 pub fn find_executable_in_path(binary: &str, path: Option<OsString>) -> Option<PathBuf> {
     let path = path?;
     env::split_paths(&path)
@@ -45,6 +46,11 @@ fn is_executable_file(path: &Path) -> bool {
     }
 }
 
+/// Returns a successful command result or maps its unsuccessful status to `E`.
+///
+/// # Errors
+///
+/// Returns the error produced by `build_error` when the command status is unsuccessful.
 pub fn ensure_command_succeeded<E, F>(
     result: CommandResult,
     command: &str,

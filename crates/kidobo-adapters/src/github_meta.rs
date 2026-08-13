@@ -71,9 +71,9 @@ enum CategorySelection {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CachePaths {
-    raw_path: PathBuf,
-    meta_path: PathBuf,
-    category_path: PathBuf,
+    raw: PathBuf,
+    metadata: PathBuf,
+    category_sidecar: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -95,13 +95,19 @@ struct GithubMetaCache {
 impl CachePaths {
     fn from_cache_dir(cache_dir: &Path) -> Self {
         Self {
-            raw_path: cache_dir.join(GITHUB_META_RAW_CACHE_FILE),
-            meta_path: cache_dir.join(GITHUB_META_META_CACHE_FILE),
-            category_path: cache_dir.join(GITHUB_META_CATEGORY_CACHE_FILE),
+            raw: cache_dir.join(GITHUB_META_RAW_CACHE_FILE),
+            metadata: cache_dir.join(GITHUB_META_META_CACHE_FILE),
+            category_sidecar: cache_dir.join(GITHUB_META_CATEGORY_CACHE_FILE),
         }
     }
 }
 
+/// Loads the selected GitHub metadata networks with conditional cache fallback.
+///
+/// # Errors
+///
+/// Returns [`GithubMetaLoadError::WriteCacheFile`] when a valid network response cannot be
+/// persisted atomically. Network and invalid-response failures otherwise use a validated fallback.
 pub fn load_github_meta_safelist(
     client: &dyn HttpClient,
     cache_dir: &Path,
@@ -151,6 +157,7 @@ pub fn load_github_meta_safelist(
     }
 }
 
+#[must_use]
 pub fn load_cached_github_meta_safelist(
     cache_dir: &Path,
     github_meta_url: &str,
@@ -168,7 +175,7 @@ fn read_github_meta_cache(
     github_meta_url: &str,
 ) -> GithubMetaCache {
     let cached_meta = read_optional_json_lossy::<GithubMetaCacheMetadata>(
-        &paths.meta_path,
+        &paths.metadata,
         GITHUB_META_META_READ_LIMIT,
         "github meta cache file",
     );
@@ -187,7 +194,7 @@ fn read_github_meta_cache(
     let meta = if cache_url_matches { cached_meta } else { None };
     let raw = if cache_url_matches {
         read_validated_bytes_lossy(
-            &paths.raw_path,
+            &paths.raw,
             GITHUB_META_CACHE_READ_LIMIT,
             "github meta cache file",
             meta.as_ref().map(|metadata| metadata.sha256_raw.as_str()),
@@ -199,7 +206,7 @@ fn read_github_meta_cache(
     };
     let sidecar = if cache_url_matches {
         read_optional_json_lossy::<GithubMetaCategorySidecar>(
-            &paths.category_path,
+            &paths.category_sidecar,
             GITHUB_META_CATEGORY_READ_LIMIT,
             "github meta cache file",
         )
@@ -328,24 +335,24 @@ fn persist_cache(
     metadata: &GithubMetaCacheMetadata,
     selection: &CategorySelection,
 ) -> Result<(), GithubMetaLoadError> {
-    write_bytes_atomic_in_cache(&paths.raw_path, raw).map_err(|err| {
+    write_bytes_atomic_in_cache(&paths.raw, raw).map_err(|err| {
         GithubMetaLoadError::WriteCacheFile {
-            path: paths.raw_path.clone(),
+            path: paths.raw.clone(),
             reason: err.to_string(),
         }
     })?;
 
     let sidecar = selection.to_sidecar();
-    write_json_pretty_atomic(&paths.category_path, &sidecar).map_err(|err| {
+    write_json_pretty_atomic(&paths.category_sidecar, &sidecar).map_err(|err| {
         GithubMetaLoadError::WriteCacheFile {
-            path: paths.category_path.clone(),
+            path: paths.category_sidecar.clone(),
             reason: err.to_string(),
         }
     })?;
 
-    write_json_pretty_atomic(&paths.meta_path, metadata).map_err(|err| {
+    write_json_pretty_atomic(&paths.metadata, metadata).map_err(|err| {
         GithubMetaLoadError::WriteCacheFile {
-            path: paths.meta_path.clone(),
+            path: paths.metadata.clone(),
             reason: err.to_string(),
         }
     })?;
@@ -378,19 +385,18 @@ fn cache_fallback(
         };
     }
 
-    let networks = match cached_networks {
-        Some(networks) => networks,
-        None => {
-            let Some(networks) = parse_and_extract_networks(raw, selection) else {
-                warn!("github meta cache is invalid JSON; ignoring stale cache");
-                return GithubMetaLoadResult {
-                    networks: Vec::new(),
-                    source: GithubMetaSource::Empty,
-                    metadata: cached_meta,
-                };
+    let networks = if let Some(networks) = cached_networks {
+        networks
+    } else {
+        let Some(networks) = parse_and_extract_networks(raw, selection) else {
+            warn!("github meta cache is invalid JSON; ignoring stale cache");
+            return GithubMetaLoadResult {
+                networks: Vec::new(),
+                source: GithubMetaSource::Empty,
+                metadata: cached_meta,
             };
-            networks
-        }
+        };
+        networks
     };
 
     GithubMetaLoadResult {
@@ -645,19 +651,19 @@ mod tests {
         assert_eq!(result.networks.len(), 5);
         assert_has(
             &result,
-            CanonicalCidr::V4(Ipv4Cidr::from_parts(0xc01efc00, 22)),
+            CanonicalCidr::V4(Ipv4Cidr::from_parts(0xc01e_fc00, 22)),
         );
         assert_has(
             &result,
             CanonicalCidr::V6(Ipv6Cidr::from_parts(
-                0x20010db8000000000000000000000001,
+                0x2001_0db8_0000_0000_0000_0000_0000_0001,
                 128,
             )),
         );
         assert!(
             !result
                 .networks
-                .contains(&CanonicalCidr::V4(Ipv4Cidr::from_parts(0xcb007200, 24)))
+                .contains(&CanonicalCidr::V4(Ipv4Cidr::from_parts(0xcb00_7200, 24)))
         );
 
         let requests = client.requests();
@@ -688,7 +694,7 @@ mod tests {
         assert_eq!(result.source, GithubMetaSource::Network);
         assert_eq!(
             result.networks,
-            vec![CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a000000, 24))]
+            vec![CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a00_0000, 24))]
         );
     }
 
@@ -754,7 +760,7 @@ mod tests {
     #[test]
     fn all_mode_distinguishes_empty_from_nonempty_invalid_trees() {
         let empty_temp = TempDir::new().expect("tempdir");
-        let empty_client = MockHttpClient::new(vec![Ok(network_response(br#"{}"#))]);
+        let empty_client = MockHttpClient::new(vec![Ok(network_response(br"{}"))]);
         let empty = load_github_meta_safelist(
             &empty_client,
             empty_temp.path(),
@@ -813,12 +819,12 @@ mod tests {
         assert_eq!(result.networks.len(), 2);
         assert_has(
             &result,
-            CanonicalCidr::V4(Ipv4Cidr::from_parts(0xc6336407, 32)),
+            CanonicalCidr::V4(Ipv4Cidr::from_parts(0xc633_6407, 32)),
         );
         assert_has(
             &result,
             CanonicalCidr::V6(Ipv6Cidr::from_parts(
-                0x20010db8000000000000000000000000,
+                0x2001_0db8_0000_0000_0000_0000_0000_0000,
                 126,
             )),
         );
@@ -1026,7 +1032,7 @@ mod tests {
         assert_eq!(result.source, GithubMetaSource::FallbackCache);
         assert_eq!(
             result.networks,
-            vec![CanonicalCidr::V4(Ipv4Cidr::from_parts(0xc6336407, 32))]
+            vec![CanonicalCidr::V4(Ipv4Cidr::from_parts(0xc633_6407, 32))]
         );
     }
 
@@ -1069,8 +1075,8 @@ mod tests {
         assert_eq!(
             result.networks,
             vec![
-                CanonicalCidr::V4(Ipv4Cidr::from_parts(0xc01efc00, 22)),
-                CanonicalCidr::V4(Ipv4Cidr::from_parts(0xc6336407, 32)),
+                CanonicalCidr::V4(Ipv4Cidr::from_parts(0xc01e_fc00, 22)),
+                CanonicalCidr::V4(Ipv4Cidr::from_parts(0xc633_6407, 32)),
             ]
         );
     }
@@ -1159,8 +1165,8 @@ mod tests {
         assert_eq!(
             result.networks,
             vec![
-                CanonicalCidr::V4(Ipv4Cidr::from_parts(0xc01efc00, 22)),
-                CanonicalCidr::V4(Ipv4Cidr::from_parts(0xc6336407, 32)),
+                CanonicalCidr::V4(Ipv4Cidr::from_parts(0xc01e_fc00, 22)),
+                CanonicalCidr::V4(Ipv4Cidr::from_parts(0xc633_6407, 32)),
             ]
         );
     }

@@ -32,6 +32,11 @@ pub enum AsnError {
 }
 
 pub trait AsnPrefixResolver {
+    /// Resolves and canonicalizes IPv4 and IPv6 prefixes for one ASN.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AsnError::ResolveFailed`] when the resolver cannot execute successfully.
     fn resolve_prefixes(&self, asn: u32) -> Result<Vec<CanonicalCidr>, AsnError>;
 }
 
@@ -42,6 +47,7 @@ pub struct Bgpq4AsnPrefixResolver<E: CommandExecutor> {
 }
 
 impl Bgpq4AsnPrefixResolver<SystemCommandExecutor> {
+    #[must_use]
     pub fn with_default_timeout() -> Self {
         Self {
             executor: SystemCommandExecutor,
@@ -110,6 +116,11 @@ pub struct CachedAsnPrefixes {
     pub stale: bool,
 }
 
+/// Parses, sorts, and deduplicates ASN tokens.
+///
+/// # Errors
+///
+/// Returns [`AsnError::InvalidAsnToken`] for the first empty, malformed, or zero-valued token.
 pub fn normalize_asn_tokens<I, S>(tokens: I) -> Result<Vec<u32>, AsnError>
 where
     I: IntoIterator<Item = S>,
@@ -124,6 +135,12 @@ where
     Ok(normalized)
 }
 
+/// Parses a positive ASN with an optional case-insensitive `AS` prefix.
+///
+/// # Errors
+///
+/// Returns [`AsnError::InvalidAsnToken`] when the input is empty, malformed, zero, or outside the
+/// `u32` range.
 pub fn parse_asn_token(input: &str) -> Result<u32, AsnError> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
@@ -148,6 +165,12 @@ pub fn parse_asn_token(input: &str) -> Result<u32, AsnError> {
     Ok(asn)
 }
 
+/// Loads fresh ASN prefixes or falls back to a stale bounded cache.
+///
+/// # Errors
+///
+/// Returns an error when the cache cannot be read, a fresh result cannot be resolved without a
+/// fallback, or a successful resolution cannot be cached atomically.
 pub fn load_asn_prefixes_with_cache(
     asn: u32,
     cache_dir: &Path,
@@ -188,6 +211,11 @@ pub fn load_asn_prefixes_with_cache(
     }
 }
 
+/// Loads cached ASN prefixes without network or subprocess access.
+///
+/// # Errors
+///
+/// Returns [`AsnError::CacheRead`] when an existing cache cannot be inspected, read, or parsed.
 pub fn load_cached_asn_prefixes(
     asn: u32,
     cache_dir: &Path,
@@ -196,6 +224,11 @@ pub fn load_cached_asn_prefixes(
     Ok(read_asn_cache_file(&cache_file)?.map(|state| state.prefixes))
 }
 
+/// Deletes one ASN cache file, reporting whether it existed.
+///
+/// # Errors
+///
+/// Returns [`AsnError::CacheWrite`] when an existing cache file cannot be removed.
 pub fn delete_asn_cache_file(asn: u32, cache_dir: &Path) -> Result<bool, AsnError> {
     let path = asn_cache_file(cache_dir, asn);
     if !path.exists() {
@@ -379,9 +412,9 @@ mod tests {
 
     #[test]
     fn parse_asn_token_accepts_bare_and_as_prefixed() {
-        assert_eq!(parse_asn_token("213412").expect("parse"), 213412);
-        assert_eq!(parse_asn_token("AS213412").expect("parse"), 213412);
-        assert_eq!(parse_asn_token("as213412").expect("parse"), 213412);
+        assert_eq!(parse_asn_token("213412").expect("parse"), 213_412);
+        assert_eq!(parse_asn_token("AS213412").expect("parse"), 213_412);
+        assert_eq!(parse_asn_token("as213412").expect("parse"), 213_412);
     }
 
     #[test]
@@ -525,7 +558,7 @@ mod tests {
         assert_eq!(
             loaded,
             CachedAsnPrefixes {
-                prefixes: vec![CanonicalCidr::V4(Ipv4Cidr::from_parts(0xcb007100, 24))],
+                prefixes: vec![CanonicalCidr::V4(Ipv4Cidr::from_parts(0xcb00_7100, 24))],
                 stale: false
             }
         );
@@ -567,7 +600,7 @@ mod tests {
         )
         .expect("write cache");
         let resolver = Mutex::new(MockResolver::new(vec![Ok(vec![CanonicalCidr::V4(
-            Ipv4Cidr::from_parts(0xc6336400, 24),
+            Ipv4Cidr::from_parts(0xc633_6400, 24),
         )])]));
 
         let loaded =
@@ -577,7 +610,7 @@ mod tests {
         assert_eq!(
             loaded,
             CachedAsnPrefixes {
-                prefixes: vec![CanonicalCidr::V4(Ipv4Cidr::from_parts(0xc6336400, 24))],
+                prefixes: vec![CanonicalCidr::V4(Ipv4Cidr::from_parts(0xc633_6400, 24))],
                 stale: false
             }
         );
@@ -659,8 +692,8 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let cache_dir = temp.path();
         let resolver = Mutex::new(MockResolver::new(vec![Ok(vec![
-            CanonicalCidr::V4(Ipv4Cidr::from_parts(0xcb007100, 24)),
-            CanonicalCidr::V4(Ipv4Cidr::from_parts(0xc6336400, 24)),
+            CanonicalCidr::V4(Ipv4Cidr::from_parts(0xcb00_7100, 24)),
+            CanonicalCidr::V4(Ipv4Cidr::from_parts(0xc633_6400, 24)),
         ])]));
 
         let first =

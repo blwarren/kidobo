@@ -12,7 +12,6 @@ use kidobo_app::init::{
     InitRequest, ProvisionState,
 };
 
-#[allow(clippy::print_stdout, reason = "CLI renders the typed init outcome")]
 pub fn run_init_command(io: &mut CliIo<'_>) -> Result<(), KidoboError> {
     let paths_input = path_resolution_input_from_process(None);
     let root_override = paths_input.env.get(ENV_KIDOBO_ROOT).map(PathBuf::from);

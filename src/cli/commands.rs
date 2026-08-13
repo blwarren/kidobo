@@ -35,11 +35,6 @@ pub fn dispatch_with(command: Command, io: &mut CliIo<'_>) -> Result<(), KidoboE
     }
 }
 
-#[allow(
-    clippy::print_stdout,
-    clippy::print_stderr,
-    reason = "CLI command writes results and diagnostics to the terminal"
-)]
 fn run_lookup_command(
     ip: Option<String>,
     file: Option<PathBuf>,
@@ -83,7 +78,7 @@ fn run_lookup_command(
     }?;
 
     for invalid in &outcome.invalid_targets {
-        writeln!(io.stderr, "invalid target: {invalid}").map_err(cli_io_error)?;
+        writeln!(io.stderr, "invalid target: {invalid}")?;
     }
 
     if !outcome.invalid_targets.is_empty() {
@@ -106,11 +101,11 @@ fn write_human_lookup(
     color: bool,
     output: &mut dyn std::io::Write,
 ) -> Result<(), KidoboError> {
-    writeln!(output, "{}", lookup_table_border('┌', '┬', '┐')).map_err(cli_io_error)?;
+    writeln!(output, "{}", lookup_table_border('┌', '┬', '┐'))?;
     for row in format_lookup_table_row(["Target", "Status", "Source", "Matched Entry"], false) {
-        writeln!(output, "{row}").map_err(cli_io_error)?;
+        writeln!(output, "{row}")?;
     }
-    writeln!(output, "{}", lookup_table_border('├', '┼', '┤')).map_err(cli_io_error)?;
+    writeln!(output, "{}", lookup_table_border('├', '┼', '┤'))?;
 
     let total_count = outcome.targets.len();
     let matched_count = outcome
@@ -121,7 +116,7 @@ fn write_human_lookup(
     for target in &outcome.targets {
         if target.matches.is_empty() {
             for row in format_lookup_table_row([&target.target, "NO MATCH", "—", "—"], color) {
-                writeln!(output, "{row}").map_err(cli_io_error)?;
+                writeln!(output, "{row}")?;
             }
         } else {
             for source in &target.matches {
@@ -134,20 +129,20 @@ fn write_human_lookup(
                     ],
                     color,
                 ) {
-                    writeln!(output, "{row}").map_err(cli_io_error)?;
+                    writeln!(output, "{row}")?;
                 }
             }
         }
     }
 
-    writeln!(output, "{}", lookup_table_border('└', '┴', '┘')).map_err(cli_io_error)?;
+    writeln!(output, "{}", lookup_table_border('└', '┴', '┘'))?;
     let unmatched_count = total_count.saturating_sub(matched_count);
     writeln!(
         output,
         "\nSummary\n  Targets:    {total_count}\n  Matched:    {matched_count}\n  Unmatched:  {unmatched_count}\n  Match rate: {}",
         percent_str(matched_count, total_count)
-    )
-    .map_err(cli_io_error)
+    )?;
+    Ok(())
 }
 
 fn write_tsv_lookup(
@@ -160,15 +155,14 @@ fn write_tsv_lookup(
                 output,
                 "{}\t{}\t{}",
                 target.target, source.source_label, source.matched_source_entry
-            )
-            .map_err(cli_io_error)?;
+            )?;
         }
     }
 
     if outcome.file_mode {
         for target in &outcome.targets {
             if target.matches.is_empty() {
-                writeln!(output, "{}\tNO_MATCH", target.target).map_err(cli_io_error)?;
+                writeln!(output, "{}\tNO_MATCH", target.target)?;
             }
         }
         let matched_count = outcome
@@ -181,8 +175,7 @@ fn write_tsv_lookup(
             "summary: total_ips={} matched_ips={matched_count} matched_pct={}",
             outcome.targets.len(),
             percent_str(matched_count, outcome.targets.len())
-        )
-        .map_err(cli_io_error)?;
+        )?;
     }
     Ok(())
 }
@@ -270,16 +263,6 @@ fn percent(numerator: usize, denominator: usize) -> usize {
 
 fn percent_str(numerator: usize, denominator: usize) -> String {
     format!("{}%", percent(numerator, denominator))
-}
-
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "Result::map_err supplies the owned I/O error"
-)]
-fn cli_io_error(error: std::io::Error) -> KidoboError {
-    KidoboError::CliIo {
-        reason: error.to_string(),
-    }
 }
 
 #[cfg(test)]

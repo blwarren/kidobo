@@ -33,7 +33,7 @@ cache_stale_after_secs = 86400
 pub const DEFAULT_BLOCKLIST_TEMPLATE: &str =
     "# Add one IP or CIDR entry per line.\n# Example: 203.0.113.7\n";
 
-pub const DEFAULT_SYSTEMD_TIMER_TEMPLATE: &str = r#"[Unit]
+pub const DEFAULT_SYSTEMD_TIMER_TEMPLATE: &str = r"[Unit]
 Description=Run kidobo sync periodically
 
 [Timer]
@@ -44,7 +44,7 @@ Unit=kidobo-sync.service
 
 [Install]
 WantedBy=timers.target
-"#;
+";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InitRequest {
@@ -72,12 +72,32 @@ pub struct InitOutcome {
 }
 
 pub trait InitProvisioner {
+    /// Selects an installed executable from the trusted candidate paths.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no candidate resolves to an acceptable executable.
     fn resolve_installed_executable(&self, candidates: &[PathBuf]) -> Result<PathBuf, AppError>;
 
+    /// Creates a directory if it is absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the directory cannot be inspected or created safely.
     fn ensure_dir(&self, path: &Path) -> Result<ProvisionState, AppError>;
 
+    /// Creates a file with the supplied contents if it is absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the file cannot be inspected or created safely.
     fn ensure_file(&self, path: &Path, contents: &str) -> Result<ProvisionState, AppError>;
 
+    /// Reloads systemd and enables the managed timer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a required systemd command fails.
     fn enable_systemd_timer(&self) -> Result<(), AppError>;
 }
 
@@ -86,6 +106,12 @@ pub struct InitDependencies<'a> {
     pub provisioner: &'a dyn InitProvisioner,
 }
 
+/// Provisions Kidobo directories, configuration, blocklist, lock, and systemd units.
+///
+/// # Errors
+///
+/// Returns an error when paths cannot be resolved, the installed executable cannot be trusted, an
+/// artifact cannot be provisioned, or live systemd enablement fails.
 pub fn execute(
     request: &InitRequest,
     dependencies: &InitDependencies<'_>,

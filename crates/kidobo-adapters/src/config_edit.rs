@@ -15,6 +15,11 @@ pub struct AsnBanUpdateResult {
     pub removed: Vec<u32>,
 }
 
+/// Atomically adds and removes ASNs while preserving unrelated TOML content.
+///
+/// # Errors
+///
+/// Returns an error when configuration cannot be read, parsed, validated, or atomically written.
 pub fn update_asn_bans(
     config_path: &Path,
     add: &[u32],

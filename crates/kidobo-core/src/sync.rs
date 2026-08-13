@@ -9,6 +9,7 @@ pub struct EffectiveBlocklists {
     pub ipv6: Vec<Ipv6Cidr>,
 }
 
+#[must_use]
 pub fn compute_effective_blocklists(
     candidates: &[CanonicalCidr],
     safelist: &[CanonicalCidr],
@@ -255,20 +256,26 @@ mod tests {
     #[test]
     fn pipeline_collapses_and_carves_per_family() {
         let candidates = vec![
-            CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a000000, 25)),
-            CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a000080, 25)),
-            CanonicalCidr::V6(Ipv6Cidr::from_parts(0x20010db8000000000000000000000000, 64)),
+            CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a00_0000, 25)),
+            CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a00_0080, 25)),
+            CanonicalCidr::V6(Ipv6Cidr::from_parts(
+                0x2001_0db8_0000_0000_0000_0000_0000_0000,
+                64,
+            )),
         ];
         let safelist = vec![
-            CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a000000, 25)),
-            CanonicalCidr::V6(Ipv6Cidr::from_parts(0x20010db8000000000000000000000000, 65)),
+            CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a00_0000, 25)),
+            CanonicalCidr::V6(Ipv6Cidr::from_parts(
+                0x2001_0db8_0000_0000_0000_0000_0000_0000,
+                65,
+            )),
         ];
 
         let effective = compute_effective_blocklists(&candidates, &safelist, true);
 
         assert_eq!(
             effective.ipv4,
-            vec![Ipv4Cidr::from_parts(0x0a000080, 25)],
+            vec![Ipv4Cidr::from_parts(0x0a00_0080, 25)],
             "collapsed /24 should be carved by /25 safelist"
         );
         assert_eq!(
@@ -289,7 +296,7 @@ mod tests {
     #[test]
     fn ipv6_disable_drops_ipv6_output() {
         let candidates = vec![CanonicalCidr::V6(Ipv6Cidr::from_parts(
-            0x20010db8000000000000000000000000,
+            0x2001_0db8_0000_0000_0000_0000_0000_0000,
             64,
         ))];
 
@@ -320,21 +327,21 @@ mod tests {
     #[test]
     fn safelist_covering_disjoint_candidate_slices_removes_all_overlaps() {
         let candidates = vec![
-            CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a000000, 26)),
-            CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a000080, 26)),
+            CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a00_0000, 26)),
+            CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a00_0080, 26)),
             CanonicalCidr::V6(Ipv6Cidr::from_parts(
-                0x20010db8000000000000000000000000,
+                0x2001_0db8_0000_0000_0000_0000_0000_0000,
                 124,
             )),
             CanonicalCidr::V6(Ipv6Cidr::from_parts(
-                0x20010db8000000000000000000000010,
+                0x2001_0db8_0000_0000_0000_0000_0000_0010,
                 124,
             )),
         ];
         let safelist = vec![
-            CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a000000, 24)),
+            CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a00_0000, 24)),
             CanonicalCidr::V6(Ipv6Cidr::from_parts(
-                0x20010db8000000000000000000000000,
+                0x2001_0db8_0000_0000_0000_0000_0000_0000,
                 120,
             )),
         ];
@@ -346,21 +353,21 @@ mod tests {
 
     #[test]
     fn subtraction_applies_all_safelist_entries_per_family() {
-        let v6_base = 0x20010db8000000000000000000000000_u128;
+        let v6_base = 0x2001_0db8_0000_0000_0000_0000_0000_0000_u128;
         let candidates = vec![
-            CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a000000, 24)),
+            CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a00_0000, 24)),
             CanonicalCidr::V6(Ipv6Cidr::from_parts(v6_base, 120)),
         ];
         let safelist = vec![
-            CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a000000, 25)),
-            CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a000080, 26)),
+            CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a00_0000, 25)),
+            CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a00_0080, 26)),
             CanonicalCidr::V6(Ipv6Cidr::from_parts(v6_base, 121)),
             CanonicalCidr::V6(Ipv6Cidr::from_parts(v6_base + 0x80, 122)),
         ];
 
         let effective = compute_effective_blocklists(&candidates, &safelist, true);
 
-        assert_eq!(effective.ipv4, vec![Ipv4Cidr::from_parts(0x0a0000c0, 26)]);
+        assert_eq!(effective.ipv4, vec![Ipv4Cidr::from_parts(0x0a00_00c0, 26)]);
         assert_eq!(
             effective.ipv6,
             vec![Ipv6Cidr::from_parts(v6_base + 0xc0, 122)]
@@ -369,15 +376,15 @@ mod tests {
 
     #[test]
     fn subtraction_carves_each_candidate_interval_not_just_first_overlap() {
-        let v6_base = 0x20010db8000000000000000000000000_u128;
+        let v6_base = 0x2001_0db8_0000_0000_0000_0000_0000_0000_u128;
         let candidates = vec![
-            CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a000000, 25)),
-            CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a000100, 24)),
+            CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a00_0000, 25)),
+            CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a00_0100, 24)),
             CanonicalCidr::V6(Ipv6Cidr::from_parts(v6_base, 127)),
             CanonicalCidr::V6(Ipv6Cidr::from_parts(v6_base + 4, 126)),
         ];
         let safelist = vec![
-            CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a000100, 25)),
+            CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a00_0100, 25)),
             CanonicalCidr::V6(Ipv6Cidr::from_parts(v6_base + 4, 127)),
         ];
 
@@ -386,8 +393,8 @@ mod tests {
         assert_eq!(
             effective.ipv4,
             vec![
-                Ipv4Cidr::from_parts(0x0a000000, 25),
-                Ipv4Cidr::from_parts(0x0a000180, 25),
+                Ipv4Cidr::from_parts(0x0a00_0000, 25),
+                Ipv4Cidr::from_parts(0x0a00_0180, 25),
             ]
         );
         assert_eq!(
@@ -401,13 +408,13 @@ mod tests {
 
     #[test]
     fn subtraction_respects_safelist_supernets() {
-        let v6_base = 0x20010db8000000000000000000000000_u128;
+        let v6_base = 0x2001_0db8_0000_0000_0000_0000_0000_0000_u128;
         let candidates = vec![
-            CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a000080, 25)),
+            CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a00_0080, 25)),
             CanonicalCidr::V6(Ipv6Cidr::from_parts(v6_base + 0x80, 121)),
         ];
         let safelist = vec![
-            CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a000000, 24)),
+            CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a00_0000, 24)),
             CanonicalCidr::V6(Ipv6Cidr::from_parts(v6_base, 120)),
         ];
 
@@ -418,32 +425,32 @@ mod tests {
 
     #[test]
     fn subtraction_preserves_no_safelisted_endpoint_addresses() {
-        let v6_base = 0x20010db8000000000000000000000000_u128;
+        let v6_base = 0x2001_0db8_0000_0000_0000_0000_0000_0000_u128;
         let candidates = vec![
-            CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a000000, 31)),
+            CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a00_0000, 31)),
             CanonicalCidr::V6(Ipv6Cidr::from_parts(v6_base, 127)),
         ];
         let safelist = vec![
-            CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a000001, 32)),
+            CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a00_0001, 32)),
             CanonicalCidr::V6(Ipv6Cidr::from_parts(v6_base + 1, 128)),
         ];
 
         let effective = compute_effective_blocklists(&candidates, &safelist, true);
 
-        assert_eq!(effective.ipv4, vec![Ipv4Cidr::from_parts(0x0a000000, 32)]);
+        assert_eq!(effective.ipv4, vec![Ipv4Cidr::from_parts(0x0a00_0000, 32)]);
         assert_eq!(effective.ipv6, vec![Ipv6Cidr::from_parts(v6_base, 128)]);
     }
 
     #[test]
     fn subtraction_handles_unsorted_safelist_ranges() {
-        let v6_base = 0x20010db8000000000000000000000000_u128;
+        let v6_base = 0x2001_0db8_0000_0000_0000_0000_0000_0000_u128;
         let candidates = vec![
-            CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a000000, 24)),
+            CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a00_0000, 24)),
             CanonicalCidr::V6(Ipv6Cidr::from_parts(v6_base, 120)),
         ];
         let safelist = vec![
-            CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a000080, 25)),
-            CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a000000, 25)),
+            CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a00_0080, 25)),
+            CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a00_0000, 25)),
             CanonicalCidr::V6(Ipv6Cidr::from_parts(v6_base + 0x80, 121)),
             CanonicalCidr::V6(Ipv6Cidr::from_parts(v6_base, 121)),
         ];

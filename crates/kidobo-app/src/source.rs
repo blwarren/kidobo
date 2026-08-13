@@ -69,6 +69,12 @@ pub struct SyncSourceContext<'a> {
 pub trait SyncSourceProvider: Send + Sync {
     fn descriptor(&self) -> SyncSourceDescriptor;
 
+    /// Loads one batch of candidate or safelist networks.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the provider cannot produce a usable batch. The registry descriptor
+    /// determines whether the sync workflow treats that failure as required or best effort.
     fn load(&self, context: &SyncSourceContext<'_>) -> Result<SyncSourceBatch, AppError>;
 }
 
@@ -79,10 +85,16 @@ pub struct SyncSourceRegistry {
 }
 
 impl SyncSourceRegistry {
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Registers a synchronization provider by its stable descriptor ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AppError::DuplicateSourceProvider`] when the ID is already registered.
     pub fn register(
         &mut self,
         provider: impl SyncSourceProvider + 'static,
@@ -116,6 +128,11 @@ pub struct OfflineLookupContext<'a> {
 pub trait OfflineLookupProvider: Send + Sync {
     fn id(&self) -> &'static str;
 
+    /// Appends this provider's offline lookup entries.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the provider's local or cached data cannot be loaded safely.
     fn append_offline(
         &self,
         context: &OfflineLookupContext<'_>,
@@ -130,10 +147,16 @@ pub struct OfflineLookupRegistry {
 }
 
 impl OfflineLookupRegistry {
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Registers an offline provider by its stable ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AppError::DuplicateSourceProvider`] when the ID is already registered.
     pub fn register(
         &mut self,
         provider: impl OfflineLookupProvider + 'static,
@@ -146,6 +169,11 @@ impl OfflineLookupRegistry {
         Ok(())
     }
 
+    /// Loads and deterministically orders entries from every offline provider.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first provider error encountered while loading its local or cached data.
     pub fn load(
         &self,
         context: &OfflineLookupContext<'_>,

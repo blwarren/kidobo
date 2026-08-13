@@ -83,6 +83,11 @@ pub enum HttpClientError {
 }
 
 pub trait HttpClient {
+    /// Fetches one response while enforcing the request's body-size bound.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HttpClientError`] when the request, response headers, or bounded body read fails.
     fn fetch(&self, request: HttpRequest) -> Result<HttpResponse, HttpClientError>;
 }
 
@@ -100,6 +105,7 @@ impl Default for ReqwestHttpClient {
 }
 
 impl ReqwestHttpClient {
+    #[must_use]
     pub fn with_timeout(request_timeout: Duration) -> Self {
         Self::new_with_timeout(default_user_agent(), request_timeout)
     }
@@ -190,10 +196,12 @@ pub enum HttpCacheError {
     ReadIplist { path: PathBuf, reason: String },
 }
 
+#[must_use]
 pub fn url_hash_prefix(url: &str) -> String {
     sha256_hex(url.as_bytes())[..16].to_string()
 }
 
+#[must_use]
 pub fn cache_paths_for_url(cache_dir: &Path, url: &str) -> CachePaths {
     let hash = url_hash_prefix(url);
     CachePaths {
@@ -203,6 +211,7 @@ pub fn cache_paths_for_url(cache_dir: &Path, url: &str) -> CachePaths {
     }
 }
 
+#[must_use]
 pub fn max_http_body_bytes(env: &BTreeMap<String, String>) -> usize {
     env.get(ENV_KIDOBO_MAX_HTTP_BODY_BYTES)
         .and_then(|value| value.trim().parse::<usize>().ok())
@@ -211,10 +220,17 @@ pub fn max_http_body_bytes(env: &BTreeMap<String, String>) -> usize {
 }
 
 #[cfg(test)]
+#[must_use]
 pub fn normalize_remote_text(raw: &[u8]) -> String {
     format_normalized_cidrs(&parse_remote_cidrs(raw).networks)
 }
 
+/// Fetches and validates a remote feed with conditional, atomic cache fallback.
+///
+/// # Errors
+///
+/// Returns [`HttpCacheError`] when required cache data cannot be read or a valid network response
+/// cannot be persisted. Network and invalid-response failures retain usable cached data.
 pub fn fetch_iplist_with_cache(
     client: &dyn HttpClient,
     url: &str,

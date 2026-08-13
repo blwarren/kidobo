@@ -55,8 +55,18 @@ pub trait DoctorProbe {
 
     fn path_exists(&self, path: &Path) -> bool;
 
+    /// Inspects whether a cache directory exists or could plausibly be created.
+    ///
+    /// # Errors
+    ///
+    /// Returns a diagnostic when the relevant filesystem metadata cannot be inspected.
     fn cache_readiness(&self, path: &Path) -> Result<CacheReadiness, String>;
 
+    /// Runs one bounded, read-only privileged probe.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProbeFailure`] when the command cannot execute or exits unsuccessfully.
     fn run_sudo_probe(&self, command: &str, args: &[&str]) -> Result<(), ProbeFailure>;
 }
 
@@ -73,6 +83,7 @@ enum Ipv6Mode {
     Unknown,
 }
 
+#[must_use]
 pub fn execute(
     request: &PathResolutionInput,
     dependencies: &DoctorDependencies<'_>,
@@ -158,21 +169,18 @@ fn push_binary_check(
     check_name: &'static str,
     binary: &str,
 ) -> bool {
-    match probe.find_binary(binary) {
-        Some(path) => {
-            checks.push(ok_check(
-                check_name,
-                format!("found on PATH: {}", path.display()),
-            ));
-            true
-        }
-        None => {
-            checks.push(fail_check(
-                check_name,
-                format!("{binary} not found on PATH"),
-            ));
-            false
-        }
+    if let Some(path) = probe.find_binary(binary) {
+        checks.push(ok_check(
+            check_name,
+            format!("found on PATH: {}", path.display()),
+        ));
+        true
+    } else {
+        checks.push(fail_check(
+            check_name,
+            format!("{binary} not found on PATH"),
+        ));
+        false
     }
 }
 

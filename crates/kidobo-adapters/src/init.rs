@@ -14,6 +14,11 @@ use crate::command_runner::{
 use crate::limited_io::write_string_atomic;
 
 pub trait InitCommandRunner {
+    /// Runs one noninteractive system command.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CommandRunnerError`] when bounded command execution fails.
     fn run(&self, command: &str, args: &[&str]) -> Result<CommandResult, CommandRunnerError>;
 }
 

@@ -23,6 +23,12 @@ pub struct CachedRemoteSource {
     pub entries: Vec<CachedRemoteEntry>,
 }
 
+/// Loads cached remote feeds in deterministic label and path order.
+///
+/// # Errors
+///
+/// Returns [`SourceLoadError`] when the cache directory cannot be enumerated or a selected source
+/// cannot be read within its configured bound.
 pub fn load_remote_sources(
     remote_cache_dir: &Path,
 ) -> Result<Vec<CachedRemoteSource>, SourceLoadError> {

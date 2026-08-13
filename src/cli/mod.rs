@@ -24,13 +24,11 @@ pub struct CliIo<'a> {
     pub no_color: bool,
 }
 
-#[allow(
-    clippy::print_stderr,
-    reason = "CLI entry point writes operator-facing diagnostics"
-)]
 pub fn run() -> ExitCode {
+    let mut stderr = io::stderr();
+
     if let Err(err) = interrupt::install_handler() {
-        eprintln!("{err}");
+        report_error(&mut stderr, &err);
         return ExitCode::from(err.exit_code());
     }
 
@@ -44,7 +42,7 @@ pub fn run() -> ExitCode {
     };
 
     if let Err(err) = crate::logging::init(cli.log_level.into()) {
-        eprintln!("{err}");
+        report_error(&mut stderr, &err);
         return ExitCode::from(err.exit_code());
     }
 
@@ -55,7 +53,6 @@ pub fn run() -> ExitCode {
     let stdin = io::stdin();
     let mut stdout = io::stdout();
     let stdout_is_terminal = stdout.is_terminal();
-    let mut stderr = io::stderr();
     let mut input = stdin.lock();
     let dispatch_result = commands::dispatch_with(
         cli.command,
@@ -77,10 +74,14 @@ pub fn run() -> ExitCode {
         Err(KidoboError::Interrupted) => ExitCode::from(130),
         Err(KidoboError::DoctorFailed) => ExitCode::from(1),
         Err(err) => {
-            eprintln!("{err}");
+            report_error(&mut stderr, &err);
             ExitCode::from(err.exit_code())
         }
     }
+}
+
+fn report_error(output: &mut dyn Write, error: &KidoboError) {
+    let _write_result = writeln!(output, "{error}");
 }
 
 fn clap_error_exit_code(err: &clap::Error) -> u8 {

@@ -8,13 +8,21 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Read the entire file into a `String`, but cap how many bytes are read.
+/// Reads the entire file as UTF-8 while enforcing a byte limit.
+///
+/// # Errors
+///
+/// Returns an I/O error when the file cannot be read, exceeds `max_bytes`, or is not valid UTF-8.
 pub fn read_to_string_with_limit(path: &Path, max_bytes: usize) -> io::Result<String> {
     let bytes = read_bytes_with_limit(path, max_bytes)?;
     String::from_utf8(bytes).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
 }
 
-/// Read the entire file into a byte vector, while capping how many bytes are read.
+/// Reads the entire file while enforcing a byte limit.
+///
+/// # Errors
+///
+/// Returns an I/O error when the file cannot be read or exceeds `max_bytes`.
 pub fn read_bytes_with_limit(path: &Path, max_bytes: usize) -> io::Result<Vec<u8>> {
     let file = File::open(path)?;
     let mut reader = BufReader::new(file);
@@ -23,7 +31,11 @@ pub fn read_bytes_with_limit(path: &Path, max_bytes: usize) -> io::Result<Vec<u8
     })
 }
 
-/// Read from any stream into a byte vector while capping how many bytes are read.
+/// Reads a stream to completion while enforcing a byte limit.
+///
+/// # Errors
+///
+/// Returns an I/O error when reading fails or the stream exceeds `max_bytes`.
 pub fn read_to_end_with_limit<F>(
     reader: &mut impl Read,
     max_bytes: usize,
@@ -49,12 +61,22 @@ where
     Ok(contents)
 }
 
-/// Atomically replace a file by writing a sibling temporary file and renaming it.
+/// Atomically replaces a UTF-8 file through a sibling temporary file.
+///
+/// # Errors
+///
+/// Returns an I/O error when temporary-file creation, writing, synchronization, permission
+/// preservation, replacement, or parent-directory synchronization fails.
 pub fn write_string_atomic(path: &Path, contents: &str) -> io::Result<()> {
     write_bytes_atomic(path, contents.as_bytes())
 }
 
-/// Atomically replace a file by writing a sibling temporary file and renaming it.
+/// Atomically replaces a file through a sibling temporary file.
+///
+/// # Errors
+///
+/// Returns an I/O error when temporary-file creation, writing, synchronization, permission
+/// preservation, replacement, or parent-directory synchronization fails.
 pub fn write_bytes_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let existing_permissions = fs::metadata(path).ok().map(|meta| meta.permissions());

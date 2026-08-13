@@ -21,6 +21,11 @@ pub enum RemoteCacheFilesError {
     ReadDirEntry(io::Error),
 }
 
+/// Collects regular `.iplist` files from a remote-cache directory.
+///
+/// # Errors
+///
+/// Returns [`RemoteCacheFilesError`] when the directory or any directory entry cannot be read.
 pub fn collect_remote_cache_files(
     remote_cache_dir: &Path,
 ) -> Result<Vec<PathBuf>, RemoteCacheFilesError> {
@@ -38,6 +43,12 @@ pub fn collect_remote_cache_files(
     Ok(files)
 }
 
+/// Reads a bounded cached iplist and validates its metadata hash when available.
+///
+/// # Errors
+///
+/// Returns an I/O error when the payload or metadata cannot be read within its bound, or when a
+/// recorded payload hash does not match.
 pub fn read_remote_cache_iplist_text(
     iplist_path: &Path,
     read_limit: usize,
@@ -48,6 +59,7 @@ pub fn read_remote_cache_iplist_text(
     Ok(contents)
 }
 
+#[must_use]
 pub fn parse_cidr_source_line(line: &str) -> Option<(CanonicalCidr, &str)> {
     let token = line.split_whitespace().next()?.trim();
     if token.is_empty() {
@@ -58,6 +70,7 @@ pub fn parse_cidr_source_line(line: &str) -> Option<(CanonicalCidr, &str)> {
     Some((cidr, token))
 }
 
+#[must_use]
 pub fn resolve_remote_source_label(iplist_path: &Path, meta_read_limit: usize) -> String {
     let Some(meta_path) = remote_meta_path_for_iplist(iplist_path) else {
         return fallback_remote_source_label(iplist_path);

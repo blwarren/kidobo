@@ -45,6 +45,7 @@ pub enum ProcessStatus {
 }
 
 impl ProcessStatus {
+    #[must_use]
     pub fn code(self) -> Option<i32> {
         match self {
             Self::Exited(code) => Some(code),
@@ -54,6 +55,7 @@ impl ProcessStatus {
         }
     }
 
+    #[must_use]
     pub fn success(self) -> bool {
         matches!(self, Self::Exited(0))
     }
@@ -92,6 +94,12 @@ pub enum CommandRunnerError {
 }
 
 pub trait CommandExecutor {
+    /// Executes one bounded command request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CommandRunnerError`] when spawning, polling, output collection, or the timeout
+    /// boundary fails.
     fn execute(&self, request: &CommandRequest) -> Result<CommandResult, CommandRunnerError>;
 }
 
@@ -235,10 +243,20 @@ impl<E: CommandExecutor> SudoCommandRunner<E> {
         }
     }
 
+    /// Runs one command through noninteractive sudo using the default timeout.
+    ///
+    /// # Errors
+    ///
+    /// Returns the wrapped executor's [`CommandRunnerError`].
     pub fn run(&self, command: &str, args: &[&str]) -> Result<CommandResult, CommandRunnerError> {
         self.run_with_timeout(command, args, self.default_timeout)
     }
 
+    /// Runs one command through noninteractive sudo using an explicit timeout.
+    ///
+    /// # Errors
+    ///
+    /// Returns the wrapped executor's [`CommandRunnerError`].
     pub fn run_with_timeout(
         &self,
         command: &str,

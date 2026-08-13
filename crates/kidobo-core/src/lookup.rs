@@ -32,6 +32,12 @@ pub enum LookupTargetParseError {
     Invalid,
 }
 
+/// Parses one lookup target using strict token rules.
+///
+/// # Errors
+///
+/// Returns [`LookupTargetParseError::Invalid`] when the input is not exactly one valid IP or
+/// CIDR.
 pub fn parse_target_strict(input: &str) -> Result<CanonicalCidr, LookupTargetParseError> {
     let normalized = input.trim();
     if normalized.is_empty() {
@@ -41,6 +47,7 @@ pub fn parse_target_strict(input: &str) -> Result<CanonicalCidr, LookupTargetPar
     parse_ip_cidr_strict(normalized).ok_or(LookupTargetParseError::Invalid)
 }
 
+#[must_use]
 pub fn cidr_overlaps(a: CanonicalCidr, b: CanonicalCidr) -> bool {
     network_cidr_overlaps(a, b)
 }
@@ -301,13 +308,16 @@ mod tests {
         let host = parse_target_strict("198.51.100.1").expect("host");
         assert_eq!(
             host,
-            CanonicalCidr::V4(Ipv4Cidr::from_parts(0xc6336401, 32))
+            CanonicalCidr::V4(Ipv4Cidr::from_parts(0xc633_6401, 32))
         );
 
         let cidr = parse_target_strict("2001:db8::/64").expect("cidr");
         assert_eq!(
             cidr,
-            CanonicalCidr::V6(Ipv6Cidr::from_parts(0x20010db8000000000000000000000000, 64))
+            CanonicalCidr::V6(Ipv6Cidr::from_parts(
+                0x2001_0db8_0000_0000_0000_0000_0000_0000,
+                64
+            ))
         );
     }
 
@@ -326,9 +336,12 @@ mod tests {
 
     #[test]
     fn overlap_matching_is_family_aware() {
-        let v4_a = CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a000000, 24));
-        let v4_b = CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a000080, 25));
-        let v6 = CanonicalCidr::V6(Ipv6Cidr::from_parts(0x20010db8000000000000000000000000, 64));
+        let v4_a = CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a00_0000, 24));
+        let v4_b = CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a00_0080, 25));
+        let v6 = CanonicalCidr::V6(Ipv6Cidr::from_parts(
+            0x2001_0db8_0000_0000_0000_0000_0000_0000,
+            64,
+        ));
 
         assert!(cidr_overlaps(v4_a, v4_b));
         assert!(!cidr_overlaps(v4_a, v6));
@@ -340,13 +353,13 @@ mod tests {
             LookupSourceEntry {
                 source_label: "internal:blocklist".into(),
                 source_line: "10.0.0.0/24".to_string(),
-                cidr: CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a000000, 24)),
+                cidr: CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a00_0000, 24)),
             },
             LookupSourceEntry {
                 source_label: "remote:abcd1234.iplist".into(),
                 source_line: "2001:db8::/64".to_string(),
                 cidr: CanonicalCidr::V6(Ipv6Cidr::from_parts(
-                    0x20010db8000000000000000000000000,
+                    0x2001_0db8_0000_0000_0000_0000_0000_0000,
                     64,
                 )),
             },
@@ -379,7 +392,7 @@ mod tests {
             source_label: "source:v6-boundary".into(),
             source_line: "2001:db8::/124".to_string(),
             cidr: CanonicalCidr::V6(Ipv6Cidr::from_parts(
-                0x20010db8000000000000000000000000,
+                0x2001_0db8_0000_0000_0000_0000_0000_0000,
                 124,
             )),
         }];
@@ -398,17 +411,17 @@ mod tests {
             LookupSourceEntry {
                 source_label: "source:a".into(),
                 source_line: "10.0.0.0/24".to_string(),
-                cidr: CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a000000, 24)),
+                cidr: CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a00_0000, 24)),
             },
             LookupSourceEntry {
                 source_label: "source:b".into(),
                 source_line: "10.0.2.0/24".to_string(),
-                cidr: CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a000200, 24)),
+                cidr: CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a00_0200, 24)),
             },
             LookupSourceEntry {
                 source_label: "source:c".into(),
                 source_line: "10.0.4.0/24".to_string(),
-                cidr: CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a000400, 24)),
+                cidr: CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a00_0400, 24)),
             },
         ];
 
@@ -423,12 +436,12 @@ mod tests {
             LookupSourceEntry {
                 source_label: "source:a".into(),
                 source_line: "10.0.0.0/24".to_string(),
-                cidr: CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a000000, 24)),
+                cidr: CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a00_0000, 24)),
             },
             LookupSourceEntry {
                 source_label: "source:a".into(),
                 source_line: "10.0.0.0/24".to_string(),
-                cidr: CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a000000, 24)),
+                cidr: CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a00_0000, 24)),
             },
         ];
 
@@ -467,12 +480,12 @@ mod tests {
             LookupSourceEntry {
                 source_label: "source:a".into(),
                 source_line: "10.0.0.0/24".to_string(),
-                cidr: CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a000000, 24)),
+                cidr: CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a00_0000, 24)),
             },
             LookupSourceEntry {
                 source_label: "source:a".into(),
                 source_line: "10.0.0.42/24".to_string(),
-                cidr: CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a000000, 24)),
+                cidr: CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a00_0000, 24)),
             },
         ];
 
@@ -492,12 +505,12 @@ mod tests {
             LookupSourceEntry {
                 source_label: "source:super".into(),
                 source_line: "10.0.0.0/8".to_string(),
-                cidr: CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a000000, 8)),
+                cidr: CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a00_0000, 8)),
             },
             LookupSourceEntry {
                 source_label: "source:narrow".into(),
                 source_line: "10.2.0.0/16".to_string(),
-                cidr: CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a020000, 16)),
+                cidr: CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a02_0000, 16)),
             },
         ];
 
@@ -518,19 +531,19 @@ mod tests {
                 source_label: "source:v6-nested".into(),
                 source_line: "2001:db8:0:1::/64".to_string(),
                 cidr: CanonicalCidr::V6(Ipv6Cidr::from_parts(
-                    0x20010db8000000010000000000000000,
+                    0x2001_0db8_0000_0001_0000_0000_0000_0000,
                     64,
                 )),
             },
             LookupSourceEntry {
                 source_label: "source:v4-outside".into(),
                 source_line: "10.2.0.0/24".to_string(),
-                cidr: CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a020000, 24)),
+                cidr: CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a02_0000, 24)),
             },
             LookupSourceEntry {
                 source_label: "source:v4-nested".into(),
                 source_line: "10.1.2.0/24".to_string(),
-                cidr: CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a010200, 24)),
+                cidr: CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a01_0200, 24)),
             },
         ];
 
@@ -559,12 +572,12 @@ mod tests {
             LookupSourceEntry {
                 source_label: "source:super".into(),
                 source_line: "10.0.0.0/8".to_string(),
-                cidr: CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a000000, 8)),
+                cidr: CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a00_0000, 8)),
             },
             LookupSourceEntry {
                 source_label: "source:narrow".into(),
                 source_line: "10.0.0.0/16".to_string(),
-                cidr: CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a000000, 16)),
+                cidr: CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a00_0000, 16)),
             },
         ];
 
@@ -580,7 +593,7 @@ mod tests {
 
     #[test]
     fn lookup_ipv6_index_keeps_same_start_nested_matches() {
-        let base = 0x20010db8000000000000000000000000_u128;
+        let base = 0x2001_0db8_0000_0000_0000_0000_0000_0000_u128;
         let sources = vec![
             LookupSourceEntry {
                 source_label: "source:super".into(),
@@ -610,12 +623,12 @@ mod tests {
             LookupSourceEntry {
                 source_label: "feed:a".into(),
                 source_line: "10.0.0.0/24".to_string(),
-                cidr: CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a000000, 24)),
+                cidr: CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a00_0000, 24)),
             },
             LookupSourceEntry {
                 source_label: "feed:b".into(),
                 source_line: "10.0.0.0/24".to_string(),
-                cidr: CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a000000, 24)),
+                cidr: CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a00_0000, 24)),
             },
         ];
 
@@ -634,7 +647,7 @@ mod tests {
         let sources = vec![LookupSourceEntry {
             source_label: "source:a".into(),
             source_line: "203.0.113.7/32".to_string(),
-            cidr: CanonicalCidr::V4(Ipv4Cidr::from_parts(0xcb007107, 32)),
+            cidr: CanonicalCidr::V4(Ipv4Cidr::from_parts(0xcb00_7107, 32)),
         }];
 
         let report = run_lookup(

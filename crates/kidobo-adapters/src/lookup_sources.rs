@@ -166,6 +166,11 @@ impl OfflineLookupProvider for AsnCacheLookupProvider {
     }
 }
 
+/// Builds the complete deterministic registry of offline lookup providers.
+///
+/// # Errors
+///
+/// Returns [`AppError::DuplicateSourceProvider`] if the built-in provider IDs are not unique.
 pub fn build_offline_lookup_registry() -> Result<OfflineLookupRegistry, AppError> {
     let mut registry = OfflineLookupRegistry::new();
     registry.register(LocalBlocklistLookupProvider)?;

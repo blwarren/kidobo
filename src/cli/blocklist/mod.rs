@@ -212,7 +212,7 @@ fn command_input(target: Option<&str>, file: Option<&Path>) -> Result<BlocklistI
 
 fn report_invalid_targets(targets: &[String], io: &mut CliIo<'_>) -> Result<(), KidoboError> {
     for target in targets {
-        writeln!(io.stderr, "invalid target: {target}").map_err(cli_io_error)?;
+        writeln!(io.stderr, "invalid target: {target}")?;
     }
     if targets.is_empty() {
         Ok(())
@@ -257,7 +257,7 @@ fn confirm_partial_matches(
         )?;
         return Ok(true);
     }
-    write!(io.stdout, "Remove these entries as well? [y/N]: ").map_err(cli_io_error)?;
+    write!(io.stdout, "Remove these entries as well? [y/N]: ")?;
     io.stdout
         .flush()
         .map_err(|error| KidoboError::BlocklistPrompt {
@@ -276,7 +276,8 @@ fn confirm_partial_matches(
 }
 
 fn output(io: &mut CliIo<'_>, arguments: fmt::Arguments<'_>) -> Result<(), KidoboError> {
-    writeln!(io.stdout, "{arguments}").map_err(cli_io_error)
+    writeln!(io.stdout, "{arguments}")?;
+    Ok(())
 }
 
 fn sync_notice(io: &mut CliIo<'_>) -> Result<(), KidoboError> {
@@ -284,16 +285,6 @@ fn sync_notice(io: &mut CliIo<'_>) -> Result<(), KidoboError> {
         io,
         format_args!("changes take effect after running `sudo kidobo sync`"),
     )
-}
-
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "Result::map_err supplies the owned I/O error"
-)]
-fn cli_io_error(error: std::io::Error) -> KidoboError {
-    KidoboError::CliIo {
-        reason: error.to_string(),
-    }
 }
 
 fn format_asn_list(asns: &[u32]) -> String {

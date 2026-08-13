@@ -24,6 +24,12 @@ pub struct BlocklistDocument {
 }
 
 impl BlocklistDocument {
+    /// Parses a line-oriented blocklist while preserving its original structure.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first [`InvalidBlocklistLine`] when a non-comment entry is not a valid IP or
+    /// CIDR.
     pub fn parse(contents: &str) -> Result<Self, InvalidBlocklistLine> {
         let mut lines = Vec::new();
         let mut in_header = true;
@@ -121,11 +127,18 @@ pub struct UnbanIndexPlan {
     pub partial_indexes: Vec<usize>,
 }
 
+/// Parses one operator-supplied blocklist target using strict token rules.
+///
+/// # Errors
+///
+/// Returns [`BlocklistTargetParseError::Invalid`] when the input is not exactly one valid IP or
+/// CIDR.
 pub fn parse_blocklist_target(input: &str) -> Result<CanonicalCidr, BlocklistTargetParseError> {
     let token = input.trim();
     parse_ip_cidr_strict(token).ok_or(BlocklistTargetParseError::Invalid)
 }
 
+#[must_use]
 pub fn classify_ban_targets(
     existing: &[CanonicalCidr],
     targets: &[CanonicalCidr],
@@ -144,10 +157,12 @@ pub fn classify_ban_targets(
     outcomes
 }
 
+#[must_use]
 pub fn plan_unban(entries: &[Option<CanonicalCidr>], target: CanonicalCidr) -> UnbanIndexPlan {
     plan_unban_many(entries, &[target])
 }
 
+#[must_use]
 pub fn plan_unban_many(
     entries: &[Option<CanonicalCidr>],
     targets: &[CanonicalCidr],
@@ -179,6 +194,7 @@ pub fn plan_unban_many(
     }
 }
 
+#[must_use]
 pub fn exact_match_indexes(
     entries: &[Option<CanonicalCidr>],
     targets: &[CanonicalCidr],
@@ -195,6 +211,11 @@ pub fn exact_match_indexes(
     indexes
 }
 
+/// Parses, collapses, and renders blocklist contents in canonical order.
+///
+/// # Errors
+///
+/// Returns the first [`InvalidBlocklistLine`] when a non-comment entry is not a valid IP or CIDR.
 pub fn canonicalize_blocklist(contents: &str) -> Result<String, InvalidBlocklistLine> {
     Ok(BlocklistDocument::parse(contents)?.canonicalized_contents())
 }
@@ -343,7 +364,7 @@ mod tests {
         let parsed = parse_blocklist_target(" 203.0.113.7 ").expect("parse");
         assert_eq!(
             parsed,
-            CanonicalCidr::V4(crate::network::Ipv4Cidr::from_parts(0xcb007107, 32))
+            CanonicalCidr::V4(crate::network::Ipv4Cidr::from_parts(0xcb00_7107, 32))
         );
     }
 

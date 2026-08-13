@@ -19,6 +19,7 @@ pub enum WriteJsonError {
     Write { reason: String },
 }
 
+#[must_use]
 pub fn read_optional_bytes_lossy(
     path: &Path,
     read_limit: usize,
@@ -37,6 +38,7 @@ pub fn read_optional_bytes_lossy(
     }
 }
 
+#[must_use]
 pub fn read_optional_json_lossy<T>(path: &Path, read_limit: usize, description: &str) -> Option<T>
 where
     T: DeserializeOwned,
@@ -55,6 +57,7 @@ where
     }
 }
 
+#[must_use]
 pub fn read_validated_bytes_lossy(
     path: &Path,
     read_limit: usize,
@@ -79,11 +82,22 @@ pub fn read_validated_bytes_lossy(
     Some(bytes)
 }
 
+/// Creates the parent cache directory and atomically writes bytes.
+///
+/// # Errors
+///
+/// Returns an I/O error when the parent cannot be created or the destination cannot be replaced.
 pub fn write_bytes_atomic_in_cache(path: &Path, bytes: &[u8]) -> Result<(), std::io::Error> {
     ensure_parent_dir(path)?;
     write_bytes_atomic(path, bytes)
 }
 
+/// Serializes pretty JSON and atomically writes it to the cache.
+///
+/// # Errors
+///
+/// Returns [`WriteJsonError::Serialize`] when encoding fails or [`WriteJsonError::Write`] when the
+/// cache cannot be replaced.
 pub fn write_json_pretty_atomic<T>(path: &Path, value: &T) -> Result<(), WriteJsonError>
 where
     T: Serialize,

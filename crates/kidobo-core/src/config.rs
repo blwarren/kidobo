@@ -28,6 +28,7 @@ const LEGACY_REMOTE_CACHE_STALE_AFTER_SECS_MAX: u32 = 7 * 24 * 60 * 60;
 pub struct HashsizePow2(NonZeroU32);
 
 impl HashsizePow2 {
+    #[must_use]
     pub fn new(value: u32) -> Option<Self> {
         let non_zero = NonZeroU32::new(value)?;
         if value.is_power_of_two() {
@@ -37,6 +38,7 @@ impl HashsizePow2 {
         }
     }
 
+    #[must_use]
     pub fn get(self) -> u32 {
         self.0.get()
     }
@@ -52,6 +54,7 @@ impl From<HashsizePow2> for u32 {
 pub struct MaxElem(NonZeroU32);
 
 impl MaxElem {
+    #[must_use]
     pub fn new(value: u32) -> Option<Self> {
         let non_zero = NonZeroU32::new(value)?;
         if value <= DEFAULT_MAXELEM {
@@ -61,6 +64,7 @@ impl MaxElem {
         }
     }
 
+    #[must_use]
     pub fn get(self) -> u32 {
         self.0.get()
     }
@@ -76,6 +80,7 @@ impl From<MaxElem> for u32 {
 pub struct RemoteTimeoutSecs(NonZeroU32);
 
 impl RemoteTimeoutSecs {
+    #[must_use]
     pub fn new(value: u32) -> Option<Self> {
         let non_zero = NonZeroU32::new(value)?;
         if value <= REMOTE_TIMEOUT_SECS_MAX {
@@ -85,6 +90,7 @@ impl RemoteTimeoutSecs {
         }
     }
 
+    #[must_use]
     pub fn get(self) -> u32 {
         self.0.get()
     }
@@ -100,6 +106,7 @@ impl From<RemoteTimeoutSecs> for u32 {
 pub struct AsnCacheStaleAfterSecs(NonZeroU32);
 
 impl AsnCacheStaleAfterSecs {
+    #[must_use]
     pub fn new(value: u32) -> Option<Self> {
         let non_zero = NonZeroU32::new(value)?;
         if value <= ASN_CACHE_STALE_AFTER_SECS_MAX {
@@ -109,6 +116,7 @@ impl AsnCacheStaleAfterSecs {
         }
     }
 
+    #[must_use]
     pub fn get(self) -> u32 {
         self.0.get()
     }
@@ -174,6 +182,7 @@ pub enum GithubMetaCategoryMode {
 }
 
 impl SafeConfig {
+    #[must_use]
     pub fn github_meta_category_mode(&self) -> GithubMetaCategoryMode {
         match &self.github_meta_categories {
             None => GithubMetaCategoryMode::Default,
@@ -242,6 +251,12 @@ struct RawAsnConfig {
 }
 
 impl Config {
+    /// Parses and validates configuration from in-memory TOML.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError`] when the TOML is malformed, a required section or field is
+    /// missing, or any configured value violates its domain constraints.
     pub fn from_toml_str(contents: &str) -> Result<Self, ConfigError> {
         let raw: RawConfig = parse_toml_str(contents).map_err(|err| ConfigError::Parse {
             reason: err.to_string(),
@@ -271,19 +286,16 @@ fn parse_ipset(raw: RawIpsetConfig) -> Result<IpsetConfig, ConfigError> {
     validate_ipset_set_name(&set_name, "ipset.set_name")?;
 
     let enable_ipv6 = raw.enable_ipv6.unwrap_or(true);
-    let set_name_v6 = match raw.set_name_v6 {
-        Some(value) => {
-            let parsed = non_empty(&value, "ipset.set_name_v6")?;
-            validate_ipset_set_name(&parsed, "ipset.set_name_v6")?;
-            parsed
+    let set_name_v6 = if let Some(value) = raw.set_name_v6 {
+        let parsed = non_empty(&value, "ipset.set_name_v6")?;
+        validate_ipset_set_name(&parsed, "ipset.set_name_v6")?;
+        parsed
+    } else {
+        let derived = format!("{set_name}-v6");
+        if enable_ipv6 {
+            validate_ipset_set_name(&derived, "ipset.set_name_v6")?;
         }
-        None => {
-            let derived = format!("{set_name}-v6");
-            if enable_ipv6 {
-                validate_ipset_set_name(&derived, "ipset.set_name_v6")?;
-            }
-            derived
-        }
+        derived
     };
     if set_name_v6 == set_name {
         return Err(ConfigError::InvalidField {
@@ -641,7 +653,7 @@ mod tests {
                 .expect("parse");
         assert_eq!(
             config.safe.ips,
-            vec![CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a000001, 32))]
+            vec![CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a00_0001, 32))]
         );
     }
 
@@ -1025,7 +1037,7 @@ mod tests {
         assert_eq!(config.ipset.set_name, "kidobo");
         assert_eq!(
             config.safe.ips,
-            vec![CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a000001, 32))]
+            vec![CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a00_0001, 32))]
         );
         assert_eq!(
             config.remote.urls,
@@ -1052,7 +1064,7 @@ mod tests {
         assert!(!config.ipset.enable_ipv6);
         assert_eq!(
             config.safe.ips,
-            vec![CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a000001, 32))]
+            vec![CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a00_0001, 32))]
         );
         assert_eq!(config.safe.github_meta_url, "https://example.com/meta");
         assert_eq!(

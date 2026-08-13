@@ -56,6 +56,12 @@ impl Drop for FileLock {
     }
 }
 
+/// Opens a permission-hardened lock file and acquires it without blocking.
+///
+/// # Errors
+///
+/// Returns [`LockError`] when the parent or file cannot be prepared securely, another process
+/// holds the lock, or the operating-system lock operation fails.
 pub fn acquire_non_blocking(path: &Path) -> Result<FileLock, LockError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|err| LockError::CreateParentDir {

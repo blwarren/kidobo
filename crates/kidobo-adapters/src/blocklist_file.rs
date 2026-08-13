@@ -139,6 +139,11 @@ impl BlocklistFastState {
     }
 }
 
+/// Atomically replaces a blocklist with normalized line endings.
+///
+/// # Errors
+///
+/// Returns [`AppError::BlocklistWrite`] when the destination cannot be replaced atomically.
 pub fn write_blocklist_lines<S: AsRef<str>>(path: &Path, lines: &[S]) -> Result<(), AppError> {
     let mut contents = lines
         .iter()
@@ -155,6 +160,11 @@ pub fn write_blocklist_lines<S: AsRef<str>>(path: &Path, lines: &[S]) -> Result<
     })
 }
 
+/// Creates the blocklist's parent directory when necessary.
+///
+/// # Errors
+///
+/// Returns [`AppError::BlocklistWrite`] when the parent directory cannot be created.
 pub fn ensure_blocklist_parent(path: &Path) -> Result<(), AppError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|err| AppError::BlocklistWrite {
@@ -166,6 +176,12 @@ pub fn ensure_blocklist_parent(path: &Path) -> Result<(), AppError> {
     Ok(())
 }
 
+/// Validates and atomically canonicalizes an existing local blocklist.
+///
+/// # Errors
+///
+/// Returns an error when the file cannot be read or written, or contains an invalid blocklist
+/// entry.
 pub fn normalize_local_blocklist(path: &Path) -> Result<(), AppError> {
     if !path.exists() {
         return Ok(());
@@ -191,6 +207,12 @@ pub fn normalize_local_blocklist(path: &Path) -> Result<(), AppError> {
     Ok(())
 }
 
+/// Canonicalizes a changed blocklist and updates its best-effort fast-state sidecar.
+///
+/// # Errors
+///
+/// Returns an error when required blocklist validation, reading, or writing fails. Sidecar write
+/// failures remain warnings.
 pub fn normalize_local_blocklist_with_fast_state(
     blocklist_path: &Path,
     fast_state_path: &Path,
@@ -238,6 +260,12 @@ fn write_blocklist_fast_state(
 }
 
 impl BlocklistDocument {
+    /// Loads and parses an existing blocklist, treating a missing file as empty.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the file cannot be read within its bound or contains an invalid
+    /// entry.
     pub fn load(path: &Path) -> Result<Self, AppError> {
         if !path.exists() {
             return Ok(Self(CoreBlocklistDocument {

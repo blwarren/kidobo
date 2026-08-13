@@ -14,6 +14,7 @@ pub const ENV_KIDOBO_ROOT: &str = "KIDOBO_ROOT";
 pub const ENV_KIDOBO_TEST_SANDBOX: &str = "KIDOBO_TEST_SANDBOX";
 pub const ENV_KIDOBO_DISABLE_TEST_SANDBOX: &str = "KIDOBO_DISABLE_TEST_SANDBOX";
 
+#[must_use]
 pub fn path_resolution_input_from_process(
     explicit_config_path: Option<PathBuf>,
 ) -> PathResolutionInput {
@@ -93,10 +94,22 @@ pub enum PathResolutionError {
     MissingConfig { attempted: PathBuf },
 }
 
+/// Resolves runtime paths and requires the selected configuration file to exist.
+///
+/// # Errors
+///
+/// Returns [`PathResolutionError`] when an explicit configuration path is missing or no default
+/// configuration file exists.
 pub fn resolve_paths(input: &PathResolutionInput) -> Result<ResolvedPaths, PathResolutionError> {
     resolve_paths_with_policy(input, false)
 }
 
+/// Resolves runtime paths while allowing the selected configuration file to be absent.
+///
+/// # Errors
+///
+/// Returns [`PathResolutionError::ExplicitConfigMissing`] when the caller supplied an explicit
+/// configuration path that does not exist.
 pub fn resolve_paths_without_config(
     input: &PathResolutionInput,
 ) -> Result<ResolvedPaths, PathResolutionError> {
@@ -181,6 +194,7 @@ fn env_truthy(vars: &BTreeMap<String, String>, key: &str) -> bool {
     env_value(vars, key).is_some_and(is_truthy_value)
 }
 
+#[must_use]
 pub fn is_truthy_value(value: &str) -> bool {
     matches!(
         value.trim().to_ascii_lowercase().as_str(),

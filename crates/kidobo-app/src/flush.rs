@@ -40,10 +40,25 @@ impl FlushOutcome {
 }
 
 pub trait FlushBackend {
+    /// Removes managed firewall wiring for one address family.
+    ///
+    /// # Errors
+    ///
+    /// Returns a diagnostic when required firewall cleanup fails.
     fn cleanup_firewall(&self, family: FirewallFamily) -> Result<(), String>;
 
+    /// Destroys one managed ipset.
+    ///
+    /// # Errors
+    ///
+    /// Returns a diagnostic when the set cannot be removed or confirmed absent.
     fn destroy_ipset(&self, set_name: &str) -> Result<(), String>;
 
+    /// Clears cached remote source data.
+    ///
+    /// # Errors
+    ///
+    /// Returns a diagnostic when the cache directory cannot be cleared.
     fn clear_remote_cache(&self, path: &Path) -> Result<(), String>;
 }
 
@@ -54,6 +69,12 @@ pub struct FlushDependencies<'a> {
     pub backend: &'a dyn FlushBackend,
 }
 
+/// Runs cache-only cleanup or a best-effort full managed-artifact flush.
+///
+/// # Errors
+///
+/// Returns an error when paths, locking, or required configuration loading fails. Individual full
+/// cleanup failures are recorded in the returned [`FlushOutcome`].
 pub fn execute(
     request: &FlushRequest,
     dependencies: &FlushDependencies<'_>,

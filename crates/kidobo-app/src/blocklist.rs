@@ -114,8 +114,18 @@ pub struct AsnConfigUpdate {
 }
 
 pub trait BlocklistRepository {
+    /// Loads and parses the blocklist at `path`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the file cannot be read or contains an invalid entry.
     fn load(&self, path: &Path) -> Result<BlocklistDocument, AppError>;
 
+    /// Appends canonical entries while preserving the document's newline structure.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the blocklist cannot be updated atomically.
     fn append_entries(
         &self,
         path: &Path,
@@ -124,14 +134,34 @@ pub trait BlocklistRepository {
         trailing_newline: bool,
     ) -> Result<(), AppError>;
 
+    /// Replaces the blocklist with the supplied lines.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the blocklist cannot be written atomically.
     fn write_lines(&self, path: &Path, lines: &[String]) -> Result<(), AppError>;
 
+    /// Reads operator-supplied blocklist targets from a file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the target file cannot be read within its configured bound.
     fn read_target_lines(&self, path: &Path) -> Result<Vec<String>, AppError>;
 }
 
 pub trait AsnOperations {
+    /// Parses, validates, sorts, and deduplicates ASN tokens.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when any token is not a supported autonomous-system number.
     fn normalize_tokens(&self, tokens: &[String]) -> Result<Vec<u32>, AppError>;
 
+    /// Loads prefixes for one ASN, using bounded cache fallback where available.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when neither a fresh resolution nor a usable cache is available.
     fn load_prefixes(
         &self,
         asn: u32,
@@ -139,6 +169,11 @@ pub trait AsnOperations {
         stale_after: Duration,
     ) -> Result<AsnPrefixBatch, AppError>;
 
+    /// Atomically updates the configured ASN ban set.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the configuration cannot be read, parsed, or written.
     fn update_config(
         &self,
         config_path: &Path,
@@ -146,6 +181,11 @@ pub trait AsnOperations {
         remove: &[u32],
     ) -> Result<AsnConfigUpdate, AppError>;
 
+    /// Deletes the cache entry for one ASN.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when an existing cache file cannot be removed.
     fn delete_cache(&self, asn: u32, cache_dir: &Path) -> Result<bool, AppError>;
 }
 
@@ -157,6 +197,12 @@ pub struct BlocklistDependencies<'a> {
     pub asn: &'a dyn AsnOperations,
 }
 
+/// Applies IP and CIDR additions to the local blocklist under the process lock.
+///
+/// # Errors
+///
+/// Returns an error when paths or locking fail, input cannot be read, or the blocklist cannot be
+/// loaded or updated.
 pub fn execute_ban(
     request: &BanRequest,
     dependencies: &BlocklistDependencies<'_>,
@@ -211,6 +257,11 @@ pub fn execute_ban(
     })
 }
 
+/// Builds a read-only unban preview from the current blocklist.
+///
+/// # Errors
+///
+/// Returns an error when paths cannot be resolved or input and blocklist data cannot be read.
 pub fn prepare_unban(
     request: &UnbanRequest,
     dependencies: &BlocklistDependencies<'_>,
@@ -235,6 +286,12 @@ pub fn prepare_unban(
     })
 }
 
+/// Applies an approved unban preview under the process lock.
+///
+/// # Errors
+///
+/// Returns an error when paths, locking, or persistence fail, or when the blocklist changed after
+/// the preview was prepared.
 pub fn apply_unban(
     request: &UnbanRequest,
     preview: &UnbanPreview,
@@ -290,6 +347,12 @@ pub fn apply_unban(
     })
 }
 
+/// Resolves and records ASN bans, then best-effort removes duplicate local entries.
+///
+/// # Errors
+///
+/// Returns an error when paths, ASN parsing or resolution, locking, configuration loading, or the
+/// required configuration update fails.
 pub fn execute_ban_asn(
     request: &AsnBanRequest,
     dependencies: &BlocklistDependencies<'_>,
@@ -337,6 +400,11 @@ pub fn execute_ban_asn(
     })
 }
 
+/// Removes ASN bans and best-effort deletes their cached prefix data.
+///
+/// # Errors
+///
+/// Returns an error when paths, ASN parsing, locking, or the required configuration update fails.
 pub fn execute_unban_asn(
     request: &AsnBanRequest,
     dependencies: &BlocklistDependencies<'_>,
