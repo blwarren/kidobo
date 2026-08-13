@@ -6,8 +6,8 @@ use std::sync::Once;
 use std::time::Duration;
 
 use log::warn;
-use reqwest::StatusCode;
 use reqwest::header::{ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED, USER_AGENT};
+use reqwest::{StatusCode, Url, redirect};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -25,6 +25,7 @@ pub const ENV_KIDOBO_MAX_HTTP_BODY_BYTES: &str = "KIDOBO_MAX_HTTP_BODY_BYTES";
 pub const DEFAULT_HTTP_REQUEST_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_HTTP_REQUEST_TIMEOUT: Duration =
     Duration::from_secs(DEFAULT_HTTP_REQUEST_TIMEOUT_SECS);
+const MAX_HTTP_REDIRECTS: usize = 10;
 const MAX_IPLIST_READ_BYTES: usize = 16 * 1024 * 1024;
 const MAX_METADATA_READ_BYTES: usize = 512 * 1024;
 static RUSTLS_PROVIDER_INIT: Once = Once::new();
@@ -78,6 +79,9 @@ pub struct HttpResponse {
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum HttpClientError {
+    #[error("http client initialization failed: {reason}")]
+    Initialization { reason: String },
+
     #[error("http client request failed: {reason}")]
     Request { reason: String },
 }
@@ -87,13 +91,14 @@ pub trait HttpClient {
     ///
     /// # Errors
     ///
-    /// Returns [`HttpClientError`] when the request, response headers, or bounded body read fails.
+    /// Returns [`HttpClientError`] when client initialization, the request, response headers, or
+    /// the bounded body read fails.
     fn fetch(&self, request: HttpRequest) -> Result<HttpResponse, HttpClientError>;
 }
 
 #[derive(Debug, Clone)]
 pub struct ReqwestHttpClient {
-    client: reqwest::blocking::Client,
+    client: Result<reqwest::blocking::Client, HttpClientError>,
     user_agent: String,
     request_timeout: Duration,
 }
@@ -119,12 +124,39 @@ impl ReqwestHttpClient {
 
     fn new_with_timeout(user_agent: impl Into<String>, request_timeout: Duration) -> Self {
         ensure_rustls_provider_installed();
+        let client = reqwest::blocking::Client::builder()
+            .redirect(same_origin_redirect_policy())
+            .build()
+            .map_err(|error| HttpClientError::Initialization {
+                reason: error.to_string(),
+            });
         Self {
-            client: reqwest::blocking::Client::new(),
+            client,
             user_agent: user_agent.into(),
             request_timeout,
         }
     }
+}
+
+fn same_origin_redirect_policy() -> redirect::Policy {
+    redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() > MAX_HTTP_REDIRECTS {
+            return attempt.error("too many redirects");
+        }
+        let Some(initial_url) = attempt.previous().first() else {
+            return attempt.error("redirect chain is missing its initial URL");
+        };
+        if !has_same_http_origin(initial_url, attempt.url()) {
+            return attempt.error("redirect target has a different origin");
+        }
+        attempt.follow()
+    })
+}
+
+fn has_same_http_origin(initial_url: &Url, redirect_url: &Url) -> bool {
+    matches!(initial_url.scheme(), "http" | "https")
+        && matches!(redirect_url.scheme(), "http" | "https")
+        && initial_url.origin() == redirect_url.origin()
 }
 
 fn ensure_rustls_provider_installed() {
@@ -135,8 +167,8 @@ fn ensure_rustls_provider_installed() {
 
 impl HttpClient for ReqwestHttpClient {
     fn fetch(&self, request: HttpRequest) -> Result<HttpResponse, HttpClientError> {
-        let mut builder = self
-            .client
+        let client = self.client.as_ref().map_err(Clone::clone)?;
+        let mut builder = client
             .get(&request.url)
             .header(USER_AGENT, &self.user_agent)
             .timeout(self.request_timeout);
@@ -433,6 +465,100 @@ fn header_to_string(
 }
 
 #[cfg(test)]
+pub(crate) mod test_support {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
+    pub(crate) struct CrossOriginRedirectFixture {
+        source_url: String,
+        destination_contacted: Arc<AtomicBool>,
+        stop_tx: mpsc::Sender<()>,
+        source_server: thread::JoinHandle<()>,
+        destination_server: thread::JoinHandle<()>,
+    }
+
+    impl CrossOriginRedirectFixture {
+        pub(crate) fn new() -> Self {
+            let destination = TcpListener::bind("127.0.0.1:0").expect("bind destination listener");
+            destination
+                .set_nonblocking(true)
+                .expect("set destination nonblocking");
+            let destination_addr = destination.local_addr().expect("destination addr");
+            let destination_contacted = Arc::new(AtomicBool::new(false));
+            let destination_contacted_for_server = Arc::clone(&destination_contacted);
+            let (stop_tx, stop_rx) = mpsc::channel();
+            let destination_server = thread::spawn(move || {
+                loop {
+                    match destination.accept() {
+                        Ok((mut socket, _)) => {
+                            destination_contacted_for_server.store(true, Ordering::SeqCst);
+                            let mut request_buf = [0_u8; 1024];
+                            let _ = socket.read(&mut request_buf).expect("read request");
+                            socket
+                                .write_all(
+                                    b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                                )
+                                .expect("write response");
+                            return;
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            if stop_rx.try_recv().is_ok() {
+                                return;
+                            }
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("accept destination: {error}"),
+                    }
+                }
+            });
+
+            let source = TcpListener::bind("127.0.0.1:0").expect("bind source listener");
+            let source_addr = source.local_addr().expect("source addr");
+            let source_server = thread::spawn(move || {
+                let (mut socket, _) = source.accept().expect("accept source");
+                let mut request_buf = [0_u8; 1024];
+                let _ = socket.read(&mut request_buf).expect("read source request");
+                let response = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: http://{destination_addr}/internal\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                socket
+                    .write_all(response.as_bytes())
+                    .expect("write redirect");
+            });
+
+            Self {
+                source_url: format!("http://{source_addr}/source"),
+                destination_contacted,
+                stop_tx,
+                source_server,
+                destination_server,
+            }
+        }
+
+        pub(crate) fn source_url(&self) -> &str {
+            &self.source_url
+        }
+
+        pub(crate) fn finish(self) {
+            self.source_server.join().expect("source server thread");
+            let _ = self.stop_tx.send(());
+            self.destination_server
+                .join()
+                .expect("destination server thread");
+            assert!(
+                !self.destination_contacted.load(Ordering::SeqCst),
+                "redirect destination must not receive a request"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::cell::RefCell;
     use std::collections::{BTreeMap, VecDeque};
@@ -447,11 +573,12 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        CacheSource, HttpClient, HttpClientError, HttpRequest, HttpResponse, RemoteCacheMetadata,
-        ReqwestHttpClient, cache_paths_for_url, fetch_iplist_with_cache, max_http_body_bytes,
-        normalize_remote_text, url_hash_prefix,
+        CacheSource, HttpClient, HttpClientError, HttpRequest, HttpResponse, MAX_HTTP_REDIRECTS,
+        RemoteCacheMetadata, ReqwestHttpClient, cache_paths_for_url, fetch_iplist_with_cache,
+        has_same_http_origin, max_http_body_bytes, normalize_remote_text, url_hash_prefix,
     };
     use crate::hash::sha256_hex;
+    use crate::http_cache::test_support::CrossOriginRedirectFixture;
     use crate::limited_io::{read_bytes_with_limit, read_to_string_with_limit};
 
     struct MockHttpClient {
@@ -489,6 +616,34 @@ mod tests {
             etag: None,
             last_modified: None,
         }
+    }
+
+    fn spawn_same_origin_redirect_chain(
+        redirect_count: usize,
+        final_response: bool,
+    ) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let request_count = redirect_count + usize::from(final_response);
+        let server = thread::spawn(move || {
+            for index in 0..request_count {
+                let (mut socket, _) = listener.accept().expect("accept");
+                let mut request_buf = [0_u8; 1024];
+                let _ = socket.read(&mut request_buf).expect("read request");
+                let response = if final_response && index == redirect_count {
+                    "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                } else {
+                    format!(
+                        "HTTP/1.1 302 Found\r\nLocation: /redirect-{}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        index + 1
+                    )
+                };
+                socket
+                    .write_all(response.as_bytes())
+                    .expect("write response");
+            }
+        });
+        (format!("http://{addr}/start"), server)
     }
 
     #[test]
@@ -960,13 +1115,163 @@ mod tests {
             })
             .expect_err("oversized body should fail");
 
-        match err {
-            HttpClientError::Request { reason } => {
-                assert!(reason.contains("exceeds max"));
-            }
-        }
+        let HttpClientError::Request { reason } = err else {
+            panic!("body read should fail during the request");
+        };
+        assert!(reason.contains("exceeds max"));
 
         server.join().expect("server thread");
+    }
+
+    #[test]
+    fn reqwest_http_client_follows_same_origin_redirect() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let addr = listener.local_addr().expect("listener addr");
+
+        let server = thread::spawn(move || {
+            for response in [
+                "HTTP/1.1 302 Found\r\nLocation: /final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    .to_string(),
+                "HTTP/1.1 200 OK\r\nContent-Length: 12\r\nConnection: close\r\n\r\n198.51.100.7"
+                    .to_string(),
+            ] {
+                let (mut socket, _) = listener.accept().expect("accept");
+                let mut request_buf = [0_u8; 1024];
+                let _ = socket.read(&mut request_buf).expect("read request");
+                socket
+                    .write_all(response.as_bytes())
+                    .expect("write response");
+            }
+        });
+
+        let client = ReqwestHttpClient::default();
+        let response = client
+            .fetch(HttpRequest {
+                url: format!("http://{addr}/start"),
+                if_none_match: None,
+                if_modified_since: None,
+                max_body_bytes: 1024,
+            })
+            .expect("same-origin redirect should succeed");
+
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.body, b"198.51.100.7");
+        server.join().expect("server thread");
+    }
+
+    #[test]
+    fn reqwest_http_client_rejects_cross_origin_redirect_before_contact() {
+        let fixture = CrossOriginRedirectFixture::new();
+        let client = ReqwestHttpClient::with_timeout(Duration::from_secs(1));
+        let result = client.fetch(HttpRequest {
+            url: fixture.source_url().to_string(),
+            if_none_match: None,
+            if_modified_since: None,
+            max_body_bytes: 1024,
+        });
+
+        fixture.finish();
+        assert!(result.is_err(), "cross-origin redirect should fail");
+    }
+
+    #[test]
+    fn blocked_remote_feed_redirect_preserves_cached_networks() {
+        let temp = TempDir::new().expect("tempdir");
+        let fixture = CrossOriginRedirectFixture::new();
+        let paths = cache_paths_for_url(temp.path(), fixture.source_url());
+        fs::write(&paths.iplist_path, "10.0.0.0/24\n").expect("write cache");
+        let client = ReqwestHttpClient::with_timeout(Duration::from_secs(1));
+
+        let result =
+            fetch_iplist_with_cache(&client, fixture.source_url(), temp.path(), &BTreeMap::new())
+                .expect("fetch");
+
+        fixture.finish();
+        assert_eq!(result.source, CacheSource::FallbackCache);
+        assert_eq!(
+            read_to_string_with_limit(&paths.iplist_path, super::MAX_IPLIST_READ_BYTES)
+                .expect("read cache"),
+            "10.0.0.0/24\n"
+        );
+    }
+
+    #[test]
+    fn http_origin_requires_matching_scheme_host_and_effective_port() {
+        let configured = reqwest::Url::parse("https://EXAMPLE.com/feed").expect("configured URL");
+
+        assert!(has_same_http_origin(
+            &configured,
+            &reqwest::Url::parse("https://example.com:443/next").expect("same origin")
+        ));
+        assert!(!has_same_http_origin(
+            &configured,
+            &reqwest::Url::parse("http://example.com/next").expect("downgrade URL")
+        ));
+        assert!(!has_same_http_origin(
+            &configured,
+            &reqwest::Url::parse("https://other.example/next").expect("other host")
+        ));
+        assert!(!has_same_http_origin(
+            &configured,
+            &reqwest::Url::parse("https://example.com:8443/next").expect("other port")
+        ));
+    }
+
+    #[test]
+    fn reqwest_http_client_allows_ten_same_origin_redirects() {
+        let (url, server) = spawn_same_origin_redirect_chain(MAX_HTTP_REDIRECTS, true);
+        let client = ReqwestHttpClient::default();
+
+        let response = client
+            .fetch(HttpRequest {
+                url,
+                if_none_match: None,
+                if_modified_since: None,
+                max_body_bytes: 1024,
+            })
+            .expect("ten redirects should succeed");
+
+        assert_eq!(response.status, StatusCode::OK);
+        server.join().expect("server thread");
+    }
+
+    #[test]
+    fn reqwest_http_client_rejects_eleventh_same_origin_redirect() {
+        let (url, server) = spawn_same_origin_redirect_chain(MAX_HTTP_REDIRECTS + 1, false);
+        let client = ReqwestHttpClient::default();
+
+        let result = client.fetch(HttpRequest {
+            url,
+            if_none_match: None,
+            if_modified_since: None,
+            max_body_bytes: 1024,
+        });
+
+        assert!(result.is_err(), "eleventh redirect should fail");
+        server.join().expect("server thread");
+    }
+
+    #[test]
+    fn reqwest_http_client_returns_stored_initialization_error() {
+        let expected = HttpClientError::Initialization {
+            reason: "test initialization failure".to_string(),
+        };
+        let client = ReqwestHttpClient {
+            client: Err(expected.clone()),
+            user_agent: "kidobo/test".to_string(),
+            request_timeout: Duration::from_secs(1),
+        };
+
+        let error = client
+            .fetch(HttpRequest {
+                url: "https://example.com/feed".to_string(),
+                if_none_match: None,
+                if_modified_since: None,
+                max_body_bytes: 1024,
+            })
+            .expect_err("stored initialization error should be returned");
+
+        assert_eq!(error, expected);
     }
 
     #[test]

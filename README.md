@@ -202,6 +202,9 @@ an arbitrary build or `cargo run` path.
   intentional empty feed. A non-empty response with no valid CIDRs, or GitHub
   metadata missing a selected category, is treated as a soft fetch failure and
   does not replace the last usable cache.
+- Remote fetches follow at most ten redirects, and only when the destination
+  keeps the configured URL's scheme, host, and effective port. A blocked
+  redirect is a soft fetch failure and does not replace the last usable cache.
 - `doctor` is read-only by default. It checks whether the remote cache path is
   structurally plausible without creating directories or writing probe files;
   plausible permissions are reported as `SKIP` because effective access is not

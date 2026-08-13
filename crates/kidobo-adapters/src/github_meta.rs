@@ -566,6 +566,7 @@ mod tests {
     use std::cell::RefCell;
     use std::collections::{BTreeMap, VecDeque};
     use std::fs;
+    use std::time::Duration;
 
     use reqwest::StatusCode;
     use tempfile::TempDir;
@@ -577,7 +578,10 @@ mod tests {
         load_github_meta_safelist,
     };
     use crate::hash::sha256_hex;
-    use crate::http_cache::{HttpClient, HttpClientError, HttpRequest, HttpResponse};
+    use crate::http_cache::test_support::CrossOriginRedirectFixture;
+    use crate::http_cache::{
+        HttpClient, HttpClientError, HttpRequest, HttpResponse, ReqwestHttpClient,
+    };
     use crate::limited_io::read_bytes_with_limit;
     use kidobo_core::config::GithubMetaCategoryMode;
     use kidobo_core::network::{CanonicalCidr, Ipv4Cidr, Ipv6Cidr};
@@ -907,6 +911,62 @@ mod tests {
 
         assert_eq!(result.source, GithubMetaSource::FallbackCache);
         assert_eq!(result.networks.len(), 1);
+    }
+
+    #[test]
+    fn blocked_github_meta_redirect_preserves_compatible_cache() {
+        let temp = TempDir::new().expect("tempdir");
+        let fixture = CrossOriginRedirectFixture::new();
+        let cached_raw = br#"{"api":["192.30.252.0/22"],"git":[],"hooks":[],"packages":[]}"#;
+        fs::write(temp.path().join(GITHUB_META_RAW_CACHE_FILE), cached_raw)
+            .expect("write raw cache");
+        fs::write(
+            temp.path().join(GITHUB_META_META_CACHE_FILE),
+            serde_json::to_vec_pretty(&GithubMetaCacheMetadata {
+                url: fixture.source_url().to_string(),
+                etag: None,
+                last_modified: None,
+                sha256_raw: sha256_hex(cached_raw),
+            })
+            .expect("metadata json"),
+        )
+        .expect("write metadata");
+        fs::write(
+            temp.path().join(GITHUB_META_CATEGORY_CACHE_FILE),
+            serde_json::to_vec_pretty(&GithubMetaCategorySidecar {
+                mode: "selected".to_string(),
+                categories: vec![
+                    "api".to_string(),
+                    "git".to_string(),
+                    "hooks".to_string(),
+                    "packages".to_string(),
+                ],
+            })
+            .expect("sidecar json"),
+        )
+        .expect("write sidecar");
+        let client = ReqwestHttpClient::with_timeout(Duration::from_secs(1));
+
+        let result = load_github_meta_safelist(
+            &client,
+            temp.path(),
+            fixture.source_url(),
+            &GithubMetaCategoryMode::Default,
+            &BTreeMap::new(),
+        )
+        .expect("load");
+
+        fixture.finish();
+        assert_eq!(result.source, GithubMetaSource::FallbackCache);
+        assert_eq!(result.networks.len(), 1);
+        assert_eq!(
+            read_bytes_with_limit(
+                &temp.path().join(GITHUB_META_RAW_CACHE_FILE),
+                super::GITHUB_META_CACHE_READ_LIMIT,
+            )
+            .expect("read cache"),
+            cached_raw
+        );
     }
 
     #[test]
