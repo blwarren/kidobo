@@ -8,16 +8,6 @@
     clippy::wildcard_dependencies
 )]
 #![warn(clippy::pedantic)]
-#![allow(
-    clippy::match_same_arms,
-    clippy::must_use_candidate,
-    clippy::needless_raw_string_hashes,
-    clippy::missing_errors_doc,
-    clippy::single_match_else,
-    clippy::struct_field_names,
-    clippy::unreadable_literal,
-    reason = "These pedantic lints conflict with the repository's established style"
-)]
 #![cfg_attr(
     not(test),
     deny(
@@ -54,6 +44,7 @@ pub mod logging;
 
 use std::process::ExitCode;
 
+#[must_use]
 pub fn run() -> ExitCode {
     cli::run()
 }

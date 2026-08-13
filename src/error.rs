@@ -32,6 +32,7 @@ pub enum KidoboError {
 }
 
 impl KidoboError {
+    #[must_use]
     pub fn exit_code(&self) -> u8 {
         match self {
             Self::Interrupted => 130,

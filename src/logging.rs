@@ -6,6 +6,12 @@ use log::LevelFilter;
 
 use crate::error::KidoboError;
 
+/// Initializes process-wide logging at the requested level.
+///
+/// # Errors
+///
+/// Returns [`KidoboError::LoggerInit`] if a logger has already been initialized or the logger
+/// otherwise cannot be installed.
 pub fn init(level: LevelFilter) -> Result<(), KidoboError> {
     let stderr_is_terminal = std::io::stderr().is_terminal();
     let no_color_set = env::var_os("NO_COLOR").is_some();
