@@ -272,9 +272,8 @@ where
 }
 
 fn remote_fetch_worker_count(url_count: usize) -> usize {
-    let cpu_parallelism = std::thread::available_parallelism()
-        .map(std::num::NonZeroUsize::get)
-        .unwrap_or(1);
+    let cpu_parallelism =
+        std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
     remote_fetch_worker_count_for(url_count, cpu_parallelism)
 }
 

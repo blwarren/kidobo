@@ -518,13 +518,9 @@ mod tests {
         fs::write(cache_dir.join("as64512.iplist"), "203.0.113.0/24\n").expect("write");
         let resolver = Mutex::new(MockResolver::new(vec![]));
 
-        let loaded = load_asn_prefixes_with_cache(
-            64512,
-            cache_dir,
-            Duration::from_secs(24 * 60 * 60),
-            &resolver,
-        )
-        .expect("load");
+        let loaded =
+            load_asn_prefixes_with_cache(64512, cache_dir, Duration::from_hours(24), &resolver)
+                .expect("load");
 
         assert_eq!(
             loaded,
@@ -546,13 +542,9 @@ mod tests {
         .expect("write cache");
         let resolver = Mutex::new(MockResolver::new(vec![]));
 
-        let loaded = load_asn_prefixes_with_cache(
-            64512,
-            cache_dir,
-            Duration::from_secs(24 * 60 * 60),
-            &resolver,
-        )
-        .expect("load");
+        let loaded =
+            load_asn_prefixes_with_cache(64512, cache_dir, Duration::from_hours(24), &resolver)
+                .expect("load");
 
         assert_eq!(
             loaded
@@ -578,13 +570,9 @@ mod tests {
             Ipv4Cidr::from_parts(0xc6336400, 24),
         )])]));
 
-        let loaded = load_asn_prefixes_with_cache(
-            64512,
-            cache_dir,
-            Duration::from_secs(24 * 60 * 60),
-            &resolver,
-        )
-        .expect("load");
+        let loaded =
+            load_asn_prefixes_with_cache(64512, cache_dir, Duration::from_hours(24), &resolver)
+                .expect("load");
 
         assert_eq!(
             loaded,
@@ -675,13 +663,9 @@ mod tests {
             CanonicalCidr::V4(Ipv4Cidr::from_parts(0xc6336400, 24)),
         ])]));
 
-        let first = load_asn_prefixes_with_cache(
-            64512,
-            cache_dir,
-            Duration::from_secs(24 * 60 * 60),
-            &resolver,
-        )
-        .expect("initial load");
+        let first =
+            load_asn_prefixes_with_cache(64512, cache_dir, Duration::from_hours(24), &resolver)
+                .expect("initial load");
         assert!(!first.stale);
         assert_eq!(first.prefixes.len(), 2);
 
@@ -692,13 +676,9 @@ mod tests {
         assert!(cache_contents.contains("203.0.113.0/24\n"));
         assert!(cache_contents.contains("198.51.100.0/24\n"));
 
-        let second = load_asn_prefixes_with_cache(
-            64512,
-            cache_dir,
-            Duration::from_secs(24 * 60 * 60),
-            &resolver,
-        )
-        .expect("cached load");
+        let second =
+            load_asn_prefixes_with_cache(64512, cache_dir, Duration::from_hours(24), &resolver)
+                .expect("cached load");
         assert!(!second.stale);
         assert_eq!(
             second

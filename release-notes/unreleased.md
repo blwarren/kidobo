@@ -1,0 +1,1 @@
+- Source builds now require Rust 1.97.1, which includes the upstream fix for an LLVM miscompilation.

@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Source builds now require Rust 1.97.1, which includes the upstream fix for an LLVM miscompilation.
 
 ## [0.12.1] - 2026-07-19
 
