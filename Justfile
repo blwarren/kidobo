@@ -2,9 +2,9 @@
 default:
     @just --list
 
-# Update dependencies, then run the test suite.
-update: && test
-    @cargo update --verbose
+# Update dependencies after the publish-age cooldown, then run the test suite.
+update: _install-cooldown && test
+    @cargo cooldown update --verbose
 
 # Build the release binary.
 build-release:
@@ -80,6 +80,10 @@ _release-notes-generate:
 # Install cargo-deny for CI and release validation.
 _install-deny:
     @cargo install --locked cargo-deny --version "${CARGO_DENY_VERSION:-0.19.0}"
+
+# Install cargo-cooldown for guarded dependency updates.
+_install-cooldown:
+    @cargo install --locked cargo-cooldown --version "${CARGO_COOLDOWN_VERSION:-0.3.4}"
 
 # Install cargo-audit for CI and release validation.
 _install-audit:

@@ -1,0 +1,8 @@
+# Keep the existing lockfile as the minimum version floor and restore it if an
+# update cannot produce a graph whose registry releases have aged long enough.
+[cooldown]
+incompatible-publish-age = "deny"
+lockfile-baseline = "floor"
+
+[registry]
+global-min-publish-age = "7 days"

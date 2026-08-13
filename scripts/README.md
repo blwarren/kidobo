@@ -7,13 +7,14 @@ is needed:
 
 ```bash
 cargo install --locked just --version 1.55.1
-just _install-deny _install-audit
+just _install-cooldown _install-deny _install-audit
 gh auth login
 ```
 
 ## Structure
 
 - `Justfile`: local validation, release-note, udeps, publication, and mutation-test recipes.
+- `cooldown.toml`: fail-closed seven-day minimum publish age for dependency updates.
 - `scripts/install.sh`: public install/uninstall flow used by operators.
 - `scripts/publish-release.sh`: guarded, transactional release preparation and publication.
 - `scripts/changelog/*`: release-notes normalization and changelog generation.
@@ -26,12 +27,24 @@ gh auth login
 - `just ci` (local formatting, lint, dependency-policy, audit, and test gate)
 - `just coverage` (release-only 90% minimum for stable region, function, and line metrics)
 - `just exercise-release` (release-only build and isolated binary exercise)
-- `just update`
+- `just update` (install the pinned cooldown tool, update dependencies at least seven days old, and test)
 - `just udeps` (manual nightly-toolchain dependency-usage audit)
 - `just release-notes-check` (required after repository changes and during release validation)
 - `just publish-release 0.11.0` (complete local release preparation, validation, upload, verification, and publication)
 - `just mutants`
 - `just mutants --shard 1/4`
+
+Use `just update` rather than raw `cargo update`; stable Cargo does not enforce
+the repository's publish-age policy by itself. Dependabot security updates
+bypass the cooldown automatically. For an urgent local security update, add a
+temporary exact-version exception to `cooldown.toml`, run `just update`, and
+remove the exception before committing:
+
+```toml
+[[allow.exact]]
+crate = "affected-crate"
+version = "1.2.3"
+```
 
 ## GitHub Automation
 
