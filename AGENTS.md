@@ -29,7 +29,7 @@ redesigns. New commands, configuration surface, or runtime modes require explici
   existence without activating new wiring → normalize and load all sources → compute family-separated
   effective sets (merge, safelist carve, and minimal CIDR regeneration) → preflight every
   enabled-family capacity → atomically replace each set → activate and normalize firewall wiring →
-  clean up disabled-family artifacts → log → unlock.
+  clean up disabled-family artifacts → unlock → log the final outcome.
 * Ipset atomicity is per set, not a transaction across both families. Preserve the temporary suffix,
   the 31-character name limit, restore+swap replacement, and best-effort temporary-set destruction.
   Check every enabled-family `maxelem` limit before swapping either family.

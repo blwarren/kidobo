@@ -2,26 +2,18 @@
 
 `kidobo` is a one-shot Linux firewall blocklist manager.
 It builds IPv4/IPv6 blocklists from local and remote sources, subtracts
-safelist entries, and updates `ipset` atomically with deterministic
-`iptables`/`ip6tables` wiring.
+safelist entries, atomically replaces each managed `ipset`, and maintains
+deterministic `iptables`/`ip6tables` wiring.
 
 ## Features
 
-- Easily manage and update both local and remote IP/CIDR blocklists.
-- Utilizes ipset to harness the efficiency of the Linux kernel in enforcing blocklists.
-- Automatic dedupe and consolidation of blocklists before ipset creation.
-- Sync happens **fast**: in testing on a Linode Nanode (Single core CPU VM with 1 GB RAM)
-  updates involving multiple blocklists totalling 400,000 lines happen in less than
-  five seconds.
-- Stay in control: identify safe IP's that are carved out of blocklists.
-- Local blocklist entries can be managed through manual editing of text
-  file or through use of CLI ban/unban commands.
+- Manages local and remote IPv4/IPv6 blocklists.
+- Deduplicates, merges, and minimizes CIDR entries before enforcement.
+- Carves operator-defined safe IP/CIDR ranges out of blocklists.
+- Uses kernel `ipset` matching with normalized `iptables`/`ip6tables` rules.
+- Supports local IP/CIDR and ASN bans through the CLI or configuration files.
 
 ## Install
-
-Release binaries are currently published for Linux x86_64.
-
-No testing has been performed on other CPU architectures, but feel free to run the test suite and build from source when using this on other platforms.
 
 Install latest release:
 
@@ -33,6 +25,14 @@ Install a specific release:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/blwarren/kidobo/main/scripts/install.sh | sudo bash -s -- --version v0.13.0
+```
+
+The command above pins the binary release while still using the installer from
+the mutable `main` branch. To pin both, use the same release tag in the installer
+URL and argument:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/blwarren/kidobo/vX.Y.Z/scripts/install.sh | sudo bash -s -- --version vX.Y.Z
 ```
 
 Install and initialize in one step:
@@ -47,14 +47,23 @@ Uninstall:
 curl -fsSL https://raw.githubusercontent.com/blwarren/kidobo/main/scripts/install.sh | sudo bash -s -- --uninstall
 ```
 
-Security note: piping a script to `sudo bash` is convenient, but you should
-review the script (and pin a version) if you need a stricter install policy.
+Security note: piping a script to `sudo bash` is convenient, but for a stricter
+install policy, download and review a tag-pinned installer before running it.
 The installer verifies the requested checksum and binary version in a staged
 file before atomically replacing an existing installation.
 
+## Requirements
+
+- Linux x86_64 for published binaries. Other architectures must build from
+  source and are not currently tested.
+- `sudo`, `ipset`, and `iptables` for runtime checks and enforcement.
+- `ip6tables` when IPv6 enforcement is enabled, which is the default.
+- `bgpq4` for ASN resolution and for the complete `doctor` check.
+- systemd only when using the generated periodic sync service and timer.
+
 ## Quick Start
 
-Initialize default files and (optionally) systemd units:
+Initialize the default files and generated systemd units:
 
 ```bash
 sudo kidobo init
@@ -66,18 +75,28 @@ Configure your sources and safelist:
 sudoedit /etc/kidobo/config.toml
 ```
 
+Check prerequisites and system wiring before changing source state:
+
+```bash
+sudo kidobo doctor
+```
+
 Add local entries (optional):
 
 Use commands:
 
 ```bash
-kidobo ban 203.0.113.7
-kidobo unban 203.0.113.7
-kidobo ban --file targets.txt
-kidobo unban --file targets.txt --yes
-kidobo ban --asn 213412
-kidobo unban --asn AS213412
+sudo kidobo ban 203.0.113.7
+sudo kidobo unban 203.0.113.7
+sudo kidobo ban --file targets.txt
+sudo kidobo unban --file targets.txt --yes
+sudo kidobo ban --asn 213412
+sudo kidobo unban --asn AS213412
 ```
+
+`ban --asn` loads or resolves the ASN prefixes and caches them before updating
+`[asn].banned`. A stale cache can be used when refresh fails. These commands
+change source state only; they do not change live firewall enforcement.
 
 Or edit the local blocklist file directly:
 
@@ -85,19 +104,8 @@ Or edit the local blocklist file directly:
 echo "203.0.113.0/24" | sudo tee -a /var/lib/kidobo/blocklist.txt
 ```
 
-Check prerequisites and system wiring:
-
-```bash
-sudo kidobo doctor
-```
-
-Apply blocklists to `ipset` and firewall rules:
-
-```bash
-sudo kidobo sync
-```
-
-Re-apply after local blocklist changes:
+Apply blocklists to `ipset` and firewall rules after any source or configuration
+change:
 
 ```bash
 sudo kidobo sync
@@ -151,7 +159,7 @@ Useful options:
 - `ipset.chain_action`: `DROP` (default) or `REJECT`
 - `ipset.maxelem`: range `[1, 500000]`
 - `remote.timeout_secs`: range `[1, 3600]`
-- `asn.banned`: ASN bans that are resolved to prefixes during `sync`
+- `asn.banned`: ASN bans loaded from cache or resolved to prefixes during `sync`
 - `asn.cache_stale_after_secs`: ASN prefix cache refresh threshold
   (default `86400`, range `[1, 604800]`)
 
@@ -177,10 +185,11 @@ an arbitrary build or `cargo run` path.
 
 ## Notes
 
-- `ban` and `unban` modify local source state only:
-  blocklist entries for IP/CIDR targets and config `[asn].banned` for ASN targets.
-  `--file` accepts one strict IP/CIDR target per line.
-  Run `sync` to apply changes to firewall/ipset runtime state.
+- IP/CIDR `ban` and `unban` commands update the local blocklist. ASN bans load
+  and cache prefixes before updating `[asn].banned`; ASN unbans remove the
+  configuration entry and make a best-effort cache cleanup. `--file` accepts
+  one strict IP/CIDR target per line. No ban or unban changes live enforcement
+  before `sync`.
 - `lookup` is offline-only and reports raw overlaps with the local blocklist,
   cached remote sources, configured `safe.ips`, compatible cached GitHub meta
   safelist data, and cached prefixes for currently configured ASN bans. It
@@ -205,55 +214,48 @@ an arbitrary build or `cargo run` path.
 - Remote fetches follow at most ten redirects, and only when the destination
   keeps the configured URL's scheme, host, and effective port. A blocked
   redirect is a soft fetch failure and does not replace the last usable cache.
+- Ipset replacement is atomic per set, not across both address families. IPv6
+  and IPv4 are capacity-checked before either set is replaced, but their swaps
+  are separate operations.
 - `doctor` is read-only by default. It checks whether the remote cache path is
   structurally plausible without creating directories or writing probe files;
   plausible permissions are reported as `SKIP` because effective access is not
   mutated to prove writability.
-- `KIDOBO_ROOT` relocates config/data/cache paths under a custom root.
+- `KIDOBO_ROOT` relocates config, data, cache, and generated systemd paths under
+  a custom root. `init` does not call `systemctl` when this override is present,
+  which also makes an unprivileged isolated setup possible when the root is
+  writable.
 
 ## Development
 
-Development commands are defined in `Justfile`.
+Development commands are defined in `Justfile`. See the
+[development-command reference](scripts/README.md) for release and recovery
+details, and the [architecture guide](docs/architecture.md) for extension
+boundaries and recipes.
 
 ```bash
 cargo install --locked just --version 1.55.1
-just _install-deny _install-audit
-gh auth login
+just _install-cooldown _install-deny _install-audit
 just check
 just ci
+just release-notes-check
 ```
 
 `just check` is the fast development loop. Run `just ci` explicitly before every
 push; GitHub does not run project CI for pushes or tags. The complete local gate
-checks formatting, lints, dependency policy, audits, and tests. Run
-`just release-notes-check` separately after repository changes. Coverage and
-the release build and isolated binary exercise run only as part of
-`just publish-release`, which installs the coverage tool when needed. The
-exercise uses a temporary `KIDOBO_ROOT`, a loopback HTTP feed, and fake
-privileged commands, never the development host's firewall or systemd.
-Dependabot update PRs are the only GitHub-hosted automation retained.
+checks formatting, lints, dependency policy, audits, and tests. Coverage and the
+isolated release-binary exercise run only during publication. The exercise uses
+a temporary `KIDOBO_ROOT`, a loopback HTTP feed, and fake privileged commands;
+it never touches the development host's firewall or systemd. Dependabot update
+PRs are the only GitHub-hosted automation retained. Run
+`just release-notes-check` after every repository change.
 
-Publish from any clean branch; the command switches to `main` automatically and
-verifies that it is not behind or diverged from `origin/main`:
-
-```bash
-just publish-release 0.11.0
-```
-
-The command prepares the release in a temporary worktree, runs `just ci`,
-repeats the release-note check, then performs the release-only coverage, build,
-and binary-exercise gates before packaging the tested Linux x86_64 binary.
-After confirmation, it atomically pushes the release commit and annotated tag,
-uploads a draft with GitHub CLI, downloads and verifies the assets, and only
-then publishes the release. Stable versions become Latest; suffixed versions
-are prereleases.
-
-Artifacts remain under `target/release-artifacts/vX.Y.Z/`. If a GitHub operation
-fails after the refs are pushed, the draft and local artifacts are retained and
-the publisher prints exact recovery commands. If validation fails or publication
-is cancelled before the push, the command restores the original branch and
-removes the unpublished artifacts. After a successful publication, the working
-tree remains on the updated `main` branch.
+Authenticate with `gh auth login` before publishing, then run
+`just publish-release X.Y.Z` from a clean branch. The publisher validates and
+packages the release locally, pushes the release commit and tag atomically,
+verifies the draft's downloaded assets, and only then publishes it. See the
+[development-command reference](scripts/README.md) for the complete workflow
+and failure recovery.
 
 Use `just --list` to see all available local and CI recipes.
 

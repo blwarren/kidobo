@@ -30,7 +30,7 @@ gh auth login
 - `just update` (install the pinned cooldown tool, update dependencies at least seven days old, and test)
 - `just udeps` (manual nightly-toolchain dependency-usage audit)
 - `just release-notes-check` (required after repository changes and during release validation)
-- `just publish-release 0.11.0` (complete local release preparation, validation, upload, verification, and publication)
+- `just publish-release X.Y.Z` (complete local release preparation, validation, upload, verification, and publication)
 - `just mutants`
 - `just mutants --shard 1/4`
 
@@ -52,17 +52,6 @@ Kidobo does not use checked-in GitHub Actions workflows. Run `just ci` before
 ordinary pushes and `just publish-release X.Y.Z` for releases. Dependabot update
 PRs remain enabled as the sole GitHub-hosted automation exception.
 
-After the commit removing the old workflows reaches `main`, disable the existing
-CodeQL default setup and verify the remaining workflow list:
-
-```bash
-gh api --method PATCH repos/blwarren/kidobo/code-scanning/default-setup \
-    -f state=not-configured
-gh workflow list --repo blwarren/kidobo
-```
-
-The second command should list only `Dependabot Updates`.
-
 ## Release Recovery
 
 The publisher retains the archive, checksum, and release notes under
@@ -71,7 +60,7 @@ GitHub release was not confirmed published. It prints commands specialized for
 that release. The equivalent manual recovery flow is:
 
 ```bash
-release_tag=v0.12.2
+release_tag="${RELEASE_TAG:?set RELEASE_TAG to vX.Y.Z}"
 release_artifacts="target/release-artifacts/${release_tag}"
 release_archive="kidobo-${release_tag}-linux-x86_64.tar.gz"
 
