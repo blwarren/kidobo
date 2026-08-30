@@ -24,7 +24,7 @@ curl -fsSL https://raw.githubusercontent.com/blwarren/kidobo/main/scripts/instal
 Install a specific release:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/blwarren/kidobo/main/scripts/install.sh | sudo bash -s -- --version v0.14.0
+curl -fsSL https://raw.githubusercontent.com/blwarren/kidobo/main/scripts/install.sh | sudo bash -s -- --version v0.14.1
 ```
 
 The command above pins the binary release while still using the installer from
