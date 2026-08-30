@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+
+## [0.14.0] - 2026-08-30
+
 - Uninstall now canonicalizes `KIDOBO_ROOT` before cleanup and rejects empty,
   root-equivalent, symlink-to-root, or unresolvable override paths.
 - Firewall activation now uses a transient Kidobo-owned staging chain to replace
