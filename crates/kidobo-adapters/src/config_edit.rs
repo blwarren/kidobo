@@ -9,9 +9,12 @@ use crate::limited_io::{read_to_string_with_limit, write_string_atomic};
 use kidobo_app::AppError;
 use kidobo_core::config::{ConfigError, DEFAULT_ASN_CACHE_STALE_AFTER_SECS};
 
+/// Exact changes made to the normalized configured ASN set.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct AsnBanUpdateResult {
+    /// ASNs newly added.
     pub added: Vec<u32>,
+    /// ASNs that were present and removed.
     pub removed: Vec<u32>,
 }
 

@@ -10,16 +10,26 @@ use thiserror::Error;
 use crate::hash::sha256_hex;
 use crate::limited_io::{read_bytes_with_limit, write_bytes_atomic};
 
+/// Failure while serializing or atomically writing a cache JSON document.
 #[derive(Debug, Error)]
 pub enum WriteJsonError {
+    /// The value could not be encoded as JSON.
     #[error("failed to serialize JSON: {reason}")]
-    Serialize { reason: String },
+    Serialize {
+        /// Serializer diagnostic.
+        reason: String,
+    },
 
+    /// Encoded JSON could not be atomically persisted.
     #[error("failed to write JSON file: {reason}")]
-    Write { reason: String },
+    Write {
+        /// Filesystem diagnostic.
+        reason: String,
+    },
 }
 
 #[must_use]
+/// Reads a bounded optional cache file, logging and returning `None` when unusable.
 pub fn read_optional_bytes_lossy(
     path: &Path,
     read_limit: usize,
@@ -39,6 +49,7 @@ pub fn read_optional_bytes_lossy(
 }
 
 #[must_use]
+/// Reads and deserializes bounded optional JSON, logging and returning `None` when unusable.
 pub fn read_optional_json_lossy<T>(path: &Path, read_limit: usize, description: &str) -> Option<T>
 where
     T: DeserializeOwned,
@@ -58,6 +69,9 @@ where
 }
 
 #[must_use]
+/// Reads bounded optional bytes and validates an optional SHA-256 checksum.
+///
+/// Missing, unreadable, or mismatched cache data is logged and returned as `None`.
 pub fn read_validated_bytes_lossy(
     path: &Path,
     read_limit: usize,

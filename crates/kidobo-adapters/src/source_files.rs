@@ -12,12 +12,17 @@ use crate::http_cache::RemoteCacheMetadata;
 use crate::limited_io::read_to_string_with_limit;
 use kidobo_core::network::{CanonicalCidr, parse_ip_cidr_token};
 
+/// Maximum accepted cached source text size.
 pub const SOURCE_FILE_READ_LIMIT: usize = 16 * 1024 * 1024;
+/// Maximum accepted legacy remote metadata sidecar size.
 pub const REMOTE_META_READ_LIMIT: usize = 256 * 1024;
 
+/// Failure while enumerating legacy cached remote sources.
 #[derive(Debug)]
 pub enum RemoteCacheFilesError {
+    /// The cache directory could not be opened.
     ReadDir(io::Error),
+    /// One cache directory entry could not be read.
     ReadDirEntry(io::Error),
 }
 
@@ -60,6 +65,7 @@ pub fn read_remote_cache_iplist_text(
 }
 
 #[must_use]
+/// Parses the first token of a non-comment source line as a canonical CIDR.
 pub fn parse_cidr_source_line(line: &str) -> Option<(CanonicalCidr, &str)> {
     let token = line.split_whitespace().next()?.trim();
     if token.is_empty() {
@@ -71,6 +77,7 @@ pub fn parse_cidr_source_line(line: &str) -> Option<(CanonicalCidr, &str)> {
 }
 
 #[must_use]
+/// Returns the metadata URL for a legacy iplist, or a stable filename-based label.
 pub fn resolve_remote_source_label(iplist_path: &Path, meta_read_limit: usize) -> String {
     let Some(meta_path) = remote_meta_path_for_iplist(iplist_path) else {
         return fallback_remote_source_label(iplist_path);

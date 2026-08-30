@@ -1,35 +1,50 @@
+//! Best-effort cleanup workflow for Kidobo-owned runtime artifacts.
+
 use std::path::Path;
 
 use crate::AppError;
 use crate::paths::{ConfigRequirement, PathResolutionInput};
 use crate::ports::{ConfigRepository, LockManager, PathResolver};
 
+/// Firewall command family selected for cleanup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FirewallFamily {
+    /// IPv4 firewall through `iptables`.
     Ipv4,
+    /// IPv6 firewall through `ip6tables`.
     Ipv6,
 }
 
+/// Request for cache-only or complete managed-artifact cleanup.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FlushRequest {
+    /// Runtime path inputs.
     pub paths: PathResolutionInput,
+    /// Whether to skip firewall and ipset cleanup.
     pub cache_only: bool,
 }
 
+/// One scoped cleanup step that could not be completed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CleanupFailure {
+    /// Operator-visible name of the attempted operation.
     pub operation: String,
+    /// Backend diagnostic explaining the failure.
     pub reason: String,
 }
 
+/// Complete ledger of successful and failed cleanup attempts.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct FlushOutcome {
+    /// Names of successfully completed operations.
     pub completed: Vec<String>,
+    /// Failures retained after every scoped operation was attempted.
     pub failed: Vec<CleanupFailure>,
 }
 
 impl FlushOutcome {
     #[must_use]
+    /// Joins backend failure diagnostics for the stable incomplete-flush error.
     pub fn failure_details(&self) -> String {
         self.failed
             .iter()
@@ -39,6 +54,7 @@ impl FlushOutcome {
     }
 }
 
+/// Adapter boundary for Kidobo-owned firewall, ipset, and cache cleanup.
 pub trait FlushBackend {
     /// Removes managed firewall wiring for one address family.
     ///
@@ -62,10 +78,15 @@ pub trait FlushBackend {
     fn clear_remote_cache(&self, path: &Path) -> Result<(), String>;
 }
 
+/// Ports required by the flush workflow.
 pub struct FlushDependencies<'a> {
+    /// Runtime path resolver.
     pub paths: &'a dyn PathResolver,
+    /// Validated configuration repository.
     pub configs: &'a dyn ConfigRepository,
+    /// Nonblocking process lock manager.
     pub locks: &'a dyn LockManager,
+    /// Managed-artifact cleanup backend.
     pub backend: &'a dyn FlushBackend,
 }
 

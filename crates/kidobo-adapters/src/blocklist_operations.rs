@@ -12,6 +12,7 @@ use crate::asn::{
 };
 use crate::config_edit::update_asn_bans;
 
+/// Production ASN operations backed by `bgpq4`, cache files, and atomic config edits.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SystemAsnOperations;
 

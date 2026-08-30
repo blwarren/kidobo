@@ -128,7 +128,9 @@ sudo kidobo flush --cache-only
 
 `flush` attempts every cleanup step and exits with status `1` if any live
 firewall, ipset, or cache artifact could not be removed. The installer preserves
-runtime files when uninstall cleanup cannot be confirmed.
+runtime files when uninstall cleanup cannot be confirmed. An uninstall using
+`KIDOBO_ROOT` requires GNU `realpath` so the installer can canonicalize and scope
+every removal before cleanup begins.
 
 ## Minimal Config
 

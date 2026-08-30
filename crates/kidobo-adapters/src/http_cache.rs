@@ -1,6 +1,7 @@
 //! Bounded HTTP and remote-feed cache adapter.
 
 use std::collections::BTreeMap;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::sync::Once;
 use std::time::Duration;
@@ -11,81 +12,151 @@ use reqwest::{StatusCode, Url, redirect};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::cached_fetch::{
-    read_optional_json_lossy, write_bytes_atomic_in_cache, write_json_pretty_atomic,
+use crate::cache_generation::{
+    GenerationCandidate, GenerationFile, GenerationFileLimit, commit_generation,
+    generation_candidates, generation_contents_match,
 };
+use crate::cached_fetch::{read_optional_json_lossy, read_validated_bytes_lossy};
 use crate::hash::sha256_hex;
 use crate::http_fetch::{ConditionalFetchResult, fetch_with_conditional_cache};
-use crate::limited_io::{read_to_end_with_limit, read_to_string_with_limit, write_string_atomic};
+use crate::limited_io::{read_to_end_with_limit, read_to_string_with_limit};
 use crate::remote_parse::{format_normalized_cidrs, parse_cached_iplist, parse_remote_cidrs};
 use kidobo_core::network::CanonicalCidr;
 
+/// Default maximum accepted HTTP response body size.
 pub const DEFAULT_MAX_HTTP_BODY_BYTES: usize = 32 * 1024 * 1024;
+/// Environment variable that overrides the maximum HTTP body size when valid Unicode and positive.
 pub const ENV_KIDOBO_MAX_HTTP_BODY_BYTES: &str = "KIDOBO_MAX_HTTP_BODY_BYTES";
+/// Default timeout for one HTTP request.
 pub const DEFAULT_HTTP_REQUEST_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_HTTP_REQUEST_TIMEOUT: Duration =
     Duration::from_secs(DEFAULT_HTTP_REQUEST_TIMEOUT_SECS);
 const MAX_HTTP_REDIRECTS: usize = 10;
 const MAX_IPLIST_READ_BYTES: usize = 16 * 1024 * 1024;
 const MAX_METADATA_READ_BYTES: usize = 512 * 1024;
+const V2_REMOTE_CACHE_DIRECTORY: &str = "v2/remote";
+const GENERATION_RAW_FILE: &str = "raw";
+const GENERATION_IPLIST_FILE: &str = "iplist";
+const GENERATION_METADATA_FILE: &str = "meta.json";
 static RUSTLS_PROVIDER_INIT: Once = Once::new();
 
+/// Legacy flat-file cache paths retained for read compatibility.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CachePaths {
+    /// Normalized CIDR list path.
     pub iplist_path: PathBuf,
+    /// Integrity and HTTP metadata path.
     pub meta_path: PathBuf,
+    /// Raw response body path.
     pub raw_path: PathBuf,
 }
 
+/// URL, HTTP validators, and checksums bound to a remote-feed cache.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoteCacheMetadata {
+    /// Configured URL whose response was cached.
     pub url: String,
+    /// Optional HTTP entity tag.
     pub etag: Option<String>,
+    /// Optional HTTP last-modified validator.
     pub last_modified: Option<String>,
+    /// Lowercase SHA-256 checksum of raw response bytes.
     pub sha256_raw: String,
+    /// Lowercase SHA-256 checksum of normalized CIDR text.
     pub sha256_iplist: String,
 }
 
+/// Origin of a remote-feed load result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheSource {
+    /// Newly validated network response.
     Network,
+    /// Existing cache accepted after HTTP 304.
     CacheNotModified,
+    /// Existing cache used after a failed or invalid refresh.
     FallbackCache,
+    /// No usable network or cache data was available.
     Empty,
 }
 
+/// Canonical remote-feed networks and cache provenance.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CachedIplist {
+    /// Sorted, unique canonical networks.
     pub networks: Vec<CanonicalCidr>,
+    /// Data provenance.
     pub source: CacheSource,
+    /// Validated URL, HTTP, and checksum metadata when available.
     pub metadata: Option<RemoteCacheMetadata>,
 }
 
+#[derive(Debug, Clone)]
+struct LoadedRemoteCache {
+    networks: Option<Vec<CanonicalCidr>>,
+    metadata: Option<RemoteCacheMetadata>,
+    generation_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ValidatedRemoteGeneration {
+    iplist_path: PathBuf,
+    iplist: String,
+    metadata: RemoteCacheMetadata,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct OfflineRemoteGeneration {
+    pub(crate) url_hash: String,
+    pub(crate) iplist_path: PathBuf,
+    pub(crate) label: String,
+    pub(crate) iplist: String,
+}
+
+/// One bounded conditional HTTP request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HttpRequest {
+    /// Absolute HTTP or HTTPS URL.
     pub url: String,
+    /// Optional `If-None-Match` validator.
     pub if_none_match: Option<String>,
+    /// Optional `If-Modified-Since` validator.
     pub if_modified_since: Option<String>,
+    /// Maximum accepted response body bytes.
     pub max_body_bytes: usize,
 }
 
+/// Bounded HTTP response and cache validators.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HttpResponse {
+    /// HTTP status code.
     pub status: StatusCode,
+    /// Response body constrained by the request bound.
     pub body: Vec<u8>,
+    /// Optional response entity tag.
     pub etag: Option<String>,
+    /// Optional response last-modified value.
     pub last_modified: Option<String>,
 }
 
+/// Failure to initialize or use an HTTP client safely.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum HttpClientError {
+    /// TLS or client construction failed.
     #[error("http client initialization failed: {reason}")]
-    Initialization { reason: String },
+    Initialization {
+        /// Client construction diagnostic.
+        reason: String,
+    },
 
+    /// Request, redirect, response, or bounded body handling failed.
     #[error("http client request failed: {reason}")]
-    Request { reason: String },
+    Request {
+        /// Request diagnostic.
+        reason: String,
+    },
 }
 
+/// Bounded HTTP client abstraction used by cache policy and tests.
 pub trait HttpClient {
     /// Fetches one response while enforcing the request's body-size bound.
     ///
@@ -96,6 +167,7 @@ pub trait HttpClient {
     fn fetch(&self, request: HttpRequest) -> Result<HttpResponse, HttpClientError>;
 }
 
+/// Reqwest-backed client enforcing same-origin redirects and bounded bodies.
 #[derive(Debug, Clone)]
 pub struct ReqwestHttpClient {
     client: Result<reqwest::blocking::Client, HttpClientError>,
@@ -111,10 +183,12 @@ impl Default for ReqwestHttpClient {
 
 impl ReqwestHttpClient {
     #[must_use]
+    /// Creates a client with the default user agent and an explicit request timeout.
     pub fn with_timeout(request_timeout: Duration) -> Self {
         Self::new_with_timeout(default_user_agent(), request_timeout)
     }
 
+    /// Creates a client with explicit user agent and request timeout.
     pub fn with_user_agent_and_timeout(
         user_agent: impl Into<String>,
         request_timeout: Duration,
@@ -213,27 +287,54 @@ fn read_response_body_capped(
     })
 }
 
+/// Failure to read legacy cache data or commit a validated v2 generation.
 #[derive(Debug, Error)]
 pub enum HttpCacheError {
+    /// Normalized CIDR cache write failed.
     #[error("failed to write iplist cache {path}: {reason}")]
-    WriteIplist { path: PathBuf, reason: String },
+    WriteIplist {
+        /// Cache path.
+        path: PathBuf,
+        /// Filesystem diagnostic.
+        reason: String,
+    },
 
+    /// Cache metadata or v2 manifest write failed.
     #[error("failed to write metadata cache {path}: {reason}")]
-    WriteMetadata { path: PathBuf, reason: String },
+    WriteMetadata {
+        /// Cache path.
+        path: PathBuf,
+        /// Serialization or filesystem diagnostic.
+        reason: String,
+    },
 
+    /// Raw response cache write failed.
     #[error("failed to write raw cache {path}: {reason}")]
-    WriteRaw { path: PathBuf, reason: String },
+    WriteRaw {
+        /// Cache path.
+        path: PathBuf,
+        /// Filesystem diagnostic.
+        reason: String,
+    },
 
+    /// Selected normalized CIDR cache could not be read safely.
     #[error("failed to read iplist cache {path}: {reason}")]
-    ReadIplist { path: PathBuf, reason: String },
+    ReadIplist {
+        /// Cache path.
+        path: PathBuf,
+        /// Bounded-read diagnostic.
+        reason: String,
+    },
 }
 
 #[must_use]
+/// Returns the stable 16-hex-character cache key prefix for a configured URL.
 pub fn url_hash_prefix(url: &str) -> String {
     sha256_hex(url.as_bytes())[..16].to_string()
 }
 
 #[must_use]
+/// Derives all legacy flat-file cache paths for a configured URL.
 pub fn cache_paths_for_url(cache_dir: &Path, url: &str) -> CachePaths {
     let hash = url_hash_prefix(url);
     CachePaths {
@@ -244,8 +345,12 @@ pub fn cache_paths_for_url(cache_dir: &Path, url: &str) -> CachePaths {
 }
 
 #[must_use]
-pub fn max_http_body_bytes(env: &BTreeMap<String, String>) -> usize {
-    env.get(ENV_KIDOBO_MAX_HTTP_BODY_BYTES)
+/// Resolves the positive Unicode body-size override or returns the documented default.
+///
+/// Missing, non-Unicode, zero, and malformed settings are treated as unset.
+pub fn max_http_body_bytes(env: &BTreeMap<OsString, OsString>) -> usize {
+    env.get(OsStr::new(ENV_KIDOBO_MAX_HTTP_BODY_BYTES))
+        .and_then(|value| value.to_str())
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_MAX_HTTP_BODY_BYTES)
@@ -253,6 +358,7 @@ pub fn max_http_body_bytes(env: &BTreeMap<String, String>) -> usize {
 
 #[cfg(test)]
 #[must_use]
+/// Parses and canonicalizes remote text for adapter regression tests.
 pub fn normalize_remote_text(raw: &[u8]) -> String {
     format_normalized_cidrs(&parse_remote_cidrs(raw).networks)
 }
@@ -267,13 +373,14 @@ pub fn fetch_iplist_with_cache(
     client: &dyn HttpClient,
     url: &str,
     cache_dir: &Path,
-    env: &BTreeMap<String, String>,
+    env: &BTreeMap<OsString, OsString>,
 ) -> Result<CachedIplist, HttpCacheError> {
     let max_bytes = max_http_body_bytes(env);
     let cache_paths = cache_paths_for_url(cache_dir, url);
-
-    let cached_meta = read_optional_metadata_lossy(&cache_paths);
-    let cached_networks = read_optional_iplist_networks(&cache_paths, cached_meta.as_ref())?;
+    let cached = read_remote_cache(cache_dir, url, &cache_paths, max_bytes)?;
+    let cached_meta = cached.metadata;
+    let cached_networks = cached.networks;
+    let previous_generation = cached.generation_id;
     let (cached_etag, cached_last_modified) = cached_meta.as_ref().map_or((None, None), |meta| {
         (meta.etag.clone(), meta.last_modified.clone())
     });
@@ -306,10 +413,11 @@ pub fn fetch_iplist_with_cache(
         ConditionalFetchResult::Network(response) => handle_network_response(
             response,
             url,
-            &cache_paths,
+            cache_dir,
             max_bytes,
             cached_networks,
             cached_meta,
+            previous_generation.as_deref(),
         ),
     }
 }
@@ -317,10 +425,11 @@ pub fn fetch_iplist_with_cache(
 fn handle_network_response(
     response: HttpResponse,
     url: &str,
-    cache_paths: &CachePaths,
+    cache_dir: &Path,
     max_bytes: usize,
     cached_networks: Option<Vec<CanonicalCidr>>,
     cached_meta: Option<RemoteCacheMetadata>,
+    previous_generation: Option<&str>,
 ) -> Result<CachedIplist, HttpCacheError> {
     if !response.status.is_success() {
         warn!(
@@ -362,7 +471,14 @@ fn handle_network_response(
         sha256_iplist: sha256_hex(normalized.as_bytes()),
     };
 
-    persist_cache(cache_paths, &normalized, &response.body, &metadata)?;
+    persist_cache(
+        cache_dir,
+        url,
+        &normalized,
+        &response.body,
+        &metadata,
+        previous_generation,
+    )?;
 
     Ok(CachedIplist {
         networks,
@@ -372,29 +488,205 @@ fn handle_network_response(
 }
 
 fn persist_cache(
-    paths: &CachePaths,
+    cache_dir: &Path,
+    url: &str,
     iplist: &str,
     raw: &[u8],
     meta: &RemoteCacheMetadata,
+    previous_generation: Option<&str>,
 ) -> Result<(), HttpCacheError> {
-    write_bytes_atomic_in_cache(&paths.raw_path, raw).map_err(|err| HttpCacheError::WriteRaw {
-        path: paths.raw_path.clone(),
-        reason: err.to_string(),
-    })?;
-
-    write_string_atomic(&paths.iplist_path, iplist).map_err(|err| HttpCacheError::WriteIplist {
-        path: paths.iplist_path.clone(),
-        reason: err.to_string(),
-    })?;
-
-    write_json_pretty_atomic(&paths.meta_path, meta).map_err(|err| {
-        HttpCacheError::WriteMetadata {
-            path: paths.meta_path.clone(),
+    let metadata =
+        serde_json::to_vec_pretty(meta).map_err(|err| HttpCacheError::WriteMetadata {
+            path: remote_generation_store(cache_dir, url).join("current.json"),
             reason: err.to_string(),
-        }
-    })?;
+        })?;
+    let store = remote_generation_store(cache_dir, url);
+    commit_generation(
+        &store,
+        &[
+            GenerationFile {
+                name: GENERATION_RAW_FILE,
+                contents: raw,
+            },
+            GenerationFile {
+                name: GENERATION_IPLIST_FILE,
+                contents: iplist.as_bytes(),
+            },
+            GenerationFile {
+                name: GENERATION_METADATA_FILE,
+                contents: &metadata,
+            },
+        ],
+        previous_generation,
+    )
+    .map(|_| ())
+    .map_err(|err| HttpCacheError::WriteMetadata {
+        path: store.join("current.json"),
+        reason: err.to_string(),
+    })
+}
 
-    Ok(())
+fn read_remote_cache(
+    cache_dir: &Path,
+    url: &str,
+    legacy_paths: &CachePaths,
+    raw_read_limit: usize,
+) -> Result<LoadedRemoteCache, HttpCacheError> {
+    for candidate in generation_candidates(&remote_generation_store(cache_dir, url)) {
+        if !remote_generation_contents_match(&candidate, raw_read_limit) {
+            continue;
+        }
+        let Some(generation) =
+            read_validated_remote_generation(&candidate.directory, Some(url), raw_read_limit)
+        else {
+            continue;
+        };
+        return Ok(LoadedRemoteCache {
+            networks: Some(parse_cached_iplist(&generation.iplist)),
+            metadata: Some(generation.metadata),
+            generation_id: Some(candidate.id),
+        });
+    }
+
+    let metadata = read_optional_metadata_lossy(legacy_paths);
+    let networks = read_optional_iplist_networks(legacy_paths, metadata.as_ref())?;
+    Ok(LoadedRemoteCache {
+        networks,
+        metadata,
+        generation_id: None,
+    })
+}
+
+pub(crate) fn remote_generation_store(cache_dir: &Path, url: &str) -> PathBuf {
+    cache_dir
+        .join(V2_REMOTE_CACHE_DIRECTORY)
+        .join(url_hash_prefix(url))
+}
+
+pub(crate) fn collect_offline_remote_generations(
+    cache_dir: &Path,
+) -> Result<Vec<OfflineRemoteGeneration>, std::io::Error> {
+    let stores_root = cache_dir.join(V2_REMOTE_CACHE_DIRECTORY);
+    if !stores_root.exists() {
+        return Ok(Vec::new());
+    }
+    let mut stores = Vec::new();
+    for entry in std::fs::read_dir(&stores_root)? {
+        let entry = entry?;
+        let url_hash = entry.file_name().to_string_lossy().into_owned();
+        if !entry.path().is_dir() || !is_url_hash(&url_hash) {
+            continue;
+        }
+        stores.push((url_hash, entry.path()));
+    }
+    stores.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let mut generations = Vec::new();
+    for (url_hash, store) in stores {
+        for candidate in generation_candidates(&store) {
+            if !remote_generation_contents_match(&candidate, DEFAULT_MAX_HTTP_BODY_BYTES) {
+                continue;
+            }
+            let Some(generation) = read_validated_remote_generation(
+                &candidate.directory,
+                None,
+                DEFAULT_MAX_HTTP_BODY_BYTES,
+            ) else {
+                continue;
+            };
+            generations.push(OfflineRemoteGeneration {
+                url_hash,
+                iplist_path: generation.iplist_path,
+                label: generation.metadata.url.trim().to_string(),
+                iplist: generation.iplist,
+            });
+            break;
+        }
+    }
+    Ok(generations)
+}
+
+fn remote_generation_contents_match(
+    candidate: &GenerationCandidate,
+    raw_read_limit: usize,
+) -> bool {
+    generation_contents_match(
+        candidate,
+        &[
+            GenerationFileLimit {
+                name: GENERATION_RAW_FILE,
+                read_limit: raw_read_limit,
+            },
+            GenerationFileLimit {
+                name: GENERATION_IPLIST_FILE,
+                read_limit: MAX_IPLIST_READ_BYTES,
+            },
+            GenerationFileLimit {
+                name: GENERATION_METADATA_FILE,
+                read_limit: MAX_METADATA_READ_BYTES,
+            },
+        ],
+    )
+}
+
+fn read_validated_remote_generation(
+    directory: &Path,
+    expected_url: Option<&str>,
+    raw_read_limit: usize,
+) -> Option<ValidatedRemoteGeneration> {
+    let paths = CachePaths {
+        iplist_path: directory.join(GENERATION_IPLIST_FILE),
+        meta_path: directory.join(GENERATION_METADATA_FILE),
+        raw_path: directory.join(GENERATION_RAW_FILE),
+    };
+    let metadata = read_optional_metadata_lossy(&paths)?;
+    let normalized_url = metadata.url.trim();
+    if normalized_url.is_empty()
+        || expected_url.is_some_and(|expected| normalized_url != expected.trim())
+    {
+        warn!(
+            "remote cache generation URL is missing or differs from the configured URL: {}",
+            directory.display()
+        );
+        return None;
+    }
+    read_validated_bytes_lossy(
+        &paths.raw_path,
+        raw_read_limit,
+        "remote raw cache generation",
+        Some(&metadata.sha256_raw),
+        "remote raw cache",
+        "raw body",
+    )?;
+    let iplist = match read_to_string_with_limit(&paths.iplist_path, MAX_IPLIST_READ_BYTES) {
+        Ok(iplist) => iplist,
+        Err(error) => {
+            warn!(
+                "failed to read remote iplist cache generation {}: {error}",
+                paths.iplist_path.display()
+            );
+            return None;
+        }
+    };
+    if sha256_hex(iplist.as_bytes()) != metadata.sha256_iplist {
+        warn!(
+            "remote iplist cache hash mismatch for {}: ignoring generation",
+            paths.iplist_path.display()
+        );
+        return None;
+    }
+    Some(ValidatedRemoteGeneration {
+        iplist_path: paths.iplist_path,
+        iplist,
+        metadata,
+    })
+}
+
+fn is_url_hash(value: &str) -> bool {
+    value.len() == 16
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn read_optional_iplist_networks(
@@ -573,10 +865,12 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        CacheSource, HttpClient, HttpClientError, HttpRequest, HttpResponse, MAX_HTTP_REDIRECTS,
-        RemoteCacheMetadata, ReqwestHttpClient, cache_paths_for_url, fetch_iplist_with_cache,
-        has_same_http_origin, max_http_body_bytes, normalize_remote_text, url_hash_prefix,
+        CacheSource, DEFAULT_MAX_HTTP_BODY_BYTES, ENV_KIDOBO_MAX_HTTP_BODY_BYTES, HttpClient,
+        HttpClientError, HttpRequest, HttpResponse, MAX_HTTP_REDIRECTS, RemoteCacheMetadata,
+        ReqwestHttpClient, cache_paths_for_url, fetch_iplist_with_cache, has_same_http_origin,
+        max_http_body_bytes, normalize_remote_text, remote_generation_store, url_hash_prefix,
     };
+    use crate::cache_generation::generation_candidates;
     use crate::hash::sha256_hex;
     use crate::http_cache::test_support::CrossOriginRedirectFixture;
     use crate::limited_io::{read_bytes_with_limit, read_to_string_with_limit};
@@ -616,6 +910,14 @@ mod tests {
             etag: None,
             last_modified: None,
         }
+    }
+
+    fn current_generation_dir(cache_dir: &Path, url: &str) -> PathBuf {
+        generation_candidates(&remote_generation_store(cache_dir, url))
+            .into_iter()
+            .next()
+            .expect("current cache generation")
+            .directory
     }
 
     fn spawn_same_origin_redirect_chain(
@@ -674,20 +976,28 @@ mod tests {
     #[test]
     fn max_body_bytes_env_override_is_supported() {
         let mut env = BTreeMap::new();
-        env.insert(
-            "KIDOBO_MAX_HTTP_BODY_BYTES".to_string(),
-            "12345".to_string(),
-        );
+        env.insert("KIDOBO_MAX_HTTP_BODY_BYTES".into(), "12345".into());
         assert_eq!(max_http_body_bytes(&env), 12345);
 
-        env.insert(
-            "KIDOBO_MAX_HTTP_BODY_BYTES".to_string(),
-            "invalid".to_string(),
-        );
+        env.insert("KIDOBO_MAX_HTTP_BODY_BYTES".into(), "invalid".into());
         assert_eq!(
             max_http_body_bytes(&env),
             super::DEFAULT_MAX_HTTP_BODY_BYTES
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_unicode_max_body_bytes_uses_the_default() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let env = BTreeMap::from([(
+            OsString::from(ENV_KIDOBO_MAX_HTTP_BODY_BYTES),
+            OsString::from_vec(vec![0xff]),
+        )]);
+
+        assert_eq!(max_http_body_bytes(&env), DEFAULT_MAX_HTTP_BODY_BYTES);
     }
 
     #[test]
@@ -722,15 +1032,27 @@ mod tests {
 
         assert_eq!(result.source, CacheSource::Network);
         assert_eq!(result.networks.len(), 1);
+        let generation = current_generation_dir(temp.path(), url);
         assert_eq!(
-            read_to_string_with_limit(&paths.iplist_path, super::MAX_IPLIST_READ_BYTES)
-                .expect("read cache"),
+            read_to_string_with_limit(
+                &generation.join(super::GENERATION_IPLIST_FILE),
+                super::MAX_IPLIST_READ_BYTES,
+            )
+            .expect("read cache"),
             "161.117.138.100/32"
         );
         assert_eq!(
-            read_bytes_with_limit(&paths.raw_path, super::DEFAULT_MAX_HTTP_BODY_BYTES)
-                .expect("read raw"),
+            read_bytes_with_limit(
+                &generation.join(super::GENERATION_RAW_FILE),
+                super::DEFAULT_MAX_HTTP_BODY_BYTES,
+            )
+            .expect("read raw"),
             body
+        );
+        assert_eq!(
+            read_to_string_with_limit(&paths.iplist_path, super::MAX_IPLIST_READ_BYTES)
+                .expect("read legacy cache"),
+            "10.0.0.0/24\n"
         );
     }
 
@@ -809,10 +1131,10 @@ mod tests {
         assert_eq!(requests[1].if_none_match, None);
         assert_eq!(requests[1].if_modified_since, None);
 
-        let paths = cache_paths_for_url(cache_dir, url);
-        assert!(paths.iplist_path.exists());
-        assert!(paths.meta_path.exists());
-        assert!(paths.raw_path.exists());
+        let generation = current_generation_dir(cache_dir, url);
+        assert!(generation.join(super::GENERATION_IPLIST_FILE).exists());
+        assert!(generation.join(super::GENERATION_METADATA_FILE).exists());
+        assert!(generation.join(super::GENERATION_RAW_FILE).exists());
     }
 
     #[test]
@@ -868,8 +1190,6 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let cache_dir = temp.path();
         let url = "https://example.com/feed.txt";
-        let paths = cache_paths_for_url(cache_dir, url);
-
         let body = b"\xEF\xBB\xBF 10.0.0.5 \n# comment\ninvalid\n2001:db8::1 trailing\n";
         let client = MockHttpClient::new(vec![Ok(HttpResponse {
             status: StatusCode::OK,
@@ -882,21 +1202,31 @@ mod tests {
             fetch_iplist_with_cache(&client, url, cache_dir, &BTreeMap::new()).expect("fetch");
         assert_eq!(result.source, CacheSource::Network);
         assert_eq!(result.networks.len(), 2);
+        let generation = current_generation_dir(cache_dir, url);
 
         assert_eq!(
-            read_to_string_with_limit(&paths.iplist_path, super::MAX_IPLIST_READ_BYTES)
-                .expect("read iplist"),
+            read_to_string_with_limit(
+                &generation.join(super::GENERATION_IPLIST_FILE),
+                super::MAX_IPLIST_READ_BYTES,
+            )
+            .expect("read iplist"),
             "10.0.0.5/32\n2001:db8::1/128"
         );
         assert_eq!(
-            read_bytes_with_limit(&paths.raw_path, super::DEFAULT_MAX_HTTP_BODY_BYTES)
-                .expect("read raw"),
+            read_bytes_with_limit(
+                &generation.join(super::GENERATION_RAW_FILE),
+                super::DEFAULT_MAX_HTTP_BODY_BYTES,
+            )
+            .expect("read raw"),
             body
         );
 
         let metadata: RemoteCacheMetadata = serde_json::from_slice(
-            &read_bytes_with_limit(&paths.meta_path, super::MAX_METADATA_READ_BYTES)
-                .expect("read metadata"),
+            &read_bytes_with_limit(
+                &generation.join(super::GENERATION_METADATA_FILE),
+                super::MAX_METADATA_READ_BYTES,
+            )
+            .expect("read metadata"),
         )
         .expect("metadata json");
         assert_eq!(metadata.url, url);
@@ -905,6 +1235,107 @@ mod tests {
             metadata.last_modified.as_deref(),
             Some("Mon, 01 Jan 2024 00:00:00 GMT")
         );
+    }
+
+    #[test]
+    fn corrupt_current_generation_falls_back_to_previous_then_legacy() {
+        let temp = TempDir::new().expect("tempdir");
+        let url = "https://example.com/feed.txt";
+
+        fetch_iplist_with_cache(
+            &MockHttpClient::new(vec![Ok(network_response_for_test(b"10.0.0.0/24\n"))]),
+            url,
+            temp.path(),
+            &BTreeMap::new(),
+        )
+        .expect("first generation");
+        fetch_iplist_with_cache(
+            &MockHttpClient::new(vec![Ok(network_response_for_test(b"198.51.100.0/24\n"))]),
+            url,
+            temp.path(),
+            &BTreeMap::new(),
+        )
+        .expect("second generation");
+
+        let candidates = generation_candidates(&remote_generation_store(temp.path(), url));
+        assert_eq!(candidates.len(), 2);
+        fs::write(
+            candidates[0].directory.join(super::GENERATION_IPLIST_FILE),
+            "corrupt\n",
+        )
+        .expect("corrupt current");
+        let fallback = fetch_iplist_with_cache(
+            &MockHttpClient::new(vec![Err(HttpClientError::Request {
+                reason: "offline".to_string(),
+            })]),
+            url,
+            temp.path(),
+            &BTreeMap::new(),
+        )
+        .expect("previous fallback");
+        assert_eq!(fallback.source, CacheSource::FallbackCache);
+        assert_eq!(
+            fallback
+                .networks
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["10.0.0.0/24"]
+        );
+
+        fs::write(
+            candidates[1].directory.join(super::GENERATION_IPLIST_FILE),
+            "also corrupt\n",
+        )
+        .expect("corrupt previous");
+        let legacy = cache_paths_for_url(temp.path(), url);
+        fs::write(&legacy.iplist_path, "203.0.113.0/24\n").expect("write legacy iplist");
+        let fallback = fetch_iplist_with_cache(
+            &MockHttpClient::new(vec![Err(HttpClientError::Request {
+                reason: "offline".to_string(),
+            })]),
+            url,
+            temp.path(),
+            &BTreeMap::new(),
+        )
+        .expect("legacy fallback");
+        assert_eq!(
+            fallback
+                .networks
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["203.0.113.0/24"]
+        );
+    }
+
+    #[test]
+    fn successful_commits_retain_only_current_and_previous_generations() {
+        let temp = TempDir::new().expect("tempdir");
+        let url = "https://example.com/feed.txt";
+        for body in [
+            b"10.0.0.0/24\n".as_slice(),
+            b"198.51.100.0/24\n".as_slice(),
+            b"203.0.113.0/24\n".as_slice(),
+        ] {
+            fetch_iplist_with_cache(
+                &MockHttpClient::new(vec![Ok(network_response_for_test(body))]),
+                url,
+                temp.path(),
+                &BTreeMap::new(),
+            )
+            .expect("commit generation");
+        }
+
+        let store = remote_generation_store(temp.path(), url);
+        let candidates = generation_candidates(&store);
+        assert_eq!(candidates.len(), 2);
+        let generation_directories = fs::read_dir(store.join("generations"))
+            .expect("read generations")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().is_dir())
+            .collect::<Vec<_>>();
+        assert_eq!(generation_directories.len(), 2);
     }
 
     #[test]
@@ -956,7 +1387,6 @@ mod tests {
     fn comment_only_network_body_is_an_intentional_empty_feed() {
         let temp = TempDir::new().expect("tempdir");
         let url = "https://example.com/feed.txt";
-        let paths = cache_paths_for_url(temp.path(), url);
         let body = b"# intentionally empty\n\n";
         let client = MockHttpClient::new(vec![Ok(network_response_for_test(body))]);
 
@@ -965,17 +1395,24 @@ mod tests {
 
         assert_eq!(result.source, CacheSource::Network);
         assert!(result.networks.is_empty());
+        let generation = current_generation_dir(temp.path(), url);
         assert_eq!(
-            read_to_string_with_limit(&paths.iplist_path, super::MAX_IPLIST_READ_BYTES)
-                .expect("read"),
+            read_to_string_with_limit(
+                &generation.join(super::GENERATION_IPLIST_FILE),
+                super::MAX_IPLIST_READ_BYTES,
+            )
+            .expect("read"),
             ""
         );
         assert_eq!(
-            read_bytes_with_limit(&paths.raw_path, super::DEFAULT_MAX_HTTP_BODY_BYTES)
-                .expect("read raw"),
+            read_bytes_with_limit(
+                &generation.join(super::GENERATION_RAW_FILE),
+                super::DEFAULT_MAX_HTTP_BODY_BYTES,
+            )
+            .expect("read raw"),
             body
         );
-        assert!(paths.meta_path.exists());
+        assert!(generation.join(super::GENERATION_METADATA_FILE).exists());
     }
 
     #[test]
@@ -996,7 +1433,7 @@ mod tests {
         })]);
 
         let mut env = BTreeMap::new();
-        env.insert("KIDOBO_MAX_HTTP_BODY_BYTES".to_string(), "1".to_string());
+        env.insert("KIDOBO_MAX_HTTP_BODY_BYTES".into(), "1".into());
 
         let result = fetch_iplist_with_cache(&client, url, cache_dir, &env).expect("fetch");
         assert_eq!(result.source, CacheSource::FallbackCache);
@@ -1077,7 +1514,7 @@ mod tests {
         })]);
 
         let mut env = BTreeMap::new();
-        env.insert("KIDOBO_MAX_HTTP_BODY_BYTES".to_string(), "1".to_string());
+        env.insert("KIDOBO_MAX_HTTP_BODY_BYTES".into(), "1".into());
 
         let result = fetch_iplist_with_cache(&client, url, cache_dir, &env).expect("fetch");
         assert_eq!(result.source, CacheSource::Empty);

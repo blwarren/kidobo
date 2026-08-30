@@ -5,9 +5,11 @@ REPO_SLUG="${KIDOBO_REPO_SLUG:-blwarren/kidobo}"
 INSTALL_DIR="${KIDOBO_INSTALL_DIR:-/usr/local/bin}"
 BINARY_NAME="kidobo"
 KIDOBO_CHAIN_NAME="kidobo-input"
+KIDOBO_STAGING_CHAIN_NAME="kidobo-input-stage"
 DEFAULT_SET_NAME="kidobo"
 DEFAULT_SET_NAME_V6="kidobo-v6"
-KIDOBO_ROOT_OVERRIDE="${KIDOBO_ROOT:-}"
+KIDOBO_ROOT_WAS_SET="${KIDOBO_ROOT+x}"
+KIDOBO_ROOT_OVERRIDE="${KIDOBO_ROOT-}"
 INIT_AFTER_INSTALL=0
 UNINSTALL_ONLY=0
 VERSION=""
@@ -228,16 +230,36 @@ warn_best_effort() {
 }
 
 resolve_uninstall_paths() {
-    if [[ -n "${KIDOBO_ROOT_OVERRIDE}" ]]; then
-        if [[ "${KIDOBO_ROOT_OVERRIDE}" == "/" ]]; then
-            echo "refusing uninstall with KIDOBO_ROOT=/" >&2
+    if [[ -n "${KIDOBO_ROOT_WAS_SET}" ]]; then
+        if [[ -z "${KIDOBO_ROOT_OVERRIDE}" ]]; then
+            echo "refusing uninstall with an empty KIDOBO_ROOT" >&2
             exit 1
         fi
+
+        require_cmd realpath
+        local canonical_root
+        if ! canonical_root="$(realpath -m -- "${KIDOBO_ROOT_OVERRIDE}")"; then
+            echo "failed to resolve KIDOBO_ROOT: ${KIDOBO_ROOT_OVERRIDE}" >&2
+            exit 1
+        fi
+        if [[ "${canonical_root}" == "/" ]]; then
+            echo "refusing uninstall with KIDOBO_ROOT resolving to /" >&2
+            exit 1
+        fi
+        KIDOBO_ROOT_OVERRIDE="${canonical_root}"
 
         CONFIG_DIR="${KIDOBO_ROOT_OVERRIDE}/config"
         DATA_DIR="${KIDOBO_ROOT_OVERRIDE}/data"
         CACHE_DIR="${KIDOBO_ROOT_OVERRIDE}/cache"
         SYSTEMD_DIR="${KIDOBO_ROOT_OVERRIDE}/systemd/system"
+
+        local scoped_path
+        for scoped_path in "${CONFIG_DIR}" "${DATA_DIR}" "${CACHE_DIR}" "${SYSTEMD_DIR}"; do
+            if [[ "${scoped_path}" != "${KIDOBO_ROOT_OVERRIDE}/"* ]]; then
+                echo "refusing uninstall path outside KIDOBO_ROOT: ${scoped_path}" >&2
+                exit 1
+            fi
+        done
     else
         CONFIG_DIR="/etc/kidobo"
         DATA_DIR="/var/lib/kidobo"
@@ -283,24 +305,30 @@ cleanup_firewall_chain_family() {
         return 1
     fi
 
+    local failed=0
+    local chain_name
     local output
-    while true; do
-        if output="$(run_with_optional_sudo "${binary}" -w 5 -D INPUT -j "${KIDOBO_CHAIN_NAME}" 2>&1)"; then
-            continue
-        fi
-        if [[ "${output}" == *"Bad rule"* || "${output}" == *"does a matching rule exist"* ]]; then
+    for chain_name in "${KIDOBO_STAGING_CHAIN_NAME}" "${KIDOBO_CHAIN_NAME}"; do
+        while true; do
+            if output="$(run_with_optional_sudo "${binary}" -w 5 -D INPUT -j "${chain_name}" 2>&1)"; then
+                continue
+            fi
+            if [[ "${output}" == *"Bad rule"* || "${output}" == *"does a matching rule exist"* ]]; then
+                break
+            fi
+            echo "failed to remove ${binary} INPUT jump to ${chain_name}: ${output:-no diagnostic output}" >&2
+            failed=1
             break
-        fi
-        echo "failed to remove ${binary} INPUT jump: ${output:-no diagnostic output}" >&2
-        return 1
+        done
     done
 
-    if ! cleanup_allow_missing_chain "flush ${binary} chain" \
-        "${binary}" -w 5 -F "${KIDOBO_CHAIN_NAME}"; then
-        return 1
-    fi
-    cleanup_allow_missing_chain "delete ${binary} chain" \
-        "${binary}" -w 5 -X "${KIDOBO_CHAIN_NAME}"
+    for chain_name in "${KIDOBO_STAGING_CHAIN_NAME}" "${KIDOBO_CHAIN_NAME}"; do
+        cleanup_allow_missing_chain "flush ${binary} chain ${chain_name}" \
+            "${binary}" -w 5 -F "${chain_name}" || failed=1
+        cleanup_allow_missing_chain "delete ${binary} chain ${chain_name}" \
+            "${binary}" -w 5 -X "${chain_name}" || failed=1
+    done
+    return "${failed}"
 }
 
 cleanup_default_ipsets() {

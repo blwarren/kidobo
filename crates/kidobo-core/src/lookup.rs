@@ -1,3 +1,5 @@
+//! Offline lookup of operator targets against canonical source entries.
+
 use std::sync::Arc;
 
 use crate::network::{
@@ -5,30 +7,45 @@ use crate::network::{
     ipv4_to_interval, ipv6_to_interval, parse_ip_cidr_strict,
 };
 
+/// One canonical CIDR retained with its operator-visible source context.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LookupSourceEntry {
+    /// Stable source label used in lookup output.
     pub source_label: Arc<str>,
+    /// Original source line shown to the operator when matched.
     pub source_line: String,
+    /// Canonical CIDR used for overlap matching.
     pub cidr: CanonicalCidr,
 }
 
+/// One target-to-source overlap reported by a lookup.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LookupMatch {
+    /// Original lookup target text.
     pub target: String,
+    /// Label of the source containing the match.
     pub source_label: String,
+    /// Original source entry containing the matched CIDR.
     pub matched_source_entry: String,
+    /// Canonical source CIDR that overlaps the target.
     pub matched_cidr: CanonicalCidr,
 }
 
+/// Deterministically ordered matches and invalid lookup targets.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct LookupReport {
+    /// Valid target-to-source overlaps.
     pub matches: Vec<LookupMatch>,
+    /// Sorted, unique target strings that could not be parsed.
     pub invalid_targets: Vec<String>,
 }
 
+/// Reason a strict lookup target could not be parsed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LookupTargetParseError {
+    /// The target is empty after trimming.
     Empty,
+    /// The target is not exactly one IP address or CIDR.
     Invalid,
 }
 
@@ -48,6 +65,9 @@ pub fn parse_target_strict(input: &str) -> Result<CanonicalCidr, LookupTargetPar
 }
 
 #[must_use]
+/// Returns whether two same-family CIDRs share at least one address.
+///
+/// CIDRs from different address families never overlap.
 pub fn cidr_overlaps(a: CanonicalCidr, b: CanonicalCidr) -> bool {
     network_cidr_overlaps(a, b)
 }
@@ -241,6 +261,10 @@ fn target_matches<'a>(
     matched_sources
 }
 
+/// Runs indexed lookup once per valid target and emits each target's complete match slice.
+///
+/// Targets and matches are emitted deterministically. The returned strings are sorted, unique
+/// invalid targets.
 pub fn run_lookup_by_target<S, F>(
     targets: &[S],
     sources: &[LookupSourceEntry],
@@ -262,6 +286,9 @@ where
     invalid_targets
 }
 
+/// Runs indexed lookup and emits one callback per target-to-source match.
+///
+/// Returns sorted, unique invalid targets after all valid matches have been emitted.
 pub fn run_lookup_streaming<S, F>(
     targets: &[S],
     sources: &[LookupSourceEntry],
@@ -278,6 +305,8 @@ where
     })
 }
 
+/// Produces a complete deterministic lookup report for all targets.
+#[must_use]
 pub fn run_lookup<S: AsRef<str>>(targets: &[S], sources: &[LookupSourceEntry]) -> LookupReport {
     let mut matches = Vec::new();
     let invalid_targets = run_lookup_streaming(targets, sources, |target, source| {

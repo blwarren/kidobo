@@ -1,5 +1,6 @@
 //! Built-in online source providers used by the sync application use case.
 
+use std::ffi::OsString;
 use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -20,9 +21,11 @@ use crate::blocklist_file::{
 use crate::github_meta::load_github_meta_safelist;
 use crate::http_cache::{HttpClient, ReqwestHttpClient, fetch_iplist_with_cache};
 
+/// Maximum number of concurrent remote-feed workers.
 pub const MAX_REMOTE_FETCH_WORKERS: usize = 5;
 const BLOCKLIST_FAST_STATE_FILE: &str = "blocklist-normalize.fast-state";
 
+/// Required synchronization provider for the normalized local blocklist.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct LocalBlocklistSyncProvider;
 
@@ -60,6 +63,7 @@ impl SyncSourceProvider for LocalBlocklistSyncProvider {
     }
 }
 
+/// Best-effort synchronization provider for configured remote feeds.
 #[derive(Debug, Clone)]
 pub struct RemoteFeedsSyncProvider {
     user_agent: String,
@@ -67,6 +71,7 @@ pub struct RemoteFeedsSyncProvider {
 
 impl RemoteFeedsSyncProvider {
     #[must_use]
+    /// Creates a remote provider with the supplied HTTP user agent.
     pub fn new(user_agent: impl Into<String>) -> Self {
         Self {
             user_agent: user_agent.into(),
@@ -96,6 +101,7 @@ impl SyncSourceProvider for RemoteFeedsSyncProvider {
     }
 }
 
+/// Required synchronization provider for explicit configuration safelist entries.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ConfigSafelistSyncProvider;
 
@@ -116,6 +122,7 @@ impl SyncSourceProvider for ConfigSafelistSyncProvider {
     }
 }
 
+/// Best-effort synchronization provider for GitHub metadata safelist networks.
 #[derive(Debug, Clone)]
 pub struct GithubMetadataSyncProvider {
     user_agent: String,
@@ -123,6 +130,7 @@ pub struct GithubMetadataSyncProvider {
 
 impl GithubMetadataSyncProvider {
     #[must_use]
+    /// Creates a GitHub metadata provider with the supplied HTTP user agent.
     pub fn new(user_agent: impl Into<String>) -> Self {
         Self {
             user_agent: user_agent.into(),
@@ -163,6 +171,7 @@ impl SyncSourceProvider for GithubMetadataSyncProvider {
     }
 }
 
+/// Required synchronization provider for configured ASN prefix caches and refreshes.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct AsnBansSyncProvider;
 
@@ -216,11 +225,14 @@ pub fn build_sync_source_registry(product_version: &str) -> Result<SyncSourceReg
     Ok(registry)
 }
 
+/// Fetches configured remote feeds with bounded parallelism and deterministic aggregation.
+///
+/// Per-feed failures become warning notices; successful networks are sorted and deduplicated.
 pub fn fetch_remote_networks_concurrently<S, C>(
     urls: &[S],
     http_client: &C,
     cache_dir: &Path,
-    env: &std::collections::BTreeMap<String, String>,
+    env: &std::collections::BTreeMap<OsString, OsString>,
 ) -> (Vec<CanonicalCidr>, Vec<Notice>)
 where
     S: AsRef<str> + Sync,
@@ -283,7 +295,7 @@ fn remote_fetch_worker_count(url_count: usize) -> usize {
 }
 
 #[must_use]
-pub fn remote_fetch_worker_count_for(url_count: usize, cpu_parallelism: usize) -> usize {
+fn remote_fetch_worker_count_for(url_count: usize, cpu_parallelism: usize) -> usize {
     let cpu_budget = cpu_parallelism.max(1);
     let max_workers = MAX_REMOTE_FETCH_WORKERS.min(cpu_budget);
     url_count.min(max_workers.max(1))

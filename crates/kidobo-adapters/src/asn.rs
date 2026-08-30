@@ -10,27 +10,52 @@ use crate::command_runner::{
     CommandExecutor, CommandRequest, ProcessStatus, SystemCommandExecutor,
 };
 use crate::limited_io::{read_to_string_with_limit, write_string_atomic};
+use kidobo_core::AddressFamily;
 use kidobo_core::network::{CanonicalCidr, parse_ip_cidr_token};
 
 const ASN_CACHE_FILE_READ_LIMIT: usize = 8 * 1024 * 1024;
 const ASN_CACHE_FILE_WRITE_HEADER: &str = "# kidobo-asn-cache-v1";
 const DEFAULT_BGPQ4_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Failure while validating, resolving, reading, or writing ASN prefixes.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum AsnError {
+    /// An operator token is not a positive `u32` ASN.
     #[error("invalid ASN token `{input}`")]
-    InvalidAsnToken { input: String },
+    InvalidAsnToken {
+        /// Original token.
+        input: String,
+    },
 
+    /// `bgpq4` could not produce a non-empty, family-correct prefix set.
     #[error("failed to resolve ASN {asn} prefixes via bgpq4: {reason}")]
-    ResolveFailed { asn: u32, reason: String },
+    ResolveFailed {
+        /// Autonomous-system number being resolved.
+        asn: u32,
+        /// Execution or strict-output-validation diagnostic.
+        reason: String,
+    },
 
+    /// An existing ASN cache could not be read safely.
     #[error("ASN cache read failed at {path}: {reason}")]
-    CacheRead { path: PathBuf, reason: String },
+    CacheRead {
+        /// Cache file path.
+        path: PathBuf,
+        /// Bounded-read or parse diagnostic.
+        reason: String,
+    },
 
+    /// An ASN cache could not be atomically updated.
     #[error("ASN cache write failed at {path}: {reason}")]
-    CacheWrite { path: PathBuf, reason: String },
+    CacheWrite {
+        /// Cache file path.
+        path: PathBuf,
+        /// Filesystem diagnostic.
+        reason: String,
+    },
 }
 
+/// Resolves the complete, canonical prefix set for one ASN.
 pub trait AsnPrefixResolver {
     /// Resolves and canonicalizes IPv4 and IPv6 prefixes for one ASN.
     ///
@@ -40,6 +65,7 @@ pub trait AsnPrefixResolver {
     fn resolve_prefixes(&self, asn: u32) -> Result<Vec<CanonicalCidr>, AsnError>;
 }
 
+/// Bounded `bgpq4` resolver that strictly validates each family-specific result.
 #[derive(Debug, Clone, Copy)]
 pub struct Bgpq4AsnPrefixResolver<E: CommandExecutor> {
     executor: E,
@@ -48,6 +74,7 @@ pub struct Bgpq4AsnPrefixResolver<E: CommandExecutor> {
 
 impl Bgpq4AsnPrefixResolver<SystemCommandExecutor> {
     #[must_use]
+    /// Creates the system resolver with Kidobo's bounded default timeout.
     pub fn with_default_timeout() -> Self {
         Self {
             executor: SystemCommandExecutor,
@@ -58,6 +85,7 @@ impl Bgpq4AsnPrefixResolver<SystemCommandExecutor> {
 
 impl<E: CommandExecutor> Bgpq4AsnPrefixResolver<E> {
     #[cfg(test)]
+    /// Creates a resolver with an injected executor and timeout for safe adapter tests.
     pub fn new(executor: E, timeout: Duration) -> Self {
         Self { executor, timeout }
     }
@@ -96,7 +124,22 @@ impl<E: CommandExecutor> Bgpq4AsnPrefixResolver<E> {
             });
         }
 
-        Ok(parse_cidrs_from_bgpq4_output(&result.stdout))
+        let expected_family = match family_flag {
+            "-4" => AddressFamily::Ipv4,
+            "-6" => AddressFamily::Ipv6,
+            _ => {
+                return Err(AsnError::ResolveFailed {
+                    asn,
+                    reason: format!("unsupported bgpq4 family flag `{family_flag}`"),
+                });
+            }
+        };
+        parse_cidrs_from_bgpq4_output(&result.stdout, expected_family).map_err(|reason| {
+            AsnError::ResolveFailed {
+                asn,
+                reason: format!("{command} returned invalid output: {reason}"),
+            }
+        })
     }
 }
 
@@ -106,13 +149,22 @@ impl<E: CommandExecutor> AsnPrefixResolver for Bgpq4AsnPrefixResolver<E> {
         prefixes.extend(self.run_bgpq4(asn, "-6")?);
         prefixes.sort_unstable();
         prefixes.dedup();
+        if prefixes.is_empty() {
+            return Err(AsnError::ResolveFailed {
+                asn,
+                reason: "bgpq4 returned no IPv4 or IPv6 prefixes".to_string(),
+            });
+        }
         Ok(prefixes)
     }
 }
 
+/// ASN prefixes loaded from a fresh resolver response or a usable cache.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CachedAsnPrefixes {
+    /// Non-empty sorted, unique canonical prefixes.
     pub prefixes: Vec<CanonicalCidr>,
+    /// Whether stale cache was used after refresh failure.
     pub stale: bool,
 }
 
@@ -178,7 +230,7 @@ pub fn load_asn_prefixes_with_cache(
     resolver: &dyn AsnPrefixResolver,
 ) -> Result<CachedAsnPrefixes, AsnError> {
     let cache_file = asn_cache_file(cache_dir, asn);
-    let cache_state = read_asn_cache_file(&cache_file)?;
+    let cache_state = read_asn_cache_file(&cache_file)?.filter(|state| !state.prefixes.is_empty());
 
     if cache_state
         .as_ref()
@@ -190,7 +242,16 @@ pub fn load_asn_prefixes_with_cache(
         });
     }
 
-    match resolver.resolve_prefixes(asn) {
+    match resolver.resolve_prefixes(asn).and_then(|prefixes| {
+        if prefixes.is_empty() {
+            Err(AsnError::ResolveFailed {
+                asn,
+                reason: "resolver returned no IPv4 or IPv6 prefixes".to_string(),
+            })
+        } else {
+            Ok(prefixes)
+        }
+    }) {
         Ok(prefixes) => {
             write_asn_cache_file(&cache_file, &prefixes)?;
             Ok(CachedAsnPrefixes {
@@ -221,7 +282,9 @@ pub fn load_cached_asn_prefixes(
     cache_dir: &Path,
 ) -> Result<Option<Vec<CanonicalCidr>>, AsnError> {
     let cache_file = asn_cache_file(cache_dir, asn);
-    Ok(read_asn_cache_file(&cache_file)?.map(|state| state.prefixes))
+    Ok(read_asn_cache_file(&cache_file)?
+        .map(|state| state.prefixes)
+        .filter(|prefixes| !prefixes.is_empty()))
 }
 
 /// Deletes one ASN cache file, reporting whether it existed.
@@ -307,18 +370,27 @@ fn write_asn_cache_file(path: &Path, prefixes: &[CanonicalCidr]) -> Result<(), A
     })
 }
 
-fn parse_cidrs_from_bgpq4_output(contents: &str) -> Vec<CanonicalCidr> {
-    contents
-        .lines()
-        .filter_map(|line| {
-            let trimmed = line.trim();
-            if trimmed.is_empty() || trimmed.starts_with('#') {
-                None
-            } else {
-                parse_ip_cidr_token(trimmed)
-            }
-        })
-        .collect()
+fn parse_cidrs_from_bgpq4_output(
+    contents: &str,
+    expected_family: AddressFamily,
+) -> Result<Vec<CanonicalCidr>, String> {
+    let mut prefixes = Vec::new();
+    for (index, line) in contents.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let prefix = parse_ip_cidr_token(trimmed)
+            .ok_or_else(|| format!("line {} is not a CIDR: `{trimmed}`", index + 1))?;
+        if prefix.family() != expected_family {
+            return Err(format!(
+                "line {} has the wrong address family: `{trimmed}`",
+                index + 1
+            ));
+        }
+        prefixes.push(prefix);
+    }
+    Ok(prefixes)
 }
 
 fn parse_cidrs_from_cache_contents(contents: &str) -> Option<Vec<CanonicalCidr>> {
@@ -450,7 +522,7 @@ mod tests {
             }),
             Ok(CommandResult {
                 status: ProcessStatus::Exited(0),
-                stdout: "2001:db8::/64\n198.51.100.0/24\n".to_string(),
+                stdout: "2001:db8::/64\n2001:db8::/64\n".to_string(),
                 stderr: String::new(),
             }),
         ]);
@@ -471,6 +543,86 @@ mod tests {
         assert_eq!(requests[0].program, "bgpq4");
         assert_eq!(requests[0].args, vec!["-4", "-F", "%n/%l\n", "AS64512"]);
         assert_eq!(requests[1].args, vec!["-6", "-F", "%n/%l\n", "AS64512"]);
+    }
+
+    #[test]
+    fn bgpq4_resolver_rejects_malformed_noncomment_output() {
+        let executor = MockCommandExecutor::new(vec![Ok(CommandResult {
+            status: ProcessStatus::Exited(0),
+            stdout: "203.0.113.0/24\nmalformed\n".to_string(),
+            stderr: String::new(),
+        })]);
+        let resolver = Bgpq4AsnPrefixResolver::new(&executor, Duration::from_secs(5));
+
+        let error = resolver
+            .resolve_prefixes(64512)
+            .expect_err("malformed output must fail");
+
+        assert!(matches!(error, AsnError::ResolveFailed { asn: 64512, .. }));
+        assert_eq!(executor.requests().len(), 1);
+    }
+
+    #[test]
+    fn bgpq4_resolver_rejects_wrong_family_output() {
+        let executor = MockCommandExecutor::new(vec![Ok(CommandResult {
+            status: ProcessStatus::Exited(0),
+            stdout: "2001:db8::/64\n".to_string(),
+            stderr: String::new(),
+        })]);
+        let resolver = Bgpq4AsnPrefixResolver::new(&executor, Duration::from_secs(5));
+
+        let error = resolver
+            .resolve_prefixes(64512)
+            .expect_err("wrong family must fail");
+
+        assert!(matches!(error, AsnError::ResolveFailed { asn: 64512, .. }));
+    }
+
+    #[test]
+    fn bgpq4_resolver_rejects_an_empty_combined_result() {
+        let executor = MockCommandExecutor::new(vec![
+            Ok(CommandResult {
+                status: ProcessStatus::Exited(0),
+                stdout: "# no IPv4 routes\n".to_string(),
+                stderr: String::new(),
+            }),
+            Ok(CommandResult {
+                status: ProcessStatus::Exited(0),
+                stdout: "\n".to_string(),
+                stderr: String::new(),
+            }),
+        ]);
+        let resolver = Bgpq4AsnPrefixResolver::new(&executor, Duration::from_secs(5));
+
+        let error = resolver
+            .resolve_prefixes(64512)
+            .expect_err("empty result must fail");
+
+        assert!(matches!(error, AsnError::ResolveFailed { asn: 64512, .. }));
+    }
+
+    #[test]
+    fn bgpq4_resolver_accepts_a_single_populated_family() {
+        let executor = MockCommandExecutor::new(vec![
+            Ok(CommandResult {
+                status: ProcessStatus::Exited(0),
+                stdout: "203.0.113.0/24\n".to_string(),
+                stderr: String::new(),
+            }),
+            Ok(CommandResult {
+                status: ProcessStatus::Exited(0),
+                stdout: "# no IPv6 routes\n".to_string(),
+                stderr: String::new(),
+            }),
+        ]);
+        let resolver = Bgpq4AsnPrefixResolver::new(&executor, Duration::from_secs(5));
+
+        let prefixes = resolver.resolve_prefixes(64512).expect("single-family ASN");
+
+        assert_eq!(
+            prefixes.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            ["203.0.113.0/24"]
+        );
     }
 
     #[test]
@@ -685,6 +837,38 @@ mod tests {
                 .expect("load");
         assert!(loaded.stale);
         assert_eq!(loaded.prefixes.len(), 1);
+    }
+
+    #[test]
+    fn empty_refresh_uses_nonempty_stale_cache_without_overwriting_it() {
+        let temp = TempDir::new().expect("tempdir");
+        let cache_path = temp.path().join("as64512.iplist");
+        fs::write(&cache_path, "203.0.113.0/24\n").expect("write cache");
+        let resolver = Mutex::new(MockResolver::new(vec![Ok(Vec::new())]));
+
+        let loaded =
+            load_asn_prefixes_with_cache(64512, temp.path(), Duration::from_secs(0), &resolver)
+                .expect("stale fallback");
+
+        assert!(loaded.stale);
+        assert_eq!(loaded.prefixes.len(), 1);
+        assert_eq!(
+            read_to_string_with_limit(&cache_path, ASN_CACHE_FILE_READ_LIMIT).expect("read cache"),
+            "203.0.113.0/24\n"
+        );
+    }
+
+    #[test]
+    fn empty_refresh_without_cache_fails_and_is_not_persisted() {
+        let temp = TempDir::new().expect("tempdir");
+        let resolver = Mutex::new(MockResolver::new(vec![Ok(Vec::new())]));
+
+        let error =
+            load_asn_prefixes_with_cache(64512, temp.path(), Duration::from_secs(0), &resolver)
+                .expect_err("empty result must fail");
+
+        assert!(matches!(error, AsnError::ResolveFailed { asn: 64512, .. }));
+        assert!(!temp.path().join("as64512.iplist").exists());
     }
 
     #[test]

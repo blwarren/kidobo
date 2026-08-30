@@ -1,15 +1,21 @@
+//! Canonical, family-aware CIDR value types.
+
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use crate::AddressFamily;
 
+/// Canonical IPv4 or IPv6 network.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum CanonicalCidr {
+    /// Canonical IPv4 network.
     V4(Ipv4Cidr),
+    /// Canonical IPv6 network.
     V6(Ipv6Cidr),
 }
 
 impl CanonicalCidr {
     #[must_use]
+    /// Returns the CIDR's address family.
     pub fn family(self) -> AddressFamily {
         match self {
             Self::V4(_) => AddressFamily::Ipv4,
@@ -27,6 +33,7 @@ impl std::fmt::Display for CanonicalCidr {
     }
 }
 
+/// Canonical IPv4 network and prefix length.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Ipv4Cidr {
     pub(crate) network: u32,
@@ -35,6 +42,9 @@ pub struct Ipv4Cidr {
 
 impl Ipv4Cidr {
     #[must_use]
+    /// Constructs a canonical network from an address and prefix.
+    ///
+    /// Returns `None` when `prefix` exceeds 32. Host bits are cleared.
     pub fn new(address: Ipv4Addr, prefix: u8) -> Option<Self> {
         if prefix > 32 {
             return None;
@@ -53,11 +63,13 @@ impl Ipv4Cidr {
     }
 
     #[must_use]
+    /// Returns the canonical network address.
     pub fn network(self) -> Ipv4Addr {
         Ipv4Addr::from(self.network)
     }
 
     #[must_use]
+    /// Returns the prefix length in the inclusive range 0 through 32.
     pub fn prefix(self) -> u8 {
         self.prefix
     }
@@ -69,6 +81,7 @@ impl std::fmt::Display for Ipv4Cidr {
     }
 }
 
+/// Canonical IPv6 network and prefix length.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Ipv6Cidr {
     pub(crate) network: u128,
@@ -77,6 +90,9 @@ pub struct Ipv6Cidr {
 
 impl Ipv6Cidr {
     #[must_use]
+    /// Constructs a canonical network from an address and prefix.
+    ///
+    /// Returns `None` when `prefix` exceeds 128. Host bits are cleared.
     pub fn new(address: Ipv6Addr, prefix: u8) -> Option<Self> {
         if prefix > 128 {
             return None;
@@ -95,11 +111,13 @@ impl Ipv6Cidr {
     }
 
     #[must_use]
+    /// Returns the canonical network address.
     pub fn network(self) -> Ipv6Addr {
         Ipv6Addr::from(self.network)
     }
 
     #[must_use]
+    /// Returns the prefix length in the inclusive range 0 through 128.
     pub fn prefix(self) -> u8 {
         self.prefix
     }
@@ -111,9 +129,12 @@ impl std::fmt::Display for Ipv6Cidr {
     }
 }
 
+/// CIDR vectors separated by address family.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct FamilyCidrs {
+    /// IPv4 CIDRs in their input or computed order.
     pub ipv4: Vec<Ipv4Cidr>,
+    /// IPv6 CIDRs in their input or computed order.
     pub ipv6: Vec<Ipv6Cidr>,
 }
 

@@ -5,13 +5,20 @@ use reqwest::StatusCode;
 
 use crate::http_cache::{HttpClient, HttpRequest, HttpResponse};
 
+/// Policy result from conditional HTTP fetching with soft cache fallback.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConditionalFetchResult {
+    /// A response body that still requires domain validation.
     Network(HttpResponse),
+    /// HTTP 304 with a usable validated cache.
     CacheNotModified,
+    /// Request failure or unusable 304; caller should attempt cache fallback.
     FallbackCache,
 }
 
+/// Applies conditional validators and retries an unusable 304 without validators.
+///
+/// Network errors are logged and represented as [`ConditionalFetchResult::FallbackCache`].
 pub fn fetch_with_conditional_cache(
     client: &dyn HttpClient,
     url: &str,

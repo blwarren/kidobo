@@ -12,6 +12,7 @@ use crate::command_runner::{
 use crate::ipset::IpsetCommandRunner;
 use crate::iptables::{FirewallCommandRunner, FirewallFamily, cleanup_firewall_wiring};
 
+/// Flush backend using injected firewall and ipset command runners.
 #[derive(Debug)]
 pub struct CommandFlushBackend<R> {
     runner: R,
@@ -19,6 +20,7 @@ pub struct CommandFlushBackend<R> {
 
 impl<R> CommandFlushBackend<R> {
     #[must_use]
+    /// Creates a flush backend around the supplied runner.
     pub fn new(runner: R) -> Self {
         Self { runner }
     }
@@ -30,6 +32,7 @@ impl Default for CommandFlushBackend<SudoCommandRunner<SystemCommandExecutor>> {
     }
 }
 
+/// Production flush backend using noninteractive bounded sudo commands.
 pub type SystemFlushBackend = CommandFlushBackend<SudoCommandRunner<SystemCommandExecutor>>;
 
 impl<R> FlushBackend for CommandFlushBackend<R>

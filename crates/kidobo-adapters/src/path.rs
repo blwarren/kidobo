@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::env;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
 use kidobo_app::AppError;
@@ -10,21 +11,36 @@ pub use kidobo_app::paths::{PathResolutionInput, ResolvedPaths};
 use kidobo_app::ports::PathResolver;
 use thiserror::Error;
 
+/// Native environment key for the alternate Kidobo filesystem root.
 pub const ENV_KIDOBO_ROOT: &str = "KIDOBO_ROOT";
+/// Native environment key enabling automatic test-sandbox root selection.
 pub const ENV_KIDOBO_TEST_SANDBOX: &str = "KIDOBO_TEST_SANDBOX";
+/// Native environment key disabling automatic test-sandbox root selection.
 pub const ENV_KIDOBO_DISABLE_TEST_SANDBOX: &str = "KIDOBO_DISABLE_TEST_SANDBOX";
 
 #[must_use]
+/// Captures only recognized Kidobo environment variables without requiring Unicode.
 pub fn path_resolution_input_from_process(
     explicit_config_path: Option<PathBuf>,
 ) -> PathResolutionInput {
+    let env = [
+        ENV_KIDOBO_ROOT,
+        ENV_KIDOBO_TEST_SANDBOX,
+        ENV_KIDOBO_DISABLE_TEST_SANDBOX,
+        crate::http_cache::ENV_KIDOBO_MAX_HTTP_BODY_BYTES,
+    ]
+    .into_iter()
+    .filter_map(|key| env::var_os(key).map(|value| (OsString::from(key), value)))
+    .collect();
+
     PathResolutionInput {
         explicit_config_path,
         temp_dir: env::temp_dir(),
-        env: env::vars().collect(),
+        env,
     }
 }
 
+/// Production implementation of compatibility-sensitive runtime path resolution.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SystemPathResolver;
 
@@ -85,13 +101,22 @@ impl BasePaths {
     }
 }
 
+/// Failure to select a required or explicitly requested configuration path.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum PathResolutionError {
+    /// Caller-supplied configuration path does not exist.
     #[error("explicit config path does not exist: {path}")]
-    ExplicitConfigMissing { path: PathBuf },
+    ExplicitConfigMissing {
+        /// Explicit path.
+        path: PathBuf,
+    },
 
+    /// No configuration was found at the derived default path.
     #[error("config file not found: {attempted}")]
-    MissingConfig { attempted: PathBuf },
+    MissingConfig {
+        /// Derived path that was checked.
+        attempted: PathBuf,
+    },
 }
 
 /// Resolves runtime paths and requires the selected configuration file to exist.
@@ -182,20 +207,22 @@ fn select_config_path(
     }
 }
 
-fn env_value<'a>(vars: &'a BTreeMap<String, String>, key: &str) -> Option<&'a str> {
-    vars.get(key).map(String::as_str)
+fn env_value<'a>(vars: &'a BTreeMap<OsString, OsString>, key: &str) -> Option<&'a OsStr> {
+    vars.get(OsStr::new(key)).map(OsString::as_os_str)
 }
 
-fn env_present(vars: &BTreeMap<String, String>, key: &str) -> bool {
-    vars.contains_key(key)
+fn env_present(vars: &BTreeMap<OsString, OsString>, key: &str) -> bool {
+    vars.contains_key(OsStr::new(key))
 }
 
-fn env_truthy(vars: &BTreeMap<String, String>, key: &str) -> bool {
-    env_value(vars, key).is_some_and(is_truthy_value)
+fn env_truthy(vars: &BTreeMap<OsString, OsString>, key: &str) -> bool {
+    env_value(vars, key)
+        .and_then(OsStr::to_str)
+        .is_some_and(is_truthy_value)
 }
 
 #[must_use]
-pub fn is_truthy_value(value: &str) -> bool {
+fn is_truthy_value(value: &str) -> bool {
     matches!(
         value.trim().to_ascii_lowercase().as_str(),
         "1" | "true" | "yes" | "on"
@@ -250,7 +277,7 @@ mod tests {
         let mut input = test_input(&temp);
         input
             .env
-            .insert(ENV_KIDOBO_ROOT.to_string(), root.display().to_string());
+            .insert(ENV_KIDOBO_ROOT.into(), root.as_os_str().to_owned());
 
         let resolved = resolve_paths(&input).expect("resolve");
 
@@ -273,7 +300,7 @@ mod tests {
         let mut input = test_input(&temp);
         input
             .env
-            .insert(ENV_KIDOBO_TEST_SANDBOX.to_string(), "true".to_string());
+            .insert(ENV_KIDOBO_TEST_SANDBOX.into(), "true".into());
 
         let resolved = resolve_paths(&input).expect("resolve");
 
@@ -288,15 +315,13 @@ mod tests {
         fs::create_dir_all(&root).expect("mkdir root");
 
         let mut input = test_input(&temp);
+        input.env.insert(ENV_KIDOBO_TEST_SANDBOX.into(), "1".into());
         input
             .env
-            .insert(ENV_KIDOBO_TEST_SANDBOX.to_string(), "1".to_string());
+            .insert(ENV_KIDOBO_DISABLE_TEST_SANDBOX.into(), "1".into());
         input
             .env
-            .insert(ENV_KIDOBO_DISABLE_TEST_SANDBOX.to_string(), "1".to_string());
-        input
-            .env
-            .insert(ENV_KIDOBO_ROOT.to_string(), root.display().to_string());
+            .insert(ENV_KIDOBO_ROOT.into(), root.as_os_str().to_owned());
 
         let err = resolve_paths(&input).expect_err("should fail without config");
         assert_eq!(
@@ -344,7 +369,7 @@ mod tests {
         let mut input = test_input(&temp);
         input
             .env
-            .insert(ENV_KIDOBO_ROOT.to_string(), root.display().to_string());
+            .insert(ENV_KIDOBO_ROOT.into(), root.as_os_str().to_owned());
 
         let err = resolve_paths(&input).expect_err("must fail");
         assert_eq!(
@@ -364,7 +389,7 @@ mod tests {
         let mut input = test_input(&temp);
         input
             .env
-            .insert(ENV_KIDOBO_ROOT.to_string(), root.display().to_string());
+            .insert(ENV_KIDOBO_ROOT.into(), root.as_os_str().to_owned());
 
         let resolved = resolve_paths_without_config(&input).expect("resolve");
         assert_eq!(resolved.config_file, root.join("config/config.toml"));

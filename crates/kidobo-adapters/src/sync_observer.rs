@@ -15,12 +15,14 @@ struct StageTimer {
 }
 
 #[derive(Debug)]
+/// Production sync observer that logs stages and optionally reports elapsed timing.
 pub struct LoggingSyncObserver {
     timer: Mutex<StageTimer>,
 }
 
 impl LoggingSyncObserver {
     #[must_use]
+    /// Creates an observer with optional timer diagnostics.
     pub fn new(timer_enabled: bool) -> Self {
         let now = Instant::now();
         Self {

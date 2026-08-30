@@ -1,38 +1,66 @@
+//! Root CLI composition and rendering failures.
+
 use kidobo_app::AppError;
 use thiserror::Error;
 
+/// Top-level failure mapped to Kidobo's stable process exit meanings.
 #[derive(Debug, Error)]
 pub enum KidoboError {
+    /// An application workflow or adapter failed.
     #[error(transparent)]
     Application {
+        /// Underlying typed application failure.
         #[from]
         source: AppError,
     },
 
+    /// Process-wide logging could not be installed.
     #[error("failed to initialize logger: {reason}")]
-    LoggerInit { reason: String },
+    LoggerInit {
+        /// Logger diagnostic.
+        reason: String,
+    },
 
+    /// The machine-readable doctor report could not be serialized.
     #[error("failed to serialize doctor report: {reason}")]
-    DoctorReportSerialize { reason: String },
+    DoctorReportSerialize {
+        /// Serialization diagnostic.
+        reason: String,
+    },
 
+    /// The process SIGINT handler could not be installed.
     #[error("failed to install SIGINT handler: {reason}")]
-    SignalHandlerInstall { reason: String },
+    SignalHandlerInstall {
+        /// Signal-handler diagnostic.
+        reason: String,
+    },
 
+    /// Operation was interrupted and maps to exit status 130.
     #[error("operation interrupted by SIGINT")]
     Interrupted,
 
+    /// Doctor completed with one or more failed checks.
     #[error("doctor checks failed")]
     DoctorFailed,
 
+    /// Interactive blocklist confirmation could not be read or rendered.
     #[error("blocklist prompt failed: {reason}")]
-    BlocklistPrompt { reason: String },
+    BlocklistPrompt {
+        /// Prompt diagnostic.
+        reason: String,
+    },
 
+    /// Standard input or output failed during CLI rendering.
     #[error("CLI I/O failed: {reason}")]
-    CliIo { reason: String },
+    CliIo {
+        /// I/O diagnostic.
+        reason: String,
+    },
 }
 
 impl KidoboError {
     #[must_use]
+    /// Returns exit 130 for interruption and exit 1 for every other runtime failure.
     pub fn exit_code(&self) -> u8 {
         match self {
             Self::Interrupted => 130,

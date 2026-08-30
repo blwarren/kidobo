@@ -1,3 +1,5 @@
+//! Locked workflows for local blocklist and ASN configuration mutation.
+
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -13,106 +15,158 @@ use crate::paths::{ConfigRequirement, PathResolutionInput};
 use crate::ports::{ConfigRepository, LockManager, PathResolver};
 use crate::source::Notice;
 
+/// One target supplied directly or through a bounded line-oriented file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BlocklistInput {
+    /// One operator-supplied IP address or CIDR.
     Single(String),
+    /// File containing one target per non-comment line.
     File(PathBuf),
 }
 
+/// Request to add IP or CIDR targets to the local blocklist.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BanRequest {
+    /// Runtime path inputs.
     pub paths: PathResolutionInput,
+    /// Direct or file-based targets.
     pub input: BlocklistInput,
 }
 
+/// Per-target result from a successful ban workflow.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BanChange {
+    /// Canonical target appended to the blocklist.
     Added(String),
+    /// Canonical target already present, including an earlier target in the same request.
     AlreadyPresent(String),
 }
 
+/// Result of parsing and applying a local blocklist ban request.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct BanOutcome {
+    /// Changes in request order when all targets were valid.
     pub changes: Vec<BanChange>,
+    /// Invalid input strings; any invalid target prevents mutation.
     pub invalid_targets: Vec<String>,
+    /// Whether file input contained no targets.
     pub empty_file: bool,
 }
 
+/// Request to prepare removal of IP or CIDR targets from the local blocklist.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnbanRequest {
+    /// Runtime path inputs.
     pub paths: PathResolutionInput,
+    /// Direct or file-based targets.
     pub input: BlocklistInput,
 }
 
+/// Mutation preview used to obtain the operator's partial-overlap decision.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnbanPreview {
+    /// Operator-facing label for the direct target or source file.
     pub target_label: String,
+    /// Number of valid, unique requested targets.
     pub requested_target_count: usize,
+    /// Existing entries exactly matching at least one target.
     pub exact_entries: Vec<String>,
+    /// Existing entries that overlap but do not exactly match a target.
     pub partial_entries: Vec<String>,
     targets: Vec<CanonicalCidr>,
 }
 
+/// Result of read-only unban preparation under the process lock.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct UnbanPreparation {
+    /// Preview to apply when input was usable.
     pub preview: Option<UnbanPreview>,
+    /// Invalid input strings; any invalid target prevents mutation.
     pub invalid_targets: Vec<String>,
+    /// Whether file input contained no targets.
     pub empty_file: bool,
 }
 
+/// Operator decision controlling removal of partially overlapping entries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnbanDecision {
+    /// Whether partial overlaps should be removed along with exact matches.
     pub remove_partial: bool,
 }
 
+/// Result of applying a prepared unban decision.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnbanOutcome {
+    /// Operator-facing label from the preview.
     pub target_label: String,
+    /// Number of valid, unique requested targets.
     pub requested_target_count: usize,
+    /// Number of exact entries removed.
     pub removed_exact: usize,
+    /// Number of partial-overlap entries removed.
     pub removed_partial: usize,
+    /// Whether the preview contained any partial overlaps.
     pub had_partial_matches: bool,
 }
 
 impl UnbanOutcome {
     #[must_use]
+    /// Returns the total number of blocklist entries removed.
     pub fn total_removed(&self) -> usize {
         self.removed_exact + self.removed_partial
     }
 }
 
+/// Request to add autonomous-system numbers to configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AsnBanRequest {
+    /// Runtime path inputs.
     pub paths: PathResolutionInput,
+    /// Operator tokens such as `AS64496` or `64496`.
     pub tokens: Vec<String>,
 }
 
+/// Result of an ASN ban configuration update and prefix validation.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AsnBanOutcome {
+    /// Normalized ASNs newly added to configuration.
     pub added: Vec<u32>,
+    /// Duplicate configured ASN entries removed during normalization.
     pub removed_duplicate_entries: usize,
+    /// Stale-cache and other best-effort notices.
     pub notices: Vec<Notice>,
 }
 
+/// Result of an ASN unban configuration and cache cleanup.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AsnUnbanOutcome {
+    /// Normalized ASNs removed from configuration.
     pub removed: Vec<u32>,
+    /// Existing ASN cache files successfully deleted before lock release.
     pub deleted_cache_files: usize,
+    /// Best-effort cache cleanup notices.
     pub notices: Vec<Notice>,
 }
 
+/// Usable ASN prefix resolution plus its freshness state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AsnPrefixBatch {
+    /// Non-empty canonical prefix set for the ASN.
     pub prefixes: Vec<CanonicalCidr>,
+    /// Whether stale cache was used after refresh failure.
     pub stale: bool,
 }
 
+/// Exact effect of an atomic ASN configuration mutation.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AsnConfigUpdate {
+    /// Requested ASNs newly added.
     pub added: Vec<u32>,
+    /// Requested ASNs that were present and removed.
     pub removed: Vec<u32>,
 }
 
+/// Persistence boundary for the operator-managed local blocklist.
 pub trait BlocklistRepository {
     /// Loads and parses the blocklist at `path`.
     ///
@@ -149,6 +203,7 @@ pub trait BlocklistRepository {
     fn read_target_lines(&self, path: &Path) -> Result<Vec<String>, AppError>;
 }
 
+/// Resolution, cache, and configuration operations for ASN workflows.
 pub trait AsnOperations {
     /// Parses, validates, sorts, and deduplicates ASN tokens.
     ///
@@ -189,11 +244,17 @@ pub trait AsnOperations {
     fn delete_cache(&self, asn: u32, cache_dir: &Path) -> Result<bool, AppError>;
 }
 
+/// Ports required by local blocklist and ASN workflows.
 pub struct BlocklistDependencies<'a> {
+    /// Runtime path resolver.
     pub paths: &'a dyn PathResolver,
+    /// Validated configuration repository.
     pub configs: &'a dyn ConfigRepository,
+    /// Nonblocking process lock manager.
     pub locks: &'a dyn LockManager,
+    /// Local blocklist persistence adapter.
     pub repository: &'a dyn BlocklistRepository,
+    /// ASN resolution and persistence adapter.
     pub asn: &'a dyn AsnOperations,
 }
 
@@ -413,12 +474,10 @@ pub fn execute_unban_asn(
         .paths
         .resolve(&request.paths, ConfigRequirement::Required)?;
     let requested_asns = dependencies.asn.normalize_tokens(&request.tokens)?;
-    let update = {
-        let _lock = dependencies.locks.acquire(&paths.lock_file)?;
-        dependencies
-            .asn
-            .update_config(&paths.config_file, &[], &requested_asns)?
-    };
+    let _lock = dependencies.locks.acquire(&paths.lock_file)?;
+    let update = dependencies
+        .asn
+        .update_config(&paths.config_file, &[], &requested_asns)?;
     let cache_dir = paths.cache_dir.join("asn");
     let mut deleted_cache_files = 0;
     let mut notices = Vec::new();
@@ -545,16 +604,16 @@ fn remove_exact_duplicates(
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use kidobo_core::blocklist::BlocklistDocument;
     use kidobo_core::config::Config;
 
     use super::{
-        AsnConfigUpdate, AsnOperations, AsnPrefixBatch, BanChange, BanRequest,
+        AsnBanRequest, AsnConfigUpdate, AsnOperations, AsnPrefixBatch, BanChange, BanRequest,
         BlocklistDependencies, BlocklistInput, BlocklistRepository, UnbanDecision, UnbanRequest,
-        apply_unban, execute_ban, prepare_unban,
+        apply_unban, execute_ban, execute_unban_asn, prepare_unban,
     };
     use crate::AppError;
     use crate::paths::{ConfigRequirement, PathResolutionInput, ResolvedPaths};
@@ -819,5 +878,92 @@ mod tests {
 
         assert!(matches!(error, AppError::BlocklistChanged));
         assert_eq!(*locks.0.lock().expect("locks"), 1);
+    }
+
+    // Drop records lock release, making the ledger sensitive to deletion occurring one statement
+    // too late even though both operations would otherwise succeed in a sequential unit test.
+    struct EventGuard(Arc<Mutex<Vec<&'static str>>>);
+
+    impl LockGuard for EventGuard {}
+
+    impl Drop for EventGuard {
+        fn drop(&mut self) {
+            self.0.lock().expect("events").push("unlock");
+        }
+    }
+
+    struct EventLocks(Arc<Mutex<Vec<&'static str>>>);
+
+    impl LockManager for EventLocks {
+        fn acquire(&self, _path: &Path) -> Result<Box<dyn LockGuard>, AppError> {
+            self.0.lock().expect("events").push("lock");
+            Ok(Box::new(EventGuard(Arc::clone(&self.0))))
+        }
+    }
+
+    struct EventAsn(Arc<Mutex<Vec<&'static str>>>);
+
+    impl AsnOperations for EventAsn {
+        fn normalize_tokens(&self, _tokens: &[String]) -> Result<Vec<u32>, AppError> {
+            Ok(vec![64512])
+        }
+
+        fn load_prefixes(
+            &self,
+            _asn: u32,
+            _cache_dir: &Path,
+            _stale_after: Duration,
+        ) -> Result<AsnPrefixBatch, AppError> {
+            unreachable!("unban does not load prefixes")
+        }
+
+        fn update_config(
+            &self,
+            _config_path: &Path,
+            _add: &[u32],
+            _remove: &[u32],
+        ) -> Result<AsnConfigUpdate, AppError> {
+            self.0.lock().expect("events").push("update");
+            Ok(AsnConfigUpdate {
+                added: Vec::new(),
+                removed: vec![64512],
+            })
+        }
+
+        fn delete_cache(&self, _asn: u32, _cache_dir: &Path) -> Result<bool, AppError> {
+            self.0.lock().expect("events").push("delete");
+            Ok(true)
+        }
+    }
+
+    #[test]
+    fn asn_unban_holds_the_process_lock_through_cache_deletion() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let locks = EventLocks(Arc::clone(&events));
+        let asn = EventAsn(Arc::clone(&events));
+        let repository = Repository::new("");
+        let dependencies = BlocklistDependencies {
+            paths: &Paths,
+            configs: &Configs,
+            locks: &locks,
+            repository: &repository,
+            asn: &asn,
+        };
+
+        let outcome = execute_unban_asn(
+            &AsnBanRequest {
+                paths: request_input(),
+                tokens: vec!["AS64512".to_string()],
+            },
+            &dependencies,
+        )
+        .expect("unban ASN");
+
+        assert_eq!(outcome.removed, [64512]);
+        assert_eq!(outcome.deleted_cache_files, 1);
+        assert_eq!(
+            *events.lock().expect("events"),
+            ["lock", "update", "delete", "unlock"]
+        );
     }
 }

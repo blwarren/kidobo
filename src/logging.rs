@@ -1,3 +1,5 @@
+//! Process-wide human or journal logging configuration.
+
 use std::env;
 use std::io::{IsTerminal, Write};
 

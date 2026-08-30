@@ -3,12 +3,14 @@
 use sha2::{Digest, Sha256};
 
 #[must_use]
+/// Returns the lowercase SHA-256 digest of `bytes`.
 pub fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     hex_lower(&digest)
 }
 
 #[must_use]
+/// Encodes arbitrary bytes as lowercase hexadecimal.
 pub fn hex_lower(bytes: &[u8]) -> String {
     let mut output = String::with_capacity(bytes.len() * 2);
 

@@ -1,6 +1,7 @@
 //! GitHub metadata safelist adapter.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use log::warn;
@@ -8,10 +9,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::cached_fetch::{
-    read_optional_json_lossy, read_validated_bytes_lossy, write_bytes_atomic_in_cache,
-    write_json_pretty_atomic,
+use crate::cache_generation::{
+    GenerationFile, GenerationFileLimit, commit_generation, generation_candidates,
+    generation_contents_match,
 };
+use crate::cached_fetch::{read_optional_json_lossy, read_validated_bytes_lossy};
 use crate::hash::sha256_hex;
 use crate::http_cache::{HttpClient, HttpResponse, max_http_body_bytes};
 use crate::http_fetch::{ConditionalFetchResult, fetch_with_conditional_cache};
@@ -23,44 +25,72 @@ use kidobo_core::network::{CanonicalCidr, parse_ip_cidr_non_strict};
 const GITHUB_META_RAW_CACHE_FILE: &str = "github-meta.raw.json";
 const GITHUB_META_META_CACHE_FILE: &str = "github-meta.meta.json";
 const GITHUB_META_CATEGORY_CACHE_FILE: &str = "github-meta.categories.json";
+const GITHUB_META_V2_STORE: &str = "v2/github-meta";
+const GENERATION_RAW_FILE: &str = "raw.json";
+const GENERATION_META_FILE: &str = "meta.json";
+const GENERATION_CATEGORY_FILE: &str = "categories.json";
 
 const GITHUB_META_CACHE_READ_LIMIT: usize = 8 * 1024 * 1024;
 const GITHUB_META_META_READ_LIMIT: usize = 512 * 1024;
 const GITHUB_META_CATEGORY_READ_LIMIT: usize = 256 * 1024;
 
+/// HTTP validators and checksum bound to a GitHub metadata cache body.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GithubMetaCacheMetadata {
+    /// Configured endpoint URL whose response was cached.
     pub url: String,
+    /// Optional HTTP entity tag.
     pub etag: Option<String>,
+    /// Optional HTTP last-modified validator.
     pub last_modified: Option<String>,
+    /// Lowercase SHA-256 checksum of the raw response bytes.
     pub sha256_raw: String,
 }
 
+/// Category selection recorded with a GitHub metadata cache generation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GithubMetaCategorySidecar {
+    /// Stable selection mode identifier.
     pub mode: String,
+    /// Sorted selected categories when the mode is explicit.
     pub categories: Vec<String>,
 }
 
+/// Origin of a GitHub metadata load result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GithubMetaSource {
+    /// Newly validated network response.
     Network,
+    /// Existing cache accepted after HTTP 304.
     CacheNotModified,
+    /// Existing cache used after a failed or invalid refresh.
     FallbackCache,
+    /// No usable network or cache data was available.
     Empty,
 }
 
+/// Selected GitHub networks and cache provenance.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GithubMetaLoadResult {
+    /// Canonical networks from categories compatible with the requested scope.
     pub networks: Vec<CanonicalCidr>,
+    /// Data provenance.
     pub source: GithubMetaSource,
+    /// Validated HTTP metadata when available.
     pub metadata: Option<GithubMetaCacheMetadata>,
 }
 
+/// Failure to persist a fully validated GitHub metadata generation.
 #[derive(Debug, Error)]
 pub enum GithubMetaLoadError {
+    /// A generation member or manifest could not be atomically written.
     #[error("failed to write github meta cache file {path}: {reason}")]
-    WriteCacheFile { path: PathBuf, reason: String },
+    WriteCacheFile {
+        /// Cache generation store path.
+        path: PathBuf,
+        /// Serialization or filesystem diagnostic.
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,6 +104,7 @@ struct CachePaths {
     raw: PathBuf,
     metadata: PathBuf,
     category_sidecar: PathBuf,
+    generation_store: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -90,6 +121,7 @@ struct GithubMetaCache {
     networks: Option<Vec<CanonicalCidr>>,
     meta: Option<GithubMetaCacheMetadata>,
     sidecar: Option<GithubMetaCategorySidecar>,
+    generation_id: Option<String>,
 }
 
 impl CachePaths {
@@ -98,6 +130,7 @@ impl CachePaths {
             raw: cache_dir.join(GITHUB_META_RAW_CACHE_FILE),
             metadata: cache_dir.join(GITHUB_META_META_CACHE_FILE),
             category_sidecar: cache_dir.join(GITHUB_META_CATEGORY_CACHE_FILE),
+            generation_store: cache_dir.join(GITHUB_META_V2_STORE),
         }
     }
 }
@@ -113,7 +146,7 @@ pub fn load_github_meta_safelist(
     cache_dir: &Path,
     github_meta_url: &str,
     category_mode: &GithubMetaCategoryMode,
-    env: &BTreeMap<String, String>,
+    env: &BTreeMap<OsString, OsString>,
 ) -> Result<GithubMetaLoadResult, GithubMetaLoadError> {
     let selection = CategorySelection::from_mode(category_mode);
     let max_bytes = max_http_body_bytes(env);
@@ -153,11 +186,15 @@ pub fn load_github_meta_safelist(
             max_bytes,
             cache.as_fallback(),
             &selection,
+            cache.generation_id.as_deref(),
         ),
     }
 }
 
 #[must_use]
+/// Loads a validated compatible GitHub metadata cache without network access.
+///
+/// The current v2 generation is preferred, followed by previous and legacy data.
 pub fn load_cached_github_meta_safelist(
     cache_dir: &Path,
     github_meta_url: &str,
@@ -174,6 +211,53 @@ fn read_github_meta_cache(
     selection: &CategorySelection,
     github_meta_url: &str,
 ) -> GithubMetaCache {
+    for candidate in generation_candidates(&paths.generation_store) {
+        if !generation_contents_match(
+            &candidate,
+            &[
+                GenerationFileLimit {
+                    name: GENERATION_RAW_FILE,
+                    read_limit: GITHUB_META_CACHE_READ_LIMIT,
+                },
+                GenerationFileLimit {
+                    name: GENERATION_META_FILE,
+                    read_limit: GITHUB_META_META_READ_LIMIT,
+                },
+                GenerationFileLimit {
+                    name: GENERATION_CATEGORY_FILE,
+                    read_limit: GITHUB_META_CATEGORY_READ_LIMIT,
+                },
+            ],
+        ) {
+            continue;
+        }
+        let generation_paths = CachePaths {
+            raw: candidate.directory.join(GENERATION_RAW_FILE),
+            metadata: candidate.directory.join(GENERATION_META_FILE),
+            category_sidecar: candidate.directory.join(GENERATION_CATEGORY_FILE),
+            generation_store: paths.generation_store.clone(),
+        };
+        let mut cache =
+            read_github_meta_cache_files(&generation_paths, selection, github_meta_url, true);
+        if cache.raw.is_some()
+            && cache.networks.is_some()
+            && cache.meta.is_some()
+            && cache.sidecar.is_some()
+        {
+            cache.generation_id = Some(candidate.id);
+            return cache;
+        }
+    }
+
+    read_github_meta_cache_files(paths, selection, github_meta_url, false)
+}
+
+fn read_github_meta_cache_files(
+    paths: &CachePaths,
+    selection: &CategorySelection,
+    github_meta_url: &str,
+    require_metadata: bool,
+) -> GithubMetaCache {
     let cached_meta = read_optional_json_lossy::<GithubMetaCacheMetadata>(
         &paths.metadata,
         GITHUB_META_META_READ_LIMIT,
@@ -181,7 +265,7 @@ fn read_github_meta_cache(
     );
     let cache_url_matches = match cached_meta.as_ref() {
         Some(meta) => github_meta_cache_url_matches(meta, github_meta_url),
-        None => github_meta_url == DEFAULT_GITHUB_META_URL,
+        None => !require_metadata && github_meta_url == DEFAULT_GITHUB_META_URL,
     };
     if !cache_url_matches {
         if cached_meta.is_some() {
@@ -226,6 +310,7 @@ fn read_github_meta_cache(
         networks,
         meta,
         sidecar,
+        generation_id: None,
     }
 }
 
@@ -269,6 +354,7 @@ fn handle_network_response(
     max_bytes: usize,
     cached: CachedFallback<'_>,
     selection: &CategorySelection,
+    previous_generation: Option<&str>,
 ) -> Result<GithubMetaLoadResult, GithubMetaLoadError> {
     if !response.status.is_success() {
         warn!(
@@ -320,7 +406,13 @@ fn handle_network_response(
         sha256_raw: sha256_hex(&response.body),
     };
 
-    persist_cache(paths, &response.body, &metadata, selection)?;
+    persist_cache(
+        paths,
+        &response.body,
+        &metadata,
+        selection,
+        previous_generation,
+    )?;
 
     Ok(GithubMetaLoadResult {
         networks,
@@ -334,30 +426,42 @@ fn persist_cache(
     raw: &[u8],
     metadata: &GithubMetaCacheMetadata,
     selection: &CategorySelection,
+    previous_generation: Option<&str>,
 ) -> Result<(), GithubMetaLoadError> {
-    write_bytes_atomic_in_cache(&paths.raw, raw).map_err(|err| {
-        GithubMetaLoadError::WriteCacheFile {
-            path: paths.raw.clone(),
-            reason: err.to_string(),
-        }
-    })?;
-
     let sidecar = selection.to_sidecar();
-    write_json_pretty_atomic(&paths.category_sidecar, &sidecar).map_err(|err| {
-        GithubMetaLoadError::WriteCacheFile {
-            path: paths.category_sidecar.clone(),
+    let sidecar_bytes =
+        serde_json::to_vec_pretty(&sidecar).map_err(|err| GithubMetaLoadError::WriteCacheFile {
+            path: paths.generation_store.join("current.json"),
             reason: err.to_string(),
-        }
-    })?;
-
-    write_json_pretty_atomic(&paths.metadata, metadata).map_err(|err| {
-        GithubMetaLoadError::WriteCacheFile {
-            path: paths.metadata.clone(),
+        })?;
+    let metadata_bytes =
+        serde_json::to_vec_pretty(metadata).map_err(|err| GithubMetaLoadError::WriteCacheFile {
+            path: paths.generation_store.join("current.json"),
             reason: err.to_string(),
-        }
-    })?;
-
-    Ok(())
+        })?;
+    commit_generation(
+        &paths.generation_store,
+        &[
+            GenerationFile {
+                name: GENERATION_RAW_FILE,
+                contents: raw,
+            },
+            GenerationFile {
+                name: GENERATION_CATEGORY_FILE,
+                contents: &sidecar_bytes,
+            },
+            GenerationFile {
+                name: GENERATION_META_FILE,
+                contents: &metadata_bytes,
+            },
+        ],
+        previous_generation,
+    )
+    .map(|_| ())
+    .map_err(|err| GithubMetaLoadError::WriteCacheFile {
+        path: paths.generation_store.join("current.json"),
+        reason: err.to_string(),
+    })
 }
 
 fn cache_fallback(
@@ -572,11 +676,12 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        GITHUB_META_CATEGORY_CACHE_FILE, GITHUB_META_CATEGORY_READ_LIMIT,
+        CachePaths, GITHUB_META_CATEGORY_CACHE_FILE, GITHUB_META_CATEGORY_READ_LIMIT,
         GITHUB_META_META_CACHE_FILE, GITHUB_META_META_READ_LIMIT, GITHUB_META_RAW_CACHE_FILE,
         GithubMetaCacheMetadata, GithubMetaCategorySidecar, GithubMetaLoadResult, GithubMetaSource,
         load_github_meta_safelist,
     };
+    use crate::cache_generation::generation_candidates;
     use crate::hash::sha256_hex;
     use crate::http_cache::test_support::CrossOriginRedirectFixture;
     use crate::http_cache::{
@@ -627,6 +732,14 @@ mod tests {
 
     fn assert_has(result: &GithubMetaLoadResult, cidr: CanonicalCidr) {
         assert!(result.networks.contains(&cidr));
+    }
+
+    fn current_generation_dir(cache_dir: &std::path::Path) -> std::path::PathBuf {
+        generation_candidates(&CachePaths::from_cache_dir(cache_dir).generation_store)
+            .into_iter()
+            .next()
+            .expect("current GitHub cache generation")
+            .directory
     }
 
     #[test]
@@ -758,7 +871,11 @@ mod tests {
 
         assert_eq!(result.source, GithubMetaSource::Network);
         assert!(result.networks.is_empty());
-        assert!(temp.path().join(GITHUB_META_RAW_CACHE_FILE).exists());
+        assert!(
+            current_generation_dir(temp.path())
+                .join(super::GENERATION_RAW_FILE)
+                .exists()
+        );
     }
 
     #[test]
@@ -849,9 +966,10 @@ mod tests {
         )
         .expect("load");
 
+        let generation = current_generation_dir(temp.path());
         let metadata: GithubMetaCacheMetadata = serde_json::from_slice(
             &read_bytes_with_limit(
-                &temp.path().join(GITHUB_META_META_CACHE_FILE),
+                &generation.join(super::GENERATION_META_FILE),
                 GITHUB_META_META_READ_LIMIT,
             )
             .expect("read metadata"),
@@ -861,7 +979,7 @@ mod tests {
 
         let sidecar: GithubMetaCategorySidecar = serde_json::from_slice(
             &read_bytes_with_limit(
-                &temp.path().join(GITHUB_META_CATEGORY_CACHE_FILE),
+                &generation.join(super::GENERATION_CATEGORY_FILE),
                 GITHUB_META_CATEGORY_READ_LIMIT,
             )
             .expect("read sidecar"),
@@ -870,7 +988,83 @@ mod tests {
         assert_eq!(sidecar.mode, "selected");
         assert_eq!(sidecar.categories, vec!["hooks".to_string()]);
 
-        assert!(temp.path().join(GITHUB_META_RAW_CACHE_FILE).exists());
+        assert!(generation.join(super::GENERATION_RAW_FILE).exists());
+    }
+
+    #[test]
+    fn corrupt_current_generation_falls_back_to_previous_then_legacy() {
+        let temp = TempDir::new().expect("tempdir");
+        let mode = GithubMetaCategoryMode::Explicit(vec!["hooks".to_string()]);
+        load_github_meta_safelist(
+            &MockHttpClient::new(vec![Ok(network_response(br#"{"hooks":["10.0.0.0/24"]}"#))]),
+            temp.path(),
+            TEST_GITHUB_META_URL,
+            &mode,
+            &BTreeMap::new(),
+        )
+        .expect("first generation");
+        load_github_meta_safelist(
+            &MockHttpClient::new(vec![Ok(network_response(
+                br#"{"hooks":["198.51.100.0/24"]}"#,
+            ))]),
+            temp.path(),
+            TEST_GITHUB_META_URL,
+            &mode,
+            &BTreeMap::new(),
+        )
+        .expect("second generation");
+
+        let store = CachePaths::from_cache_dir(temp.path()).generation_store;
+        let candidates = generation_candidates(&store);
+        assert_eq!(candidates.len(), 2);
+        fs::write(
+            candidates[0].directory.join(super::GENERATION_RAW_FILE),
+            b"corrupt",
+        )
+        .expect("corrupt current");
+        let fallback = load_github_meta_safelist(
+            &MockHttpClient::new(vec![Err(HttpClientError::Request {
+                reason: "offline".to_string(),
+            })]),
+            temp.path(),
+            TEST_GITHUB_META_URL,
+            &mode,
+            &BTreeMap::new(),
+        )
+        .expect("previous fallback");
+        assert_eq!(fallback.source, GithubMetaSource::FallbackCache);
+        assert_eq!(fallback.networks[0].to_string(), "10.0.0.0/24");
+
+        fs::write(
+            candidates[1].directory.join(super::GENERATION_RAW_FILE),
+            b"also corrupt",
+        )
+        .expect("corrupt previous");
+        fs::write(
+            temp.path().join(GITHUB_META_RAW_CACHE_FILE),
+            br#"{"hooks":["203.0.113.0/24"]}"#,
+        )
+        .expect("write legacy raw");
+        fs::write(
+            temp.path().join(GITHUB_META_CATEGORY_CACHE_FILE),
+            serde_json::to_vec_pretty(&GithubMetaCategorySidecar {
+                mode: "selected".to_string(),
+                categories: vec!["hooks".to_string()],
+            })
+            .expect("serialize legacy sidecar"),
+        )
+        .expect("write legacy sidecar");
+        let fallback = load_github_meta_safelist(
+            &MockHttpClient::new(vec![Err(HttpClientError::Request {
+                reason: "offline".to_string(),
+            })]),
+            temp.path(),
+            TEST_GITHUB_META_URL,
+            &mode,
+            &BTreeMap::new(),
+        )
+        .expect("legacy fallback");
+        assert_eq!(fallback.networks[0].to_string(), "203.0.113.0/24");
     }
 
     #[test]

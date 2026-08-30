@@ -9,6 +9,7 @@ use kidobo_app::doctor::{CacheReadiness, DoctorProbe, ProbeFailure};
 use crate::command_common::find_executable_in_path;
 use crate::command_runner::{CommandExecutor, SudoCommandRunner, SystemCommandExecutor};
 
+/// Production read-only doctor probes backed by filesystem inspection and bounded commands.
 #[derive(Debug)]
 pub struct SystemDoctorProbe<R = SudoCommandRunner<SystemCommandExecutor>> {
     runner: R,
@@ -16,6 +17,7 @@ pub struct SystemDoctorProbe<R = SudoCommandRunner<SystemCommandExecutor>> {
 
 impl<R> SystemDoctorProbe<R> {
     #[must_use]
+    /// Creates a doctor probe around the supplied command runner.
     pub fn new(runner: R) -> Self {
         Self { runner }
     }

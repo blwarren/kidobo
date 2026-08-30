@@ -1,3 +1,5 @@
+//! Deterministic parsing and mutation planning for the local blocklist.
+
 use std::collections::{BTreeSet, HashSet};
 
 use crate::network::{
@@ -5,21 +7,30 @@ use crate::network::{
     split_by_family,
 };
 
+/// Error returned when an operator-supplied ban or unban target is invalid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlocklistTargetParseError {
+    /// The target is not exactly one valid IP address or CIDR.
     Invalid,
 }
 
+/// A non-comment blocklist line that could not be parsed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InvalidBlocklistLine {
+    /// One-based line number in the original document.
     pub line_number: usize,
+    /// Original invalid line contents.
     pub content: String,
 }
 
+/// Parsed blocklist contents with enough structure to render canonical output.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlocklistDocument {
+    /// Original lines paired with any canonical CIDR they contain.
     pub lines: Vec<BlocklistLine>,
+    /// Whether the source document contained any bytes.
     pub has_content: bool,
+    /// Whether the source document ended in a newline.
     pub trailing_newline: bool,
 }
 
@@ -45,6 +56,8 @@ impl BlocklistDocument {
         })
     }
 
+    /// Renders the preserved header followed by sorted, collapsed CIDRs.
+    #[must_use]
     pub fn canonicalized_contents(&self) -> String {
         let mut header_lines = Vec::new();
         let mut entries = Vec::new();
@@ -84,9 +97,12 @@ impl BlocklistDocument {
     }
 }
 
+/// One original blocklist line and its optional canonical CIDR.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlocklistLine {
+    /// Unmodified line contents.
     pub original: String,
+    /// Parsed CIDR, or `None` for a blank or comment line.
     pub canonical: Option<CanonicalCidr>,
 }
 
@@ -115,15 +131,21 @@ impl BlocklistLine {
     }
 }
 
+/// Result of comparing a requested ban target with the current blocklist.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BanClassification {
+    /// The target was not already present and should be added.
     Added(CanonicalCidr),
+    /// The target is an exact duplicate of an existing or earlier requested entry.
     AlreadyPresent(CanonicalCidr),
 }
 
+/// Exact and overlapping line indexes affected by an unban request.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct UnbanIndexPlan {
+    /// Zero-based indexes that exactly equal a requested target.
     pub exact_indexes: Vec<usize>,
+    /// Zero-based indexes that overlap but do not exactly equal a target.
     pub partial_indexes: Vec<usize>,
 }
 
@@ -139,6 +161,7 @@ pub fn parse_blocklist_target(input: &str) -> Result<CanonicalCidr, BlocklistTar
 }
 
 #[must_use]
+/// Classifies ban targets in input order, treating earlier new targets as present.
 pub fn classify_ban_targets(
     existing: &[CanonicalCidr],
     targets: &[CanonicalCidr],
@@ -158,11 +181,15 @@ pub fn classify_ban_targets(
 }
 
 #[must_use]
+/// Plans removal of one target without mutating the parsed document.
 pub fn plan_unban(entries: &[Option<CanonicalCidr>], target: CanonicalCidr) -> UnbanIndexPlan {
     plan_unban_many(entries, &[target])
 }
 
 #[must_use]
+/// Plans exact removals and partial-overlap warnings for multiple targets.
+///
+/// Returned indexes are sorted and unique; exact matches are excluded from the partial list.
 pub fn plan_unban_many(
     entries: &[Option<CanonicalCidr>],
     targets: &[CanonicalCidr],
@@ -195,6 +222,7 @@ pub fn plan_unban_many(
 }
 
 #[must_use]
+/// Returns sorted zero-based indexes exactly matching any requested target.
 pub fn exact_match_indexes(
     entries: &[Option<CanonicalCidr>],
     targets: &[CanonicalCidr],

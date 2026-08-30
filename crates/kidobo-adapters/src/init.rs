@@ -13,6 +13,7 @@ use crate::command_runner::{
 };
 use crate::limited_io::write_string_atomic;
 
+/// Command boundary used for systemd initialization.
 pub trait InitCommandRunner {
     /// Runs one noninteractive system command.
     ///
@@ -28,6 +29,7 @@ impl<E: CommandExecutor> InitCommandRunner for SudoCommandRunner<E> {
     }
 }
 
+/// Filesystem provisioner with an injected runner for live systemd operations.
 #[derive(Debug)]
 pub struct FileInitProvisioner<R> {
     runner: R,
@@ -35,6 +37,7 @@ pub struct FileInitProvisioner<R> {
 
 impl<R> FileInitProvisioner<R> {
     #[must_use]
+    /// Creates an initialization provisioner around the supplied command runner.
     pub fn new(runner: R) -> Self {
         Self { runner }
     }
@@ -46,6 +49,7 @@ impl Default for FileInitProvisioner<SudoCommandRunner<SystemCommandExecutor>> {
     }
 }
 
+/// Production initialization provisioner using noninteractive bounded sudo commands.
 pub type SystemInitProvisioner = FileInitProvisioner<SudoCommandRunner<SystemCommandExecutor>>;
 
 impl<R: InitCommandRunner> InitProvisioner for FileInitProvisioner<R> {

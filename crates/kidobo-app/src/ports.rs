@@ -1,3 +1,5 @@
+//! Application ports implemented by operating-system and network adapters.
+
 use std::path::Path;
 
 use kidobo_core::config::Config;
@@ -5,6 +7,7 @@ use kidobo_core::config::Config;
 use crate::error::AppError;
 use crate::paths::{ConfigRequirement, PathResolutionInput, ResolvedPaths};
 
+/// Resolves all runtime locations before a command workflow begins.
 pub trait PathResolver {
     /// Resolves compatibility-sensitive runtime paths.
     ///
@@ -19,6 +22,7 @@ pub trait PathResolver {
     ) -> Result<ResolvedPaths, AppError>;
 }
 
+/// Loads validated configuration without exposing filesystem details to workflows.
 pub trait ConfigRepository {
     /// Loads validated configuration from `path`.
     ///
@@ -28,8 +32,12 @@ pub trait ConfigRepository {
     fn load(&self, path: &Path) -> Result<Config, AppError>;
 }
 
+/// Lifetime guard for an acquired Kidobo process lock.
+///
+/// Implementations release the lock when the guard is dropped.
 pub trait LockGuard {}
 
+/// Acquires the process-wide workflow lock without blocking.
 pub trait LockManager {
     /// Acquires the nonblocking process lock at `path`.
     ///
@@ -39,6 +47,7 @@ pub trait LockManager {
     fn acquire(&self, path: &Path) -> Result<Box<dyn LockGuard>, AppError>;
 }
 
+/// Reads operator-provided line-oriented target files through a bounded adapter.
 pub trait TargetFileReader {
     /// Reads bounded line-oriented targets from `path`.
     ///

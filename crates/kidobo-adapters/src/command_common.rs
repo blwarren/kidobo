@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 
 use crate::command_runner::{CommandResult, ProcessStatus};
 
+/// Renders a command and its arguments for bounded operator diagnostics.
 pub fn display_command<S: AsRef<str>>(command: &str, args: &[S]) -> String {
     if args.is_empty() {
         command.to_string()
@@ -17,6 +18,7 @@ pub fn display_command<S: AsRef<str>>(command: &str, args: &[S]) -> String {
 }
 
 #[must_use]
+/// Finds the first regular executable file named `binary` in an explicit native `PATH` value.
 pub fn find_executable_in_path(binary: &str, path: Option<OsString>) -> Option<PathBuf> {
     let path = path?;
     env::split_paths(&path)

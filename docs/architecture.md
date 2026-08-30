@@ -19,9 +19,8 @@ kidobo-adapters
   └── kidobo-core
 ```
 
-`kidobo-core` performs no filesystem, network, process, clock, or terminal I/O. Its disabled-feature
-`reqwest` dependency is used only for the existing URL parser type; HTTP clients and transport remain in
-`kidobo-adapters`.
+`kidobo-core` performs no filesystem, network, process, clock, or terminal I/O. It uses `url::Url` only
+for deterministic configuration validation; HTTP clients and transport remain in `kidobo-adapters`.
 
 `kidobo-app` owns command sequencing and failure policy. Its public-in-workspace interfaces are typed
 requests, typed outcomes, focused capability ports, and internal source registries. It never depends on
@@ -82,8 +81,28 @@ The application sync use case explicitly preserves this order:
 8. Best-effort clean disabled-family artifacts.
 
 The enforcement adapter retains the 31-character ipset name constraint, temporary restore-and-swap
-replacement, per-set atomicity, and fail-closed chain and INPUT jump ordering. Tests use recording ports and
-scripted command runners; development validation must never invoke live firewall or systemd mutations.
+replacement, per-set atomicity, and fail-closed chain and INPUT jump ordering. To normalize a family's
+shared `INPUT` chain without numeric-position deletion, it temporarily creates `kidobo-input-stage`, points
+that chain at `kidobo-input`, and activates the staging jump before replacing stable jumps by exact rule
+specification. A successful activation leaves exactly one stable jump at position 1 and removes the staging
+jump and chain. Cleanup handles both names so an interrupted prior activation cannot leave unmanaged
+artifacts. Tests use recording ports and scripted command runners; development validation must never invoke
+live firewall or systemd mutations.
+
+## Remote cache generations
+
+Validated remote-feed and GitHub metadata writes use a private generation adapter. A complete generation is
+written and synced in a sibling staging directory, atomically published under its content SHA-256 ID, then
+selected by an atomically replaced and synced `current.json` manifest. Remote feeds are stored below
+`v2/remote/<url-hash>/generations/<sha256>/`; GitHub metadata is stored below
+`v2/github-meta/generations/<sha256>/`. Each manifest names a current and optional previous generation.
+
+Readers validate the manifest, generation identifiers, bounded members, configured URL, checksums, and
+GitHub category scope before accepting data. They try current, then previous, then the legacy flat-file
+layout. New writes use only v2, while legacy files remain readable and unchanged for compatibility. After a
+successful commit, only the current and previous generations are retained; incomplete staging directories
+are never selected. Normal cache flush removes the containing remote-cache directory and therefore both
+layouts.
 
 ## Validation and release
 

@@ -26,6 +26,7 @@ enum LookupSourceLoadError {
     Asn(#[from] AsnError),
 }
 
+/// Offline provider for the operator-managed local blocklist.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct LocalBlocklistLookupProvider;
 
@@ -47,6 +48,7 @@ impl OfflineLookupProvider for LocalBlocklistLookupProvider {
     }
 }
 
+/// Offline provider for validated v2 and legacy remote-feed caches.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct RemoteCacheLookupProvider;
 
@@ -80,6 +82,7 @@ impl OfflineLookupProvider for RemoteCacheLookupProvider {
     }
 }
 
+/// Offline provider for explicit configuration safelist entries.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ConfigSafelistLookupProvider;
 
@@ -100,6 +103,7 @@ impl OfflineLookupProvider for ConfigSafelistLookupProvider {
     }
 }
 
+/// Offline provider for a validated GitHub metadata cache.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct GithubMetaLookupProvider;
 
@@ -134,6 +138,7 @@ impl OfflineLookupProvider for GithubMetaLookupProvider {
     }
 }
 
+/// Offline provider for non-empty configured ASN caches.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct AsnCacheLookupProvider;
 

@@ -1,3 +1,5 @@
+//! Ordered, fail-closed synchronization workflow and its enforcement port.
+
 use kidobo_core::AddressFamily;
 use kidobo_core::config::{Config, FirewallAction};
 use kidobo_core::network::CanonicalCidr;
@@ -8,26 +10,39 @@ use crate::paths::{ConfigRequirement, PathResolutionInput};
 use crate::ports::{ConfigRepository, LockManager, PathResolver};
 use crate::source::{FailurePolicy, Notice, SourceRole, SyncSourceContext, SyncSourceRegistry};
 
+/// Validated kernel-set parameters for one address family.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManagedSetSpec {
+    /// Address family owned by the set.
     pub family: AddressFamily,
+    /// Compatibility-sensitive kernel set name.
     pub set_name: String,
+    /// Kernel set type.
     pub set_type: String,
+    /// Initial kernel hash table size.
     pub hashsize: u32,
+    /// Maximum permitted entries.
     pub maxelem: u32,
+    /// Kernel entry timeout; zero disables expiry.
     pub timeout: u32,
 }
 
+/// Complete family-separated firewall and ipset enforcement plan.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnforcementPlan {
+    /// IPv4 managed-set specification.
     pub ipv4: ManagedSetSpec,
+    /// IPv6 managed-set specification, used only when enabled.
     pub ipv6: ManagedSetSpec,
+    /// Whether IPv6 artifacts should be enforced rather than cleaned up.
     pub enable_ipv6: bool,
+    /// Firewall verdict used by each managed chain rule.
     pub chain_action: FirewallAction,
 }
 
 impl EnforcementPlan {
     #[must_use]
+    /// Builds an enforcement plan from validated configuration.
     pub fn from_config(config: &Config) -> Self {
         Self {
             ipv4: ManagedSetSpec {
@@ -52,6 +67,7 @@ impl EnforcementPlan {
     }
 }
 
+/// Side-effect boundary for atomic set replacement and fail-closed firewall wiring.
 pub trait EnforcementBackend {
     /// Ensures inactive managed sets and chains exist without enabling new wiring.
     ///
@@ -76,36 +92,58 @@ pub trait EnforcementBackend {
     /// Returns an error when fail-closed wiring cannot be established or normalized.
     fn activate(&self, plan: &EnforcementPlan) -> Result<(), AppError>;
 
+    /// Best-effort removal of managed IPv6 artifacts when IPv6 is disabled.
+    ///
+    /// All scoped cleanup steps must be attempted; incomplete steps are returned as notices.
     fn cleanup_disabled_ipv6(&self, plan: &EnforcementPlan) -> Vec<Notice>;
 }
 
+/// Observer for stable workflow stage markers and operator notices.
 pub trait SyncObserver {
+    /// Records completion of a named ordered synchronization stage.
     fn stage_completed(&self, stage: &'static str);
 
+    /// Records a notice without changing workflow error policy.
     fn notice(&self, notice: &Notice);
 }
 
+/// Outcome summary for one registered synchronization source.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceSummary {
+    /// Stable provider identifier.
     pub id: &'static str,
+    /// Candidate or safelist role.
     pub role: SourceRole,
+    /// Number of networks loaded, or zero after a best-effort failure.
     pub entries: usize,
+    /// Whether the provider produced a usable batch.
     pub loaded: bool,
 }
 
+/// Successful synchronization result.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncOutcome {
+    /// Number of effective IPv4 CIDRs installed.
     pub ipv4_entries: usize,
+    /// Number of effective IPv6 CIDRs installed.
     pub ipv6_entries: usize,
+    /// Per-provider load summaries in registry order.
     pub sources: Vec<SourceSummary>,
 }
 
+/// Ports and registries required by the synchronization workflow.
 pub struct SyncDependencies<'a> {
+    /// Runtime path resolver.
     pub paths: &'a dyn PathResolver,
+    /// Validated configuration repository.
     pub configs: &'a dyn ConfigRepository,
+    /// Nonblocking process lock manager.
     pub locks: &'a dyn LockManager,
+    /// Ordered source registry.
     pub sources: &'a SyncSourceRegistry,
+    /// Atomic set and fail-closed firewall backend.
     pub enforcement: &'a dyn EnforcementBackend,
+    /// Workflow event observer.
     pub observer: &'a dyn SyncObserver,
 }
 

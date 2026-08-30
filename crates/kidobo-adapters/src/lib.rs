@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 #![deny(dead_code)]
+#![deny(missing_docs)]
 #![deny(clippy::all)]
 #![warn(clippy::pedantic)]
 #![cfg_attr(
@@ -37,6 +38,7 @@
 pub mod asn;
 pub mod blocklist_file;
 pub mod blocklist_operations;
+mod cache_generation;
 pub mod cached_fetch;
 pub mod cached_sources;
 pub mod command_common;

@@ -16,6 +16,7 @@ use crate::iptables::{
     ensure_firewall_wiring_for_families,
 };
 
+/// Enforcement backend using injected ipset and firewall command runners.
 #[derive(Debug)]
 pub struct CommandEnforcementBackend<R> {
     runner: R,
@@ -23,6 +24,7 @@ pub struct CommandEnforcementBackend<R> {
 
 impl<R> CommandEnforcementBackend<R> {
     #[must_use]
+    /// Creates an enforcement backend around the supplied runner.
     pub fn new(runner: R) -> Self {
         Self { runner }
     }
@@ -34,6 +36,7 @@ impl Default for CommandEnforcementBackend<SudoCommandRunner<SystemCommandExecut
     }
 }
 
+/// Production enforcement backend using noninteractive bounded sudo commands.
 pub type SystemEnforcementBackend =
     CommandEnforcementBackend<SudoCommandRunner<SystemCommandExecutor>>;
 

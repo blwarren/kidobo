@@ -434,6 +434,132 @@ fn uninstall_removes_scoped_artifacts_after_successful_flush() {
 }
 
 #[test]
+fn uninstall_canonicalizes_scoped_root_without_touching_siblings() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().join("root");
+    let root_alias = root.join("unused").join("..");
+    let sibling = temp.path().join("keep");
+    let install_dir = temp.path().join("bin");
+    let binary = install_dir.join("kidobo");
+    write_executable(&binary, "#!/usr/bin/env bash\nexit 0\n");
+    for directory in ["config", "data", "cache", "systemd/system"] {
+        fs::create_dir_all(root.join(directory)).expect("mkdir artifact");
+    }
+    fs::create_dir_all(&sibling).expect("mkdir sibling");
+    fs::write(sibling.join("sentinel"), "preserve").expect("write sentinel");
+
+    let status = Command::new("bash")
+        .arg("-c")
+        .arg("source \"$INSTALLER\"; run_flush_best_effort() { return 0; }; uninstall_artifacts")
+        .env("INSTALLER", installer_path())
+        .env("KIDOBO_ROOT", &root_alias)
+        .env("KIDOBO_INSTALL_DIR", &install_dir)
+        .status()
+        .expect("run bash");
+
+    assert!(status.success());
+    assert!(!binary.exists());
+    assert!(!root.join("config").exists());
+    assert!(!root.join("data").exists());
+    assert!(!root.join("cache").exists());
+    assert_eq!(
+        read_to_string_with_limit(&sibling.join("sentinel"), FIXTURE_FILE_READ_LIMIT),
+        "preserve"
+    );
+}
+
+#[test]
+fn uninstall_rejects_root_aliases_before_cleanup() {
+    let temp = TempDir::new().expect("tempdir");
+    let root_symlink = temp.path().join("root-alias");
+    std::os::unix::fs::symlink("/", &root_symlink).expect("symlink to root");
+    let cleanup_marker = temp.path().join("cleanup-started");
+
+    let roots = [
+        "/.".to_string(),
+        "//".to_string(),
+        "/tmp/..".to_string(),
+        root_symlink.display().to_string(),
+    ];
+
+    for root in roots {
+        let _remove_result = fs::remove_file(&cleanup_marker);
+        let status = Command::new("bash")
+            .arg("-c")
+            .arg(
+                "source \"$INSTALLER\"; \
+                 run_flush_best_effort() { : > \"$CLEANUP_MARKER\"; return 0; }; \
+                 remove_path() { : > \"$CLEANUP_MARKER\"; }; \
+                 uninstall_artifacts",
+            )
+            .env("INSTALLER", installer_path())
+            .env("CLEANUP_MARKER", &cleanup_marker)
+            .env("KIDOBO_ROOT", &root)
+            .env("KIDOBO_INSTALL_DIR", temp.path().join("bin"))
+            .status()
+            .expect("run bash");
+
+        assert_eq!(status.code(), Some(1), "root alias was accepted: {root}");
+        assert!(
+            !cleanup_marker.exists(),
+            "cleanup began for rejected root alias: {root}"
+        );
+    }
+}
+
+#[test]
+fn uninstall_rejects_explicit_empty_root_before_cleanup() {
+    let temp = TempDir::new().expect("tempdir");
+    let cleanup_marker = temp.path().join("cleanup-started");
+
+    let status = Command::new("bash")
+        .arg("-c")
+        .arg(
+            "source \"$INSTALLER\"; \
+             run_flush_best_effort() { : > \"$CLEANUP_MARKER\"; return 0; }; \
+             remove_path() { : > \"$CLEANUP_MARKER\"; }; \
+             uninstall_artifacts",
+        )
+        .env("INSTALLER", installer_path())
+        .env("CLEANUP_MARKER", &cleanup_marker)
+        .env("KIDOBO_ROOT", "")
+        .env("KIDOBO_INSTALL_DIR", temp.path().join("bin"))
+        .status()
+        .expect("run bash");
+
+    assert_eq!(status.code(), Some(1));
+    assert!(!cleanup_marker.exists());
+}
+
+#[test]
+fn uninstall_rejects_override_when_realpath_is_unavailable() {
+    let temp = TempDir::new().expect("tempdir");
+    let fake_bin = temp.path().join("fake-bin");
+    fs::create_dir_all(&fake_bin).expect("create fake bin");
+    std::os::unix::fs::symlink("/usr/bin/rm", fake_bin.join("rm")).expect("link rm");
+    let cleanup_marker = temp.path().join("cleanup-started");
+
+    let status = Command::new("/bin/bash")
+        .arg("-c")
+        .arg(
+            "source \"$INSTALLER\"; \
+             run_flush_best_effort() { : > \"$CLEANUP_MARKER\"; return 0; }; \
+             remove_path() { : > \"$CLEANUP_MARKER\"; }; \
+             uninstall_artifacts",
+        )
+        .env("INSTALLER", installer_path())
+        .env("CLEANUP_MARKER", &cleanup_marker)
+        .env("KIDOBO_ROOT", temp.path().join("root"))
+        .env("KIDOBO_INSTALL_DIR", temp.path().join("bin"))
+        .env("PATH", &fake_bin)
+        .status()
+        .expect("run bash");
+
+    assert_eq!(status.code(), Some(1));
+    assert!(!cleanup_marker.exists());
+}
+
+#[test]
 fn uninstall_real_fallback_cleans_both_families_and_default_sets() {
     let temp = TempDir::new().expect("tempdir");
     let root = temp.path().join("root");
@@ -460,10 +586,16 @@ fn uninstall_real_fallback_cleans_both_families_and_default_sets() {
     assert!(status.success());
     let transcript = read_to_string_with_limit(&cleanup_log, FIXTURE_FILE_READ_LIMIT);
     for expected in [
+        "iptables -w 5 -D INPUT -j kidobo-input-stage",
         "iptables -w 5 -D INPUT -j kidobo-input",
+        "iptables -w 5 -F kidobo-input-stage",
+        "iptables -w 5 -X kidobo-input-stage",
         "iptables -w 5 -F kidobo-input",
         "iptables -w 5 -X kidobo-input",
+        "ip6tables -w 5 -D INPUT -j kidobo-input-stage",
         "ip6tables -w 5 -D INPUT -j kidobo-input",
+        "ip6tables -w 5 -F kidobo-input-stage",
+        "ip6tables -w 5 -X kidobo-input-stage",
         "ip6tables -w 5 -F kidobo-input",
         "ip6tables -w 5 -X kidobo-input",
         "ipset destroy kidobo",

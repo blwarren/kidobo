@@ -15,6 +15,7 @@ use nix::unistd::Pid;
 use crate::command_common::display_command;
 use crate::limited_io::read_to_end_with_limit;
 
+/// Default upper bound for one external command.
 pub const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const PRODUCTION_COMMAND_OUTPUT_LIMIT: usize = 16 * 1024 * 1024;
 #[cfg(not(test))]
@@ -22,30 +23,43 @@ const DEFAULT_COMMAND_OUTPUT_LIMIT: usize = PRODUCTION_COMMAND_OUTPUT_LIMIT;
 #[cfg(test)]
 const DEFAULT_COMMAND_OUTPUT_LIMIT: usize = 1024 * 1024;
 
+/// Program, arguments, and time bound for one subprocess execution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandRequest {
+    /// Program name or path.
     pub program: String,
+    /// Arguments passed without shell interpretation.
     pub args: Vec<String>,
+    /// Maximum execution duration.
     pub timeout: Duration,
 }
 
+/// Bounded subprocess status and lossy UTF-8 output.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandResult {
+    /// Portable process termination state.
     pub status: ProcessStatus,
+    /// Bounded standard output.
     pub stdout: String,
+    /// Bounded standard error.
     pub stderr: String,
 }
 
+/// Portable process termination state used by command adapters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessStatus {
+    /// Process exited normally with this code.
     Exited(i32),
     #[cfg(unix)]
+    /// Process terminated after receiving this signal number.
     Signaled(i32),
+    /// Platform status was neither a normal exit nor a recognized Unix signal.
     Other,
 }
 
 impl ProcessStatus {
     #[must_use]
+    /// Returns the normal exit code, if available.
     pub fn code(self) -> Option<i32> {
         match self {
             Self::Exited(code) => Some(code),
@@ -56,6 +70,7 @@ impl ProcessStatus {
     }
 
     #[must_use]
+    /// Returns true only for a normal zero exit.
     pub fn success(self) -> bool {
         matches!(self, Self::Exited(0))
     }
@@ -78,21 +93,47 @@ impl ProcessStatus {
     }
 }
 
+/// Failure while starting, supervising, or collecting a bounded subprocess.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum CommandRunnerError {
+    /// The operating system refused to start the process.
     #[error("failed to spawn command `{command}`: {reason}")]
-    Spawn { command: String, reason: String },
+    Spawn {
+        /// Rendered command.
+        command: String,
+        /// Operating-system diagnostic.
+        reason: String,
+    },
 
+    /// Process status polling failed.
     #[error("failed to poll command `{command}`: {reason}")]
-    Poll { command: String, reason: String },
+    Poll {
+        /// Rendered command.
+        command: String,
+        /// Operating-system diagnostic.
+        reason: String,
+    },
 
+    /// Bounded output collection failed.
     #[error("failed to read output for command `{command}`: {reason}")]
-    Output { command: String, reason: String },
+    Output {
+        /// Rendered command.
+        command: String,
+        /// Pipe, size-bound, or reader diagnostic.
+        reason: String,
+    },
 
+    /// The process exceeded its deadline and was terminated.
     #[error("command `{command}` timed out after {timeout_ms} ms")]
-    Timeout { command: String, timeout_ms: u64 },
+    Timeout {
+        /// Rendered command.
+        command: String,
+        /// Configured timeout in milliseconds.
+        timeout_ms: u64,
+    },
 }
 
+/// Executes bounded subprocess requests without a shell.
 pub trait CommandExecutor {
     /// Executes one bounded command request.
     ///
@@ -103,6 +144,7 @@ pub trait CommandExecutor {
     fn execute(&self, request: &CommandRequest) -> Result<CommandResult, CommandRunnerError>;
 }
 
+/// Production executor using operating-system subprocess APIs.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SystemCommandExecutor;
 
@@ -229,6 +271,7 @@ fn best_effort_join_output_reader(handle: thread::JoinHandle<std::io::Result<Vec
     let _join_result = handle.join();
 }
 
+/// Command runner that prepends noninteractive `sudo -n` to every request.
 #[derive(Debug)]
 pub struct SudoCommandRunner<E: CommandExecutor> {
     executor: E,
@@ -236,6 +279,7 @@ pub struct SudoCommandRunner<E: CommandExecutor> {
 }
 
 impl<E: CommandExecutor> SudoCommandRunner<E> {
+    /// Wraps an executor with the specified default command timeout.
     pub fn new(executor: E, default_timeout: Duration) -> Self {
         Self {
             executor,

@@ -1,3 +1,5 @@
+//! Family-separated parsing, interval arithmetic, collapse, and safelist subtraction.
+
 use std::net::IpAddr;
 
 pub use crate::network_types::{CanonicalCidr, FamilyCidrs, Ipv4Cidr, Ipv6Cidr};
@@ -30,6 +32,9 @@ impl From<Ipv6Cidr> for IntervalU128 {
 }
 
 #[must_use]
+/// Parses the first whitespace-delimited token as an IP address or CIDR.
+///
+/// Host addresses become `/32` or `/128`; invalid input returns `None`.
 pub fn parse_ip_cidr_non_strict(input: &str) -> Option<CanonicalCidr> {
     let token = input.split_whitespace().next()?.trim();
     if token.is_empty() {
@@ -40,6 +45,9 @@ pub fn parse_ip_cidr_non_strict(input: &str) -> Option<CanonicalCidr> {
 }
 
 #[must_use]
+/// Parses exactly one IP address or CIDR after trimming surrounding whitespace.
+///
+/// Embedded whitespace or invalid input returns `None`.
 pub fn parse_ip_cidr_strict(input: &str) -> Option<CanonicalCidr> {
     let normalized = input.trim();
     if normalized.is_empty() {
@@ -53,6 +61,8 @@ pub fn parse_ip_cidr_strict(input: &str) -> Option<CanonicalCidr> {
     parse_ip_cidr_token(normalized)
 }
 
+/// Parses an already isolated IP-address or CIDR token into canonical network form.
+#[must_use]
 pub fn parse_ip_cidr_token(token: &str) -> Option<CanonicalCidr> {
     if let Ok(ip) = token.parse::<IpAddr>() {
         return Some(match ip {
@@ -71,6 +81,7 @@ pub fn parse_ip_cidr_token(token: &str) -> Option<CanonicalCidr> {
     }
 }
 
+/// Parses the first token from each input and discards invalid inputs.
 pub fn parse_lines_non_strict<I, S>(inputs: I) -> Vec<CanonicalCidr>
 where
     I: IntoIterator<Item = S>,
@@ -83,6 +94,9 @@ where
 }
 
 #[must_use]
+/// Separates canonical CIDRs into independent IPv4 and IPv6 vectors.
+///
+/// Relative order within each family is preserved.
 pub fn split_by_family(cidrs: &[CanonicalCidr]) -> FamilyCidrs {
     let mut separated = FamilyCidrs::default();
 
@@ -96,12 +110,16 @@ pub fn split_by_family(cidrs: &[CanonicalCidr]) -> FamilyCidrs {
     separated
 }
 
+/// Merges overlapping or adjacent IPv4 ranges and emits minimal canonical CIDRs.
+#[must_use]
 pub fn collapse_ipv4(cidrs: &[Ipv4Cidr]) -> Vec<Ipv4Cidr> {
     let intervals = cidrs.iter().copied().map(IntervalU32::from).collect();
     let merged = merge_intervals_u32_owned(intervals);
     intervals_to_ipv4_cidrs_from_merged(&merged)
 }
 
+/// Merges overlapping or adjacent IPv6 ranges and emits minimal canonical CIDRs.
+#[must_use]
 pub fn collapse_ipv6(cidrs: &[Ipv6Cidr]) -> Vec<Ipv6Cidr> {
     let intervals = cidrs.iter().copied().map(IntervalU128::from).collect();
     let merged = merge_intervals_u128_owned(intervals);
@@ -134,6 +152,8 @@ pub(crate) fn merge_intervals_u128(intervals: &[IntervalU128]) -> Vec<IntervalU1
     merge_intervals_u128_owned(intervals.to_vec())
 }
 
+/// Removes all safelisted IPv4 addresses and returns minimal canonical CIDRs.
+#[must_use]
 pub fn subtract_safelist_ipv4(candidates: &[Ipv4Cidr], safelist: &[Ipv4Cidr]) -> Vec<Ipv4Cidr> {
     let candidate_intervals = merge_intervals_u32_owned(
         candidates
@@ -154,6 +174,8 @@ pub fn subtract_safelist_ipv4(candidates: &[Ipv4Cidr], safelist: &[Ipv4Cidr]) ->
     intervals_to_ipv4_cidrs_from_merged(&carved)
 }
 
+/// Removes all safelisted IPv6 addresses and returns minimal canonical CIDRs.
+#[must_use]
 pub fn subtract_safelist_ipv6(candidates: &[Ipv6Cidr], safelist: &[Ipv6Cidr]) -> Vec<Ipv6Cidr> {
     let candidate_intervals = merge_intervals_u128_owned(
         candidates
@@ -187,6 +209,9 @@ pub(crate) fn intervals_to_ipv6_cidrs(intervals: &[IntervalU128]) -> Vec<Ipv6Cid
 }
 
 #[must_use]
+/// Returns whether two same-family CIDRs share at least one address.
+///
+/// CIDRs from different address families never overlap.
 pub fn cidr_overlaps(a: CanonicalCidr, b: CanonicalCidr) -> bool {
     match (a, b) {
         (CanonicalCidr::V4(left), CanonicalCidr::V4(right)) => {

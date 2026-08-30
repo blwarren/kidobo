@@ -993,10 +993,10 @@ dependencies = [
 name = "kidobo-core"
 version = "0.0.0"
 dependencies = [
- "reqwest",
  "serde",
  "thiserror",
  "toml_edit",
+ "url",
 ]
 
 [[package]]

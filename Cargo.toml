@@ -30,6 +30,7 @@ sha2 = "0.11"
 tempfile = "3"
 thiserror = "2"
 toml_edit = { version = "0.25", features = ["serde"] }
+url = "2.5"
 
 [workspace.lints.rust]
 dead_code = "deny"

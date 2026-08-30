@@ -7,10 +7,10 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
-reqwest.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 toml_edit.workspace = true
+url.workspace = true
 
 [lints]
 workspace = true

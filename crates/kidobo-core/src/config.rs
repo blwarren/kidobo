@@ -1,3 +1,5 @@
+//! In-memory TOML configuration parsing, defaults, and validation.
+
 use std::num::NonZeroU32;
 
 use serde::Deserialize;
@@ -10,25 +12,41 @@ use crate::config_validation::{
 };
 use crate::network::CanonicalCidr;
 
+/// Default kernel ipset type used for managed sets.
 pub const DEFAULT_IPSET_TYPE: &str = "hash:net";
+/// Default firewall action for matched addresses.
 pub const DEFAULT_CHAIN_ACTION: FirewallAction = FirewallAction::Drop;
+/// Default ipset hash table size.
 pub const DEFAULT_HASHSIZE: u32 = 65_536;
+/// Default and maximum supported number of entries per managed ipset.
 pub const DEFAULT_MAXELEM: u32 = 500_000;
+/// Default ipset entry timeout; zero means entries do not expire.
 pub const DEFAULT_TIMEOUT: u32 = 0;
+/// Default timeout for a remote source request.
 pub const DEFAULT_REMOTE_TIMEOUT_SECS: u32 = 30;
+/// Default age after which an ASN cache is eligible for refresh.
 pub const DEFAULT_ASN_CACHE_STALE_AFTER_SECS: u32 = 24 * 60 * 60;
+/// Whether GitHub metadata networks are included by default.
 pub const DEFAULT_INCLUDE_GITHUB_META: bool = true;
+/// GitHub metadata categories included when no explicit category list is configured.
 pub const DEFAULT_GITHUB_META_CATEGORIES: [&str; 4] = ["api", "git", "hooks", "packages"];
+/// Default GitHub metadata API endpoint.
 pub const DEFAULT_GITHUB_META_URL: &str = "https://api.github.com/meta";
+/// Maximum accepted remote request timeout.
 pub const REMOTE_TIMEOUT_SECS_MAX: u32 = 3600;
+/// Maximum accepted ASN cache refresh interval.
 pub const ASN_CACHE_STALE_AFTER_SECS_MAX: u32 = 7 * 24 * 60 * 60;
 const LEGACY_REMOTE_CACHE_STALE_AFTER_SECS_MAX: u32 = 7 * 24 * 60 * 60;
 
+/// Validated, non-zero, power-of-two ipset hash table size.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct HashsizePow2(NonZeroU32);
 
 impl HashsizePow2 {
     #[must_use]
+    /// Validates a raw hash size.
+    ///
+    /// Returns `None` for zero or a value that is not a power of two.
     pub fn new(value: u32) -> Option<Self> {
         let non_zero = NonZeroU32::new(value)?;
         if value.is_power_of_two() {
@@ -39,6 +57,7 @@ impl HashsizePow2 {
     }
 
     #[must_use]
+    /// Returns the validated raw value.
     pub fn get(self) -> u32 {
         self.0.get()
     }
@@ -50,11 +69,15 @@ impl From<HashsizePow2> for u32 {
     }
 }
 
+/// Validated, non-zero ipset capacity within Kidobo's supported limit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct MaxElem(NonZeroU32);
 
 impl MaxElem {
     #[must_use]
+    /// Validates a raw capacity.
+    ///
+    /// Returns `None` for zero or a value above [`DEFAULT_MAXELEM`].
     pub fn new(value: u32) -> Option<Self> {
         let non_zero = NonZeroU32::new(value)?;
         if value <= DEFAULT_MAXELEM {
@@ -65,6 +88,7 @@ impl MaxElem {
     }
 
     #[must_use]
+    /// Returns the validated raw value.
     pub fn get(self) -> u32 {
         self.0.get()
     }
@@ -76,11 +100,15 @@ impl From<MaxElem> for u32 {
     }
 }
 
+/// Validated, non-zero remote request timeout in seconds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct RemoteTimeoutSecs(NonZeroU32);
 
 impl RemoteTimeoutSecs {
     #[must_use]
+    /// Validates a raw timeout.
+    ///
+    /// Returns `None` for zero or a value above [`REMOTE_TIMEOUT_SECS_MAX`].
     pub fn new(value: u32) -> Option<Self> {
         let non_zero = NonZeroU32::new(value)?;
         if value <= REMOTE_TIMEOUT_SECS_MAX {
@@ -91,6 +119,7 @@ impl RemoteTimeoutSecs {
     }
 
     #[must_use]
+    /// Returns the validated timeout in seconds.
     pub fn get(self) -> u32 {
         self.0.get()
     }
@@ -102,11 +131,15 @@ impl From<RemoteTimeoutSecs> for u32 {
     }
 }
 
+/// Validated, non-zero ASN cache refresh interval in seconds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct AsnCacheStaleAfterSecs(NonZeroU32);
 
 impl AsnCacheStaleAfterSecs {
     #[must_use]
+    /// Validates a raw refresh interval.
+    ///
+    /// Returns `None` for zero or a value above [`ASN_CACHE_STALE_AFTER_SECS_MAX`].
     pub fn new(value: u32) -> Option<Self> {
         let non_zero = NonZeroU32::new(value)?;
         if value <= ASN_CACHE_STALE_AFTER_SECS_MAX {
@@ -117,6 +150,7 @@ impl AsnCacheStaleAfterSecs {
     }
 
     #[must_use]
+    /// Returns the validated refresh interval in seconds.
     pub fn get(self) -> u32 {
         self.0.get()
     }
@@ -128,61 +162,94 @@ impl From<AsnCacheStaleAfterSecs> for u32 {
     }
 }
 
+/// Complete validated Kidobo configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
+    /// Managed ipset and firewall settings.
     pub ipset: IpsetConfig,
+    /// Networks carved out of the effective blocklist.
     pub safe: SafeConfig,
+    /// Remote blocklist source settings.
     pub remote: RemoteConfig,
+    /// ASN source and cache settings.
     pub asn: AsnConfig,
 }
 
+/// Managed ipset and firewall settings.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IpsetConfig {
+    /// IPv4 ipset name.
     pub set_name: String,
+    /// IPv6 ipset name.
     pub set_name_v6: String,
+    /// Whether IPv6 enforcement is enabled.
     pub enable_ipv6: bool,
+    /// Firewall action applied to set matches.
     pub chain_action: FirewallAction,
+    /// Kernel ipset type, currently constrained to the supported network type.
     pub set_type: String,
+    /// Initial ipset hash table size.
     pub hashsize: HashsizePow2,
+    /// Maximum number of entries in each managed set.
     pub maxelem: MaxElem,
+    /// Kernel timeout assigned to entries; zero disables expiry.
     pub timeout: u32,
 }
 
+/// Firewall verdict applied to a matching address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FirewallAction {
+    /// Silently discard the packet.
     Drop,
+    /// Reject the packet with the firewall's standard response.
     Reject,
 }
 
+/// Safelist and GitHub metadata configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SafeConfig {
+    /// Explicit CIDRs that must be removed from effective blocklists.
     pub ips: Vec<CanonicalCidr>,
+    /// Whether GitHub metadata CIDRs participate in safelisting.
     pub include_github_meta: bool,
+    /// Configured GitHub metadata endpoint.
     pub github_meta_url: String,
+    /// Category selection; `None` uses defaults and an empty list selects all categories.
     pub github_meta_categories: Option<Vec<String>>,
 }
 
+/// Remote blocklist configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteConfig {
+    /// Canonical HTTP or HTTPS source URLs in configured order.
     pub urls: Vec<String>,
+    /// Per-request timeout.
     pub timeout_secs: RemoteTimeoutSecs,
 }
 
+/// Autonomous-system blocklist configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AsnConfig {
+    /// Sorted, unique autonomous-system numbers to block.
     pub banned: Vec<u32>,
+    /// Age after which cached ASN prefixes should be refreshed.
     pub cache_stale_after_secs: AsnCacheStaleAfterSecs,
 }
 
+/// Interpreted GitHub metadata category selection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GithubMetaCategoryMode {
+    /// Use Kidobo's documented default category set.
     Default,
+    /// Accept every network category returned by the endpoint.
     All,
+    /// Accept only the listed category names.
     Explicit(Vec<String>),
 }
 
 impl SafeConfig {
     #[must_use]
+    /// Resolves the compatibility-sensitive optional category representation.
     pub fn github_meta_category_mode(&self) -> GithubMetaCategoryMode {
         match &self.github_meta_categories {
             None => GithubMetaCategoryMode::Default,
@@ -192,16 +259,28 @@ impl SafeConfig {
     }
 }
 
+/// Error produced while parsing or validating configuration text.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum ConfigError {
+    /// The input is not valid TOML or does not match the expected schema.
     #[error("failed to parse TOML config: {reason}")]
-    Parse { reason: String },
+    Parse {
+        /// Parser diagnostic suitable for operator-facing error context.
+        reason: String,
+    },
 
+    /// The required `[ipset]` table is absent.
     #[error("missing required config section `[ipset]`")]
     MissingIpsetSection,
 
+    /// A known field violates its semantic constraints.
     #[error("invalid config value for `{field}`: {reason}")]
-    InvalidField { field: &'static str, reason: String },
+    InvalidField {
+        /// Stable configuration field path.
+        field: &'static str,
+        /// Human-readable validation failure.
+        reason: String,
+    },
 }
 
 #[derive(Debug, Deserialize)]

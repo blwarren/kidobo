@@ -108,7 +108,7 @@ pub(super) fn validate_ipset_set_type(value: &str) -> Result<(), ConfigError> {
 }
 
 pub(super) fn validate_http_url(value: &str, field: &'static str) -> Result<(), ConfigError> {
-    let parsed = reqwest::Url::parse(value).map_err(|_| ConfigError::InvalidField {
+    let parsed = url::Url::parse(value).map_err(|_| ConfigError::InvalidField {
         field,
         reason: "must be a valid http:// or https:// URL with a host".to_string(),
     })?;

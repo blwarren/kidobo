@@ -1,4 +1,7 @@
+//! Registries and contracts for synchronization and offline lookup sources.
+
 use std::collections::BTreeSet;
+use std::ffi::OsString;
 
 use kidobo_core::config::Config;
 use kidobo_core::lookup::LookupSourceEntry;
@@ -7,38 +10,55 @@ use kidobo_core::network::CanonicalCidr;
 use crate::error::AppError;
 use crate::paths::ResolvedPaths;
 
+/// How a synchronization source contributes networks to the effective blocklist.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceRole {
+    /// Networks are candidates for enforcement.
     Candidate,
+    /// Networks are carved out of candidate ranges.
     Safelist,
 }
 
+/// Whether a source failure aborts synchronization.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailurePolicy {
+    /// A usable result is required for synchronization to continue.
     Required,
+    /// A failure becomes an operator-visible warning and synchronization continues.
     BestEffort,
 }
 
+/// Stable metadata controlling a synchronization provider's workflow policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SyncSourceDescriptor {
+    /// Unique stable provider identifier.
     pub id: &'static str,
+    /// Whether networks are candidates or safelist entries.
     pub role: SourceRole,
+    /// Required or best-effort error policy.
     pub failure_policy: FailurePolicy,
 }
 
+/// Operator-visible notice severity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NoticeLevel {
+    /// Informational status that does not indicate degraded behavior.
     Info,
+    /// Warning about degraded or incomplete behavior.
     Warning,
 }
 
+/// Structured application notice rendered by the CLI layer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Notice {
+    /// Notice severity.
     pub level: NoticeLevel,
+    /// Human-readable operator message.
     pub message: String,
 }
 
 impl Notice {
+    /// Creates an informational notice.
     pub fn info(message: impl Into<String>) -> Self {
         Self {
             level: NoticeLevel::Info,
@@ -46,6 +66,7 @@ impl Notice {
         }
     }
 
+    /// Creates a warning notice.
     pub fn warning(message: impl Into<String>) -> Self {
         Self {
             level: NoticeLevel::Warning,
@@ -54,19 +75,28 @@ impl Notice {
     }
 }
 
+/// Networks and notices loaded by one synchronization provider.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SyncSourceBatch {
+    /// Canonical networks in the provider's declared role.
     pub networks: Vec<CanonicalCidr>,
+    /// Operator-visible provider notices.
     pub notices: Vec<Notice>,
 }
 
+/// Read-only context supplied to synchronization providers.
 pub struct SyncSourceContext<'a> {
+    /// Pre-resolved runtime paths.
     pub paths: &'a ResolvedPaths,
+    /// Validated active configuration.
     pub config: &'a Config,
-    pub env: &'a std::collections::BTreeMap<String, String>,
+    /// Recognized Kidobo environment values as native strings.
+    pub env: &'a std::collections::BTreeMap<OsString, OsString>,
 }
 
+/// Provider of one candidate or safelist batch for synchronization.
 pub trait SyncSourceProvider: Send + Sync {
+    /// Returns stable provider identity and workflow policy.
     fn descriptor(&self) -> SyncSourceDescriptor;
 
     /// Loads one batch of candidate or safelist networks.
@@ -78,6 +108,7 @@ pub trait SyncSourceProvider: Send + Sync {
     fn load(&self, context: &SyncSourceContext<'_>) -> Result<SyncSourceBatch, AppError>;
 }
 
+/// Ordered collection of uniquely identified synchronization providers.
 #[derive(Default)]
 pub struct SyncSourceRegistry {
     providers: Vec<Box<dyn SyncSourceProvider>>,
@@ -86,6 +117,7 @@ pub struct SyncSourceRegistry {
 
 impl SyncSourceRegistry {
     #[must_use]
+    /// Creates an empty registry.
     pub fn new() -> Self {
         Self::default()
     }
@@ -112,6 +144,7 @@ impl SyncSourceRegistry {
     }
 
     #[must_use]
+    /// Returns provider descriptors in registration order.
     pub fn descriptors(&self) -> Vec<SyncSourceDescriptor> {
         self.providers
             .iter()
@@ -120,12 +153,17 @@ impl SyncSourceRegistry {
     }
 }
 
+/// Read-only context supplied to offline lookup providers.
 pub struct OfflineLookupContext<'a> {
+    /// Pre-resolved runtime paths.
     pub paths: &'a ResolvedPaths,
+    /// Validated configuration when available; lookup remains usable without it.
     pub config: Option<&'a Config>,
 }
 
+/// Provider of local or cached entries for the offline-only lookup workflow.
 pub trait OfflineLookupProvider: Send + Sync {
+    /// Returns the provider's unique stable identifier.
     fn id(&self) -> &'static str;
 
     /// Appends this provider's offline lookup entries.
@@ -140,6 +178,7 @@ pub trait OfflineLookupProvider: Send + Sync {
     ) -> Result<(), AppError>;
 }
 
+/// Ordered collection of uniquely identified offline lookup providers.
 #[derive(Default)]
 pub struct OfflineLookupRegistry {
     providers: Vec<Box<dyn OfflineLookupProvider>>,
@@ -148,6 +187,7 @@ pub struct OfflineLookupRegistry {
 
 impl OfflineLookupRegistry {
     #[must_use]
+    /// Creates an empty registry.
     pub fn new() -> Self {
         Self::default()
     }
@@ -189,6 +229,7 @@ impl OfflineLookupRegistry {
     }
 
     #[must_use]
+    /// Returns provider IDs in registration order.
     pub fn provider_ids(&self) -> Vec<&'static str> {
         self.providers
             .iter()

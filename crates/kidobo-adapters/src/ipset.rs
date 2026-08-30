@@ -22,9 +22,12 @@ const IPSET_NAME_MAX_LEN: usize = 31;
 #[cfg(test)]
 const RESTORE_SCRIPT_READ_LIMIT: usize = 8_388_608;
 
+/// Kernel address family used when creating an ipset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IpsetFamily {
+    /// IPv4 `inet` family.
     Inet,
+    /// IPv6 `inet6` family.
     Inet6,
 }
 
@@ -37,13 +40,20 @@ impl IpsetFamily {
     }
 }
 
+/// Complete compatibility-sensitive specification for one managed ipset.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IpsetSetSpec {
+    /// Kernel set name, constrained to the 31-character ipset limit.
     pub set_name: String,
+    /// Kernel set type.
     pub set_type: String,
+    /// IPv4 or IPv6 family.
     pub family: IpsetFamily,
+    /// Initial hash table size.
     pub hashsize: u32,
+    /// Maximum entry count.
     pub maxelem: u32,
+    /// Entry timeout; zero disables expiry.
     pub timeout: u32,
 }
 
@@ -53,42 +63,74 @@ struct IpsetSetInfo {
     family: IpsetFamily,
 }
 
+/// Failure while inspecting, preparing, or atomically replacing an ipset.
 #[derive(Debug, Error)]
 pub enum IpsetError {
+    /// Bounded command execution failed.
     #[error("ipset command execution failed: {source}")]
     CommandExecution {
+        /// Underlying command-runner failure.
         #[from]
         source: CommandRunnerError,
     },
 
+    /// An ipset command returned an unsuccessful status.
     #[error("ipset command failed `{command}` with status {status:?}: {stderr}")]
     CommandFailed {
+        /// Rendered command.
         command: String,
+        /// Process termination state.
         status: ProcessStatus,
+        /// Bounded standard error.
         stderr: String,
     },
 
+    /// The complete restore program could not be written and synced.
     #[error("failed to write ipset restore script {path}: {reason}")]
-    WriteRestoreScript { path: PathBuf, reason: String },
+    WriteRestoreScript {
+        /// Temporary restore script path.
+        path: PathBuf,
+        /// Filesystem diagnostic.
+        reason: String,
+    },
 
+    /// A private restore program file could not be created exclusively.
     #[error("failed to create ipset restore script {path}: {reason}")]
-    CreateRestoreScript { path: PathBuf, reason: String },
+    CreateRestoreScript {
+        /// Temporary restore script path.
+        path: PathBuf,
+        /// Filesystem diagnostic.
+        reason: String,
+    },
 
+    /// Existing-set inspection output was incomplete or inconsistent.
     #[error("failed to inspect existing ipset `{set_name}`: {reason}")]
-    MalformedInspection { set_name: String, reason: String },
+    MalformedInspection {
+        /// Inspected set name.
+        set_name: String,
+        /// Strict parser diagnostic.
+        reason: String,
+    },
 
+    /// An existing managed-name set has an incompatible type or family.
     #[error(
         "existing ipset `{set_name}` is incompatible: expected type `{expected_type}` family `{expected_family}`, found type `{actual_type}` family `{actual_family}`"
     )]
     IncompatibleSet {
+        /// Existing managed set name.
         set_name: String,
+        /// Configured set type.
         expected_type: String,
+        /// Configured family label.
         expected_family: &'static str,
+        /// Inspected set type.
         actual_type: String,
+        /// Inspected family label.
         actual_family: &'static str,
     },
 }
 
+/// Command boundary used by atomic ipset operations.
 pub trait IpsetCommandRunner {
     /// Runs one bounded ipset command.
     ///
@@ -236,7 +278,7 @@ pub fn create_ipset(
 }
 
 #[must_use]
-pub fn generate_temp_set_name(base_set_name: &str) -> String {
+fn generate_temp_set_name(base_set_name: &str) -> String {
     let suffix = random_hex_suffix(8);
     let max_base_len = IPSET_NAME_MAX_LEN.saturating_sub(suffix.len() + 1);
     let mut base = truncate_to_max_bytes(base_set_name, max_base_len).to_string();

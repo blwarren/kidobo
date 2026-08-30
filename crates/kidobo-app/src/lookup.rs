@@ -1,3 +1,5 @@
+//! Deterministic offline lookup workflow and presentation-oriented outcomes.
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -9,43 +11,66 @@ use crate::paths::{ConfigRequirement, PathResolutionInput};
 use crate::ports::{ConfigRepository, PathResolver, TargetFileReader};
 use crate::source::{Notice, OfflineLookupContext, OfflineLookupRegistry};
 
+/// One lookup target supplied directly or through a bounded file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LookupInput {
+    /// One operator-supplied IP address or CIDR.
     Single(String),
+    /// File containing line-oriented targets.
     File(PathBuf),
 }
 
+/// Request to search local and cached source data without network access.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LookupRequest {
+    /// Runtime path inputs.
     pub paths: PathResolutionInput,
+    /// Direct or file-based targets.
     pub input: LookupInput,
 }
 
+/// One source entry overlapping a valid lookup target.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LookupSourceMatch {
+    /// Stable operator-visible source label.
     pub source_label: Arc<str>,
+    /// Original matched source line.
     pub matched_source_entry: String,
+    /// Canonical CIDR used for overlap matching.
     pub matched_cidr: CanonicalCidr,
 }
 
+/// A valid lookup target and its deterministic matches.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LookupTargetOutcome {
+    /// Original target text.
     pub target: String,
+    /// Source matches sorted by source identity and entry.
     pub matches: Vec<LookupSourceMatch>,
 }
 
+/// Complete offline lookup result.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LookupOutcome {
+    /// Valid targets and their matches in deterministic target order.
     pub targets: Vec<LookupTargetOutcome>,
+    /// Sorted, unique invalid target strings.
     pub invalid_targets: Vec<String>,
+    /// Whether targets came from a file rather than one direct argument.
     pub file_mode: bool,
+    /// Soft configuration or source-availability notices.
     pub notices: Vec<Notice>,
 }
 
+/// Ports and registry required by offline lookup.
 pub struct LookupDependencies<'a> {
+    /// Runtime path resolver.
     pub paths: &'a dyn PathResolver,
+    /// Optional validated configuration source.
     pub configs: &'a dyn ConfigRepository,
+    /// Bounded target-file reader.
     pub target_files: &'a dyn TargetFileReader,
+    /// Ordered offline source registry.
     pub sources: &'a OfflineLookupRegistry,
 }
 

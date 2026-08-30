@@ -1,3 +1,5 @@
+//! Read-only health checks and machine-readable doctor report types.
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -7,52 +9,86 @@ use crate::AppError;
 use crate::paths::{ConfigRequirement, PathResolutionInput, ResolvedPaths};
 use crate::ports::{ConfigRepository, PathResolver};
 
+/// Aggregate doctor result used by human and JSON renderers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum DoctorOverall {
+    /// Every required check succeeded or was intentionally skipped.
     #[serde(rename = "OK")]
     Ok,
+    /// At least one required check failed.
     #[serde(rename = "FAIL")]
     Fail,
 }
 
+/// Stable status of one doctor check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum DoctorCheckStatus {
+    /// Check succeeded.
     #[serde(rename = "OK")]
     Ok,
+    /// Check failed.
     #[serde(rename = "FAIL")]
     Fail,
+    /// Check was not applicable or could not safely be attempted.
     #[serde(rename = "SKIP")]
     Skip,
 }
 
+/// One named, operator-visible doctor check result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DoctorCheck {
+    /// Stable machine-readable check name.
     pub name: String,
+    /// Check status.
     pub status: DoctorCheckStatus,
+    /// Human-readable evidence or failure detail.
     pub detail: String,
 }
 
+/// Complete deterministic doctor report.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DoctorReport {
+    /// Aggregate status.
     pub overall: DoctorOverall,
+    /// Ordered individual checks.
     pub checks: Vec<DoctorCheck>,
 }
 
+/// Readiness of the configured cache location without creating it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CacheReadiness {
+    /// The cache path is already a directory.
     ExistingDirectory,
-    CreatableFromParent { parent: PathBuf },
+    /// The cache path is absent but has an existing writable-parent candidate.
+    CreatableFromParent {
+        /// Existing ancestor used for the readiness check.
+        parent: PathBuf,
+    },
 }
 
+/// Failure from a bounded, read-only external diagnostic probe.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProbeFailure {
-    Execution { reason: String },
-    Exit { status: String, stderr: String },
+    /// The command could not be executed.
+    Execution {
+        /// Execution diagnostic.
+        reason: String,
+    },
+    /// The command ran but returned an unsuccessful status.
+    Exit {
+        /// Rendered exit status.
+        status: String,
+        /// Bounded standard-error diagnostic.
+        stderr: String,
+    },
 }
 
+/// Read-only operating-system probes used by the doctor workflow.
 pub trait DoctorProbe {
+    /// Finds an executable by name without running it.
     fn find_binary(&self, binary: &str) -> Option<PathBuf>;
 
+    /// Returns whether a path exists without mutating it.
     fn path_exists(&self, path: &Path) -> bool;
 
     /// Inspects whether a cache directory exists or could plausibly be created.
@@ -70,9 +106,13 @@ pub trait DoctorProbe {
     fn run_sudo_probe(&self, command: &str, args: &[&str]) -> Result<(), ProbeFailure>;
 }
 
+/// Ports required by the read-only doctor workflow.
 pub struct DoctorDependencies<'a> {
+    /// Runtime path resolver.
     pub paths: &'a dyn PathResolver,
+    /// Validated configuration repository.
     pub configs: &'a dyn ConfigRepository,
+    /// Read-only host probe adapter.
     pub probes: &'a dyn DoctorProbe,
 }
 
@@ -84,6 +124,9 @@ enum Ipv6Mode {
 }
 
 #[must_use]
+/// Runs all applicable read-only checks and returns a deterministic report.
+///
+/// Individual failures are represented in the report rather than returned as workflow errors.
 pub fn execute(
     request: &PathResolutionInput,
     dependencies: &DoctorDependencies<'_>,

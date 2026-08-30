@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 #![deny(dead_code)]
+#![deny(missing_docs)]
 #![deny(clippy::all)]
 #![deny(
     clippy::allow_attributes_without_reason,
@@ -7,6 +8,8 @@
     clippy::cargo_common_metadata,
     clippy::wildcard_dependencies
 )]
+
+//! Command-line composition, rendering, logging, and exit mapping for Kidobo.
 #![warn(clippy::pedantic)]
 #![cfg_attr(
     not(test),
@@ -45,6 +48,7 @@ pub mod logging;
 use std::process::ExitCode;
 
 #[must_use]
+/// Runs the command-line application and returns its stable process exit status.
 pub fn run() -> ExitCode {
     cli::run()
 }

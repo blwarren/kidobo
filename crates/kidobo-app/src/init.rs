@@ -1,3 +1,5 @@
+//! Idempotent provisioning workflow and generated systemd unit templates.
+
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 
@@ -5,12 +7,18 @@ use crate::AppError;
 use crate::paths::{ConfigRequirement, PathResolutionInput};
 use crate::ports::PathResolver;
 
+/// Preferred trusted installed executable path.
 pub const DEFAULT_KIDOBO_BINARY_PATH: &str = "/usr/local/bin/kidobo";
+/// Secondary trusted installed executable path.
 pub const FALLBACK_KIDOBO_BINARY_PATH: &str = "/usr/bin/kidobo";
+/// Default systemd unit directory.
 pub const DEFAULT_SYSTEMD_DIR: &str = "/etc/systemd/system";
+/// Managed one-shot synchronization service filename.
 pub const KIDOBO_SYNC_SERVICE_FILE: &str = "kidobo-sync.service";
+/// Managed synchronization timer filename.
 pub const KIDOBO_SYNC_TIMER_FILE: &str = "kidobo-sync.timer";
 
+/// Default configuration written only when no configuration exists.
 pub const DEFAULT_CONFIG_TEMPLATE: &str = r#"[ipset]
 set_name = "kidobo"
 chain_action = "DROP"
@@ -30,9 +38,11 @@ banned = []
 cache_stale_after_secs = 86400
 "#;
 
+/// Default local blocklist written only when none exists.
 pub const DEFAULT_BLOCKLIST_TEMPLATE: &str =
     "# Add one IP or CIDR entry per line.\n# Example: 203.0.113.7\n";
 
+/// Default persistent hourly systemd timer unit.
 pub const DEFAULT_SYSTEMD_TIMER_TEMPLATE: &str = r"[Unit]
 Description=Run kidobo sync periodically
 
@@ -46,31 +56,45 @@ Unit=kidobo-sync.service
 WantedBy=timers.target
 ";
 
+/// Request to provision Kidobo's local files and optional live systemd units.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InitRequest {
+    /// Runtime path inputs.
     pub paths: PathResolutionInput,
+    /// Alternate filesystem root; when present, live systemd enablement is skipped.
     pub root_override: Option<PathBuf>,
+    /// Trusted executable paths considered in order.
     pub executable_candidates: Vec<PathBuf>,
 }
 
+/// Whether an idempotently provisioned artifact was created or retained.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProvisionState {
+    /// Artifact did not exist and was created.
     Created,
+    /// Existing artifact was preserved unchanged.
     Preserved,
 }
 
+/// Path and state of one provisioned directory or file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProvisionedArtifact {
+    /// Provisioned path.
     pub path: PathBuf,
+    /// Whether the artifact was created or preserved.
     pub state: ProvisionState,
 }
 
+/// Successful initialization result.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct InitOutcome {
+    /// Provisioned artifacts in workflow order.
     pub artifacts: Vec<ProvisionedArtifact>,
+    /// Whether the live systemd timer was enabled.
     pub systemd_enabled: bool,
 }
 
+/// Side-effect boundary for safe, idempotent initialization.
 pub trait InitProvisioner {
     /// Selects an installed executable from the trusted candidate paths.
     ///
@@ -101,8 +125,11 @@ pub trait InitProvisioner {
     fn enable_systemd_timer(&self) -> Result<(), AppError>;
 }
 
+/// Ports required by the initialization workflow.
 pub struct InitDependencies<'a> {
+    /// Runtime path resolver.
     pub paths: &'a dyn PathResolver,
+    /// Filesystem and systemd provisioner.
     pub provisioner: &'a dyn InitProvisioner,
 }
 
@@ -167,6 +194,9 @@ pub fn execute(
 }
 
 #[must_use]
+/// Renders the compatibility-sensitive one-shot systemd service unit.
+///
+/// A root override is encoded as a native `KIDOBO_ROOT` environment setting for fixture installs.
 pub fn build_systemd_service_template(
     executable_path: &Path,
     root_override: Option<&Path>,

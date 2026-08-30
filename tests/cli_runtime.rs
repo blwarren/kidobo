@@ -237,26 +237,76 @@ case "${cmd}" in
     if [[ "${1:-}" == "-w" ]]; then
       shift 2
     fi
-    chain_marker="${KIDOBO_ROOT:-/tmp}/cache/test-${cmd}-chain"
+    state_dir="${KIDOBO_ROOT:-/tmp}/cache/test-${cmd}"
+    input_state="${state_dir}/INPUT"
+    mkdir -p "${state_dir}"
     case "${1:-}" in
       -S)
-        if [[ "${2:-}" == "INPUT" || -f "${chain_marker}" ]]; then
+        if [[ "${2:-}" == "INPUT" ]]; then
+          if [[ -f "${input_state}" ]]; then
+            cat "${input_state}"
+          fi
+          exit 0
+        fi
+        chain_state="${state_dir}/${2:-missing}"
+        if [[ -f "${chain_state}" ]]; then
+          cat "${chain_state}"
           exit 0
         fi
         echo "No chain/target/match by that name" >&2
         exit 1
         ;;
       -N)
-        mkdir -p "$(dirname "${chain_marker}")"
-        : > "${chain_marker}"
+        : > "${state_dir}/${2}"
         exit 0
         ;;
+      -A)
+        chain="${2}"
+        shift 2
+        printf '%s\n' "-A ${chain} $*" >> "${state_dir}/${chain}"
+        exit 0
+        ;;
+      -I)
+        if [[ "${2:-}" == "INPUT" && "${3:-}" == "1" && "${4:-}" == "-j" ]]; then
+          temporary="${input_state}.tmp"
+          printf '%s\n' "-A INPUT -j ${5}" > "${temporary}"
+          if [[ -f "${input_state}" ]]; then
+            cat "${input_state}" >> "${temporary}"
+          fi
+          mv "${temporary}" "${input_state}"
+          exit 0
+        fi
+        exit 2
+        ;;
+      -F)
+        chain_state="${state_dir}/${2}"
+        if [[ -f "${chain_state}" ]]; then
+          : > "${chain_state}"
+          exit 0
+        fi
+        echo "No chain/target/match by that name" >&2
+        exit 1
+        ;;
       -D)
+        if [[ "${2:-}" == "INPUT" && "${3:-}" == "-j" ]]; then
+          expected="-A INPUT -j ${4}"
+          if [[ -f "${input_state}" ]] && grep -Fxq -- "${expected}" "${input_state}"; then
+            temporary="${input_state}.tmp"
+            grep -Fvx -- "${expected}" "${input_state}" > "${temporary}" || true
+            mv "${temporary}" "${input_state}"
+            exit 0
+          fi
+        elif [[ "${3:-}" == "1" && -s "${state_dir}/${2}" ]]; then
+          temporary="${state_dir}/${2}.tmp"
+          tail -n +2 "${state_dir}/${2}" > "${temporary}"
+          mv "${temporary}" "${state_dir}/${2}"
+          exit 0
+        fi
         echo "Bad rule (does a matching rule exist in that chain?)." >&2
         exit 1
         ;;
       -X)
-        rm -f "${chain_marker}"
+        rm -f "${state_dir}/${2}"
         exit 0
         ;;
       *)
@@ -459,6 +509,60 @@ fn lookup_uses_local_sources_and_exits_zero() {
     assert!(
         stdout.contains("203.0.113.7\tinternal:blocklist\t203.0.113.7"),
         "unexpected lookup output: {stdout}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn lookup_ignores_unrelated_non_unicode_environment_values() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let root = create_lookup_root("203.0.113.7\n");
+    let output =
+        kidobo_with_root_command(root.path(), &["lookup", "203.0.113.7", "--format", "tsv"])
+            .env(
+                "KIDOBO_TEST_UNRELATED_NON_UNICODE",
+                OsString::from_vec(vec![0xff]),
+            )
+            .output()
+            .expect("run lookup with non-Unicode environment value");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "lookup panicked: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains("203.0.113.7\tinternal:blocklist\t203.0.113.7")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn lookup_preserves_a_non_unicode_root_path() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().join(OsString::from_vec(b"root-\xff".to_vec()));
+    fs::create_dir_all(root.join("data")).expect("create data dir");
+    fs::create_dir_all(root.join("cache/remote")).expect("create remote cache dir");
+    fs::write(root.join("data/blocklist.txt"), "203.0.113.7\n").expect("write blocklist");
+
+    let output = run_kidobo_with_root(&root, &["lookup", "203.0.113.7", "--format", "tsv"]);
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "lookup failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains("203.0.113.7\tinternal:blocklist\t203.0.113.7")
     );
 }
 
@@ -1002,18 +1106,19 @@ fn sync_remote_worker_warning_does_not_deadlock() {
     );
 
     let remote_cache = root.path().join("cache/remote");
-    let cached_iplist = fs::read_dir(&remote_cache)
-        .expect("read remote cache")
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .find(|path| {
-            path.extension()
-                .is_some_and(|extension| extension == "iplist")
-        })
-        .expect("cached remote iplist");
-    let cached = read_to_string_with_limit(&cached_iplist, BLOCKLIST_READ_LIMIT)
-        .expect("read cached remote iplist");
-    assert_eq!(cached, "161.117.138.100/32");
+    let cached_sources = kidobo_adapters::cached_sources::load_remote_sources(&remote_cache)
+        .expect("load cached remote sources");
+    assert_eq!(cached_sources.len(), 1);
+    assert!(
+        cached_sources[0]
+            .path
+            .starts_with(remote_cache.join("v2/remote"))
+    );
+    assert_eq!(cached_sources[0].entries.len(), 1);
+    assert_eq!(
+        cached_sources[0].entries[0].cidr.to_string(),
+        "161.117.138.100/32"
+    );
 }
 
 #[test]
@@ -1410,6 +1515,43 @@ fn ban_asn_lock_failure_does_not_resolve_prefixes() {
         !touched.exists(),
         "ASN resolution should not run after lock acquisition fails"
     );
+}
+
+#[test]
+fn ban_asn_empty_resolution_leaves_configuration_unchanged() {
+    let initial_config = "[ipset]\nset_name='kidobo'\n[asn]\nbanned=[]\n";
+    let root = create_root(initial_config, "");
+    let bin_dir = root.path().join("bin");
+    fs::create_dir_all(&bin_dir).expect("create fake bin dir");
+    let fake_bgpq4 = bin_dir.join("bgpq4");
+    fs::write(&fake_bgpq4, "#!/bin/bash\nexit 0\n").expect("write fake bgpq4");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut permissions = fs::metadata(&fake_bgpq4)
+            .expect("fake bgpq4 metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&fake_bgpq4, permissions).expect("chmod fake bgpq4");
+    }
+
+    let mut command = kidobo_with_root_command(root.path(), &["ban", "--asn", "64512"]);
+    command.env("PATH", path_with_bin_prefix(&bin_dir));
+    let output = command.output().expect("run ban --asn");
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("bgpq4 returned no IPv4 or IPv6 prefixes"),
+        "missing empty-result diagnostic: {stderr}"
+    );
+    let config_text = read_to_string_with_limit(
+        &root.path().join("config/config.toml"),
+        BLOCKLIST_READ_LIMIT,
+    )
+    .expect("read config");
+    assert_eq!(config_text, initial_config);
 }
 
 #[test]

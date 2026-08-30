@@ -31,6 +31,7 @@ pub fn load_config_from_file(path: &Path) -> Result<Config, AppError> {
     Config::from_toml_str(&contents).map_err(AppError::from)
 }
 
+/// Production configuration repository using a bounded read and core validation.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct FileConfigRepository;
 

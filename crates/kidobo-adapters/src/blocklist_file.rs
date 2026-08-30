@@ -13,14 +13,17 @@ use kidobo_app::blocklist::BlocklistRepository;
 use kidobo_core::blocklist::canonicalize_blocklist;
 use kidobo_core::blocklist::{BlocklistDocument as CoreBlocklistDocument, InvalidBlocklistLine};
 
+/// Maximum accepted local blocklist size.
 pub const BLOCKLIST_READ_LIMIT: usize = 16 * 1024 * 1024;
 const BLOCKLIST_TARGET_FILE_READ_LIMIT: usize = 2 * 1024 * 1024;
 const BLOCKLIST_FAST_STATE_VERSION: &str = "v1";
 const BLOCKLIST_FAST_STATE_READ_LIMIT: usize = 1024;
 
+/// Filesystem-loaded core blocklist document.
 #[derive(Debug, Clone)]
 pub struct BlocklistDocument(CoreBlocklistDocument);
 
+/// Production local blocklist repository using bounded reads and atomic writes.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct FileBlocklistRepository;
 
@@ -87,10 +90,14 @@ impl Deref for BlocklistDocument {
     }
 }
 
+/// Result of checking or normalizing the local blocklist during sync.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlocklistNormalizeResult {
+    /// The blocklist did not exist and no file was created.
     MissingBlocklist,
+    /// File metadata matched the previous successful normalization state.
     SkippedUnchanged,
+    /// Contents were parsed and any canonical rewrite was completed.
     Checked,
 }
 

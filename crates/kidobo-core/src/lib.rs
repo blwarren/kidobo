@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 #![deny(dead_code)]
+#![deny(missing_docs)]
 #![deny(clippy::all)]
 #![warn(clippy::pedantic)]
 #![cfg_attr(
@@ -32,6 +33,8 @@
     )
 )]
 
+//! Pure deterministic domain logic for Kidobo.
+
 pub mod blocklist;
 pub mod config;
 mod config_validation;
@@ -41,7 +44,10 @@ mod network_types;
 pub mod sync;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// IP address family used to keep IPv4 and IPv6 processing separate.
 pub enum AddressFamily {
+    /// Internet Protocol version 4.
     Ipv4,
+    /// Internet Protocol version 6.
     Ipv6,
 }

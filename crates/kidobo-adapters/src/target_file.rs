@@ -9,6 +9,7 @@ use crate::limited_io::read_to_string_with_limit;
 
 const LOOKUP_TARGET_READ_LIMIT: usize = 2 * 1024 * 1024;
 
+/// Production bounded reader for lookup target files.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct LookupTargetFileReader;
 

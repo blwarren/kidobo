@@ -1,15 +1,23 @@
+//! Pure computation of the family-separated blocklists enforced by sync.
+
 use crate::network::{
     CanonicalCidr, Ipv4Cidr, Ipv6Cidr, split_by_family, subtract_safelist_ipv4,
     subtract_safelist_ipv6,
 };
 
+/// Minimal effective CIDRs remaining after family separation and safelist carving.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct EffectiveBlocklists {
+    /// Effective IPv4 networks.
     pub ipv4: Vec<Ipv4Cidr>,
+    /// Effective IPv6 networks, empty when IPv6 enforcement is disabled.
     pub ipv6: Vec<Ipv6Cidr>,
 }
 
 #[must_use]
+/// Computes the minimal, safelist-carved blocklists for enabled address families.
+///
+/// IPv4 and IPv6 never interact. When `enable_ipv6` is false, IPv6 candidates are ignored.
 pub fn compute_effective_blocklists(
     candidates: &[CanonicalCidr],
     safelist: &[CanonicalCidr],

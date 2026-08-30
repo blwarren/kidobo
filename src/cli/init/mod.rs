@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::fmt::Write;
 use std::path::PathBuf;
 
@@ -14,7 +15,10 @@ use kidobo_app::init::{
 
 pub fn run_init_command(io: &mut CliIo<'_>) -> Result<(), KidoboError> {
     let paths_input = path_resolution_input_from_process(None);
-    let root_override = paths_input.env.get(ENV_KIDOBO_ROOT).map(PathBuf::from);
+    let root_override = paths_input
+        .env
+        .get(OsStr::new(ENV_KIDOBO_ROOT))
+        .map(PathBuf::from);
     let paths = SystemPathResolver;
     let provisioner = SystemInitProvisioner::default();
     let outcome = init::execute(
