@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- `kidobo flush` now treats an absent transient firewall staging chain as already
+  clean instead of reporting incomplete IPv4 and IPv6 cleanup.
 
 ## [0.14.0] - 2026-08-30
 

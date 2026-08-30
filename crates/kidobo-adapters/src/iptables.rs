@@ -238,12 +238,11 @@ fn ensure_chain_exists(
     run_checked(runner, family.binary(), &["-N", chain_name]).map(|_| ())
 }
 
-/// Repeatedly removes exact input jumps to a named chain until none remain.
+/// Repeatedly inspects and removes exact input jumps to a named chain until none remain.
 ///
 /// # Errors
 ///
-/// Returns [`FirewallError`] when inspection or deletion fails for a reason other than a missing
-/// rule.
+/// Returns [`FirewallError`] when inspection or deletion fails.
 pub fn remove_all_input_jumps_for_chain(
     runner: &dyn FirewallCommandRunner,
     family: FirewallFamily,
@@ -252,14 +251,15 @@ pub fn remove_all_input_jumps_for_chain(
     let binary = family.binary();
 
     loop {
+        let input = run_checked(runner, binary, &["-S", "INPUT"])?;
+        if exact_jump_positions(&input.stdout, chain_name).is_empty() {
+            return Ok(());
+        }
+
         let args = with_lock_wait(&["-D", "INPUT", "-j", chain_name]);
         let result = runner.run(binary, &args)?;
         if result.status.success() {
             continue;
-        }
-
-        if is_missing_rule_result(&result) {
-            break;
         }
 
         return Err(FirewallError::CommandFailed {
@@ -268,8 +268,6 @@ pub fn remove_all_input_jumps_for_chain(
             stderr: result.stderr,
         });
     }
-
-    Ok(())
 }
 
 fn normalize_input_jump_fail_closed(
@@ -420,10 +418,6 @@ fn is_missing_chain_result(result: &CommandResult) -> bool {
             .stderr
             .to_ascii_lowercase()
             .contains("no chain/target/match by that name")
-}
-
-fn is_missing_rule_result(result: &CommandResult) -> bool {
-    result.status.code() == Some(1) && result.stderr.to_ascii_lowercase().contains("bad rule")
 }
 
 #[cfg(test)]
@@ -656,6 +650,9 @@ mod tests {
                 ok(0)
             }
             ["-D", "INPUT", "-j", chain_name] => {
+                if !table.chains.contains_key(*chain_name) {
+                    return missing_target_chain(chain_name);
+                }
                 let expected = format!("-j {chain_name}");
                 table
                     .input_rules
@@ -729,6 +726,14 @@ mod tests {
         }
     }
 
+    fn missing_target_chain(chain_name: &str) -> CommandResult {
+        CommandResult {
+            status: ProcessStatus::Exited(2),
+            stdout: String::new(),
+            stderr: format!("iptables v1.8.10 (nf_tables): Chain '{chain_name}' does not exist"),
+        }
+    }
+
     fn ok(status: i32) -> CommandResult {
         CommandResult {
             status: ProcessStatus::Exited(status),
@@ -762,18 +767,29 @@ mod tests {
 
     #[test]
     fn jump_cleanup_propagates_nonmissing_delete_failure() {
-        let runner = MockRunner::new(vec![Ok(CommandResult {
-            status: ProcessStatus::Exited(1),
-            stdout: String::new(),
-            stderr: "permission denied".to_string(),
-        })]);
+        let runner = MockRunner::new(vec![
+            Ok(CommandResult {
+                status: ProcessStatus::Exited(0),
+                stdout: format!("-A INPUT -j {KIDOBO_CHAIN_NAME}\n"),
+                stderr: String::new(),
+            }),
+            Ok(CommandResult {
+                status: ProcessStatus::Exited(1),
+                stdout: String::new(),
+                stderr: "permission denied".to_string(),
+            }),
+        ]);
 
         let err =
             remove_all_input_jumps_for_chain(&runner, FirewallFamily::Ipv4, KIDOBO_CHAIN_NAME)
                 .expect_err("nonmissing delete failure");
 
         assert!(matches!(err, FirewallError::CommandFailed { .. }));
-        assert_eq!(runner.invocations().len(), 1);
+        assert_eq!(runner.invocations().len(), 2);
+        assert_eq!(
+            runner.invocations()[1].1,
+            vec!["-w", "5", "-D", "INPUT", "-j", KIDOBO_CHAIN_NAME]
+        );
     }
 
     #[test]
@@ -1082,5 +1098,10 @@ mod tests {
         let runner = StatefulRunner::default();
 
         cleanup_firewall_wiring(&runner, FirewallFamily::Ipv6).expect("cleanup");
+        assert!(
+            runner.invocations().iter().all(|(_, args)| {
+                args.get(2..4) != Some(&["-D".to_string(), "INPUT".to_string()])
+            })
+        );
     }
 }

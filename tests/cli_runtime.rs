@@ -289,6 +289,10 @@ case "${cmd}" in
         ;;
       -D)
         if [[ "${2:-}" == "INPUT" && "${3:-}" == "-j" ]]; then
+          if [[ ! -f "${state_dir}/${4}" ]]; then
+            echo "${cmd} v1.8.10 (nf_tables): Chain '${4}' does not exist" >&2
+            exit 2
+          fi
           expected="-A INPUT -j ${4}"
           if [[ -f "${input_state}" ]] && grep -Fxq -- "${expected}" "${input_state}"; then
             temporary="${input_state}.tmp"
@@ -439,6 +443,26 @@ fn flush_cache_only_respects_the_nonblocking_lock() {
 
     assert_eq!(output.status.code(), Some(1));
     assert!(cached.exists(), "lock failure must leave cache untouched");
+}
+
+#[test]
+fn flush_succeeds_when_transient_firewall_chain_is_absent() {
+    let root = create_root("[ipset]\nset_name='kidobo'\n", "");
+    let fake_sudo = write_fake_sudo_script(&root);
+
+    let mut command = kidobo_with_root_command(root.path(), &["flush"]);
+    command.env(
+        "PATH",
+        path_with_bin_prefix(fake_sudo.parent().expect("sudo parent")),
+    );
+    let output = command.output().expect("run flush");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "flush rejected already-absent transient chains: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
