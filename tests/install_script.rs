@@ -377,6 +377,102 @@ fn run_init_after_install_propagates_target_failure_status() {
 }
 
 #[test]
+fn custom_root_init_uses_direct_path_without_sudo() {
+    let temp = TempDir::new().expect("tempdir");
+    let install_dir = temp.path().join("bin");
+    let root = temp.path().join("root with spaces");
+    let observed_root = temp.path().join("observed-root");
+    let sudo_marker = temp.path().join("sudo-called");
+    write_executable(
+        &install_dir.join("kidobo"),
+        "#!/usr/bin/env bash\nset -euo pipefail\n[[ \"${1:-}\" == \"init\" ]]\nprintf '%s' \"${KIDOBO_ROOT-}\" > \"${KIDOBO_TEST_OBSERVED_ROOT}\"\n",
+    );
+    let init_log = temp.path().join("init.log");
+
+    let status = Command::new("bash")
+        .arg("-c")
+        .arg(
+            "source \"$INSTALLER\"; \
+             sudo() { : > \"$SUDO_MARKER\"; return 99; }; \
+             run_init_after_install \"$INIT_LOG\"",
+        )
+        .env("INSTALLER", installer_path())
+        .env("INIT_LOG", &init_log)
+        .env("SUDO_MARKER", &sudo_marker)
+        .env("KIDOBO_INSTALL_DIR", &install_dir)
+        .env("KIDOBO_ROOT", &root)
+        .env("KIDOBO_TEST_OBSERVED_ROOT", &observed_root)
+        .status()
+        .expect("run bash");
+
+    assert!(status.success());
+    assert_eq!(
+        read_to_string_with_limit(&observed_root, FIXTURE_FILE_READ_LIMIT),
+        root.display().to_string()
+    );
+    assert!(!sudo_marker.exists());
+}
+
+#[test]
+fn custom_root_init_preserves_exact_value_through_sudo_env() {
+    let temp = TempDir::new().expect("tempdir");
+    let install_dir = temp.path().join("bin");
+    let root = temp.path().join("root with spaces");
+    let observed_root = temp.path().join("observed-root");
+    write_executable(
+        &install_dir.join("kidobo"),
+        "#!/usr/bin/env bash\nset -euo pipefail\nif [[ \"${KIDOBO_TEST_ELEVATED:-0}\" != \"1\" ]]; then exit 23; fi\n[[ \"${1:-}\" == \"init\" ]]\nprintf '%s' \"${KIDOBO_ROOT-}\" > \"${KIDOBO_TEST_OBSERVED_ROOT}\"\n",
+    );
+    let init_log = temp.path().join("init.log");
+
+    let status = Command::new("bash")
+        .arg("-c")
+        .arg(
+            "source \"$INSTALLER\"; \
+             sudo() { env -i PATH=\"$PATH\" KIDOBO_TEST_ELEVATED=1 KIDOBO_TEST_OBSERVED_ROOT=\"$KIDOBO_TEST_OBSERVED_ROOT\" \"$@\"; }; \
+             run_init_after_install \"$INIT_LOG\"",
+        )
+        .env("INSTALLER", installer_path())
+        .env("INIT_LOG", &init_log)
+        .env("KIDOBO_INSTALL_DIR", &install_dir)
+        .env("KIDOBO_ROOT", &root)
+        .env("KIDOBO_TEST_OBSERVED_ROOT", &observed_root)
+        .status()
+        .expect("run bash");
+
+    assert!(status.success());
+    assert_eq!(
+        read_to_string_with_limit(&observed_root, FIXTURE_FILE_READ_LIMIT),
+        root.display().to_string()
+    );
+}
+
+#[test]
+fn custom_root_init_rejects_explicit_empty_value_before_execution() {
+    let temp = TempDir::new().expect("tempdir");
+    let install_dir = temp.path().join("bin");
+    let marker = temp.path().join("target-called");
+    write_executable(
+        &install_dir.join("kidobo"),
+        "#!/usr/bin/env bash\n: > \"${KIDOBO_TEST_MARKER}\"\n",
+    );
+
+    let status = Command::new("bash")
+        .arg("-c")
+        .arg("source \"$INSTALLER\"; run_init_after_install \"$INIT_LOG\"")
+        .env("INSTALLER", installer_path())
+        .env("INIT_LOG", temp.path().join("init.log"))
+        .env("KIDOBO_INSTALL_DIR", &install_dir)
+        .env("KIDOBO_ROOT", "")
+        .env("KIDOBO_TEST_MARKER", &marker)
+        .status()
+        .expect("run bash");
+
+    assert_eq!(status.code(), Some(1));
+    assert!(!marker.exists());
+}
+
+#[test]
 fn uninstall_preserves_artifacts_when_fallback_cleanup_fails() {
     let temp = TempDir::new().expect("tempdir");
     let root = temp.path().join("root");
@@ -560,7 +656,7 @@ fn uninstall_rejects_override_when_realpath_is_unavailable() {
 }
 
 #[test]
-fn uninstall_real_fallback_cleans_both_families_and_default_sets() {
+fn failed_config_aware_uninstall_attempts_default_cleanup_but_preserves_artifacts() {
     let temp = TempDir::new().expect("tempdir");
     let root = temp.path().join("root");
     let install_dir = temp.path().join("bin");
@@ -568,6 +664,15 @@ fn uninstall_real_fallback_cleans_both_families_and_default_sets() {
     write_executable(&binary, "#!/usr/bin/env bash\nexit 1\n");
     for directory in ["config", "data", "cache", "systemd/system"] {
         fs::create_dir_all(root.join(directory)).expect("mkdir artifact");
+    }
+    for artifact in [
+        "config/config.toml",
+        "data/blocklist.txt",
+        "cache/remote.cache",
+        "systemd/system/kidobo-sync.service",
+        "systemd/system/kidobo-sync.timer",
+    ] {
+        fs::write(root.join(artifact), "preserve").expect("write artifact");
     }
     let cleanup_log = temp.path().join("cleanup.log");
     let fake_bin = write_cleanup_fakes(&temp);
@@ -583,7 +688,7 @@ fn uninstall_real_fallback_cleans_both_families_and_default_sets() {
         .status()
         .expect("run bash");
 
-    assert!(status.success());
+    assert_eq!(status.code(), Some(1));
     let transcript = read_to_string_with_limit(&cleanup_log, FIXTURE_FILE_READ_LIMIT);
     for expected in [
         "iptables -w 5 -D INPUT -j kidobo-input-stage",
@@ -606,8 +711,20 @@ fn uninstall_real_fallback_cleans_both_families_and_default_sets() {
             "missing `{expected}` in: {transcript}"
         );
     }
-    assert!(!binary.exists());
-    assert!(!root.join("config").exists());
+    assert!(binary.exists());
+    assert!(root.join("config").exists());
+    assert!(root.join("data").exists());
+    assert!(root.join("cache").exists());
+    assert!(root.join("systemd/system").exists());
+    for artifact in [
+        "config/config.toml",
+        "data/blocklist.txt",
+        "cache/remote.cache",
+        "systemd/system/kidobo-sync.service",
+        "systemd/system/kidobo-sync.timer",
+    ] {
+        assert!(root.join(artifact).exists(), "removed {artifact}");
+    }
 }
 
 #[test]

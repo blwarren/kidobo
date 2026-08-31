@@ -222,6 +222,24 @@ pub enum AppError {
         reason: String,
     },
 
+    /// Aggregate remote source material exceeded its deterministic admission budget.
+    #[error("remote source aggregate exceeds admission budget: entries={entries} limit={limit}")]
+    SourceAggregateBudgetExceeded {
+        /// Number of distinct canonical CIDRs observed when the limit was exceeded.
+        entries: usize,
+        /// Maximum permitted aggregate distinct CIDRs.
+        limit: usize,
+    },
+
+    /// A semantically accepted staged cache generation could not be selected before enforcement.
+    #[error("cache promotion failed for source provider `{provider}`: {reason}")]
+    CachePromotion {
+        /// Stable source provider identifier.
+        provider: &'static str,
+        /// Cache manifest diagnostic.
+        reason: String,
+    },
+
     /// A source registry contains duplicate stable provider IDs.
     #[error("source provider ID is registered more than once: {provider}")]
     DuplicateSourceProvider {

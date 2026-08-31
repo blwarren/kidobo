@@ -9,6 +9,7 @@ use crate::AppError;
 use crate::paths::{ConfigRequirement, PathResolutionInput};
 use crate::ports::{ConfigRepository, LockManager, PathResolver};
 use crate::source::{FailurePolicy, Notice, SourceRole, SyncSourceContext, SyncSourceRegistry};
+use crate::source::{PendingCachePromotion, SyncSourceBatch, SyncSourceLoad};
 
 /// Validated kernel-set parameters for one address family.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -150,7 +151,22 @@ pub struct SyncDependencies<'a> {
 struct LoadedSources {
     candidates: Vec<CanonicalCidr>,
     safelist: Vec<CanonicalCidr>,
+    external_safelists: Vec<LoadedExternalSafelist>,
+    pending_promotions: Vec<PendingPromotion>,
     summaries: Vec<SourceSummary>,
+}
+
+struct LoadedExternalSafelist {
+    provider: &'static str,
+    primary: SyncSourceBatch,
+    fallback: Option<SyncSourceBatch>,
+    pending_promotions: Vec<Box<dyn PendingCachePromotion>>,
+    summary_index: usize,
+}
+
+struct PendingPromotion {
+    provider: &'static str,
+    promotion: Box<dyn PendingCachePromotion>,
 }
 
 /// Runs one complete fail-closed synchronization.
@@ -191,7 +207,9 @@ pub fn execute(
     let LoadedSources {
         mut candidates,
         mut safelist,
-        summaries,
+        external_safelists,
+        mut pending_promotions,
+        mut summaries,
     } = load_sources(dependencies.sources, &source_context, dependencies.observer)?;
     dependencies.observer.stage_completed("load_sources");
 
@@ -199,6 +217,15 @@ pub fn execute(
     candidates.dedup();
     safelist.sort_unstable();
     safelist.dedup();
+    admit_external_safelists(
+        &candidates,
+        &mut safelist,
+        external_safelists,
+        enforcement_plan.enable_ipv6,
+        &mut pending_promotions,
+        &mut summaries,
+        dependencies.observer,
+    );
     let effective =
         compute_effective_blocklists(&candidates, &safelist, enforcement_plan.enable_ipv6);
     dependencies
@@ -209,6 +236,8 @@ pub fn execute(
         ensure_within_capacity(&enforcement_plan.ipv6, effective.ipv6.len())?;
     }
     ensure_within_capacity(&enforcement_plan.ipv4, effective.ipv4.len())?;
+
+    promote_pending_caches(pending_promotions, dependencies.observer)?;
 
     if enforcement_plan.enable_ipv6 {
         let entries = effective
@@ -260,19 +289,52 @@ fn load_sources(
 ) -> Result<LoadedSources, AppError> {
     let mut candidates = Vec::new();
     let mut safelist = Vec::new();
+    let mut external_safelists = Vec::new();
+    let mut pending_promotions = Vec::new();
     let mut summaries = Vec::new();
 
     for provider in registry.providers() {
         let descriptor = provider.descriptor();
         match provider.load(context) {
-            Ok(batch) => {
-                let entry_count = batch.networks.len();
-                match descriptor.role {
-                    SourceRole::Candidate => candidates.extend(batch.networks),
-                    SourceRole::Safelist => safelist.extend(batch.networks),
-                }
-                for notice in &batch.notices {
+            Ok(loaded) => {
+                let SyncSourceLoad {
+                    primary,
+                    fallback,
+                    pending_promotions: loaded_promotions,
+                } = loaded;
+                let entry_count = primary.networks.len();
+                let summary_index = summaries.len();
+                for notice in &primary.notices {
                     observer.notice(notice);
+                }
+                match descriptor.role {
+                    SourceRole::Candidate => {
+                        candidates.extend(primary.networks);
+                        pending_promotions.extend(loaded_promotions.into_iter().map(|promotion| {
+                            PendingPromotion {
+                                provider: descriptor.id,
+                                promotion,
+                            }
+                        }));
+                    }
+                    SourceRole::Safelist => {
+                        safelist.extend(primary.networks);
+                        pending_promotions.extend(loaded_promotions.into_iter().map(|promotion| {
+                            PendingPromotion {
+                                provider: descriptor.id,
+                                promotion,
+                            }
+                        }));
+                    }
+                    SourceRole::ExternalSafelist => {
+                        external_safelists.push(LoadedExternalSafelist {
+                            provider: descriptor.id,
+                            primary,
+                            fallback,
+                            pending_promotions: loaded_promotions,
+                            summary_index,
+                        });
+                    }
                 }
                 summaries.push(SourceSummary {
                     id: descriptor.id,
@@ -281,6 +343,7 @@ fn load_sources(
                     loaded: true,
                 });
             }
+            Err(error @ AppError::SourceAggregateBudgetExceeded { .. }) => return Err(error),
             Err(error) if descriptor.failure_policy == FailurePolicy::BestEffort => {
                 observer.notice(&Notice::warning(format!(
                     "source provider `{}` failed softly: {error}",
@@ -300,8 +363,112 @@ fn load_sources(
     Ok(LoadedSources {
         candidates,
         safelist,
+        external_safelists,
+        pending_promotions,
         summaries,
     })
+}
+
+fn promote_pending_caches(
+    pending_promotions: Vec<PendingPromotion>,
+    observer: &dyn SyncObserver,
+) -> Result<(), AppError> {
+    for pending in pending_promotions {
+        pending
+            .promotion
+            .promote()
+            .map_err(|reason| AppError::CachePromotion {
+                provider: pending.provider,
+                reason,
+            })?;
+    }
+    observer.stage_completed("promote_source_caches");
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn admit_external_safelists(
+    candidates: &[CanonicalCidr],
+    safelist: &mut Vec<CanonicalCidr>,
+    external_safelists: Vec<LoadedExternalSafelist>,
+    enable_ipv6: bool,
+    pending_promotions: &mut Vec<PendingPromotion>,
+    summaries: &mut [SourceSummary],
+    observer: &dyn SyncObserver,
+) {
+    let baseline = compute_effective_blocklists(candidates, safelist, enable_ipv6);
+
+    for external in external_safelists {
+        let primary_admitted = external_safelist_preserves_baseline(
+            candidates,
+            safelist,
+            &external.primary.networks,
+            enable_ipv6,
+            &baseline,
+        );
+        if primary_admitted {
+            safelist.extend(external.primary.networks.iter().copied());
+            pending_promotions.extend(external.pending_promotions.into_iter().map(|promotion| {
+                PendingPromotion {
+                    provider: external.provider,
+                    promotion,
+                }
+            }));
+            continue;
+        }
+
+        observer.notice(&Notice::warning(format!(
+            "externally controlled safelist `{}` was rejected because it would empty an enabled address family",
+            external.provider
+        )));
+        if let Some(fallback) = external.fallback.filter(|fallback| {
+            external_safelist_preserves_baseline(
+                candidates,
+                safelist,
+                &fallback.networks,
+                enable_ipv6,
+                &baseline,
+            )
+        }) {
+            for notice in &fallback.notices {
+                observer.notice(notice);
+            }
+            safelist.extend(fallback.networks.iter().copied());
+            if let Some(summary) = summaries.get_mut(external.summary_index) {
+                summary.entries = fallback.networks.len();
+            }
+        } else {
+            observer.notice(&Notice::warning(format!(
+                "externally controlled safelist `{}` has no admissible fallback; using only operator-controlled safelist entries",
+                external.provider
+            )));
+            if let Some(summary) = summaries.get_mut(external.summary_index) {
+                summary.entries = 0;
+                summary.loaded = false;
+            }
+        }
+    }
+
+    safelist.sort_unstable();
+    safelist.dedup();
+}
+
+fn external_safelist_preserves_baseline(
+    candidates: &[CanonicalCidr],
+    operator_safelist: &[CanonicalCidr],
+    external_safelist: &[CanonicalCidr],
+    enable_ipv6: bool,
+    baseline: &kidobo_core::sync::EffectiveBlocklists,
+) -> bool {
+    let mut combined = Vec::with_capacity(operator_safelist.len() + external_safelist.len());
+    combined.extend_from_slice(operator_safelist);
+    combined.extend_from_slice(external_safelist);
+    combined.sort_unstable();
+    combined.dedup();
+    let admitted = compute_effective_blocklists(candidates, &combined, enable_ipv6);
+
+    (baseline.ipv4.is_empty() || !admitted.ipv4.is_empty())
+        && (!enable_ipv6 || baseline.ipv6.is_empty() || !admitted.ipv6.is_empty())
 }
 
 fn ensure_within_capacity(spec: &ManagedSetSpec, entries: usize) -> Result<(), AppError> {
@@ -338,8 +505,9 @@ mod tests {
     use crate::paths::{ConfigRequirement, PathResolutionInput, ResolvedPaths};
     use crate::ports::{ConfigRepository, LockGuard, LockManager, PathResolver};
     use crate::source::{
-        FailurePolicy, Notice, SourceRole, SyncSourceBatch, SyncSourceContext,
-        SyncSourceDescriptor, SyncSourceProvider, SyncSourceRegistry,
+        FailurePolicy, Notice, PendingCachePromotion, SourceRole, SyncSourceBatch,
+        SyncSourceContext, SyncSourceDescriptor, SyncSourceLoad, SyncSourceProvider,
+        SyncSourceRegistry,
     };
 
     type Ledger = Arc<Mutex<Vec<String>>>;
@@ -450,7 +618,7 @@ mod tests {
             self.descriptor
         }
 
-        fn load(&self, _context: &SyncSourceContext<'_>) -> Result<SyncSourceBatch, AppError> {
+        fn load(&self, _context: &SyncSourceContext<'_>) -> Result<SyncSourceLoad, AppError> {
             record(&self.ledger, format!("source:{}", self.descriptor.id));
             if self.fail {
                 return Err(AppError::Source {
@@ -458,10 +626,10 @@ mod tests {
                     reason: "injected failure".to_string(),
                 });
             }
-            Ok(SyncSourceBatch {
+            Ok(SyncSourceLoad::ready(SyncSourceBatch {
                 networks: self.networks.clone(),
                 notices: Vec::new(),
-            })
+            }))
         }
     }
 
@@ -469,6 +637,54 @@ mod tests {
         ledger: Ledger,
         fail_at: Option<&'static str>,
         replacements: Mutex<Vec<(AddressFamily, Vec<CanonicalCidr>)>>,
+    }
+
+    struct RecordingPromotion {
+        ledger: Ledger,
+        fail: bool,
+    }
+
+    impl PendingCachePromotion for RecordingPromotion {
+        fn promote(self: Box<Self>) -> Result<(), String> {
+            record(&self.ledger, "promote");
+            if self.fail {
+                Err("injected promotion failure".to_string())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    struct DeferredSource {
+        ledger: Ledger,
+        descriptor: SyncSourceDescriptor,
+        primary: Vec<CanonicalCidr>,
+        fallback: Option<Vec<CanonicalCidr>>,
+        fail_promotion: bool,
+    }
+
+    impl SyncSourceProvider for DeferredSource {
+        fn descriptor(&self) -> SyncSourceDescriptor {
+            self.descriptor
+        }
+
+        fn load(&self, _context: &SyncSourceContext<'_>) -> Result<SyncSourceLoad, AppError> {
+            record(&self.ledger, format!("source:{}", self.descriptor.id));
+            Ok(SyncSourceLoad {
+                primary: SyncSourceBatch {
+                    networks: self.primary.clone(),
+                    notices: Vec::new(),
+                },
+                fallback: self.fallback.as_ref().map(|networks| SyncSourceBatch {
+                    networks: networks.clone(),
+                    notices: Vec::new(),
+                }),
+                pending_promotions: vec![Box::new(RecordingPromotion {
+                    ledger: Arc::clone(&self.ledger),
+                    fail: self.fail_promotion,
+                })],
+            })
+        }
     }
 
     impl EnforcementBackend for FakeEnforcement {
@@ -921,5 +1137,199 @@ mod tests {
         assert!(events.contains(&"replace-v6".to_string()));
         assert!(events.contains(&"replace-v4".to_string()));
         assert!(!events.contains(&"activate".to_string()));
+    }
+
+    #[test]
+    fn capacity_rejection_drops_staged_cache_before_enforcement() {
+        let ledger = Ledger::default();
+        let mut sources = SyncSourceRegistry::new();
+        sources
+            .register(DeferredSource {
+                ledger: Arc::clone(&ledger),
+                descriptor: SyncSourceDescriptor {
+                    id: "deferred-candidate",
+                    role: SourceRole::Candidate,
+                    failure_policy: FailurePolicy::Required,
+                },
+                primary: vec![cidr("192.0.2.0/24"), cidr("198.51.100.0/24")],
+                fallback: None,
+                fail_promotion: false,
+            })
+            .expect("register source");
+        let enforcement = FakeEnforcement {
+            ledger: Arc::clone(&ledger),
+            fail_at: None,
+            replacements: Mutex::new(Vec::new()),
+        };
+
+        let error = execute_with(
+            &ledger,
+            config(false, 1),
+            &sources,
+            &enforcement,
+            &RecordingObserver::default(),
+        )
+        .expect_err("capacity must reject the staged source");
+
+        assert!(matches!(error, AppError::IpsetCapacityExceeded { .. }));
+        assert!(!events(&ledger).iter().any(|event| event == "promote"));
+        assert!(
+            enforcement
+                .replacements
+                .lock()
+                .expect("replacements")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn cache_promotion_failure_precedes_both_family_replacements() {
+        let ledger = Ledger::default();
+        let mut sources = SyncSourceRegistry::new();
+        sources
+            .register(DeferredSource {
+                ledger: Arc::clone(&ledger),
+                descriptor: SyncSourceDescriptor {
+                    id: "deferred-candidate",
+                    role: SourceRole::Candidate,
+                    failure_policy: FailurePolicy::Required,
+                },
+                primary: vec![cidr("192.0.2.0/24"), cidr("2001:db8::/64")],
+                fallback: None,
+                fail_promotion: true,
+            })
+            .expect("register source");
+        let enforcement = FakeEnforcement {
+            ledger: Arc::clone(&ledger),
+            fail_at: None,
+            replacements: Mutex::new(Vec::new()),
+        };
+
+        let error = execute_with(
+            &ledger,
+            config(true, 10),
+            &sources,
+            &enforcement,
+            &RecordingObserver::default(),
+        )
+        .expect_err("promotion must fail");
+
+        assert!(matches!(error, AppError::CachePromotion { .. }));
+        assert!(events(&ledger).iter().any(|event| event == "promote"));
+        assert!(
+            enforcement
+                .replacements
+                .lock()
+                .expect("replacements")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn external_safelist_uses_admissible_fallback_when_primary_empties_family() {
+        let ledger = Ledger::default();
+        let mut sources = SyncSourceRegistry::new();
+        sources
+            .register(provider(
+                &ledger,
+                "candidate",
+                SourceRole::Candidate,
+                FailurePolicy::Required,
+                vec![cidr("192.0.2.0/24")],
+            ))
+            .expect("register candidate");
+        sources
+            .register(DeferredSource {
+                ledger: Arc::clone(&ledger),
+                descriptor: SyncSourceDescriptor {
+                    id: "external",
+                    role: SourceRole::ExternalSafelist,
+                    failure_policy: FailurePolicy::BestEffort,
+                },
+                primary: vec![cidr("192.0.2.0/24")],
+                fallback: Some(vec![cidr("192.0.2.0/25")]),
+                fail_promotion: false,
+            })
+            .expect("register external safelist");
+        let enforcement = FakeEnforcement {
+            ledger: Arc::clone(&ledger),
+            fail_at: None,
+            replacements: Mutex::new(Vec::new()),
+        };
+        let observer = RecordingObserver::default();
+
+        let outcome = execute_with(
+            &ledger,
+            config(false, 10),
+            &sources,
+            &enforcement,
+            &observer,
+        )
+        .expect("fallback should be admitted");
+
+        assert_eq!(outcome.ipv4_entries, 1);
+        assert_eq!(outcome.sources[1].entries, 1);
+        assert!(!events(&ledger).iter().any(|event| event == "promote"));
+        assert!(
+            observer
+                .notices
+                .lock()
+                .expect("notices")
+                .iter()
+                .any(|notice| notice.contains("would empty"))
+        );
+    }
+
+    #[test]
+    fn admitted_external_safelist_promotes_before_replacement() {
+        let ledger = Ledger::default();
+        let mut sources = SyncSourceRegistry::new();
+        sources
+            .register(provider(
+                &ledger,
+                "candidate",
+                SourceRole::Candidate,
+                FailurePolicy::Required,
+                vec![cidr("192.0.2.0/24")],
+            ))
+            .expect("register candidate");
+        sources
+            .register(DeferredSource {
+                ledger: Arc::clone(&ledger),
+                descriptor: SyncSourceDescriptor {
+                    id: "external",
+                    role: SourceRole::ExternalSafelist,
+                    failure_policy: FailurePolicy::BestEffort,
+                },
+                primary: vec![cidr("192.0.2.0/25")],
+                fallback: None,
+                fail_promotion: false,
+            })
+            .expect("register external safelist");
+        let enforcement = FakeEnforcement {
+            ledger: Arc::clone(&ledger),
+            fail_at: None,
+            replacements: Mutex::new(Vec::new()),
+        };
+
+        execute_with(
+            &ledger,
+            config(false, 10),
+            &sources,
+            &enforcement,
+            &RecordingObserver::default(),
+        )
+        .expect("sync");
+
+        let ledger = events(&ledger);
+        let promotion = ledger
+            .iter()
+            .position(|event| event == "promote")
+            .expect("promotion");
+        let replacement = ledger
+            .iter()
+            .position(|event| event == "replace-v4")
+            .expect("replacement");
+        assert!(promotion < replacement);
     }
 }

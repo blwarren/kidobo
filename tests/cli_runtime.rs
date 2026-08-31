@@ -866,6 +866,36 @@ fn lookup_invalid_target_exits_with_one() {
 }
 
 #[test]
+fn lookup_tsv_escapes_target_controls_without_changing_structure() {
+    let root = create_lookup_root("203.0.113.7\n");
+    let target = "\t203.0.113.7\n";
+    let output = run_kidobo_with_root(root.path(), &["lookup", target, "--format", "tsv"]);
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "\\t203.0.113.7\\n\tinternal:blocklist\t203.0.113.7\n"
+    );
+    assert!(!output.stdout.contains(&0x1b));
+}
+
+#[test]
+fn lookup_invalid_target_escapes_terminal_control_sequences() {
+    let root = create_lookup_root("");
+    let target = "bad\x1b]0;owned\x07";
+    let output = run_kidobo_with_root(root.path(), &["lookup", target]);
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("invalid target: bad\\x1B]0;owned\\x07"),
+        "escaped invalid target missing: {stderr:?}"
+    );
+    assert!(!output.stderr.contains(&0x1b));
+    assert!(!output.stderr.contains(&0x07));
+}
+
+#[test]
 fn lookup_succeeds_without_config_file() {
     let root = create_lookup_root_without_config("203.0.113.7\n");
     let output = run_kidobo_with_root(root.path(), &["lookup", "203.0.113.7", "--format", "tsv"]);

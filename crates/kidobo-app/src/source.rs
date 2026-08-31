@@ -17,6 +17,8 @@ pub enum SourceRole {
     Candidate,
     /// Networks are carved out of candidate ranges.
     Safelist,
+    /// Externally controlled networks are carved out only after admission checks.
+    ExternalSafelist,
 }
 
 /// Whether a source failure aborts synchronization.
@@ -84,6 +86,39 @@ pub struct SyncSourceBatch {
     pub notices: Vec<Notice>,
 }
 
+/// Deferred selection of a fully written cache generation.
+pub trait PendingCachePromotion: Send {
+    /// Atomically selects the staged generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a diagnostic when the cache manifest cannot be promoted.
+    fn promote(self: Box<Self>) -> Result<(), String>;
+}
+
+/// Primary source data, an optional validated fallback, and deferred cache selections.
+#[derive(Default)]
+pub struct SyncSourceLoad {
+    /// Preferred batch for this synchronization attempt.
+    pub primary: SyncSourceBatch,
+    /// Previously selected compatible batch, when distinct from the primary.
+    pub fallback: Option<SyncSourceBatch>,
+    /// Cache manifests selected only after semantic and capacity preflight succeeds.
+    pub pending_promotions: Vec<Box<dyn PendingCachePromotion>>,
+}
+
+impl SyncSourceLoad {
+    #[must_use]
+    /// Wraps a source batch that has no deferred cache work.
+    pub fn ready(primary: SyncSourceBatch) -> Self {
+        Self {
+            primary,
+            fallback: None,
+            pending_promotions: Vec::new(),
+        }
+    }
+}
+
 /// Read-only context supplied to synchronization providers.
 pub struct SyncSourceContext<'a> {
     /// Pre-resolved runtime paths.
@@ -105,7 +140,7 @@ pub trait SyncSourceProvider: Send + Sync {
     ///
     /// Returns an error when the provider cannot produce a usable batch. The registry descriptor
     /// determines whether the sync workflow treats that failure as required or best effort.
-    fn load(&self, context: &SyncSourceContext<'_>) -> Result<SyncSourceBatch, AppError>;
+    fn load(&self, context: &SyncSourceContext<'_>) -> Result<SyncSourceLoad, AppError>;
 }
 
 /// Ordered collection of uniquely identified synchronization providers.
@@ -242,7 +277,8 @@ impl OfflineLookupRegistry {
 mod tests {
     use super::{
         FailurePolicy, OfflineLookupProvider, OfflineLookupRegistry, SourceRole, SyncSourceBatch,
-        SyncSourceContext, SyncSourceDescriptor, SyncSourceProvider, SyncSourceRegistry,
+        SyncSourceContext, SyncSourceDescriptor, SyncSourceLoad, SyncSourceProvider,
+        SyncSourceRegistry,
     };
     use crate::AppError;
 
@@ -257,8 +293,8 @@ mod tests {
             }
         }
 
-        fn load(&self, _context: &SyncSourceContext<'_>) -> Result<SyncSourceBatch, AppError> {
-            Ok(SyncSourceBatch::default())
+        fn load(&self, _context: &SyncSourceContext<'_>) -> Result<SyncSourceLoad, AppError> {
+            Ok(SyncSourceLoad::ready(SyncSourceBatch::default()))
         }
     }
 

@@ -54,8 +54,11 @@ file before atomically replacing an existing installation.
 
 ## Requirements
 
-- Linux x86_64 for published binaries. Other architectures must build from
+- Linux x86_64 for the published static musl binary. The release artifact is
+  exercised on Debian 11 and Alpine 3.22; other architectures must build from
   source and are not currently tested.
+- Bash, `curl`, `tar`, `sha256sum`, and standard file-installation tools for the
+  installer. GNU `realpath` is additionally required for custom-root uninstall.
 - `sudo`, `ipset`, and `iptables` for runtime checks and enforcement.
 - `ip6tables` when IPv6 enforcement is enabled, which is the default.
 - `bgpq4` for ASN resolution and for the complete `doctor` check.
@@ -128,9 +131,9 @@ sudo kidobo flush --cache-only
 
 `flush` attempts every cleanup step and exits with status `1` if any live
 firewall, ipset, or cache artifact could not be removed. The installer preserves
-runtime files when uninstall cleanup cannot be confirmed. An uninstall using
-`KIDOBO_ROOT` requires GNU `realpath` so the installer can canonicalize and scope
-every removal before cleanup begins.
+the binary, configuration, data, cache, and generated units whenever the
+config-aware flush fails, even if its direct default-name recovery cleanup
+succeeds. Artifact removal starts only after a successful config-aware flush.
 
 ## Minimal Config
 
@@ -205,7 +208,9 @@ an arbitrary build or `cargo run` path.
   status and summary counts for both single targets and files. Long source URLs
   wrap without being truncated. Use `--format tsv` for the legacy tab-separated
   output intended for scripts; color is limited to interactive terminals and
-  disabled when `NO_COLOR` is set.
+  disabled when `NO_COLOR` is set. Target fields use the stable 1.x escaping
+  `\\`, `\t`, `\r`, `\n`, `\xNN`, and `\u{…}` so control characters cannot
+  create terminal sequences or additional TSV records.
 - `sync` canonicalizes a valid local blocklist, preserving only the leading
   comment/header section before canonical entries. Invalid non-header local
   lines now fail `sync`; they are not silently dropped or rewritten away.
@@ -213,6 +218,16 @@ an arbitrary build or `cargo run` path.
   intentional empty feed. A non-empty response with no valid CIDRs, or GitHub
   metadata missing a selected category, is treated as a soft fetch failure and
   does not replace the last usable cache.
+- Remote HTTP bodies default to an 8 MiB limit. The
+  `KIDOBO_MAX_HTTP_BODY_BYTES` override is capped at 32 MiB, while GitHub
+  metadata remains capped at 8 MiB. Feed line, unique-CIDR, and aggregate
+  budgets scale with `ipset.maxelem`; an aggregate-budget failure aborts before
+  enforcement.
+- GitHub metadata safelists accept at most 4,096 distinct entries, reject IPv4
+  prefixes broader than `/8` and IPv6 prefixes broader than `/16`, and limit
+  each family's collapsed coverage to one-sixteenth. A batch that would erase
+  a nonempty enabled family is rejected in favor of a compatible previous
+  generation or the operator-controlled safelist.
 - Remote fetches follow at most ten redirects, and only when the destination
   keeps the configured URL's scheme, host, and effective port. A blocked
   redirect is a soft fetch failure and does not replace the last usable cache.
@@ -226,7 +241,12 @@ an arbitrary build or `cargo run` path.
 - `KIDOBO_ROOT` relocates config, data, cache, and generated systemd paths under
   a custom root. `init` does not call `systemctl` when this override is present,
   which also makes an unprivileged isolated setup possible when the root is
-  writable.
+  writable. The installer rejects an explicitly empty value for `--init`, tries
+  a writable custom root without sudo first, and preserves the exact value if
+  elevation is required.
+
+The supported 1.x compatibility promises are documented in
+[docs/compatibility.md](docs/compatibility.md).
 
 ## Development
 
@@ -245,10 +265,11 @@ just release-notes-check
 
 `just check` is the fast development loop. Run `just ci` explicitly before every
 push; GitHub does not run project CI for pushes or tags. The complete local gate
-checks formatting, lints, dependency policy, audits, and tests. Coverage and the
-isolated release-binary exercise run only during publication. The exercise uses
-a temporary `KIDOBO_ROOT`, a loopback HTTP feed, and fake privileged commands;
-it never touches the development host's firewall or systemd. Dependabot update
+checks formatting, lints, dependency policy, audits, and tests. Coverage,
+strict rustdoc, the isolated release-binary exercise, and static Debian/Alpine
+compatibility run only during publication. The exercises use a temporary
+`KIDOBO_ROOT`, a loopback HTTP feed, and fake privileged commands; they never
+touch the development host's firewall or systemd. Dependabot update
 PRs are the only GitHub-hosted automation retained. Run
 `just release-notes-check` after every repository change.
 

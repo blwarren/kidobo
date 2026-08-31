@@ -81,6 +81,30 @@ run_init_after_install() {
     local init_log="$1"
     : > "${init_log}"
 
+    if [[ -n "${KIDOBO_ROOT_WAS_SET}" ]]; then
+        if [[ -z "${KIDOBO_ROOT_OVERRIDE}" ]]; then
+            echo "KIDOBO_ROOT must not be empty when --init is requested" >&2
+            return 1
+        fi
+
+        local direct_status
+        if KIDOBO_ROOT="${KIDOBO_ROOT_OVERRIDE}" "${TARGET_PATH}" init > >(tee "${init_log}") 2>&1; then
+            return 0
+        else
+            direct_status=$?
+        fi
+
+        if [[ "${EUID}" -ne 0 ]] && has_cmd sudo; then
+            if sudo env "KIDOBO_ROOT=${KIDOBO_ROOT_OVERRIDE}" "${TARGET_PATH}" init \
+                > >(tee -a "${init_log}") 2>&1; then
+                return 0
+            else
+                return $?
+            fi
+        fi
+        return "${direct_status}"
+    fi
+
     if [[ -w /etc || -w /var || -w /usr ]]; then
         if "${TARGET_PATH}" init > >(tee "${init_log}") 2>&1; then
             return 0
@@ -414,8 +438,10 @@ uninstall_artifacts() {
         cleanup_default_ipsets || cleanup_failed=1
         if [[ "${cleanup_failed}" -ne 0 ]]; then
             echo "uninstall aborted: live firewall cleanup could not be confirmed; runtime artifacts were preserved" >&2
-            return 1
+        else
+            echo "uninstall aborted: config-aware flush failed; default recovery cleanup was attempted and runtime artifacts were preserved" >&2
         fi
+        return 1
     fi
 
     disable_systemd_timer_best_effort

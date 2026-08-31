@@ -10,8 +10,8 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::cache_generation::{
-    GenerationFile, GenerationFileLimit, commit_generation, generation_candidates,
-    generation_contents_match,
+    GenerationFile, GenerationFileLimit, StagedGeneration, cleanup_unselected_generations,
+    generation_candidates, generation_contents_match, stage_generation,
 };
 use crate::cached_fetch::{read_optional_json_lossy, read_validated_bytes_lossy};
 use crate::hash::sha256_hex;
@@ -20,7 +20,9 @@ use crate::http_fetch::{ConditionalFetchResult, fetch_with_conditional_cache};
 use kidobo_core::config::{
     DEFAULT_GITHUB_META_CATEGORIES, DEFAULT_GITHUB_META_URL, GithubMetaCategoryMode,
 };
-use kidobo_core::network::{CanonicalCidr, parse_ip_cidr_non_strict};
+use kidobo_core::network::{
+    CanonicalCidr, collapse_ipv4, collapse_ipv6, parse_ip_cidr_non_strict, split_by_family,
+};
 
 const GITHUB_META_RAW_CACHE_FILE: &str = "github-meta.raw.json";
 const GITHUB_META_META_CACHE_FILE: &str = "github-meta.meta.json";
@@ -33,6 +35,11 @@ const GENERATION_CATEGORY_FILE: &str = "categories.json";
 const GITHUB_META_CACHE_READ_LIMIT: usize = 8 * 1024 * 1024;
 const GITHUB_META_META_READ_LIMIT: usize = 512 * 1024;
 const GITHUB_META_CATEGORY_READ_LIMIT: usize = 256 * 1024;
+const GITHUB_META_MAX_ENTRIES: usize = 4_096;
+const GITHUB_META_MIN_IPV4_PREFIX: u8 = 8;
+const GITHUB_META_MIN_IPV6_PREFIX: u8 = 16;
+const GITHUB_META_IPV4_COVERAGE_LIMIT: u64 = 1_u64 << 28;
+const GITHUB_META_IPV6_COVERAGE_LIMIT: u128 = 1_u128 << 124;
 
 /// HTTP validators and checksum bound to a GitHub metadata cache body.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,6 +87,12 @@ pub struct GithubMetaLoadResult {
     pub metadata: Option<GithubMetaCacheMetadata>,
 }
 
+pub(crate) struct PreparedGithubMetaLoad {
+    pub(crate) primary: GithubMetaLoadResult,
+    pub(crate) fallback: Option<GithubMetaLoadResult>,
+    pub(crate) pending_promotion: Option<StagedGeneration>,
+}
+
 /// Failure to persist a fully validated GitHub metadata generation.
 #[derive(Debug, Error)]
 pub enum GithubMetaLoadError {
@@ -113,6 +126,8 @@ struct CachedFallback<'a> {
     networks: Option<Vec<CanonicalCidr>>,
     meta: Option<GithubMetaCacheMetadata>,
     sidecar: Option<&'a GithubMetaCategorySidecar>,
+    previous_networks: Option<Vec<CanonicalCidr>>,
+    previous_meta: Option<GithubMetaCacheMetadata>,
 }
 
 #[derive(Debug, Clone)]
@@ -122,6 +137,8 @@ struct GithubMetaCache {
     meta: Option<GithubMetaCacheMetadata>,
     sidecar: Option<GithubMetaCategorySidecar>,
     generation_id: Option<String>,
+    previous_networks: Option<Vec<CanonicalCidr>>,
+    previous_meta: Option<GithubMetaCacheMetadata>,
 }
 
 impl CachePaths {
@@ -141,6 +158,7 @@ impl CachePaths {
 ///
 /// Returns [`GithubMetaLoadError::WriteCacheFile`] when a valid network response cannot be
 /// persisted atomically. Network and invalid-response failures otherwise use a validated fallback.
+#[cfg(test)]
 pub fn load_github_meta_safelist(
     client: &dyn HttpClient,
     cache_dir: &Path,
@@ -148,11 +166,35 @@ pub fn load_github_meta_safelist(
     category_mode: &GithubMetaCategoryMode,
     env: &BTreeMap<OsString, OsString>,
 ) -> Result<GithubMetaLoadResult, GithubMetaLoadError> {
+    let prepared =
+        prepare_github_meta_safelist(client, cache_dir, github_meta_url, category_mode, env)?;
+    if let Some(promotion) = prepared.pending_promotion {
+        promotion
+            .promote()
+            .map_err(|err| GithubMetaLoadError::WriteCacheFile {
+                path: CachePaths::from_cache_dir(cache_dir)
+                    .generation_store
+                    .join("current.json"),
+                reason: err.to_string(),
+            })?;
+    }
+    Ok(prepared.primary)
+}
+
+pub(crate) fn prepare_github_meta_safelist(
+    client: &dyn HttpClient,
+    cache_dir: &Path,
+    github_meta_url: &str,
+    category_mode: &GithubMetaCategoryMode,
+    env: &BTreeMap<OsString, OsString>,
+) -> Result<PreparedGithubMetaLoad, GithubMetaLoadError> {
     let selection = CategorySelection::from_mode(category_mode);
-    let max_bytes = max_http_body_bytes(env);
+    let max_bytes = max_http_body_bytes(env).min(GITHUB_META_CACHE_READ_LIMIT);
     let paths = CachePaths::from_cache_dir(cache_dir);
+    cleanup_unselected_generations(&paths.generation_store);
     let cache = read_github_meta_cache(&paths, &selection, github_meta_url);
     let (cached_etag, cached_last_modified) = cache.http_validators();
+    let previous = cache.previous_result();
 
     match fetch_with_conditional_cache(
         client,
@@ -165,20 +207,32 @@ pub fn load_github_meta_safelist(
     ) {
         ConditionalFetchResult::CacheNotModified => {
             if let Some(networks) = cache.networks.clone() {
-                Ok(GithubMetaLoadResult {
-                    networks,
-                    source: GithubMetaSource::CacheNotModified,
-                    metadata: cache.meta,
+                Ok(PreparedGithubMetaLoad {
+                    primary: GithubMetaLoadResult {
+                        networks,
+                        source: GithubMetaSource::CacheNotModified,
+                        metadata: cache.meta,
+                    },
+                    fallback: previous,
+                    pending_promotion: None,
                 })
             } else {
-                Ok(cache.fallback(None, &selection, GithubMetaSource::FallbackCache))
+                Ok(PreparedGithubMetaLoad {
+                    primary: cache.fallback(None, &selection, GithubMetaSource::FallbackCache),
+                    fallback: previous,
+                    pending_promotion: None,
+                })
             }
         }
-        ConditionalFetchResult::FallbackCache => Ok(cache.fallback(
-            cache.networks.clone(),
-            &selection,
-            GithubMetaSource::FallbackCache,
-        )),
+        ConditionalFetchResult::FallbackCache => Ok(PreparedGithubMetaLoad {
+            primary: cache.fallback(
+                cache.networks.clone(),
+                &selection,
+                GithubMetaSource::FallbackCache,
+            ),
+            fallback: previous,
+            pending_promotion: None,
+        }),
         ConditionalFetchResult::Network(response) => handle_network_response(
             response,
             &paths,
@@ -211,6 +265,7 @@ fn read_github_meta_cache(
     selection: &CategorySelection,
     github_meta_url: &str,
 ) -> GithubMetaCache {
+    let mut selected: Option<GithubMetaCache> = None;
     for candidate in generation_candidates(&paths.generation_store) {
         if !generation_contents_match(
             &candidate,
@@ -244,12 +299,24 @@ fn read_github_meta_cache(
             && cache.meta.is_some()
             && cache.sidecar.is_some()
         {
+            if let Some(mut primary) = selected {
+                primary.previous_networks = cache.networks;
+                primary.previous_meta = cache.meta;
+                return primary;
+            }
             cache.generation_id = Some(candidate.id);
-            return cache;
+            selected = Some(cache);
         }
     }
 
-    read_github_meta_cache_files(paths, selection, github_meta_url, false)
+    let legacy = read_github_meta_cache_files(paths, selection, github_meta_url, false);
+    if let Some(mut primary) = selected {
+        primary.previous_networks = legacy.networks;
+        primary.previous_meta = legacy.meta;
+        primary
+    } else {
+        legacy
+    }
 }
 
 fn read_github_meta_cache_files(
@@ -311,6 +378,8 @@ fn read_github_meta_cache_files(
         meta,
         sidecar,
         generation_id: None,
+        previous_networks: None,
+        previous_meta: None,
     }
 }
 
@@ -327,7 +396,19 @@ impl GithubMetaCache {
             networks: self.networks.clone(),
             meta: self.meta.clone(),
             sidecar: self.sidecar.as_ref(),
+            previous_networks: self.previous_networks.clone(),
+            previous_meta: self.previous_meta.clone(),
         }
+    }
+
+    fn previous_result(&self) -> Option<GithubMetaLoadResult> {
+        self.previous_networks
+            .clone()
+            .map(|networks| GithubMetaLoadResult {
+                networks,
+                source: GithubMetaSource::FallbackCache,
+                metadata: self.previous_meta.clone(),
+            })
     }
 
     fn fallback(
@@ -355,20 +436,13 @@ fn handle_network_response(
     cached: CachedFallback<'_>,
     selection: &CategorySelection,
     previous_generation: Option<&str>,
-) -> Result<GithubMetaLoadResult, GithubMetaLoadError> {
+) -> Result<PreparedGithubMetaLoad, GithubMetaLoadError> {
     if !response.status.is_success() {
         warn!(
             "github meta fetch failed: unexpected status {}",
             response.status
         );
-        return Ok(cache_fallback(
-            cached.raw,
-            cached.networks,
-            cached.meta,
-            cached.sidecar,
-            selection,
-            GithubMetaSource::FallbackCache,
-        ));
+        return Ok(prepared_github_fallback(cached, selection));
     }
 
     if response.body.len() > max_bytes {
@@ -377,26 +451,12 @@ fn handle_network_response(
             response.body.len(),
             max_bytes
         );
-        return Ok(cache_fallback(
-            cached.raw,
-            cached.networks,
-            cached.meta,
-            cached.sidecar,
-            selection,
-            GithubMetaSource::FallbackCache,
-        ));
+        return Ok(prepared_github_fallback(cached, selection));
     }
 
     let Some(networks) = parse_and_extract_networks(&response.body, selection) else {
         warn!("github meta fetch failed: response body has invalid JSON or category data");
-        return Ok(cache_fallback(
-            cached.raw,
-            cached.networks,
-            cached.meta,
-            cached.sidecar,
-            selection,
-            GithubMetaSource::FallbackCache,
-        ));
+        return Ok(prepared_github_fallback(cached, selection));
     };
 
     let metadata = GithubMetaCacheMetadata {
@@ -406,7 +466,7 @@ fn handle_network_response(
         sha256_raw: sha256_hex(&response.body),
     };
 
-    persist_cache(
+    let pending_promotion = stage_cache(
         paths,
         &response.body,
         &metadata,
@@ -414,20 +474,29 @@ fn handle_network_response(
         previous_generation,
     )?;
 
-    Ok(GithubMetaLoadResult {
+    let fallback = cached.networks.map(|networks| GithubMetaLoadResult {
         networks,
-        source: GithubMetaSource::Network,
-        metadata: Some(metadata),
+        source: GithubMetaSource::FallbackCache,
+        metadata: cached.meta,
+    });
+    Ok(PreparedGithubMetaLoad {
+        primary: GithubMetaLoadResult {
+            networks,
+            source: GithubMetaSource::Network,
+            metadata: Some(metadata),
+        },
+        fallback,
+        pending_promotion: Some(pending_promotion),
     })
 }
 
-fn persist_cache(
+fn stage_cache(
     paths: &CachePaths,
     raw: &[u8],
     metadata: &GithubMetaCacheMetadata,
     selection: &CategorySelection,
     previous_generation: Option<&str>,
-) -> Result<(), GithubMetaLoadError> {
+) -> Result<StagedGeneration, GithubMetaLoadError> {
     let sidecar = selection.to_sidecar();
     let sidecar_bytes =
         serde_json::to_vec_pretty(&sidecar).map_err(|err| GithubMetaLoadError::WriteCacheFile {
@@ -439,7 +508,7 @@ fn persist_cache(
             path: paths.generation_store.join("current.json"),
             reason: err.to_string(),
         })?;
-    commit_generation(
+    stage_generation(
         &paths.generation_store,
         &[
             GenerationFile {
@@ -457,11 +526,40 @@ fn persist_cache(
         ],
         previous_generation,
     )
-    .map(|_| ())
     .map_err(|err| GithubMetaLoadError::WriteCacheFile {
         path: paths.generation_store.join("current.json"),
         reason: err.to_string(),
     })
+}
+
+fn prepared_github_fallback(
+    cached: CachedFallback<'_>,
+    selection: &CategorySelection,
+) -> PreparedGithubMetaLoad {
+    let CachedFallback {
+        raw,
+        networks,
+        meta,
+        sidecar,
+        previous_networks,
+        previous_meta,
+    } = cached;
+    PreparedGithubMetaLoad {
+        primary: cache_fallback(
+            raw,
+            networks,
+            meta,
+            sidecar,
+            selection,
+            GithubMetaSource::FallbackCache,
+        ),
+        fallback: previous_networks.map(|networks| GithubMetaLoadResult {
+            networks,
+            source: GithubMetaSource::FallbackCache,
+            metadata: previous_meta,
+        }),
+        pending_promotion: None,
+    }
 }
 
 fn cache_fallback(
@@ -540,7 +638,35 @@ fn parse_and_extract_networks(
         }
     }
 
+    if !github_meta_networks_within_envelope(&networks) {
+        return None;
+    }
+
     Some(networks)
+}
+
+fn github_meta_networks_within_envelope(networks: &[CanonicalCidr]) -> bool {
+    if networks.len() > GITHUB_META_MAX_ENTRIES
+        || networks.iter().any(|network| match network {
+            CanonicalCidr::V4(cidr) => cidr.prefix() < GITHUB_META_MIN_IPV4_PREFIX,
+            CanonicalCidr::V6(cidr) => cidr.prefix() < GITHUB_META_MIN_IPV6_PREFIX,
+        })
+    {
+        return false;
+    }
+
+    let families = split_by_family(networks);
+    let ipv4_coverage = collapse_ipv4(&families.ipv4)
+        .iter()
+        .map(|cidr| 1_u64 << (32 - u32::from(cidr.prefix())))
+        .try_fold(0_u64, u64::checked_add);
+    let ipv6_coverage = collapse_ipv6(&families.ipv6)
+        .iter()
+        .map(|cidr| 1_u128 << (128 - u32::from(cidr.prefix())))
+        .try_fold(0_u128, u128::checked_add);
+
+    ipv4_coverage.is_some_and(|coverage| coverage <= GITHUB_META_IPV4_COVERAGE_LIMIT)
+        && ipv6_coverage.is_some_and(|coverage| coverage <= GITHUB_META_IPV6_COVERAGE_LIMIT)
 }
 
 fn is_empty_container_tree(value: &Value) -> bool {
@@ -669,6 +795,7 @@ where
 mod tests {
     use std::cell::RefCell;
     use std::collections::{BTreeMap, VecDeque};
+    use std::fmt::Write as _;
     use std::fs;
     use std::time::Duration;
 
@@ -676,10 +803,11 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        CachePaths, GITHUB_META_CATEGORY_CACHE_FILE, GITHUB_META_CATEGORY_READ_LIMIT,
-        GITHUB_META_META_CACHE_FILE, GITHUB_META_META_READ_LIMIT, GITHUB_META_RAW_CACHE_FILE,
-        GithubMetaCacheMetadata, GithubMetaCategorySidecar, GithubMetaLoadResult, GithubMetaSource,
-        load_github_meta_safelist,
+        CachePaths, CategorySelection, GITHUB_META_CATEGORY_CACHE_FILE,
+        GITHUB_META_CATEGORY_READ_LIMIT, GITHUB_META_META_CACHE_FILE, GITHUB_META_META_READ_LIMIT,
+        GITHUB_META_RAW_CACHE_FILE, GithubMetaCacheMetadata, GithubMetaCategorySidecar,
+        GithubMetaLoadResult, GithubMetaSource, load_github_meta_safelist,
+        parse_and_extract_networks, prepare_github_meta_safelist,
     };
     use crate::cache_generation::generation_candidates;
     use crate::hash::sha256_hex;
@@ -1065,6 +1193,55 @@ mod tests {
         )
         .expect("legacy fallback");
         assert_eq!(fallback.networks[0].to_string(), "203.0.113.0/24");
+    }
+
+    #[test]
+    fn network_failure_exposes_previous_generation_for_application_admission() {
+        let temp = TempDir::new().expect("tempdir");
+        for body in [
+            br#"{"api":["192.0.2.0/25"],"git":[],"hooks":[],"packages":[]}"#.as_slice(),
+            br#"{"api":["198.51.100.0/25"],"git":[],"hooks":[],"packages":[]}"#.as_slice(),
+        ] {
+            load_github_meta_safelist(
+                &MockHttpClient::new(vec![Ok(network_response(body))]),
+                temp.path(),
+                TEST_GITHUB_META_URL,
+                &GithubMetaCategoryMode::Default,
+                &BTreeMap::new(),
+            )
+            .expect("populate generation");
+        }
+
+        let prepared = prepare_github_meta_safelist(
+            &MockHttpClient::new(vec![Err(HttpClientError::Request {
+                reason: "offline".to_string(),
+            })]),
+            temp.path(),
+            TEST_GITHUB_META_URL,
+            &GithubMetaCategoryMode::Default,
+            &BTreeMap::new(),
+        )
+        .expect("prepare fallback");
+
+        assert_eq!(
+            prepared
+                .primary
+                .networks
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["198.51.100.0/25"]
+        );
+        assert_eq!(
+            prepared
+                .fallback
+                .expect("previous generation")
+                .networks
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["192.0.2.0/25"]
+        );
     }
 
     #[test]
@@ -1546,6 +1723,108 @@ mod tests {
             temp.path(),
             TEST_GITHUB_META_URL,
             &GithubMetaCategoryMode::All,
+            &BTreeMap::new(),
+        )
+        .expect("load");
+
+        assert_eq!(result.source, GithubMetaSource::Empty);
+        assert!(result.networks.is_empty());
+    }
+
+    #[test]
+    fn fixed_envelope_rejects_universal_broad_coverage_and_count_cases() {
+        let selection = CategorySelection::All;
+        for raw in [
+            br#"{"ranges":["0.0.0.0/0"]}"#.as_slice(),
+            br#"{"ranges":["::/0"]}"#.as_slice(),
+            br#"{"ranges":["0.0.0.0/1","128.0.0.0/1"]}"#.as_slice(),
+            br#"{"ranges":["2001:db8::/15"]}"#.as_slice(),
+        ] {
+            assert!(parse_and_extract_networks(raw, &selection).is_none());
+        }
+
+        let mut coverage_ranges = String::new();
+        for octet in 0..17 {
+            if octet > 0 {
+                coverage_ranges.push(',');
+            }
+            write!(coverage_ranges, "\"{octet}.0.0.0/8\"").expect("write coverage fixture");
+        }
+        let excessive_coverage = format!("{{\"ranges\":[{coverage_ranges}]}}");
+        assert!(parse_and_extract_networks(excessive_coverage.as_bytes(), &selection).is_none());
+
+        let mut count_ranges = String::new();
+        for index in 0..4_097 {
+            if index > 0 {
+                count_ranges.push(',');
+            }
+            write!(
+                count_ranges,
+                "\"198.18.{}.{}\"",
+                (index / 256) % 256,
+                index % 256
+            )
+            .expect("write count fixture");
+        }
+        let excessive_count = format!("{{\"ranges\":[{count_ranges}]}}");
+        assert!(parse_and_extract_networks(excessive_count.as_bytes(), &selection).is_none());
+    }
+
+    #[test]
+    fn fixed_envelope_accepts_exact_coverage_boundary() {
+        let mut ranges = String::new();
+        for octet in 0..16 {
+            if octet > 0 {
+                ranges.push(',');
+            }
+            write!(ranges, "\"{octet}.0.0.0/8\"").expect("write boundary fixture");
+        }
+        let raw = format!("{{\"ranges\":[{ranges}]}}");
+
+        let networks = parse_and_extract_networks(raw.as_bytes(), &CategorySelection::All)
+            .expect("one-sixteenth coverage is permitted");
+        assert_eq!(networks.len(), 16);
+    }
+
+    #[test]
+    fn poisoned_legacy_cache_is_ignored_under_the_fixed_envelope() {
+        let temp = TempDir::new().expect("tempdir");
+        let raw = br#"{"api":["0.0.0.0/0"]}"#;
+        fs::write(temp.path().join(GITHUB_META_RAW_CACHE_FILE), raw).expect("write raw cache");
+        fs::write(
+            temp.path().join(GITHUB_META_META_CACHE_FILE),
+            serde_json::to_vec_pretty(&GithubMetaCacheMetadata {
+                url: TEST_GITHUB_META_URL.to_string(),
+                etag: None,
+                last_modified: None,
+                sha256_raw: sha256_hex(raw),
+            })
+            .expect("metadata"),
+        )
+        .expect("write metadata");
+
+        fs::write(
+            temp.path().join(GITHUB_META_CATEGORY_CACHE_FILE),
+            serde_json::to_vec_pretty(&GithubMetaCategorySidecar {
+                mode: "selected".to_string(),
+                categories: vec![
+                    "api".to_string(),
+                    "git".to_string(),
+                    "hooks".to_string(),
+                    "packages".to_string(),
+                ],
+            })
+            .expect("sidecar"),
+        )
+        .expect("write sidecar");
+
+        let result = load_github_meta_safelist(
+            &MockHttpClient::new(vec![Err(HttpClientError::Request {
+                reason: "offline".to_string(),
+            })]),
+            temp.path(),
+            TEST_GITHUB_META_URL,
+            &GithubMetaCategoryMode::Default,
             &BTreeMap::new(),
         )
         .expect("load");

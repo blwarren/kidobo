@@ -78,7 +78,11 @@ fn run_lookup_command(
     }?;
 
     for invalid in &outcome.invalid_targets {
-        writeln!(io.stderr, "invalid target: {invalid}")?;
+        writeln!(
+            io.stderr,
+            "invalid target: {}",
+            encode_lookup_field(invalid)
+        )?;
     }
 
     if !outcome.invalid_targets.is_empty() {
@@ -114,15 +118,16 @@ fn write_human_lookup(
         .filter(|target| !target.matches.is_empty())
         .count();
     for target in &outcome.targets {
+        let encoded_target = encode_lookup_field(&target.target);
         if target.matches.is_empty() {
-            for row in format_lookup_table_row([&target.target, "NO MATCH", "—", "—"], color) {
+            for row in format_lookup_table_row([&encoded_target, "NO MATCH", "—", "—"], color) {
                 writeln!(output, "{row}")?;
             }
         } else {
             for source in &target.matches {
                 for row in format_lookup_table_row(
                     [
-                        &target.target,
+                        &encoded_target,
                         "MATCH",
                         source.source_label.as_ref(),
                         &source.matched_source_entry,
@@ -150,11 +155,12 @@ fn write_tsv_lookup(
     output: &mut dyn std::io::Write,
 ) -> Result<(), KidoboError> {
     for target in &outcome.targets {
+        let encoded_target = encode_lookup_field(&target.target);
         for source in &target.matches {
             writeln!(
                 output,
                 "{}\t{}\t{}",
-                target.target, source.source_label, source.matched_source_entry
+                encoded_target, source.source_label, source.matched_source_entry
             )?;
         }
     }
@@ -162,7 +168,7 @@ fn write_tsv_lookup(
     if outcome.file_mode {
         for target in &outcome.targets {
             if target.matches.is_empty() {
-                writeln!(output, "{}\tNO_MATCH", target.target)?;
+                writeln!(output, "{}\tNO_MATCH", encode_lookup_field(&target.target))?;
             }
         }
         let matched_count = outcome
@@ -178,6 +184,28 @@ fn write_tsv_lookup(
         )?;
     }
     Ok(())
+}
+
+fn encode_lookup_field(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '\\' => encoded.push_str("\\\\"),
+            '\t' => encoded.push_str("\\t"),
+            '\r' => encoded.push_str("\\r"),
+            '\n' => encoded.push_str("\\n"),
+            character if character.is_ascii_control() => {
+                use std::fmt::Write as _;
+                let _write_result = write!(encoded, "\\x{:02X}", u32::from(character));
+            }
+            character if character.is_control() => {
+                use std::fmt::Write as _;
+                let _write_result = write!(encoded, "\\u{{{:X}}}", u32::from(character));
+            }
+            character => encoded.push(character),
+        }
+    }
+    encoded
 }
 
 fn should_color_lookup(stdout_is_terminal: bool, no_color_set: bool) -> bool {
@@ -268,7 +296,8 @@ fn percent_str(numerator: usize, denominator: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        color_lookup_status, format_lookup_table_row, should_color_lookup, wrap_lookup_cell,
+        color_lookup_status, encode_lookup_field, format_lookup_table_row, should_color_lookup,
+        wrap_lookup_cell,
     };
 
     #[test]
@@ -312,5 +341,14 @@ mod tests {
         assert_eq!(wrapped, vec!["abcd", "efgh", "ij"]);
         assert_eq!(wrapped.concat(), "abcdefghij");
         assert!(wrapped.iter().all(|line| line.chars().count() <= 4));
+    }
+
+    #[test]
+    fn lookup_field_encoding_is_deterministic_and_printable() {
+        assert_eq!(
+            encode_lookup_field("plain\\\t\r\n\x1b\x7f\u{85}"),
+            "plain\\\\\\t\\r\\n\\x1B\\x7F\\u{85}"
+        );
+        assert_eq!(encode_lookup_field("café 東京"), "café 東京");
     }
 }

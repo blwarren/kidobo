@@ -52,6 +52,58 @@ enum CommitStage {
     ManifestCommitted,
 }
 
+/// Fully written generation whose manifest has not yet selected it.
+///
+/// Dropping an unpromoted generation removes a newly published directory when possible. A
+/// content-addressed directory that already existed is left untouched because another selected
+/// manifest may still reference it.
+#[derive(Debug)]
+pub(crate) struct StagedGeneration {
+    store_root: PathBuf,
+    generation_id: String,
+    previous: Option<String>,
+    remove_on_drop: bool,
+    promoted: bool,
+}
+
+impl StagedGeneration {
+    pub(crate) fn promote(mut self) -> io::Result<String> {
+        self.promote_with_hook(|_| Ok(()))?;
+        Ok(self.generation_id.clone())
+    }
+
+    fn promote_with_hook<F>(&mut self, mut hook: F) -> io::Result<()>
+    where
+        F: FnMut(CommitStage) -> io::Result<()>,
+    {
+        let manifest = GenerationManifest {
+            version: CACHE_SCHEMA_VERSION,
+            current: self.generation_id.clone(),
+            previous: self.previous.clone(),
+        };
+        let manifest_bytes = serde_json::to_vec_pretty(&manifest)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        write_bytes_atomic(&self.store_root.join(MANIFEST_FILE_NAME), &manifest_bytes)?;
+        self.promoted = true;
+        self.remove_on_drop = false;
+        hook(CommitStage::ManifestCommitted)?;
+        prune_generations(&self.store_root, &manifest);
+        Ok(())
+    }
+}
+
+impl Drop for StagedGeneration {
+    fn drop(&mut self) {
+        if !self.promoted && self.remove_on_drop {
+            let directory = self
+                .store_root
+                .join(GENERATIONS_DIRECTORY)
+                .join(&self.generation_id);
+            let _remove_result = fs::remove_dir_all(directory);
+        }
+    }
+}
+
 pub(crate) fn generation_candidates(store_root: &Path) -> Vec<GenerationCandidate> {
     let manifest_path = store_root.join(MANIFEST_FILE_NAME);
     let bytes = match read_bytes_with_limit(&manifest_path, MANIFEST_READ_LIMIT) {
@@ -107,6 +159,37 @@ pub(crate) fn generation_candidates(store_root: &Path) -> Vec<GenerationCandidat
         .collect()
 }
 
+pub(crate) fn cleanup_unselected_generations(store_root: &Path) {
+    let manifest_path = store_root.join(MANIFEST_FILE_NAME);
+    let candidates = generation_candidates(store_root);
+    if candidates.is_empty() {
+        if manifest_path.exists() {
+            return;
+        }
+        let generations_root = store_root.join(GENERATIONS_DIRECTORY);
+        let Ok(entries) = fs::read_dir(&generations_root) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            if entry.path().is_dir() {
+                let _remove_result = fs::remove_dir_all(entry.path());
+            }
+        }
+        let _sync_result = sync_directory(&generations_root);
+        return;
+    }
+
+    let Some(current) = candidates.first() else {
+        return;
+    };
+    let manifest = GenerationManifest {
+        version: CACHE_SCHEMA_VERSION,
+        current: current.id.clone(),
+        previous: candidates.get(1).map(|candidate| candidate.id.clone()),
+    };
+    prune_generations(store_root, &manifest);
+}
+
 pub(crate) fn generation_contents_match(
     candidate: &GenerationCandidate,
     files: &[GenerationFileLimit],
@@ -143,6 +226,7 @@ pub(crate) fn generation_contents_match(
     true
 }
 
+#[cfg(test)]
 pub(crate) fn commit_generation(
     store_root: &Path,
     files: &[GenerationFile<'_>],
@@ -151,12 +235,35 @@ pub(crate) fn commit_generation(
     commit_generation_with_hook(store_root, files, previous, |_| Ok(()))
 }
 
+pub(crate) fn stage_generation(
+    store_root: &Path,
+    files: &[GenerationFile<'_>],
+    previous: Option<&str>,
+) -> io::Result<StagedGeneration> {
+    stage_generation_with_hook(store_root, files, previous, |_| Ok(()))
+}
+
+#[cfg(test)]
 fn commit_generation_with_hook<F>(
     store_root: &Path,
     files: &[GenerationFile<'_>],
     previous: Option<&str>,
     mut hook: F,
 ) -> io::Result<String>
+where
+    F: FnMut(CommitStage) -> io::Result<()>,
+{
+    let mut staged = stage_generation_with_hook(store_root, files, previous, &mut hook)?;
+    staged.promote_with_hook(&mut hook)?;
+    Ok(staged.generation_id.clone())
+}
+
+fn stage_generation_with_hook<F>(
+    store_root: &Path,
+    files: &[GenerationFile<'_>],
+    previous: Option<&str>,
+    mut hook: F,
+) -> io::Result<StagedGeneration>
 where
     F: FnMut(CommitStage) -> io::Result<()>,
 {
@@ -197,34 +304,32 @@ where
         hook(CommitStage::Staged)?;
 
         let generation_directory = generations_root.join(&generation_id);
-        if generation_directory.exists() {
+        let remove_on_drop = if generation_directory.exists() {
             fs::remove_dir_all(&staging_directory)?;
+            false
         } else {
             fs::rename(&staging_directory, &generation_directory)?;
             sync_directory(&generations_root)?;
-        }
-        hook(CommitStage::Published)?;
-
+            true
+        };
         let previous = previous
             .filter(|candidate| is_generation_id(candidate) && *candidate != generation_id)
             .map(str::to_owned);
-        let manifest = GenerationManifest {
-            version: CACHE_SCHEMA_VERSION,
-            current: generation_id.clone(),
+        let staged = StagedGeneration {
+            store_root: store_root.to_path_buf(),
+            generation_id: generation_id.clone(),
             previous,
+            remove_on_drop,
+            promoted: false,
         };
-        let manifest_bytes = serde_json::to_vec_pretty(&manifest)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        write_bytes_atomic(&store_root.join(MANIFEST_FILE_NAME), &manifest_bytes)?;
-        hook(CommitStage::ManifestCommitted)?;
-        prune_generations(store_root, &manifest);
-        Ok(())
+        hook(CommitStage::Published)?;
+        Ok(staged)
     })();
 
     if write_result.is_err() {
         let _cleanup_result = fs::remove_dir_all(&staging_directory);
     }
-    write_result.map(|()| generation_id)
+    write_result
 }
 
 fn create_staging_directory(generations_root: &Path) -> io::Result<PathBuf> {
@@ -308,8 +413,9 @@ mod tests {
     use crate::limited_io::read_bytes_with_limit;
 
     use super::{
-        CommitStage, GenerationFile, GenerationFileLimit, commit_generation,
-        commit_generation_with_hook, generation_candidates, generation_contents_match,
+        CommitStage, GENERATIONS_DIRECTORY, GenerationFile, GenerationFileLimit,
+        cleanup_unselected_generations, commit_generation, commit_generation_with_hook,
+        generation_candidates, generation_contents_match, stage_generation,
     };
 
     fn commit(store: &std::path::Path, value: &[u8], previous: Option<&str>) -> String {
@@ -419,5 +525,29 @@ mod tests {
         .expect("write malformed manifest");
 
         assert!(generation_candidates(temp.path()).is_empty());
+    }
+
+    #[test]
+    fn online_cleanup_removes_unselected_crash_generation() {
+        let temp = TempDir::new().expect("tempdir");
+        let selected = commit(temp.path(), b"selected", None);
+        let staged = stage_generation(
+            temp.path(),
+            &[GenerationFile {
+                name: "payload",
+                contents: b"unselected",
+            }],
+            Some(&selected),
+        )
+        .expect("stage generation");
+        std::mem::forget(staged);
+
+        cleanup_unselected_generations(temp.path());
+
+        let directories = std::fs::read_dir(temp.path().join(GENERATIONS_DIRECTORY))
+            .expect("read generations")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(directories, [std::ffi::OsString::from(selected)]);
     }
 }

@@ -49,10 +49,21 @@ fn publisher_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/publish-release.sh")
 }
 
+fn compatibility_script_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/check-release-compat.sh")
+}
+
 fn write_executable(path: &Path, contents: &str) {
     fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
     fs::write(path, contents).expect("write executable");
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("chmod");
+}
+
+fn path_with_prefix(path: &Path) -> String {
+    match std::env::var("PATH") {
+        Ok(existing) if !existing.is_empty() => format!("{}:{existing}", path.display()),
+        _ => path.display().to_string(),
+    }
 }
 
 fn clear_repository_local_git_env(command: &mut Command) {
@@ -177,18 +188,24 @@ exec "${KIDOBO_TEST_REAL_GIT}" "$@"
             r#"#!/usr/bin/env bash
 set -euo pipefail
 printf 'just %s\n' "$*" >> "${KIDOBO_TEST_EVENT_LOG}"
-if [[ -n "${KIDOBO_TEST_READY_MARKER:-}" && "$*" == "exercise-release" ]]; then
+if [[ -n "${KIDOBO_TEST_READY_MARKER:-}" && "$*" == "release-compat" ]]; then
   : > "${KIDOBO_TEST_READY_MARKER}"
 fi
 if [[ "$*" == "exercise-release" ]]; then
-  mkdir -p target/release
+  mkdir -p target/x86_64-unknown-linux-musl/release
   printf '#!/usr/bin/env bash\nprintf '\''kidobo %%s\\n'\'' %q\n' \
-    "${KIDOBO_TEST_BINARY_VERSION}" > target/release/kidobo
-  chmod 0755 target/release/kidobo
+    "${KIDOBO_TEST_BINARY_VERSION}" > target/x86_64-unknown-linux-musl/release/kidobo
+  chmod 0755 target/x86_64-unknown-linux-musl/release/kidobo
 fi
 exit 0
 "#,
         );
+        for command in ["docker", "musl-gcc", "readelf"] {
+            write_executable(
+                &fake_bin.join(command),
+                "#!/usr/bin/env bash\nset -euo pipefail\nexit 0\n",
+            );
+        }
         write_executable(
             &fake_bin.join("gh"),
             r#"#!/usr/bin/env bash
@@ -479,6 +496,76 @@ fn publisher_script_has_valid_bash_syntax() {
         .status()
         .expect("check publisher syntax");
     assert!(status.success());
+}
+
+#[test]
+fn release_compatibility_script_has_valid_bash_syntax() {
+    let status = Command::new("bash")
+        .arg("-n")
+        .arg(compatibility_script_path())
+        .status()
+        .expect("check compatibility script syntax");
+    assert!(status.success());
+}
+
+#[test]
+fn release_compatibility_gate_checks_both_container_baselines() {
+    let temp = TempDir::new().expect("tempdir");
+    let fake_bin = temp.path().join("fake-bin");
+    let docker_log = temp.path().join("docker.log");
+    let binary = temp.path().join("kidobo");
+    write_executable(&binary, "#!/usr/bin/env bash\nexit 0\n");
+    write_executable(
+        &fake_bin.join("readelf"),
+        "#!/usr/bin/env bash\nset -euo pipefail\nexit 0\n",
+    );
+    write_executable(
+        &fake_bin.join("docker"),
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "${KIDOBO_TEST_DOCKER_LOG}"
+if [[ " $* " == *" lookup 203.0.113.7 --format tsv "* ]]; then
+  printf '203.0.113.7\tinternal:blocklist\t203.0.113.0/24\n'
+fi
+"#,
+    );
+
+    let output = Command::new(compatibility_script_path())
+        .arg(&binary)
+        .env("PATH", path_with_prefix(&fake_bin))
+        .env("KIDOBO_TEST_DOCKER_LOG", &docker_log)
+        .output()
+        .expect("run compatibility gate");
+
+    assert_success(&output, "release compatibility gate");
+    let log = read_to_string_with_limit(&docker_log, FIXTURE_LOG_READ_LIMIT);
+    assert_eq!(log.lines().count(), 6);
+    assert!(log.contains("debian:11-slim"));
+    assert!(log.contains("alpine:3.22"));
+    assert!(log.contains("--network none"));
+    assert!(log.contains("--read-only"));
+}
+
+#[test]
+fn release_compatibility_gate_rejects_an_elf_interpreter() {
+    let temp = TempDir::new().expect("tempdir");
+    let fake_bin = temp.path().join("fake-bin");
+    let binary = temp.path().join("kidobo");
+    write_executable(&binary, "#!/usr/bin/env bash\nexit 0\n");
+    write_executable(
+        &fake_bin.join("readelf"),
+        "#!/usr/bin/env bash\nset -euo pipefail\nif [[ \"$1\" == \"-l\" ]]; then echo 'Requesting program interpreter'; fi\n",
+    );
+    write_executable(&fake_bin.join("docker"), "#!/usr/bin/env bash\nexit 99\n");
+
+    let output = Command::new(compatibility_script_path())
+        .arg(&binary)
+        .env("PATH", path_with_prefix(&fake_bin))
+        .output()
+        .expect("run compatibility gate");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("ELF interpreter"));
 }
 
 #[test]
@@ -775,6 +862,9 @@ fn publisher_atomically_pushes_then_verifies_and_publishes_local_artifacts() {
     let exercise_position = events
         .find("just exercise-release\n")
         .expect("release binary exercise event");
+    let compatibility_position = events
+        .find("just release-compat\n")
+        .expect("release compatibility event");
     let push_position = events
         .find("git push --atomic ")
         .expect("atomic push event");
@@ -788,6 +878,8 @@ fn publisher_atomically_pushes_then_verifies_and_publishes_local_artifacts() {
         .find("gh release edit ")
         .expect("draft publication event");
     assert!(exercise_position < push_position);
+    assert!(exercise_position < compatibility_position);
+    assert!(compatibility_position < push_position);
     assert!(push_position < create_position);
     assert!(create_position < download_position);
     assert!(download_position < edit_position);

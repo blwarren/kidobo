@@ -8,7 +8,7 @@ update: _install-cooldown && test
 
 # Build the release binary.
 build-release:
-    @cargo build --release --locked --package kidobo --bin kidobo
+    @env CC_x86_64_unknown_linux_musl=musl-gcc CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc cargo build --release --locked --package kidobo --bin kidobo --target x86_64-unknown-linux-musl
 
 # Run clippy with the repository lint policy.
 lint:
@@ -41,7 +41,15 @@ check: format test lint
 
 # Exercise the locally built release binary with isolated runtime fixtures.
 exercise-release: build-release
-    @env KIDOBO_TEST_BINARY="${CARGO_TARGET_DIR:-target}/release/kidobo" cargo test --locked --test cli_runtime sync_remote_worker_warning_does_not_deadlock -- --exact
+    @env KIDOBO_TEST_BINARY="${CARGO_TARGET_DIR:-target}/x86_64-unknown-linux-musl/release/kidobo" cargo test --locked --test cli_runtime sync_remote_worker_warning_does_not_deadlock -- --exact
+
+# Reject dynamic Linux artifacts and exercise the static binary on supported baselines.
+release-compat: build-release
+    @./scripts/check-release-compat.sh "${CARGO_TARGET_DIR:-target}/x86_64-unknown-linux-musl/release/kidobo"
+
+# Build workspace documentation with rustdoc warnings denied.
+rustdoc:
+    @env RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
 
 # Run the complete local CI validation sequence.
 ci: && lint deny audit test

@@ -17,6 +17,7 @@ gh auth login
 - `cooldown.toml`: fail-closed seven-day minimum publish age for dependency updates.
 - `scripts/install.sh`: public install/uninstall flow used by operators.
 - `scripts/publish-release.sh`: guarded, transactional release preparation and publication.
+- `scripts/check-release-compat.sh`: static ELF and Debian/Alpine release compatibility gate.
 - `scripts/changelog/*`: release-notes normalization and changelog generation.
 - `scripts/perf/*`: benchmark and lookup RSS regression tooling.
 - `.cargo/mutants.toml`: cargo-mutants mutation-testing configuration.
@@ -27,6 +28,8 @@ gh auth login
 - `just ci` (local formatting, lint, dependency-policy, audit, and test gate)
 - `just coverage` (release-only 90% minimum for stable region, function, and line metrics)
 - `just exercise-release` (release-only build and isolated binary exercise)
+- `just release-compat` (release-only static ELF, Debian 11, and Alpine 3.22 gate)
+- `just rustdoc` (workspace documentation with warnings denied)
 - `just update` (install the pinned cooldown tool, update dependencies at least seven days old, and test)
 - `just udeps` (manual nightly-toolchain dependency-usage audit)
 - `just release-notes-check` (required after repository changes and during release validation)
@@ -45,6 +48,11 @@ remove the exception before committing:
 crate = "affected-crate"
 version = "1.2.3"
 ```
+
+Release builds require `musl-gcc` and the pinned
+`x86_64-unknown-linux-musl` Rust target. The compatibility gate additionally
+requires `readelf` and Docker access; it runs only offline Kidobo commands in
+the containers and never invokes firewall or systemd operations.
 
 ## GitHub Automation
 

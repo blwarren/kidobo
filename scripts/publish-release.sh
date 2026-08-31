@@ -24,7 +24,7 @@ fi
 
 release_tag="v${requested_version#v}"
 release_version="${release_tag#v}"
-required_commands=(gh cargo cat cmp date git grep head install just mkdir mktemp rm rustup sed sha256sum sort tar uname)
+required_commands=(gh cargo cat cmp date docker git grep head install just mkdir mktemp musl-gcc readelf rm rustup sed sha256sum sort tar uname)
 for required_command in "${required_commands[@]}"; do
     if ! command -v "${required_command}" >/dev/null 2>&1; then
         echo "missing required command: ${required_command}" >&2
@@ -248,7 +248,9 @@ just ci
 echo "[release] running release-only validation"
 just release-notes-check
 just coverage
+just rustdoc
 just exercise-release
+just release-compat
 git diff --check --cached
 if ! git diff --quiet || [[ -n "$(git ls-files --others --exclude-standard)" ]]; then
     echo "validation produced uncommitted changes outside the staged release update" >&2
@@ -260,7 +262,7 @@ echo "[release] packaging locally built artifacts"
 package_root="${temporary_root}/package/${archive_root}"
 mkdir -p "${package_root}" "${artifact_root}"
 artifacts_created=true
-install -m 0755 target/release/kidobo "${package_root}/kidobo"
+install -m 0755 target/x86_64-unknown-linux-musl/release/kidobo "${package_root}/kidobo"
 install -m 0644 README.md LICENSE "${package_root}/"
 tar -C "${temporary_root}/package" -czf "${archive_path}" "${archive_root}"
 (

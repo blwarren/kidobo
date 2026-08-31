@@ -1,5 +1,6 @@
 //! Built-in online source providers used by the sync application use case.
 
+use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::path::Path;
 use std::sync::Mutex;
@@ -9,21 +10,37 @@ use std::time::Duration;
 
 use kidobo_app::AppError;
 use kidobo_app::source::{
-    FailurePolicy, Notice, SourceRole, SyncSourceBatch, SyncSourceContext, SyncSourceDescriptor,
-    SyncSourceProvider, SyncSourceRegistry,
+    FailurePolicy, Notice, PendingCachePromotion, SourceRole, SyncSourceBatch, SyncSourceContext,
+    SyncSourceDescriptor, SyncSourceLoad, SyncSourceProvider, SyncSourceRegistry,
 };
+#[cfg(test)]
 use kidobo_core::network::CanonicalCidr;
 
 use crate::asn::{Bgpq4AsnPrefixResolver, load_asn_prefixes_with_cache};
 use crate::blocklist_file::{
     BlocklistDocument, BlocklistNormalizeResult, normalize_local_blocklist_with_fast_state,
 };
-use crate::github_meta::load_github_meta_safelist;
-use crate::http_cache::{HttpClient, ReqwestHttpClient, fetch_iplist_with_cache};
+use crate::cache_generation::StagedGeneration;
+use crate::github_meta::prepare_github_meta_safelist;
+#[cfg(test)]
+use crate::http_cache::fetch_iplist_with_cache;
+use crate::http_cache::{HttpClient, ReqwestHttpClient, prepare_iplist_with_cache};
 
 /// Maximum number of concurrent remote-feed workers.
 pub const MAX_REMOTE_FETCH_WORKERS: usize = 5;
 const BLOCKLIST_FAST_STATE_FILE: &str = "blocklist-normalize.fast-state";
+
+struct StagedCachePromotion(StagedGeneration);
+
+impl PendingCachePromotion for StagedCachePromotion {
+    fn promote(self: Box<Self>) -> Result<(), String> {
+        let Self(generation) = *self;
+        generation
+            .promote()
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+}
 
 /// Required synchronization provider for the normalized local blocklist.
 #[derive(Debug, Default, Clone, Copy)]
@@ -38,7 +55,7 @@ impl SyncSourceProvider for LocalBlocklistSyncProvider {
         }
     }
 
-    fn load(&self, context: &SyncSourceContext<'_>) -> Result<SyncSourceBatch, AppError> {
+    fn load(&self, context: &SyncSourceContext<'_>) -> Result<SyncSourceLoad, AppError> {
         let fast_state_path = context.paths.cache_dir.join(BLOCKLIST_FAST_STATE_FILE);
         let normalization = normalize_local_blocklist_with_fast_state(
             &context.paths.blocklist_file,
@@ -59,7 +76,7 @@ impl SyncSourceProvider for LocalBlocklistSyncProvider {
             .iter()
             .filter_map(|line| line.canonical)
             .collect();
-        Ok(SyncSourceBatch { networks, notices })
+        Ok(SyncSourceLoad::ready(SyncSourceBatch { networks, notices }))
     }
 }
 
@@ -88,16 +105,16 @@ impl SyncSourceProvider for RemoteFeedsSyncProvider {
         }
     }
 
-    fn load(&self, context: &SyncSourceContext<'_>) -> Result<SyncSourceBatch, AppError> {
+    fn load(&self, context: &SyncSourceContext<'_>) -> Result<SyncSourceLoad, AppError> {
         let timeout = Duration::from_secs(u64::from(context.config.remote.timeout_secs.get()));
         let client = ReqwestHttpClient::with_user_agent_and_timeout(&self.user_agent, timeout);
-        let (networks, notices) = fetch_remote_networks_concurrently(
+        prepare_remote_networks_in_chunks(
             &context.config.remote.urls,
             &client,
             &context.paths.remote_cache_dir,
             context.env,
-        );
-        Ok(SyncSourceBatch { networks, notices })
+            context.config.ipset.maxelem.get(),
+        )
     }
 }
 
@@ -114,11 +131,11 @@ impl SyncSourceProvider for ConfigSafelistSyncProvider {
         }
     }
 
-    fn load(&self, context: &SyncSourceContext<'_>) -> Result<SyncSourceBatch, AppError> {
-        Ok(SyncSourceBatch {
+    fn load(&self, context: &SyncSourceContext<'_>) -> Result<SyncSourceLoad, AppError> {
+        Ok(SyncSourceLoad::ready(SyncSourceBatch {
             networks: context.config.safe.ips.clone(),
             notices: Vec::new(),
-        })
+        }))
     }
 }
 
@@ -142,18 +159,18 @@ impl SyncSourceProvider for GithubMetadataSyncProvider {
     fn descriptor(&self) -> SyncSourceDescriptor {
         SyncSourceDescriptor {
             id: "github-metadata",
-            role: SourceRole::Safelist,
+            role: SourceRole::ExternalSafelist,
             failure_policy: FailurePolicy::BestEffort,
         }
     }
 
-    fn load(&self, context: &SyncSourceContext<'_>) -> Result<SyncSourceBatch, AppError> {
+    fn load(&self, context: &SyncSourceContext<'_>) -> Result<SyncSourceLoad, AppError> {
         if !context.config.safe.include_github_meta {
-            return Ok(SyncSourceBatch::default());
+            return Ok(SyncSourceLoad::default());
         }
         let timeout = Duration::from_secs(u64::from(context.config.remote.timeout_secs.get()));
         let client = ReqwestHttpClient::with_user_agent_and_timeout(&self.user_agent, timeout);
-        let loaded = load_github_meta_safelist(
+        let loaded = prepare_github_meta_safelist(
             &client,
             &context.paths.remote_cache_dir,
             &context.config.safe.github_meta_url,
@@ -164,9 +181,24 @@ impl SyncSourceProvider for GithubMetadataSyncProvider {
             provider: "github-metadata",
             reason: error.to_string(),
         })?;
-        Ok(SyncSourceBatch {
-            networks: loaded.networks,
+        let fallback = loaded.fallback.map(|fallback| SyncSourceBatch {
+            networks: fallback.networks,
             notices: Vec::new(),
+        });
+        let pending_promotions = loaded
+            .pending_promotion
+            .map(|promotion| -> Box<dyn PendingCachePromotion> {
+                Box::new(StagedCachePromotion(promotion))
+            })
+            .into_iter()
+            .collect();
+        Ok(SyncSourceLoad {
+            primary: SyncSourceBatch {
+                networks: loaded.primary.networks,
+                notices: Vec::new(),
+            },
+            fallback,
+            pending_promotions,
         })
     }
 }
@@ -184,7 +216,7 @@ impl SyncSourceProvider for AsnBansSyncProvider {
         }
     }
 
-    fn load(&self, context: &SyncSourceContext<'_>) -> Result<SyncSourceBatch, AppError> {
+    fn load(&self, context: &SyncSourceContext<'_>) -> Result<SyncSourceLoad, AppError> {
         let stale_after =
             Duration::from_secs(u64::from(context.config.asn.cache_stale_after_secs.get()));
         let cache_dir = context.paths.cache_dir.join("asn");
@@ -205,7 +237,7 @@ impl SyncSourceProvider for AsnBansSyncProvider {
         }
         networks.sort_unstable();
         networks.dedup();
-        Ok(SyncSourceBatch { networks, notices })
+        Ok(SyncSourceLoad::ready(SyncSourceBatch { networks, notices }))
     }
 }
 
@@ -225,6 +257,98 @@ pub fn build_sync_source_registry(product_version: &str) -> Result<SyncSourceReg
     Ok(registry)
 }
 
+fn prepare_remote_networks_in_chunks<S, C>(
+    urls: &[S],
+    http_client: &C,
+    cache_dir: &Path,
+    env: &std::collections::BTreeMap<OsString, OsString>,
+    maxelem: u32,
+) -> Result<SyncSourceLoad, AppError>
+where
+    S: AsRef<str> + Sync,
+    C: HttpClient + Sync,
+{
+    let aggregate_limit = remote_aggregate_limit(maxelem);
+    let mut seen_urls = BTreeSet::new();
+    let unique_urls = urls
+        .iter()
+        .map(AsRef::as_ref)
+        .filter(|url| seen_urls.insert(*url))
+        .collect::<Vec<_>>();
+    let mut aggregate = BTreeSet::new();
+    let mut notices = Vec::new();
+    let mut pending_promotions: Vec<Box<dyn PendingCachePromotion>> = Vec::new();
+
+    for chunk in unique_urls.chunks(MAX_REMOTE_FETCH_WORKERS) {
+        let worker_count = remote_fetch_worker_count(chunk.len());
+        let next_idx = AtomicUsize::new(0);
+        let results = Mutex::new(Vec::with_capacity(chunk.len()));
+        thread::scope(|scope| {
+            for _ in 0..worker_count {
+                scope.spawn(|| {
+                    loop {
+                        let index = next_idx.fetch_add(1, Ordering::Relaxed);
+                        let Some(url) = chunk.get(index) else {
+                            break;
+                        };
+                        let url = *url;
+                        let result =
+                            prepare_iplist_with_cache(http_client, url, cache_dir, env, maxelem)
+                                .map_err(|error| {
+                                    Notice::warning(format!(
+                                        "remote source fetch failed softly for {url}: {error}"
+                                    ))
+                                });
+                        results
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push((index, result));
+                    }
+                });
+            }
+        });
+
+        let mut chunk_results = results
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        chunk_results.sort_unstable_by_key(|(index, _)| *index);
+        for (_, result) in chunk_results {
+            match result {
+                Ok(prepared) => {
+                    for network in prepared.loaded.networks {
+                        aggregate.insert(network);
+                        if aggregate.len() > aggregate_limit {
+                            return Err(AppError::SourceAggregateBudgetExceeded {
+                                entries: aggregate.len(),
+                                limit: aggregate_limit,
+                            });
+                        }
+                    }
+                    if let Some(promotion) = prepared.pending_promotion {
+                        pending_promotions.push(Box::new(StagedCachePromotion(promotion)));
+                    }
+                }
+                Err(notice) => notices.push(notice),
+            }
+        }
+    }
+
+    Ok(SyncSourceLoad {
+        primary: SyncSourceBatch {
+            networks: aggregate.into_iter().collect(),
+            notices,
+        },
+        fallback: None,
+        pending_promotions,
+    })
+}
+
+fn remote_aggregate_limit(maxelem: u32) -> usize {
+    let maxelem = usize::try_from(maxelem).unwrap_or(usize::MAX);
+    8_192.max(maxelem.saturating_mul(4).min(2_000_000))
+}
+
+#[cfg(test)]
 /// Fetches configured remote feeds with bounded parallelism and deterministic aggregation.
 ///
 /// Per-feed failures become warning notices; successful networks are sorted and deduplicated.
@@ -303,6 +427,7 @@ fn remote_fetch_worker_count_for(url_count: usize, cpu_parallelism: usize) -> us
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write as _;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
@@ -312,13 +437,46 @@ mod tests {
 
     use super::{
         MAX_REMOTE_FETCH_WORKERS, RemoteFeedsSyncProvider, build_sync_source_registry,
-        fetch_remote_networks_concurrently, remote_fetch_worker_count_for,
+        fetch_remote_networks_concurrently, prepare_remote_networks_in_chunks,
+        remote_fetch_worker_count_for,
     };
     use crate::http_cache::{HttpClient, HttpClientError, HttpRequest, HttpResponse};
 
     struct DelayedClient {
         in_flight: AtomicUsize,
         max_in_flight: AtomicUsize,
+    }
+
+    struct AggregateBudgetClient;
+
+    struct DuplicateUrlClient {
+        calls: AtomicUsize,
+    }
+
+    struct FailingClient;
+
+    impl HttpClient for AggregateBudgetClient {
+        fn fetch(&self, request: HttpRequest) -> Result<HttpResponse, HttpClientError> {
+            let feed = request.url.rsplit('/').next().unwrap_or_default();
+            let body = match feed {
+                "0" | "1" => {
+                    let first = if feed == "0" { 10 } else { 11 };
+                    let mut body = String::new();
+                    for index in 0..4_096 {
+                        writeln!(body, "{first}.0.{}.{}", index / 256, index % 256)
+                            .expect("write aggregate fixture");
+                    }
+                    body.into_bytes()
+                }
+                _ => b"12.0.0.1\n".to_vec(),
+            };
+            Ok(HttpResponse {
+                status: StatusCode::OK,
+                body,
+                etag: None,
+                last_modified: None,
+            })
+        }
     }
 
     impl HttpClient for DelayedClient {
@@ -333,6 +491,31 @@ mod tests {
                 body: format!("198.51.100.{final_octet}\n").into_bytes(),
                 etag: None,
                 last_modified: None,
+            })
+        }
+    }
+
+    impl HttpClient for DuplicateUrlClient {
+        fn fetch(&self, _request: HttpRequest) -> Result<HttpResponse, HttpClientError> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            let body = if call == 0 {
+                b"192.0.2.1\n".to_vec()
+            } else {
+                b"198.51.100.1\n".to_vec()
+            };
+            Ok(HttpResponse {
+                status: StatusCode::OK,
+                body,
+                etag: None,
+                last_modified: None,
+            })
+        }
+    }
+
+    impl HttpClient for FailingClient {
+        fn fetch(&self, _request: HttpRequest) -> Result<HttpResponse, HttpClientError> {
+            Err(HttpClientError::Request {
+                reason: "offline".to_owned(),
             })
         }
     }
@@ -371,7 +554,7 @@ mod tests {
                 ),
                 (
                     "github-metadata",
-                    SourceRole::Safelist,
+                    SourceRole::ExternalSafelist,
                     FailurePolicy::BestEffort
                 ),
                 ("asn-bans", SourceRole::Candidate, FailurePolicy::Required),
@@ -412,5 +595,73 @@ mod tests {
         assert_eq!(networks.len(), 8);
         assert!(notices.is_empty());
         assert!(client.max_in_flight.load(Ordering::SeqCst) <= MAX_REMOTE_FETCH_WORKERS);
+    }
+
+    #[test]
+    fn aggregate_budget_rejection_drops_every_staged_generation() {
+        let temp = TempDir::new().expect("tempdir");
+        let urls = [
+            "https://example.test/0",
+            "https://example.test/1",
+            "https://example.test/2",
+        ];
+
+        let Err(error) = prepare_remote_networks_in_chunks(
+            &urls,
+            &AggregateBudgetClient,
+            temp.path(),
+            &std::collections::BTreeMap::new(),
+            1,
+        ) else {
+            panic!("8,193 distinct entries must exceed the aggregate floor");
+        };
+
+        assert!(matches!(
+            error,
+            kidobo_app::AppError::SourceAggregateBudgetExceeded {
+                entries: 8_193,
+                limit: 8_192
+            }
+        ));
+        for url in urls {
+            assert!(
+                !crate::http_cache::remote_generation_store(temp.path(), url)
+                    .join("current.json")
+                    .exists()
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_urls_share_one_staged_generation_and_leave_a_usable_cache() {
+        let temp = TempDir::new().expect("tempdir");
+        let url = "https://example.test/duplicate";
+        let client = DuplicateUrlClient {
+            calls: AtomicUsize::new(0),
+        };
+
+        let loaded = prepare_remote_networks_in_chunks(
+            &[url, url],
+            &client,
+            temp.path(),
+            &std::collections::BTreeMap::new(),
+            65_536,
+        )
+        .expect("duplicate URLs should load once");
+
+        assert_eq!(client.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(loaded.pending_promotions.len(), 1);
+        for promotion in loaded.pending_promotions {
+            promotion.promote().expect("promote staged cache");
+        }
+
+        let cached = fetch_remote_networks_concurrently(
+            &[url],
+            &FailingClient,
+            temp.path(),
+            &std::collections::BTreeMap::new(),
+        );
+        assert_eq!(cached.0, loaded.primary.networks);
+        assert!(cached.1.is_empty());
     }
 }

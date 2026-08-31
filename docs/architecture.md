@@ -60,7 +60,7 @@ remains deterministic regardless of filesystem iteration order.
 | Local blocklist | Candidate, required | Local entries |
 | Remote feeds | Candidate, best effort | Compatible cached entries only |
 | Config safelist | Safelist, required | Included with valid config |
-| GitHub metadata | Safelist, best effort | Compatible cache only |
+| GitHub metadata | External safelist, best effort with admission checks | Compatible cache only |
 | ASN bans | Candidate, required with stale fallback | Configured ASN caches only |
 
 To add a built-in source, implement the appropriate provider trait, assign a stable unique ID, register it
@@ -74,11 +74,13 @@ The application sync use case explicitly preserves this order:
 1. Resolve paths and valid config, then acquire the nonblocking lock.
 2. Ensure sets and chains without activating new wiring.
 3. Load every registered source and apply provider failure policy.
-4. Compute family-separated effective lists.
+4. Admit externally controlled safelists without allowing them to empty a
+   nonempty enabled-family baseline, then compute family-separated effective lists.
 5. Validate both enabled-family capacities before either swap.
-6. Atomically replace IPv6, then IPv4.
-7. Activate and normalize fail-closed firewall wiring.
-8. Best-effort clean disabled-family artifacts.
+6. Promote every accepted staged cache manifest; any promotion failure aborts.
+7. Atomically replace IPv6, then IPv4.
+8. Activate and normalize fail-closed firewall wiring.
+9. Best-effort clean disabled-family artifacts.
 
 The enforcement adapter retains the 31-character ipset name constraint, temporary restore-and-swap
 replacement, per-set atomicity, and fail-closed chain and INPUT jump ordering. To normalize a family's
@@ -92,24 +94,39 @@ live firewall or systemd mutations.
 ## Remote cache generations
 
 Validated remote-feed and GitHub metadata writes use a private generation adapter. A complete generation is
-written and synced in a sibling staging directory, atomically published under its content SHA-256 ID, then
-selected by an atomically replaced and synced `current.json` manifest. Remote feeds are stored below
+written and synced in a sibling staging directory and atomically published under its content SHA-256 ID.
+The application selects it with an atomically replaced and synced `current.json` manifest only after all
+source semantics and both enabled-family capacities pass, and before either set replacement. Remote feeds are stored below
 `v2/remote/<url-hash>/generations/<sha256>/`; GitHub metadata is stored below
 `v2/github-meta/generations/<sha256>/`. Each manifest names a current and optional previous generation.
 
 Readers validate the manifest, generation identifiers, bounded members, configured URL, checksums, and
 GitHub category scope before accepting data. They try current, then previous, then the legacy flat-file
 layout. New writes use only v2, while legacy files remain readable and unchanged for compatibility. After a
-successful commit, only the current and previous generations are retained; incomplete staging directories
-are never selected. Normal cache flush removes the containing remote-cache directory and therefore both
-layouts.
+successful promotion, only the current and previous generations are retained; incomplete or unselected
+staging directories are never selected and are removed opportunistically by online cache work. Normal cache
+flush removes the containing remote-cache directory and therefore both layouts.
+
+Remote feeds are parsed into an incrementally deduplicated set. For configured
+`maxelem = M`, one feed accepts at most `max(16384, min(2M, 1000000))` data
+lines and `max(4096, min(2M, 1000000))` unique canonical CIDRs. The combined
+remote set accepts at most `max(8192, min(4M, 2000000))` CIDRs. URLs are fetched
+in deterministic chunks of at most five workers so memory retains one chunk
+plus the bounded aggregate. Per-feed rejection uses a compatible selected
+cache; aggregate rejection aborts before enforcement.
+
+GitHub metadata is an externally controlled safelist. Fresh and cached batches
+share the same 4,096-entry, IPv4 `/8`, IPv6 `/16`, and one-sixteenth-per-family
+coverage envelope. The application separately rejects an otherwise valid batch
+when it would empty an enabled family that remains nonempty after applying only
+the operator's `safe.ips` baseline.
 
 ## Validation and release
 
 Use `just check` at each implementation checkpoint and `just ci` for final integration. The local CI recipe
 checks formatting, lints, dependency policy, audits, and tests. `just publish-release X.Y.Z` prepares the
 candidate in a temporary worktree, runs that gate, repeats the release-note check, then performs the
-release-only coverage, build, and isolated binary-exercise gates. The exercise uses a temporary runtime
-root, loopback feed, and fake privileged commands. The publisher packages the tested Linux x86_64 binary
+release-only coverage, rustdoc, isolated binary-exercise, and static compatibility gates. The exercises use a temporary runtime
+root, loopback feed, fake privileged commands, and Debian 11/Alpine 3.22 containers. The publisher packages the tested static Linux x86_64 binary
 and uses GitHub CLI to upload, verify, and publish the release. Run `just release-notes-check` after every
 repository change.
