@@ -31,6 +31,7 @@ pub fn run_init_command(io: &mut CliIo<'_>) -> Result<(), KidoboError> {
             ],
         },
         &InitDependencies {
+            cancellation: &crate::cli::interrupt::SigintCancellation,
             paths: &paths,
             provisioner: &provisioner,
         },

@@ -59,6 +59,7 @@ pub mod limited_io;
 pub mod lock;
 pub mod lookup_sources;
 pub mod path;
+pub mod prompt;
 mod remote_parse;
 pub mod source_files;
 pub mod source_load;

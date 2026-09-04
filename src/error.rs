@@ -63,7 +63,10 @@ impl KidoboError {
     /// Returns exit 130 for interruption and exit 1 for every other runtime failure.
     pub fn exit_code(&self) -> u8 {
         match self {
-            Self::Interrupted => 130,
+            Self::Interrupted
+            | Self::Application {
+                source: AppError::Interrupted,
+            } => 130,
             _ => 1,
         }
     }

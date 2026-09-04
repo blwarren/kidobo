@@ -57,6 +57,7 @@ fn run_lookup_command(
     let outcome = lookup::execute(
         &request,
         &LookupDependencies {
+            cancellation: &crate::cli::interrupt::SigintCancellation,
             paths: &paths,
             configs: &configs,
             target_files: &target_files,

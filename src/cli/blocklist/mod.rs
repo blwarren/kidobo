@@ -192,6 +192,7 @@ fn production_dependencies() -> BlocklistDependencies<'static> {
     static REPOSITORY: FileBlocklistRepository = FileBlocklistRepository;
     static ASN: SystemAsnOperations = SystemAsnOperations;
     BlocklistDependencies {
+        cancellation: &crate::cli::interrupt::SigintCancellation,
         paths: &PATHS,
         configs: &CONFIGS,
         locks: &LOCKS,
@@ -263,12 +264,7 @@ fn confirm_partial_matches(
         .map_err(|error| KidoboError::BlocklistPrompt {
             reason: error.to_string(),
         })?;
-    let mut response = String::new();
-    io.input
-        .read_line(&mut response)
-        .map_err(|error| KidoboError::BlocklistPrompt {
-            reason: error.to_string(),
-        })?;
+    let response = io.input.read_response()?;
     Ok(matches!(
         response.trim().to_ascii_lowercase().as_str(),
         "y" | "yes"

@@ -20,6 +20,7 @@ pub fn run_sync_command(timer: bool) -> Result<(), KidoboError> {
     let outcome = sync::execute(
         &request,
         &SyncDependencies {
+            cancellation: &crate::cli::interrupt::SigintCancellation,
             paths: &paths,
             configs: &configs,
             locks: &locks,
@@ -28,6 +29,10 @@ pub fn run_sync_command(timer: bool) -> Result<(), KidoboError> {
             observer: &observer,
         },
     )?;
+    if crate::cli::interrupt::was_interrupted() {
+        info!("sync enforcement completed after SIGINT");
+        return Err(KidoboError::Interrupted);
+    }
     observer.stage_completed("sync_pipeline_complete");
 
     let source_count = |id: &str| {

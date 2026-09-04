@@ -17,6 +17,7 @@ pub fn run_flush_command(cache_only: bool) -> Result<(), KidoboError> {
             cache_only,
         },
         &FlushDependencies {
+            cancellation: &crate::cli::interrupt::SigintCancellation,
             paths: &paths,
             configs: &configs,
             locks: &locks,

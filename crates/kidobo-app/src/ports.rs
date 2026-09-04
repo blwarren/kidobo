@@ -7,6 +7,41 @@ use kidobo_core::config::Config;
 use crate::error::AppError;
 use crate::paths::{ConfigRequirement, PathResolutionInput, ResolvedPaths};
 
+/// Cooperative cancellation checked between operations and outside enforcement commits.
+pub trait Cancellation: Send + Sync {
+    /// Returns whether the caller requested cancellation.
+    fn is_cancelled(&self) -> bool;
+
+    /// Rejects further work when cancellation has been requested.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AppError::Interrupted`] when cancellation is pending.
+    fn check(&self) -> Result<(), AppError> {
+        if self.is_cancelled() {
+            Err(AppError::Interrupted)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// Cancellation policy for callers that do not install an interrupt handler.
+#[derive(Debug, Default)]
+pub struct NoCancellation;
+
+impl Cancellation for NoCancellation {
+    fn is_cancelled(&self) -> bool {
+        false
+    }
+}
+
+impl Cancellation for std::sync::atomic::AtomicBool {
+    fn is_cancelled(&self) -> bool {
+        self.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
 /// Resolves all runtime locations before a command workflow begins.
 pub trait PathResolver {
     /// Resolves compatibility-sensitive runtime paths.

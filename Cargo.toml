@@ -21,7 +21,7 @@ kidobo-adapters = { path = "crates/kidobo-adapters" }
 kidobo-app = { path = "crates/kidobo-app" }
 kidobo-core = { path = "crates/kidobo-core" }
 log = "0.4"
-nix = { version = "0.31", default-features = false, features = ["process", "signal"] }
+nix = { version = "0.31", default-features = false, features = ["fs", "poll", "process", "signal"] }
 reqwest = { version = "0.13", default-features = false }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1", features = ["derive"] }

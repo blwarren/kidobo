@@ -91,6 +91,7 @@ pub(crate) struct PreparedGithubMetaLoad {
     pub(crate) primary: GithubMetaLoadResult,
     pub(crate) fallback: Option<GithubMetaLoadResult>,
     pub(crate) pending_promotion: Option<StagedGeneration>,
+    pub(crate) staging_failure: Option<GithubMetaLoadError>,
 }
 
 /// Failure to persist a fully validated GitHub metadata generation.
@@ -157,7 +158,8 @@ impl CachePaths {
 /// # Errors
 ///
 /// Returns [`GithubMetaLoadError::WriteCacheFile`] when a valid network response cannot be
-/// persisted atomically. Network and invalid-response failures otherwise use a validated fallback.
+/// persisted atomically and no compatible fallback exists, or when promotion fails. Network and
+/// invalid-response failures otherwise use a validated fallback.
 #[cfg(test)]
 pub fn load_github_meta_safelist(
     client: &dyn HttpClient,
@@ -208,6 +210,7 @@ pub(crate) fn prepare_github_meta_safelist(
         ConditionalFetchResult::CacheNotModified => {
             if let Some(networks) = cache.networks.clone() {
                 Ok(PreparedGithubMetaLoad {
+                    staging_failure: None,
                     primary: GithubMetaLoadResult {
                         networks,
                         source: GithubMetaSource::CacheNotModified,
@@ -218,6 +221,7 @@ pub(crate) fn prepare_github_meta_safelist(
                 })
             } else {
                 Ok(PreparedGithubMetaLoad {
+                    staging_failure: None,
                     primary: cache.fallback(None, &selection, GithubMetaSource::FallbackCache),
                     fallback: previous,
                     pending_promotion: None,
@@ -225,6 +229,7 @@ pub(crate) fn prepare_github_meta_safelist(
             }
         }
         ConditionalFetchResult::FallbackCache => Ok(PreparedGithubMetaLoad {
+            staging_failure: None,
             primary: cache.fallback(
                 cache.networks.clone(),
                 &selection,
@@ -466,13 +471,24 @@ fn handle_network_response(
         sha256_raw: sha256_hex(&response.body),
     };
 
-    let pending_promotion = stage_cache(
+    let pending_promotion = match stage_cache(
         paths,
         &response.body,
         &metadata,
         selection,
         previous_generation,
-    )?;
+    ) {
+        Ok(promotion) => promotion,
+        Err(error) => {
+            let mut fallback = prepared_github_fallback(cached, selection);
+            if fallback.primary.source == GithubMetaSource::Empty {
+                return Err(error);
+            }
+            warn!("github meta cache staging failed; using validated cache: {error}");
+            fallback.staging_failure = Some(error);
+            return Ok(fallback);
+        }
+    };
 
     let fallback = cached.networks.map(|networks| GithubMetaLoadResult {
         networks,
@@ -487,6 +503,7 @@ fn handle_network_response(
         },
         fallback,
         pending_promotion: Some(pending_promotion),
+        staging_failure: None,
     })
 }
 
@@ -559,6 +576,7 @@ fn prepared_github_fallback(
             metadata: previous_meta,
         }),
         pending_promotion: None,
+        staging_failure: None,
     }
 }
 
@@ -896,20 +914,24 @@ mod tests {
         assert_eq!(result.networks.len(), 5);
         assert_has(
             &result,
-            CanonicalCidr::V4(Ipv4Cidr::from_parts(0xc01e_fc00, 22)),
+            CanonicalCidr::V4(
+                Ipv4Cidr::new(std::net::Ipv4Addr::from(0xc01e_fc00_u32), 22)
+                    .expect("valid test CIDR"),
+            ),
         );
         assert_has(
             &result,
-            CanonicalCidr::V6(Ipv6Cidr::from_parts(
-                0x2001_0db8_0000_0000_0000_0000_0000_0001,
-                128,
-            )),
+            CanonicalCidr::V6(
+                Ipv6Cidr::new(
+                    std::net::Ipv6Addr::from(0x2001_0db8_0000_0000_0000_0000_0000_0001_u128),
+                    128,
+                )
+                .expect("valid test CIDR"),
+            ),
         );
-        assert!(
-            !result
-                .networks
-                .contains(&CanonicalCidr::V4(Ipv4Cidr::from_parts(0xcb00_7200, 24)))
-        );
+        assert!(!result.networks.contains(&CanonicalCidr::V4(
+            Ipv4Cidr::new(std::net::Ipv4Addr::from(0xcb00_7200_u32), 24).expect("valid test CIDR")
+        )));
 
         let requests = client.requests();
         assert_eq!(requests.len(), 1);
@@ -939,7 +961,152 @@ mod tests {
         assert_eq!(result.source, GithubMetaSource::Network);
         assert_eq!(
             result.networks,
-            vec![CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a00_0000, 24))]
+            vec![CanonicalCidr::V4(
+                Ipv4Cidr::new(std::net::Ipv4Addr::from(0x0a00_0000_u32), 24)
+                    .expect("valid test CIDR")
+            )]
+        );
+    }
+
+    #[test]
+    fn staging_failure_retains_current_or_previous_github_generation() {
+        for corrupt_current in [false, true] {
+            let temp = TempDir::new().expect("tempdir");
+            for body in [
+                br#"{"hooks":["203.0.113.0/24"]}"#.as_slice(),
+                br#"{"hooks":["198.51.100.0/24"]}"#.as_slice(),
+            ] {
+                let client = MockHttpClient::new(vec![Ok(network_response(body))]);
+                load_github_meta_safelist(
+                    &client,
+                    temp.path(),
+                    TEST_GITHUB_META_URL,
+                    &GithubMetaCategoryMode::All,
+                    &BTreeMap::new(),
+                )
+                .expect("seed");
+            }
+            if corrupt_current {
+                fs::write(
+                    current_generation_dir(temp.path()).join(super::GENERATION_RAW_FILE),
+                    b"corrupt",
+                )
+                .expect("corrupt");
+            }
+            let client = crate::http_cache::test_support::StagingFailureClient {
+                cache_dir: temp.path(),
+                response: network_response(br#"{"hooks":["192.0.2.0/24"]}"#),
+            };
+            let result = super::prepare_github_meta_safelist(
+                &client,
+                temp.path(),
+                TEST_GITHUB_META_URL,
+                &GithubMetaCategoryMode::All,
+                &BTreeMap::new(),
+            );
+            client.restore_store();
+            let prepared = result.expect("fallback");
+            assert_eq!(prepared.primary.source, GithubMetaSource::FallbackCache);
+            assert_eq!(
+                prepared.primary.networks[0].to_string(),
+                if corrupt_current {
+                    "203.0.113.0/24"
+                } else {
+                    "198.51.100.0/24"
+                }
+            );
+            assert!(prepared.staging_failure.is_some());
+            assert!(prepared.pending_promotion.is_none());
+        }
+    }
+
+    #[test]
+    fn staging_failure_retains_legacy_fallback_and_rejects_absent_cache() {
+        for raw in [
+            Some(br#"{"hooks":["203.0.113.0/24"]}"#.as_slice()),
+            Some(b"{}".as_slice()),
+            None,
+        ] {
+            let temp = TempDir::new().expect("tempdir");
+            fs::write(temp.path().join("v2"), b"block generation staging").expect("block");
+            if let Some(raw) = raw {
+                fs::write(temp.path().join(GITHUB_META_RAW_CACHE_FILE), raw).expect("legacy");
+            }
+            let client = MockHttpClient::new(vec![Ok(network_response(
+                br#"{"hooks":["198.51.100.0/24"]}"#,
+            ))]);
+            let result = super::prepare_github_meta_safelist(
+                &client,
+                temp.path(),
+                TEST_GITHUB_META_URL,
+                &GithubMetaCategoryMode::All,
+                &BTreeMap::new(),
+            );
+            if let Some(raw) = raw {
+                let prepared = result.expect("fallback");
+                assert_eq!(prepared.primary.source, GithubMetaSource::FallbackCache);
+                assert!(prepared.staging_failure.is_some());
+                assert!(prepared.pending_promotion.is_none());
+                assert_eq!(prepared.primary.networks.len(), usize::from(raw != b"{}"));
+            } else {
+                assert!(result.is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn unchanged_refresh_retains_previous_and_repairs_identical_corruption() {
+        let temp = TempDir::new().expect("tempdir");
+        let first = br#"{"hooks":["203.0.113.0/24"]}"#;
+        let second = br#"{"hooks":["198.51.100.0/24"]}"#;
+        for body in [first.as_slice(), second.as_slice(), second.as_slice()] {
+            let client = MockHttpClient::new(vec![Ok(network_response(body))]);
+            load_github_meta_safelist(
+                &client,
+                temp.path(),
+                TEST_GITHUB_META_URL,
+                &GithubMetaCategoryMode::All,
+                &BTreeMap::new(),
+            )
+            .expect("refresh");
+        }
+        let candidates = crate::cache_generation::generation_candidates(
+            &super::CachePaths::from_cache_dir(temp.path()).generation_store,
+        );
+        assert_eq!(candidates.len(), 2);
+        fs::write(
+            candidates[0].directory.join(super::GENERATION_RAW_FILE),
+            b"corrupt",
+        )
+        .expect("corrupt");
+        let offline = MockHttpClient::new(vec![Err(HttpClientError::Request {
+            reason: "offline".to_string(),
+        })]);
+        let fallback = load_github_meta_safelist(
+            &offline,
+            temp.path(),
+            TEST_GITHUB_META_URL,
+            &GithubMetaCategoryMode::All,
+            &BTreeMap::new(),
+        )
+        .expect("previous");
+        assert_eq!(fallback.networks[0].to_string(), "203.0.113.0/24");
+        let client = MockHttpClient::new(vec![Ok(network_response(second))]);
+        load_github_meta_safelist(
+            &client,
+            temp.path(),
+            TEST_GITHUB_META_URL,
+            &GithubMetaCategoryMode::All,
+            &BTreeMap::new(),
+        )
+        .expect("repair");
+        assert_eq!(
+            read_bytes_with_limit(
+                &candidates[0].directory.join(super::GENERATION_RAW_FILE),
+                1024
+            )
+            .expect("repaired"),
+            second
         );
     }
 
@@ -1068,14 +1235,20 @@ mod tests {
         assert_eq!(result.networks.len(), 2);
         assert_has(
             &result,
-            CanonicalCidr::V4(Ipv4Cidr::from_parts(0xc633_6407, 32)),
+            CanonicalCidr::V4(
+                Ipv4Cidr::new(std::net::Ipv4Addr::from(0xc633_6407_u32), 32)
+                    .expect("valid test CIDR"),
+            ),
         );
         assert_has(
             &result,
-            CanonicalCidr::V6(Ipv6Cidr::from_parts(
-                0x2001_0db8_0000_0000_0000_0000_0000_0000,
-                126,
-            )),
+            CanonicalCidr::V6(
+                Ipv6Cidr::new(
+                    std::net::Ipv6Addr::from(0x2001_0db8_0000_0000_0000_0000_0000_0000_u128),
+                    126,
+                )
+                .expect("valid test CIDR"),
+            ),
         );
     }
 
@@ -1463,7 +1636,10 @@ mod tests {
         assert_eq!(result.source, GithubMetaSource::FallbackCache);
         assert_eq!(
             result.networks,
-            vec![CanonicalCidr::V4(Ipv4Cidr::from_parts(0xc633_6407, 32))]
+            vec![CanonicalCidr::V4(
+                Ipv4Cidr::new(std::net::Ipv4Addr::from(0xc633_6407_u32), 32)
+                    .expect("valid test CIDR")
+            )]
         );
     }
 
@@ -1506,8 +1682,14 @@ mod tests {
         assert_eq!(
             result.networks,
             vec![
-                CanonicalCidr::V4(Ipv4Cidr::from_parts(0xc01e_fc00, 22)),
-                CanonicalCidr::V4(Ipv4Cidr::from_parts(0xc633_6407, 32)),
+                CanonicalCidr::V4(
+                    Ipv4Cidr::new(std::net::Ipv4Addr::from(0xc01e_fc00_u32), 22)
+                        .expect("valid test CIDR")
+                ),
+                CanonicalCidr::V4(
+                    Ipv4Cidr::new(std::net::Ipv4Addr::from(0xc633_6407_u32), 32)
+                        .expect("valid test CIDR")
+                ),
             ]
         );
     }
@@ -1596,8 +1778,14 @@ mod tests {
         assert_eq!(
             result.networks,
             vec![
-                CanonicalCidr::V4(Ipv4Cidr::from_parts(0xc01e_fc00, 22)),
-                CanonicalCidr::V4(Ipv4Cidr::from_parts(0xc633_6407, 32)),
+                CanonicalCidr::V4(
+                    Ipv4Cidr::new(std::net::Ipv4Addr::from(0xc01e_fc00_u32), 22)
+                        .expect("valid test CIDR")
+                ),
+                CanonicalCidr::V4(
+                    Ipv4Cidr::new(std::net::Ipv4Addr::from(0xc633_6407_u32), 32)
+                        .expect("valid test CIDR")
+                ),
             ]
         );
     }

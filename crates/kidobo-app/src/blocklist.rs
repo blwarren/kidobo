@@ -246,6 +246,8 @@ pub trait AsnOperations {
 
 /// Ports required by local blocklist and ASN workflows.
 pub struct BlocklistDependencies<'a> {
+    /// Cooperative cancellation outside a started mutation.
+    pub cancellation: &'a dyn crate::ports::Cancellation,
     /// Runtime path resolver.
     pub paths: &'a dyn PathResolver,
     /// Validated configuration repository.
@@ -268,10 +270,12 @@ pub fn execute_ban(
     request: &BanRequest,
     dependencies: &BlocklistDependencies<'_>,
 ) -> Result<BanOutcome, AppError> {
+    dependencies.cancellation.check()?;
     let paths = dependencies
         .paths
         .resolve(&request.paths, ConfigRequirement::Required)?;
     let _lock = dependencies.locks.acquire(&paths.lock_file)?;
+    dependencies.configs.load(&paths.config_file)?;
     let (targets, invalid_targets, empty_file) =
         parse_input(&request.input, dependencies.repository)?;
     if !invalid_targets.is_empty() || empty_file {
@@ -297,6 +301,7 @@ pub fn execute_ban(
         })
         .collect::<Vec<_>>();
     if !appended.is_empty() {
+        dependencies.cancellation.check()?;
         dependencies.repository.append_entries(
             &paths.blocklist_file,
             &appended,
@@ -327,9 +332,11 @@ pub fn prepare_unban(
     request: &UnbanRequest,
     dependencies: &BlocklistDependencies<'_>,
 ) -> Result<UnbanPreparation, AppError> {
+    dependencies.cancellation.check()?;
     let paths = dependencies
         .paths
         .resolve(&request.paths, ConfigRequirement::Required)?;
+    dependencies.configs.load(&paths.config_file)?;
     let (targets, invalid_targets, empty_file) =
         parse_input(&request.input, dependencies.repository)?;
     if !invalid_targets.is_empty() || empty_file {
@@ -359,10 +366,12 @@ pub fn apply_unban(
     decision: &UnbanDecision,
     dependencies: &BlocklistDependencies<'_>,
 ) -> Result<UnbanOutcome, AppError> {
+    dependencies.cancellation.check()?;
     let paths = dependencies
         .paths
         .resolve(&request.paths, ConfigRequirement::Required)?;
     let _lock = dependencies.locks.acquire(&paths.lock_file)?;
+    dependencies.configs.load(&paths.config_file)?;
     let document = dependencies.repository.load(&paths.blocklist_file)?;
     let current = build_preview(&request.input, preview.targets.clone(), &document);
     if current != *preview {
@@ -384,6 +393,7 @@ pub fn apply_unban(
         removal_indexes.extend(index_plan.partial_indexes.iter().copied());
     }
     if !removal_indexes.is_empty() {
+        dependencies.cancellation.check()?;
         let kept_lines = document
             .lines
             .iter()
@@ -418,6 +428,7 @@ pub fn execute_ban_asn(
     request: &AsnBanRequest,
     dependencies: &BlocklistDependencies<'_>,
 ) -> Result<AsnBanOutcome, AppError> {
+    dependencies.cancellation.check()?;
     let paths = dependencies
         .paths
         .resolve(&request.paths, ConfigRequirement::Required)?;
@@ -429,6 +440,7 @@ pub fn execute_ban_asn(
     let mut resolved_prefixes = Vec::new();
     let mut notices = Vec::new();
     for asn in &requested_asns {
+        dependencies.cancellation.check()?;
         let loaded = dependencies
             .asn
             .load_prefixes(*asn, &cache_dir, stale_after)?;
@@ -441,6 +453,7 @@ pub fn execute_ban_asn(
     }
     resolved_prefixes.sort_unstable();
     resolved_prefixes.dedup();
+    dependencies.cancellation.check()?;
     let update = dependencies
         .asn
         .update_config(&paths.config_file, &requested_asns, &[])?;
@@ -470,11 +483,14 @@ pub fn execute_unban_asn(
     request: &AsnBanRequest,
     dependencies: &BlocklistDependencies<'_>,
 ) -> Result<AsnUnbanOutcome, AppError> {
+    dependencies.cancellation.check()?;
     let paths = dependencies
         .paths
         .resolve(&request.paths, ConfigRequirement::Required)?;
     let requested_asns = dependencies.asn.normalize_tokens(&request.tokens)?;
     let _lock = dependencies.locks.acquire(&paths.lock_file)?;
+    dependencies.configs.load(&paths.config_file)?;
+    dependencies.cancellation.check()?;
     let update = dependencies
         .asn
         .update_config(&paths.config_file, &[], &requested_asns)?;
@@ -760,12 +776,61 @@ mod tests {
 
     fn dependencies<'a>(repository: &'a Repository, locks: &'a Locks) -> BlocklistDependencies<'a> {
         BlocklistDependencies {
+            cancellation: &crate::ports::NoCancellation,
             paths: &Paths,
             configs: &Configs,
             locks,
             repository,
             asn: &Asn,
         }
+    }
+
+    #[test]
+    fn cancellation_after_configuration_or_preview_preserves_blocklist() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct CancellingConfigs<'a>(&'a AtomicBool);
+        impl ConfigRepository for CancellingConfigs<'_> {
+            fn load(&self, path: &Path) -> Result<Config, AppError> {
+                self.0.store(true, Ordering::SeqCst);
+                Configs.load(path)
+            }
+        }
+        let repository = Repository::new("203.0.113.0/24\n");
+        let locks = Locks::default();
+        let cancelled = AtomicBool::new(false);
+        let configs = CancellingConfigs(&cancelled);
+        let mut dependencies = dependencies(&repository, &locks);
+        dependencies.cancellation = &cancelled;
+        dependencies.configs = &configs;
+        let result = execute_ban(
+            &BanRequest {
+                paths: request_input(),
+                input: BlocklistInput::Single("198.51.100.1".to_string()),
+            },
+            &dependencies,
+        );
+        assert!(matches!(result, Err(AppError::Interrupted)));
+        cancelled.store(false, Ordering::SeqCst);
+        dependencies.configs = &Configs;
+        let request = UnbanRequest {
+            paths: request_input(),
+            input: BlocklistInput::Single("203.0.113.7".to_string()),
+        };
+        let preparation = prepare_unban(&request, &dependencies).expect("preview");
+        cancelled.store(true, Ordering::SeqCst);
+        let result = apply_unban(
+            &request,
+            &preparation.preview.expect("preview"),
+            &UnbanDecision {
+                remove_partial: true,
+            },
+            &dependencies,
+        );
+        assert!(matches!(result, Err(AppError::Interrupted)));
+        assert_eq!(
+            *repository.contents.lock().expect("contents"),
+            "203.0.113.0/24\n"
+        );
     }
 
     #[test]
@@ -943,6 +1008,7 @@ mod tests {
         let asn = EventAsn(Arc::clone(&events));
         let repository = Repository::new("");
         let dependencies = BlocklistDependencies {
+            cancellation: &crate::ports::NoCancellation,
             paths: &Paths,
             configs: &Configs,
             locks: &locks,

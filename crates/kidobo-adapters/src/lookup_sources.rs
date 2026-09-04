@@ -260,7 +260,11 @@ mod tests {
         paths: &ResolvedPaths,
         config: Option<&Config>,
     ) -> Result<Vec<kidobo_core::lookup::LookupSourceEntry>, AppError> {
-        build_offline_lookup_registry()?.load(&OfflineLookupContext { paths, config })
+        build_offline_lookup_registry()?.load(&OfflineLookupContext {
+            paths,
+            config,
+            cancellation: &kidobo_app::ports::NoCancellation,
+        })
     }
 
     #[test]

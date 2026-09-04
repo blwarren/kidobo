@@ -91,6 +91,15 @@ jump and chain. Cleanup handles both names so an interrupted prior activation ca
 artifacts. Tests use recording ports and scripted command runners; development validation must never invoke
 live firewall or systemd mutations.
 
+The CLI signal handler supplies the application cancellation port. Workflows check it between operations,
+source workers stop taking new work and join active requests, and prompt input polls for cancellation.
+Sync checks cancellation before promotions and immediately before entering enforcement. The enforcement
+section has no cancellation checkpoints: family replacements, activation, and disabled-family cleanup
+retain their existing failure ordering. Full flush likewise completes every scoped cleanup attempt after
+starting. The CLI preserves operational diagnostics and returns 130 when SIGINT accompanies a failure.
+Subprocess supervision covers both child exit and pipe EOF under one deadline, including pipes inherited
+by descendants after their parent exits; output limits apply independently to stdout and stderr.
+
 ## Remote cache generations
 
 Validated remote-feed and GitHub metadata writes use a private generation adapter. A complete generation is
@@ -106,6 +115,13 @@ layout. New writes use only v2, while legacy files remain readable and unchanged
 successful promotion, only the current and previous generations are retained; incomplete or unselected
 staging directories are never selected and are removed opportunistically by online cache work. Normal cache
 flush removes the containing remote-cache directory and therefore both layouts.
+
+An unchanged current generation retains its previous manifest entry and skips redundant promotion.
+Existing same-ID content is verified before reuse. Corrupt or missing members are repaired from retained
+staging data only after admission, using atomic member replacement followed by whole-generation
+verification. Repair failure preserves the previous generation, and abandoned repairs remove only their
+staging directories. A cache staging failure uses a validated fallback with a warning; absence or rejection
+of that fallback is a hard error even for best-effort providers. Manifest promotion failures remain hard.
 
 Remote feeds are parsed into an incrementally deduplicated set. For configured
 `maxelem = M`, one feed accepts at most `max(16384, min(2M, 1000000))` data

@@ -134,6 +134,8 @@ pub struct SyncOutcome {
 
 /// Ports and registries required by the synchronization workflow.
 pub struct SyncDependencies<'a> {
+    /// Cooperative cancellation outside a started mutation.
+    pub cancellation: &'a dyn crate::ports::Cancellation,
     /// Runtime path resolver.
     pub paths: &'a dyn PathResolver,
     /// Validated configuration repository.
@@ -162,6 +164,7 @@ struct LoadedExternalSafelist {
     fallback: Option<SyncSourceBatch>,
     pending_promotions: Vec<Box<dyn PendingCachePromotion>>,
     summary_index: usize,
+    fallback_failure: Option<AppError>,
 }
 
 struct PendingPromotion {
@@ -180,16 +183,20 @@ pub fn execute(
     request: &PathResolutionInput,
     dependencies: &SyncDependencies<'_>,
 ) -> Result<SyncOutcome, AppError> {
+    dependencies.cancellation.check()?;
     let paths = dependencies
         .paths
         .resolve(request, ConfigRequirement::Required)?;
     dependencies.observer.stage_completed("resolve_paths");
+    dependencies.cancellation.check()?;
 
     let config = dependencies.configs.load(&paths.config_file)?;
     dependencies.observer.stage_completed("load_config");
+    dependencies.cancellation.check()?;
 
     let _lock = dependencies.locks.acquire(&paths.lock_file)?;
     dependencies.observer.stage_completed("acquire_lock");
+    dependencies.cancellation.check()?;
 
     let enforcement_plan = EnforcementPlan::from_config(&config);
     dependencies
@@ -200,6 +207,7 @@ pub fn execute(
         .stage_completed("ensure_ipset_artifacts");
 
     let source_context = SyncSourceContext {
+        cancellation: dependencies.cancellation,
         paths: &paths,
         config: &config,
         env: &request.env,
@@ -212,6 +220,7 @@ pub fn execute(
         mut summaries,
     } = load_sources(dependencies.sources, &source_context, dependencies.observer)?;
     dependencies.observer.stage_completed("load_sources");
+    dependencies.cancellation.check()?;
 
     candidates.sort_unstable();
     candidates.dedup();
@@ -225,7 +234,7 @@ pub fn execute(
         &mut pending_promotions,
         &mut summaries,
         dependencies.observer,
-    );
+    )?;
     let effective =
         compute_effective_blocklists(&candidates, &safelist, enforcement_plan.enable_ipv6);
     dependencies
@@ -237,8 +246,29 @@ pub fn execute(
     }
     ensure_within_capacity(&enforcement_plan.ipv4, effective.ipv4.len())?;
 
-    promote_pending_caches(pending_promotions, dependencies.observer)?;
+    dependencies.cancellation.check()?;
+    promote_pending_caches(
+        pending_promotions,
+        dependencies.observer,
+        dependencies.cancellation,
+    )?;
+    dependencies.cancellation.check()?;
 
+    apply_enforcement(&enforcement_plan, &effective, dependencies)?;
+
+    Ok(SyncOutcome {
+        ipv4_entries: effective.ipv4.len(),
+        ipv6_entries: effective.ipv6.len(),
+        sources: summaries,
+    })
+}
+
+// Finish enforcement once the first replacement starts, including wiring and cleanup.
+fn apply_enforcement(
+    enforcement_plan: &EnforcementPlan,
+    effective: &kidobo_core::sync::EffectiveBlocklists,
+    dependencies: &SyncDependencies<'_>,
+) -> Result<(), AppError> {
     if enforcement_plan.enable_ipv6 {
         let entries = effective
             .ipv6
@@ -262,11 +292,11 @@ pub fn execute(
         .replace_set(&enforcement_plan.ipv4, &entries)?;
     dependencies.observer.stage_completed("apply_ipv4_ipset");
 
-    dependencies.enforcement.activate(&enforcement_plan)?;
+    dependencies.enforcement.activate(enforcement_plan)?;
     if !enforcement_plan.enable_ipv6 {
         for notice in dependencies
             .enforcement
-            .cleanup_disabled_ipv6(&enforcement_plan)
+            .cleanup_disabled_ipv6(enforcement_plan)
         {
             dependencies.observer.notice(&notice);
         }
@@ -275,11 +305,7 @@ pub fn execute(
         .observer
         .stage_completed("ensure_firewall_wiring");
 
-    Ok(SyncOutcome {
-        ipv4_entries: effective.ipv4.len(),
-        ipv6_entries: effective.ipv6.len(),
-        sources: summaries,
-    })
+    Ok(())
 }
 
 fn load_sources(
@@ -294,6 +320,7 @@ fn load_sources(
     let mut summaries = Vec::new();
 
     for provider in registry.providers() {
+        context.cancellation.check()?;
         let descriptor = provider.descriptor();
         match provider.load(context) {
             Ok(loaded) => {
@@ -301,6 +328,7 @@ fn load_sources(
                     primary,
                     fallback,
                     pending_promotions: loaded_promotions,
+                    fallback_failure,
                 } = loaded;
                 let entry_count = primary.networks.len();
                 let summary_index = summaries.len();
@@ -333,6 +361,7 @@ fn load_sources(
                             fallback,
                             pending_promotions: loaded_promotions,
                             summary_index,
+                            fallback_failure,
                         });
                     }
                 }
@@ -343,7 +372,11 @@ fn load_sources(
                     loaded: true,
                 });
             }
-            Err(error @ AppError::SourceAggregateBudgetExceeded { .. }) => return Err(error),
+            Err(AppError::Interrupted) => return Err(AppError::Interrupted),
+            Err(
+                error @ (AppError::SourceAggregateBudgetExceeded { .. }
+                | AppError::CacheStaging { .. }),
+            ) => return Err(error),
             Err(error) if descriptor.failure_policy == FailurePolicy::BestEffort => {
                 observer.notice(&Notice::warning(format!(
                     "source provider `{}` failed softly: {error}",
@@ -372,8 +405,10 @@ fn load_sources(
 fn promote_pending_caches(
     pending_promotions: Vec<PendingPromotion>,
     observer: &dyn SyncObserver,
+    cancellation: &dyn crate::ports::Cancellation,
 ) -> Result<(), AppError> {
     for pending in pending_promotions {
+        cancellation.check()?;
         pending
             .promotion
             .promote()
@@ -395,7 +430,7 @@ fn admit_external_safelists(
     pending_promotions: &mut Vec<PendingPromotion>,
     summaries: &mut [SourceSummary],
     observer: &dyn SyncObserver,
-) {
+) -> Result<(), AppError> {
     let baseline = compute_effective_blocklists(candidates, safelist, enable_ipv6);
 
     for external in external_safelists {
@@ -438,6 +473,9 @@ fn admit_external_safelists(
                 summary.entries = fallback.networks.len();
             }
         } else {
+            if let Some(error) = external.fallback_failure {
+                return Err(error);
+            }
             observer.notice(&Notice::warning(format!(
                 "externally controlled safelist `{}` has no admissible fallback; using only operator-controlled safelist entries",
                 external.provider
@@ -451,6 +489,7 @@ fn admit_external_safelists(
 
     safelist.sort_unstable();
     safelist.dedup();
+    Ok(())
 }
 
 fn external_safelist_preserves_baseline(
@@ -671,6 +710,7 @@ mod tests {
         fn load(&self, _context: &SyncSourceContext<'_>) -> Result<SyncSourceLoad, AppError> {
             record(&self.ledger, format!("source:{}", self.descriptor.id));
             Ok(SyncSourceLoad {
+                fallback_failure: None,
                 primary: SyncSourceBatch {
                     networks: self.primary.clone(),
                     notices: Vec::new(),
@@ -737,10 +777,22 @@ mod tests {
     struct RecordingObserver {
         stages: Mutex<Vec<&'static str>>,
         notices: Mutex<Vec<String>>,
+        cancel_at: Option<&'static str>,
+        cancelled: std::sync::atomic::AtomicBool,
+    }
+
+    impl crate::ports::Cancellation for RecordingObserver {
+        fn is_cancelled(&self) -> bool {
+            self.cancelled.load(std::sync::atomic::Ordering::SeqCst)
+        }
     }
 
     impl SyncObserver for RecordingObserver {
         fn stage_completed(&self, stage: &'static str) {
+            if self.cancel_at == Some(stage) {
+                self.cancelled
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
             self.stages
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -802,6 +854,7 @@ mod tests {
         execute(
             &request(),
             &SyncDependencies {
+                cancellation: observer,
                 paths: &paths,
                 configs: &configs,
                 locks: &locks,
@@ -810,6 +863,152 @@ mod tests {
                 observer,
             },
         )
+    }
+
+    #[test]
+    fn cancellation_stops_before_replacement_but_finishes_started_enforcement() {
+        for (stage, finishes) in [
+            ("load_sources", false),
+            ("compute_effective_blocklists", false),
+            ("promote_source_caches", false),
+            ("apply_ipv6_ipset", true),
+        ] {
+            let ledger = Ledger::default();
+            let sources = registry(
+                &ledger,
+                vec![provider(
+                    &ledger,
+                    "local",
+                    SourceRole::Candidate,
+                    FailurePolicy::Required,
+                    vec![cidr("203.0.113.0/24"), cidr("2001:db8::/64")],
+                )],
+            );
+            let enforcement = FakeEnforcement {
+                ledger: Arc::clone(&ledger),
+                fail_at: None,
+                replacements: Mutex::new(Vec::new()),
+            };
+            let observer = RecordingObserver {
+                cancel_at: Some(stage),
+                ..RecordingObserver::default()
+            };
+            let result = execute_with(
+                &ledger,
+                config(true, 100),
+                &sources,
+                &enforcement,
+                &observer,
+            );
+            let replacements = enforcement.replacements.lock().expect("replacements");
+            if finishes {
+                let outcome = result.expect("finish enforcement");
+                assert_eq!((outcome.ipv4_entries, outcome.ipv6_entries), (1, 1));
+                assert_eq!(
+                    replacements
+                        .iter()
+                        .map(|(family, _)| *family)
+                        .collect::<Vec<_>>(),
+                    [AddressFamily::Ipv6, AddressFamily::Ipv4]
+                );
+                assert!(
+                    ledger
+                        .lock()
+                        .expect("ledger")
+                        .iter()
+                        .any(|event| event == "activate")
+                );
+            } else {
+                assert!(matches!(result, Err(AppError::Interrupted)));
+                assert!(replacements.is_empty());
+                assert!(
+                    !ledger
+                        .lock()
+                        .expect("ledger")
+                        .iter()
+                        .any(|event| event == "activate")
+                );
+            }
+            assert_eq!(
+                ledger.lock().expect("ledger").last().map(String::as_str),
+                Some("unlock")
+            );
+        }
+    }
+
+    #[test]
+    fn staging_failure_requires_a_usable_fallback_even_for_best_effort_sources() {
+        struct FailedRefresh(Option<Vec<CanonicalCidr>>);
+        impl SyncSourceProvider for FailedRefresh {
+            fn descriptor(&self) -> SyncSourceDescriptor {
+                SyncSourceDescriptor {
+                    id: "external",
+                    role: SourceRole::ExternalSafelist,
+                    failure_policy: FailurePolicy::BestEffort,
+                }
+            }
+            fn load(&self, _: &SyncSourceContext<'_>) -> Result<SyncSourceLoad, AppError> {
+                let failure = AppError::CacheStaging {
+                    provider: "external",
+                    reason: "injected disk failure".to_string(),
+                };
+                let Some(networks) = &self.0 else {
+                    return Err(failure);
+                };
+                Ok(SyncSourceLoad {
+                    primary: SyncSourceBatch {
+                        networks: networks.clone(),
+                        notices: Vec::new(),
+                    },
+                    fallback_failure: Some(failure),
+                    ..SyncSourceLoad::default()
+                })
+            }
+        }
+        for (fallback, succeeds) in [
+            (None, false),
+            (Some(vec![cidr("192.0.2.0/24")]), false),
+            (Some(Vec::new()), true),
+            (Some(vec![cidr("192.0.2.0/25")]), true),
+        ] {
+            let ledger = Ledger::default();
+            let mut sources = registry(
+                &ledger,
+                vec![provider(
+                    &ledger,
+                    "local",
+                    SourceRole::Candidate,
+                    FailurePolicy::Required,
+                    vec![cidr("192.0.2.0/24")],
+                )],
+            );
+            sources.register(FailedRefresh(fallback)).expect("source");
+            let enforcement = FakeEnforcement {
+                ledger: Arc::clone(&ledger),
+                fail_at: None,
+                replacements: Mutex::new(Vec::new()),
+            };
+            let result = execute_with(
+                &ledger,
+                config(false, 10),
+                &sources,
+                &enforcement,
+                &RecordingObserver::default(),
+            );
+            if succeeds {
+                assert_eq!(result.expect("fallback").ipv4_entries, 1);
+            } else {
+                assert!(matches!(result, Err(AppError::CacheStaging { .. })));
+                assert!(
+                    enforcement
+                        .replacements
+                        .lock()
+                        .expect("replacements")
+                        .is_empty()
+                );
+                assert!(!events(&ledger).iter().any(|event| event == "activate"));
+            }
+        }
     }
 
     #[test]

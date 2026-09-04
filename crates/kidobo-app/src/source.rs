@@ -105,6 +105,8 @@ pub struct SyncSourceLoad {
     pub fallback: Option<SyncSourceBatch>,
     /// Cache manifests selected only after semantic and capacity preflight succeeds.
     pub pending_promotions: Vec<Box<dyn PendingCachePromotion>>,
+    /// Persistence failure that must abort sync if neither cached batch passes admission.
+    pub fallback_failure: Option<AppError>,
 }
 
 impl SyncSourceLoad {
@@ -115,12 +117,15 @@ impl SyncSourceLoad {
             primary,
             fallback: None,
             pending_promotions: Vec::new(),
+            fallback_failure: None,
         }
     }
 }
 
 /// Read-only context supplied to synchronization providers.
 pub struct SyncSourceContext<'a> {
+    /// Cancellation checked before starting another source operation.
+    pub cancellation: &'a dyn crate::ports::Cancellation,
     /// Pre-resolved runtime paths.
     pub paths: &'a ResolvedPaths,
     /// Validated active configuration.
@@ -190,6 +195,8 @@ impl SyncSourceRegistry {
 
 /// Read-only context supplied to offline lookup providers.
 pub struct OfflineLookupContext<'a> {
+    /// Cancellation checked between offline providers.
+    pub cancellation: &'a dyn crate::ports::Cancellation,
     /// Pre-resolved runtime paths.
     pub paths: &'a ResolvedPaths,
     /// Validated configuration when available; lookup remains usable without it.
@@ -255,6 +262,7 @@ impl OfflineLookupRegistry {
     ) -> Result<Vec<LookupSourceEntry>, AppError> {
         let mut entries = Vec::new();
         for provider in &self.providers {
+            context.cancellation.check()?;
             provider.append_offline(context, &mut entries)?;
         }
         entries.sort_by(|a, b| {

@@ -52,9 +52,8 @@ impl Ipv4Cidr {
         Some(Self::from_parts(u32::from(address), prefix))
     }
 
-    #[doc(hidden)]
     #[must_use]
-    pub fn from_parts(network: u32, prefix: u8) -> Self {
+    pub(crate) fn from_parts(network: u32, prefix: u8) -> Self {
         debug_assert!(prefix <= 32);
         Self {
             network: network & ipv4_mask(prefix),
@@ -100,9 +99,8 @@ impl Ipv6Cidr {
         Some(Self::from_parts(u128::from(address), prefix))
     }
 
-    #[doc(hidden)]
     #[must_use]
-    pub fn from_parts(network: u128, prefix: u8) -> Self {
+    pub(crate) fn from_parts(network: u128, prefix: u8) -> Self {
         debug_assert!(prefix <= 128);
         Self {
             network: network & ipv6_mask(prefix),

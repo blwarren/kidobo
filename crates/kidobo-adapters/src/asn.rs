@@ -710,7 +710,10 @@ mod tests {
         assert_eq!(
             loaded,
             CachedAsnPrefixes {
-                prefixes: vec![CanonicalCidr::V4(Ipv4Cidr::from_parts(0xcb00_7100, 24))],
+                prefixes: vec![CanonicalCidr::V4(
+                    Ipv4Cidr::new(std::net::Ipv4Addr::from(0xcb00_7100_u32), 24)
+                        .expect("valid test CIDR")
+                )],
                 stale: false
             }
         );
@@ -752,7 +755,7 @@ mod tests {
         )
         .expect("write cache");
         let resolver = Mutex::new(MockResolver::new(vec![Ok(vec![CanonicalCidr::V4(
-            Ipv4Cidr::from_parts(0xc633_6400, 24),
+            Ipv4Cidr::new(std::net::Ipv4Addr::from(0xc633_6400_u32), 24).expect("valid test CIDR"),
         )])]));
 
         let loaded =
@@ -762,7 +765,10 @@ mod tests {
         assert_eq!(
             loaded,
             CachedAsnPrefixes {
-                prefixes: vec![CanonicalCidr::V4(Ipv4Cidr::from_parts(0xc633_6400, 24))],
+                prefixes: vec![CanonicalCidr::V4(
+                    Ipv4Cidr::new(std::net::Ipv4Addr::from(0xc633_6400_u32), 24)
+                        .expect("valid test CIDR")
+                )],
                 stale: false
             }
         );
@@ -876,8 +882,14 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let cache_dir = temp.path();
         let resolver = Mutex::new(MockResolver::new(vec![Ok(vec![
-            CanonicalCidr::V4(Ipv4Cidr::from_parts(0xcb00_7100, 24)),
-            CanonicalCidr::V4(Ipv4Cidr::from_parts(0xc633_6400, 24)),
+            CanonicalCidr::V4(
+                Ipv4Cidr::new(std::net::Ipv4Addr::from(0xcb00_7100_u32), 24)
+                    .expect("valid test CIDR"),
+            ),
+            CanonicalCidr::V4(
+                Ipv4Cidr::new(std::net::Ipv4Addr::from(0xc633_6400_u32), 24)
+                    .expect("valid test CIDR"),
+            ),
         ])]));
 
         let first =

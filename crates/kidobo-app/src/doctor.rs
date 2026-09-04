@@ -108,6 +108,8 @@ pub trait DoctorProbe {
 
 /// Ports required by the read-only doctor workflow.
 pub struct DoctorDependencies<'a> {
+    /// Cooperative cancellation outside a started mutation.
+    pub cancellation: &'a dyn crate::ports::Cancellation,
     /// Runtime path resolver.
     pub paths: &'a dyn PathResolver,
     /// Validated configuration repository.
@@ -123,14 +125,18 @@ enum Ipv6Mode {
     Unknown,
 }
 
-#[must_use]
 /// Runs all applicable read-only checks and returns a deterministic report.
 ///
 /// Individual failures are represented in the report rather than returned as workflow errors.
+///
+/// # Errors
+///
+/// Returns [`AppError::Interrupted`] when cancellation is observed between checks.
 pub fn execute(
     request: &PathResolutionInput,
     dependencies: &DoctorDependencies<'_>,
-) -> DoctorReport {
+) -> Result<DoctorReport, AppError> {
+    dependencies.cancellation.check()?;
     let mut checks = Vec::new();
     let paths_result = dependencies
         .paths
@@ -169,6 +175,7 @@ pub fn execute(
         ("binary_ipset", "ipset"),
         ("binary_iptables", "iptables"),
     ] {
+        dependencies.cancellation.check()?;
         available.insert(
             binary,
             push_binary_check(&mut checks, dependencies.probes, check_name, binary),
@@ -188,8 +195,16 @@ pub fn execute(
     available.insert("ip6tables", ip6_available);
 
     push_path_checks(&mut checks, &paths_result, dependencies.probes);
-    push_sudo_checks(&mut checks, ipv6_mode, &available, dependencies.probes);
-    DoctorReport::from_checks(checks)
+    dependencies.cancellation.check()?;
+    push_sudo_checks(
+        &mut checks,
+        ipv6_mode,
+        &available,
+        dependencies.probes,
+        dependencies.cancellation,
+    )?;
+    dependencies.cancellation.check()?;
+    Ok(DoctorReport::from_checks(checks))
 }
 
 impl DoctorReport {
@@ -294,13 +309,16 @@ fn push_sudo_checks(
     ipv6_mode: Ipv6Mode,
     available: &BTreeMap<&str, bool>,
     probe: &dyn DoctorProbe,
-) {
+    cancellation: &dyn crate::ports::Cancellation,
+) -> Result<(), AppError> {
     for (name, binary, arguments) in [
         ("sudo_probe_ipset", "ipset", &["list"][..]),
         ("sudo_probe_iptables", "iptables", &["-S"][..]),
     ] {
+        cancellation.check()?;
         checks.push(sudo_check(name, binary, arguments, available, probe));
     }
+    cancellation.check()?;
     if let Some(reason) = ipv6_skip_reason(ipv6_mode) {
         checks.push(skip_check("sudo_probe_ip6tables", reason));
     } else {
@@ -312,6 +330,7 @@ fn push_sudo_checks(
             probe,
         ));
     }
+    Ok(())
 }
 
 fn sudo_check(
@@ -463,12 +482,14 @@ mod tests {
         let report = execute(
             &request(),
             &DoctorDependencies {
+                cancellation: &crate::ports::NoCancellation,
                 paths: &Paths,
                 configs: &Configs,
                 probes: &probes,
             },
         );
 
+        let report = report.expect("doctor report");
         assert_eq!(report.overall, DoctorOverall::Ok);
         let ip6_checks = report
             .checks

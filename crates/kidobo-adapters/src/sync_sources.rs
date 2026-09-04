@@ -13,8 +13,6 @@ use kidobo_app::source::{
     FailurePolicy, Notice, PendingCachePromotion, SourceRole, SyncSourceBatch, SyncSourceContext,
     SyncSourceDescriptor, SyncSourceLoad, SyncSourceProvider, SyncSourceRegistry,
 };
-#[cfg(test)]
-use kidobo_core::network::CanonicalCidr;
 
 use crate::asn::{Bgpq4AsnPrefixResolver, load_asn_prefixes_with_cache};
 use crate::blocklist_file::{
@@ -22,9 +20,26 @@ use crate::blocklist_file::{
 };
 use crate::cache_generation::StagedGeneration;
 use crate::github_meta::prepare_github_meta_safelist;
-#[cfg(test)]
-use crate::http_cache::fetch_iplist_with_cache;
 use crate::http_cache::{HttpClient, ReqwestHttpClient, prepare_iplist_with_cache};
+
+struct CancellableHttpClient<'a, C: ?Sized> {
+    inner: &'a C,
+    cancellation: &'a dyn kidobo_app::ports::Cancellation,
+}
+
+impl<C: HttpClient + ?Sized> HttpClient for CancellableHttpClient<'_, C> {
+    fn fetch(
+        &self,
+        request: crate::http_cache::HttpRequest,
+    ) -> Result<crate::http_cache::HttpResponse, crate::http_cache::HttpClientError> {
+        self.cancellation
+            .check()
+            .map_err(|error| crate::http_cache::HttpClientError::Request {
+                reason: error.to_string(),
+            })?;
+        self.inner.fetch(request)
+    }
+}
 
 /// Maximum number of concurrent remote-feed workers.
 pub const MAX_REMOTE_FETCH_WORKERS: usize = 5;
@@ -56,6 +71,7 @@ impl SyncSourceProvider for LocalBlocklistSyncProvider {
     }
 
     fn load(&self, context: &SyncSourceContext<'_>) -> Result<SyncSourceLoad, AppError> {
+        context.cancellation.check()?;
         let fast_state_path = context.paths.cache_dir.join(BLOCKLIST_FAST_STATE_FILE);
         let normalization = normalize_local_blocklist_with_fast_state(
             &context.paths.blocklist_file,
@@ -114,6 +130,7 @@ impl SyncSourceProvider for RemoteFeedsSyncProvider {
             &context.paths.remote_cache_dir,
             context.env,
             context.config.ipset.maxelem.get(),
+            context.cancellation,
         )
     }
 }
@@ -171,13 +188,16 @@ impl SyncSourceProvider for GithubMetadataSyncProvider {
         let timeout = Duration::from_secs(u64::from(context.config.remote.timeout_secs.get()));
         let client = ReqwestHttpClient::with_user_agent_and_timeout(&self.user_agent, timeout);
         let loaded = prepare_github_meta_safelist(
-            &client,
+            &CancellableHttpClient {
+                inner: &client,
+                cancellation: context.cancellation,
+            },
             &context.paths.remote_cache_dir,
             &context.config.safe.github_meta_url,
             &context.config.safe.github_meta_category_mode(),
             context.env,
         )
-        .map_err(|error| AppError::Source {
+        .map_err(|error| AppError::CacheStaging {
             provider: "github-metadata",
             reason: error.to_string(),
         })?;
@@ -193,6 +213,10 @@ impl SyncSourceProvider for GithubMetadataSyncProvider {
             .into_iter()
             .collect();
         Ok(SyncSourceLoad {
+            fallback_failure: loaded.staging_failure.map(|error| AppError::CacheStaging {
+                provider: "github-metadata",
+                reason: error.to_string(),
+            }),
             primary: SyncSourceBatch {
                 networks: loaded.primary.networks,
                 notices: Vec::new(),
@@ -224,6 +248,7 @@ impl SyncSourceProvider for AsnBansSyncProvider {
         let mut networks = Vec::new();
         let mut notices = Vec::new();
         for asn in &context.config.asn.banned {
+            context.cancellation.check()?;
             let loaded = load_asn_prefixes_with_cache(*asn, &cache_dir, stale_after, &resolver)
                 .map_err(|error| AppError::Asn {
                     reason: error.to_string(),
@@ -263,11 +288,16 @@ fn prepare_remote_networks_in_chunks<S, C>(
     cache_dir: &Path,
     env: &std::collections::BTreeMap<OsString, OsString>,
     maxelem: u32,
+    cancellation: &dyn kidobo_app::ports::Cancellation,
 ) -> Result<SyncSourceLoad, AppError>
 where
     S: AsRef<str> + Sync,
     C: HttpClient + Sync,
 {
+    let http_client = CancellableHttpClient {
+        inner: http_client,
+        cancellation,
+    };
     let aggregate_limit = remote_aggregate_limit(maxelem);
     let mut seen_urls = BTreeSet::new();
     let unique_urls = urls
@@ -280,6 +310,7 @@ where
     let mut pending_promotions: Vec<Box<dyn PendingCachePromotion>> = Vec::new();
 
     for chunk in unique_urls.chunks(MAX_REMOTE_FETCH_WORKERS) {
+        cancellation.check()?;
         let worker_count = remote_fetch_worker_count(chunk.len());
         let next_idx = AtomicUsize::new(0);
         let results = Mutex::new(Vec::with_capacity(chunk.len()));
@@ -287,17 +318,27 @@ where
             for _ in 0..worker_count {
                 scope.spawn(|| {
                     loop {
+                        if cancellation.is_cancelled() {
+                            break;
+                        }
                         let index = next_idx.fetch_add(1, Ordering::Relaxed);
                         let Some(url) = chunk.get(index) else {
                             break;
                         };
                         let url = *url;
                         let result =
-                            prepare_iplist_with_cache(http_client, url, cache_dir, env, maxelem)
-                                .map_err(|error| {
-                                    Notice::warning(format!(
-                                        "remote source fetch failed softly for {url}: {error}"
-                                    ))
+                            prepare_iplist_with_cache(&http_client, url, cache_dir, env, maxelem)
+                                .map_err(|error| match error {
+                                    error @ crate::http_cache::HttpCacheError::ReadIplist {
+                                        ..
+                                    } => AppError::Source {
+                                        provider: "remote-feeds",
+                                        reason: format!("{url}: {error}"),
+                                    },
+                                    error => AppError::CacheStaging {
+                                        provider: "remote-feeds",
+                                        reason: format!("{url}: {error}"),
+                                    },
                                 });
                         results
                             .lock()
@@ -308,27 +349,34 @@ where
             }
         });
 
+        cancellation.check()?;
+
         let mut chunk_results = results
             .into_inner()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         chunk_results.sort_unstable_by_key(|(index, _)| *index);
         for (_, result) in chunk_results {
-            match result {
-                Ok(prepared) => {
-                    for network in prepared.loaded.networks {
-                        aggregate.insert(network);
-                        if aggregate.len() > aggregate_limit {
-                            return Err(AppError::SourceAggregateBudgetExceeded {
-                                entries: aggregate.len(),
-                                limit: aggregate_limit,
-                            });
-                        }
-                    }
-                    if let Some(promotion) = prepared.pending_promotion {
-                        pending_promotions.push(Box::new(StagedCachePromotion(promotion)));
-                    }
+            let prepared = match result {
+                Ok(prepared) => prepared,
+                Err(error @ AppError::Source { .. }) => {
+                    notices.push(Notice::warning(format!(
+                        "remote source fetch failed softly: {error}"
+                    )));
+                    continue;
                 }
-                Err(notice) => notices.push(notice),
+                Err(error) => return Err(error),
+            };
+            for network in prepared.loaded.networks {
+                aggregate.insert(network);
+                if aggregate.len() > aggregate_limit {
+                    return Err(AppError::SourceAggregateBudgetExceeded {
+                        entries: aggregate.len(),
+                        limit: aggregate_limit,
+                    });
+                }
+            }
+            if let Some(promotion) = prepared.pending_promotion {
+                pending_promotions.push(Box::new(StagedCachePromotion(promotion)));
             }
         }
     }
@@ -340,76 +388,13 @@ where
         },
         fallback: None,
         pending_promotions,
+        fallback_failure: None,
     })
 }
 
 fn remote_aggregate_limit(maxelem: u32) -> usize {
     let maxelem = usize::try_from(maxelem).unwrap_or(usize::MAX);
     8_192.max(maxelem.saturating_mul(4).min(2_000_000))
-}
-
-#[cfg(test)]
-/// Fetches configured remote feeds with bounded parallelism and deterministic aggregation.
-///
-/// Per-feed failures become warning notices; successful networks are sorted and deduplicated.
-pub fn fetch_remote_networks_concurrently<S, C>(
-    urls: &[S],
-    http_client: &C,
-    cache_dir: &Path,
-    env: &std::collections::BTreeMap<OsString, OsString>,
-) -> (Vec<CanonicalCidr>, Vec<Notice>)
-where
-    S: AsRef<str> + Sync,
-    C: HttpClient + Sync,
-{
-    if urls.is_empty() {
-        return (Vec::new(), Vec::new());
-    }
-
-    let worker_count = remote_fetch_worker_count(urls.len());
-    let next_idx = AtomicUsize::new(0);
-    let results = Mutex::new(Vec::with_capacity(urls.len()));
-
-    thread::scope(|scope| {
-        for _ in 0..worker_count {
-            scope.spawn(|| {
-                loop {
-                    let index = next_idx.fetch_add(1, Ordering::Relaxed);
-                    let Some(url) = urls.get(index) else {
-                        break;
-                    };
-                    let url = url.as_ref();
-                    let result = fetch_iplist_with_cache(http_client, url, cache_dir, env)
-                        .map(|cached| cached.networks)
-                        .map_err(|error| {
-                            Notice::warning(format!(
-                                "remote source fetch failed softly for {url}: {error}"
-                            ))
-                        });
-                    results
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .push((index, result));
-                }
-            });
-        }
-    });
-
-    let mut results = results
-        .into_inner()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    results.sort_unstable_by_key(|(index, _)| *index);
-    let mut networks = Vec::new();
-    let mut notices = Vec::new();
-    for (_, result) in results {
-        match result {
-            Ok(loaded) => networks.extend(loaded),
-            Err(notice) => notices.push(notice),
-        }
-    }
-    networks.sort_unstable();
-    networks.dedup();
-    (networks, notices)
 }
 
 fn remote_fetch_worker_count(url_count: usize) -> usize {
@@ -429,7 +414,6 @@ fn remote_fetch_worker_count_for(url_count: usize, cpu_parallelism: usize) -> us
 mod tests {
     use std::fmt::Write as _;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::Duration;
 
     use kidobo_app::source::{FailurePolicy, SourceRole};
     use reqwest::StatusCode;
@@ -437,14 +421,16 @@ mod tests {
 
     use super::{
         MAX_REMOTE_FETCH_WORKERS, RemoteFeedsSyncProvider, build_sync_source_registry,
-        fetch_remote_networks_concurrently, prepare_remote_networks_in_chunks,
-        remote_fetch_worker_count_for,
+        prepare_remote_networks_in_chunks, remote_fetch_worker_count_for,
     };
     use crate::http_cache::{HttpClient, HttpClientError, HttpRequest, HttpResponse};
 
     struct DelayedClient {
         in_flight: AtomicUsize,
         max_in_flight: AtomicUsize,
+        calls: AtomicUsize,
+        workers: usize,
+        first_wave: std::sync::Barrier,
     }
 
     struct AggregateBudgetClient;
@@ -483,7 +469,9 @@ mod tests {
         fn fetch(&self, request: HttpRequest) -> Result<HttpResponse, HttpClientError> {
             let current = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
             self.max_in_flight.fetch_max(current, Ordering::SeqCst);
-            std::thread::sleep(Duration::from_millis(10));
+            if self.calls.fetch_add(1, Ordering::SeqCst) < self.workers {
+                self.first_wave.wait();
+            }
             self.in_flight.fetch_sub(1, Ordering::SeqCst);
             let final_octet = request.url.rsplit('/').next().unwrap_or("1");
             Ok(HttpResponse {
@@ -580,21 +568,39 @@ mod tests {
         let urls = (1..=8)
             .map(|index| format!("https://example.test/{index}"))
             .collect::<Vec<_>>();
+        let workers = super::remote_fetch_worker_count(MAX_REMOTE_FETCH_WORKERS);
         let client = DelayedClient {
             in_flight: AtomicUsize::new(0),
             max_in_flight: AtomicUsize::new(0),
+            calls: AtomicUsize::new(0),
+            workers,
+            first_wave: std::sync::Barrier::new(workers),
         };
 
-        let (networks, notices) = fetch_remote_networks_concurrently(
+        let loaded = prepare_remote_networks_in_chunks(
             &urls,
             &client,
             temp.path(),
             &std::collections::BTreeMap::new(),
-        );
+            65_536,
+            &kidobo_app::ports::NoCancellation,
+        )
+        .expect("production preparation");
 
-        assert_eq!(networks.len(), 8);
-        assert!(notices.is_empty());
-        assert!(client.max_in_flight.load(Ordering::SeqCst) <= MAX_REMOTE_FETCH_WORKERS);
+        assert_eq!(
+            loaded
+                .primary
+                .networks
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            (1..=8)
+                .map(|index| format!("198.51.100.{index}/32"))
+                .collect::<Vec<_>>()
+        );
+        assert!(loaded.primary.notices.is_empty());
+        assert_eq!(loaded.pending_promotions.len(), 8);
+        assert_eq!(client.max_in_flight.load(Ordering::SeqCst), workers);
     }
 
     #[test]
@@ -612,6 +618,7 @@ mod tests {
             temp.path(),
             &std::collections::BTreeMap::new(),
             1,
+            &kidobo_app::ports::NoCancellation,
         ) else {
             panic!("8,193 distinct entries must exceed the aggregate floor");
         };
@@ -633,6 +640,87 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_joins_active_fetches_and_never_starts_another_wave() {
+        struct CancellingClient {
+            cancellation: std::sync::atomic::AtomicBool,
+            entered: std::sync::Barrier,
+            calls: AtomicUsize,
+            finished: AtomicUsize,
+        }
+        impl HttpClient for CancellingClient {
+            fn fetch(&self, _: HttpRequest) -> Result<HttpResponse, HttpClientError> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.entered.wait();
+                self.cancellation.store(true, Ordering::SeqCst);
+                self.finished.fetch_add(1, Ordering::SeqCst);
+                Ok(HttpResponse {
+                    status: StatusCode::OK,
+                    body: b"203.0.113.0/24".to_vec(),
+                    etag: None,
+                    last_modified: None,
+                })
+            }
+        }
+        let temp = TempDir::new().expect("tempdir");
+        let workers = super::remote_fetch_worker_count(MAX_REMOTE_FETCH_WORKERS);
+        let client = CancellingClient {
+            cancellation: std::sync::atomic::AtomicBool::new(false),
+            entered: std::sync::Barrier::new(workers),
+            calls: AtomicUsize::new(0),
+            finished: AtomicUsize::new(0),
+        };
+        let urls = (0..12)
+            .map(|index| format!("https://example.test/{index}"))
+            .collect::<Vec<_>>();
+        let result = prepare_remote_networks_in_chunks(
+            &urls,
+            &client,
+            temp.path(),
+            &std::collections::BTreeMap::new(),
+            100,
+            &client.cancellation,
+        );
+        assert!(matches!(result, Err(kidobo_app::AppError::Interrupted)));
+        assert_eq!(client.calls.load(Ordering::SeqCst), workers);
+        assert_eq!(client.finished.load(Ordering::SeqCst), workers);
+        for url in urls {
+            let store = temp
+                .path()
+                .join("v2/remote")
+                .join(crate::http_cache::url_hash_prefix(&url));
+            assert!(!store.join("current.json").exists());
+            if store.join("generations").exists() {
+                assert_eq!(
+                    std::fs::read_dir(store.join("generations"))
+                        .expect("generations")
+                        .count(),
+                    0
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn remote_staging_failure_without_cache_propagates_as_hard_error() {
+        let temp = TempDir::new().expect("tempdir");
+        std::fs::write(temp.path().join("v2"), b"block staging").expect("block");
+        let result = prepare_remote_networks_in_chunks(
+            &["https://example.test/feed"],
+            &DuplicateUrlClient {
+                calls: AtomicUsize::new(0),
+            },
+            temp.path(),
+            &std::collections::BTreeMap::new(),
+            100,
+            &kidobo_app::ports::NoCancellation,
+        );
+        assert!(matches!(
+            result,
+            Err(kidobo_app::AppError::CacheStaging { .. })
+        ));
+    }
+
+    #[test]
     fn duplicate_urls_share_one_staged_generation_and_leave_a_usable_cache() {
         let temp = TempDir::new().expect("tempdir");
         let url = "https://example.test/duplicate";
@@ -646,6 +734,7 @@ mod tests {
             temp.path(),
             &std::collections::BTreeMap::new(),
             65_536,
+            &kidobo_app::ports::NoCancellation,
         )
         .expect("duplicate URLs should load once");
 
@@ -655,13 +744,16 @@ mod tests {
             promotion.promote().expect("promote staged cache");
         }
 
-        let cached = fetch_remote_networks_concurrently(
+        let cached = prepare_remote_networks_in_chunks(
             &[url],
             &FailingClient,
             temp.path(),
             &std::collections::BTreeMap::new(),
-        );
-        assert_eq!(cached.0, loaded.primary.networks);
-        assert!(cached.1.is_empty());
+            65_536,
+            &kidobo_app::ports::NoCancellation,
+        )
+        .expect("cached production load");
+        assert_eq!(cached.primary.networks, loaded.primary.networks);
+        assert!(cached.primary.notices.is_empty());
     }
 }

@@ -64,6 +64,8 @@ pub struct LookupOutcome {
 
 /// Ports and registry required by offline lookup.
 pub struct LookupDependencies<'a> {
+    /// Cooperative cancellation outside a started mutation.
+    pub cancellation: &'a dyn crate::ports::Cancellation,
     /// Runtime path resolver.
     pub paths: &'a dyn PathResolver,
     /// Optional validated configuration source.
@@ -84,6 +86,7 @@ pub fn execute(
     request: &LookupRequest,
     dependencies: &LookupDependencies<'_>,
 ) -> Result<LookupOutcome, AppError> {
+    dependencies.cancellation.check()?;
     let paths = dependencies
         .paths
         .resolve(&request.paths, ConfigRequirement::Optional)?;
@@ -103,10 +106,12 @@ pub fn execute(
     };
 
     let context = OfflineLookupContext {
+        cancellation: dependencies.cancellation,
         paths: &paths,
         config: config.as_ref(),
     };
     let source_entries = dependencies.sources.load(&context)?;
+    dependencies.cancellation.check()?;
 
     let mut target_outcomes = Vec::with_capacity(targets.len());
     let invalid_targets = run_lookup_by_target(&targets, &source_entries, |target, matches| {
@@ -224,6 +229,7 @@ mod tests {
                 input: LookupInput::File(PathBuf::from("targets.txt")),
             },
             &LookupDependencies {
+                cancellation: &crate::ports::NoCancellation,
                 paths: &Paths,
                 configs: &MissingConfig,
                 target_files: &Targets,

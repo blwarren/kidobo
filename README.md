@@ -194,7 +194,8 @@ an arbitrary build or `cargo run` path.
   and cache prefixes before updating `[asn].banned`; ASN unbans remove the
   configuration entry and make a best-effort cache cleanup. `--file` accepts
   one strict IP/CIDR target per line. No ban or unban changes live enforcement
-  before `sync`.
+  before `sync`. These commands require valid configuration; interactive unban
+  validates it again after confirmation and before writing.
 - `lookup` is offline-only and reports raw overlaps with the local blocklist,
   cached remote sources, configured `safe.ips`, compatible cached GitHub meta
   safelist data, and cached prefixes for currently configured ASN bans. It
@@ -218,6 +219,10 @@ an arbitrary build or `cargo run` path.
   intentional empty feed. A non-empty response with no valid CIDRs, or GitHub
   metadata missing a selected category, is treated as a soft fetch failure and
   does not replace the last usable cache.
+- A remote or GitHub cache staging failure uses validated cached data and warns.
+  If no cached data passes the applicable checks, sync fails before replacing
+  either firewall set. Unchanged refreshes retain the previous generation;
+  identical fresh data can repair a corrupted generation after admission.
 - Remote HTTP bodies default to an 8 MiB limit. The
   `KIDOBO_MAX_HTTP_BODY_BYTES` override is capped at 32 MiB, while GitHub
   metadata remains capped at 8 MiB. Feed line, unique-CIDR, and aggregate
@@ -234,6 +239,11 @@ an arbitrary build or `cargo run` path.
 - Ipset replacement is atomic per set, not across both address families. IPv6
   and IPv4 are capacity-checked before either set is replaced, but their swaps
   are separate operations.
+- Ctrl-C exits with status 130. Prompts cancel without waiting for a response;
+  other operations stop at safe boundaries after active I/O completes or reaches
+  its configured timeout. Once sync begins replacing sets, it finishes enforcement
+  and cleanup unless an operational error prevents completion. Full flush also
+  finishes all scoped cleanup attempts once cleanup begins.
 - `doctor` is read-only by default. It checks whether the remote cache path is
   structurally plausible without creating directories or writing probe files;
   plausible permissions are reported as `SKIP` because effective access is not

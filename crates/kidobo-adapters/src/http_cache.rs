@@ -557,14 +557,21 @@ fn handle_network_response(
         sha256_iplist: sha256_hex(normalized.as_bytes()),
     };
 
-    let pending_promotion = stage_cache(
+    let pending_promotion = match stage_cache(
         cache_dir,
         url,
         &normalized,
         &response.body,
         &metadata,
         previous_generation,
-    )?;
+    ) {
+        Ok(promotion) => promotion,
+        Err(error) if cached_networks.is_some() => {
+            warn!("remote cache staging failed for {url}; using validated cache: {error}");
+            return Ok(prepared_fallback(cached_networks, cached_meta));
+        }
+        Err(error) => return Err(error),
+    };
 
     Ok(PreparedCachedIplist {
         loaded: CachedIplist {
@@ -888,6 +895,33 @@ pub(crate) mod test_support {
     use std::thread;
     use std::time::Duration;
 
+    // Hide the store after its validated contents have been loaded, then block generation staging.
+    // This injects the same failure under root and unprivileged test users without chmod assumptions.
+    pub(crate) struct StagingFailureClient<'a> {
+        pub(crate) cache_dir: &'a std::path::Path,
+        pub(crate) response: super::HttpResponse,
+    }
+
+    impl super::HttpClient for StagingFailureClient<'_> {
+        fn fetch(
+            &self,
+            _: super::HttpRequest,
+        ) -> Result<super::HttpResponse, super::HttpClientError> {
+            std::fs::rename(self.cache_dir.join("v2"), self.cache_dir.join("saved-v2"))
+                .expect("hide store");
+            std::fs::write(self.cache_dir.join("v2"), b"block staging").expect("block staging");
+            Ok(self.response.clone())
+        }
+    }
+
+    impl StagingFailureClient<'_> {
+        pub(crate) fn restore_store(&self) {
+            std::fs::remove_file(self.cache_dir.join("v2")).expect("remove blocker");
+            std::fs::rename(self.cache_dir.join("saved-v2"), self.cache_dir.join("v2"))
+                .expect("restore store");
+        }
+    }
+
     pub(crate) struct CrossOriginRedirectFixture {
         source_url: String,
         destination_contacted: Arc<AtomicBool>,
@@ -1070,6 +1104,112 @@ mod tests {
             }
         });
         (format!("http://{addr}/start"), server)
+    }
+
+    #[test]
+    fn staging_failure_uses_validated_current_or_previous_generation() {
+        let url = "https://example.test/feed";
+        for corrupt_current in [false, true] {
+            let temp = TempDir::new().expect("tempdir");
+            for body in [b"203.0.113.0/24".as_slice(), b"198.51.100.0/24".as_slice()] {
+                let client = MockHttpClient::new(vec![Ok(network_response_for_test(body))]);
+                fetch_iplist_with_cache(&client, url, temp.path(), &BTreeMap::new()).expect("seed");
+            }
+            if corrupt_current {
+                fs::write(
+                    current_generation_dir(temp.path(), url).join(super::GENERATION_RAW_FILE),
+                    b"corrupt",
+                )
+                .expect("corrupt");
+            }
+            let client = super::test_support::StagingFailureClient {
+                cache_dir: temp.path(),
+                response: network_response_for_test(b"192.0.2.0/24"),
+            };
+            let result =
+                prepare_iplist_with_cache(&client, url, temp.path(), &BTreeMap::new(), 100);
+            client.restore_store();
+            let prepared = result.expect("fallback");
+            assert_eq!(prepared.loaded.source, CacheSource::FallbackCache);
+            assert_eq!(
+                prepared.loaded.networks[0].to_string(),
+                if corrupt_current {
+                    "203.0.113.0/24"
+                } else {
+                    "198.51.100.0/24"
+                }
+            );
+            assert!(prepared.pending_promotion.is_none());
+            assert_eq!(
+                super::collect_offline_remote_generations(temp.path()).expect("offline")[0].iplist,
+                crate::remote_parse::format_normalized_cidrs(&prepared.loaded.networks)
+            );
+        }
+    }
+
+    #[test]
+    fn staging_failure_keeps_validated_legacy_including_empty_cache() {
+        let url = "https://example.test/feed";
+        for contents in [Some("203.0.113.0/24\n"), Some(""), None] {
+            let temp = TempDir::new().expect("tempdir");
+            fs::write(temp.path().join("v2"), b"block generation staging").expect("block");
+            if let Some(contents) = contents {
+                fs::write(cache_paths_for_url(temp.path(), url).iplist_path, contents)
+                    .expect("legacy");
+            }
+            let client =
+                MockHttpClient::new(vec![Ok(network_response_for_test(b"198.51.100.0/24\n"))]);
+            let result =
+                prepare_iplist_with_cache(&client, url, temp.path(), &BTreeMap::new(), 100);
+            if let Some(contents) = contents {
+                let result = result.expect("validated fallback");
+                assert_eq!(result.loaded.source, CacheSource::FallbackCache);
+                assert_eq!(
+                    crate::remote_parse::format_normalized_cidrs(&result.loaded.networks),
+                    contents.trim()
+                );
+                assert!(result.pending_promotion.is_none());
+            } else {
+                assert!(
+                    result.is_err(),
+                    "a staging error without cache must remain fatal"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn identical_refresh_repairs_cache_for_offline_and_failed_fetch_reads() {
+        let temp = TempDir::new().expect("tempdir");
+        let url = "https://example.test/feed";
+        let body = b"203.0.113.0/24\n";
+        let client = MockHttpClient::new(vec![
+            Ok(network_response_for_test(body)),
+            Ok(network_response_for_test(body)),
+            Err(HttpClientError::Request {
+                reason: "offline".to_string(),
+            }),
+        ]);
+        fetch_iplist_with_cache(&client, url, temp.path(), &BTreeMap::new()).expect("seed");
+        fs::write(
+            current_generation_dir(temp.path(), url).join(super::GENERATION_RAW_FILE),
+            b"corrupt",
+        )
+        .expect("corrupt");
+        fetch_iplist_with_cache(&client, url, temp.path(), &BTreeMap::new()).expect("repair");
+        let cached = super::read_remote_cache(
+            temp.path(),
+            url,
+            &cache_paths_for_url(temp.path(), url),
+            MAX_HTTP_BODY_BYTES,
+            crate::remote_parse::RemoteFeedLimits::from_maxelem(100),
+        )
+        .expect("offline read");
+        assert_eq!(cached.networks.expect("cache").len(), 1);
+        let fallback =
+            fetch_iplist_with_cache(&client, url, temp.path(), &BTreeMap::new()).expect("fallback");
+        assert_eq!(fallback.source, CacheSource::FallbackCache);
+        assert_eq!(fallback.networks[0].to_string(), "203.0.113.0/24");
     }
 
     #[test]

@@ -127,6 +127,8 @@ pub trait InitProvisioner {
 
 /// Ports required by the initialization workflow.
 pub struct InitDependencies<'a> {
+    /// Cooperative cancellation outside a started mutation.
+    pub cancellation: &'a dyn crate::ports::Cancellation,
     /// Runtime path resolver.
     pub paths: &'a dyn PathResolver,
     /// Filesystem and systemd provisioner.
@@ -143,6 +145,7 @@ pub fn execute(
     request: &InitRequest,
     dependencies: &InitDependencies<'_>,
 ) -> Result<InitOutcome, AppError> {
+    dependencies.cancellation.check()?;
     let paths = dependencies
         .paths
         .resolve(&request.paths, ConfigRequirement::Optional)?;
@@ -163,6 +166,7 @@ pub fn execute(
         &paths.remote_cache_dir,
         &systemd_dir,
     ] {
+        dependencies.cancellation.check()?;
         let state = dependencies.provisioner.ensure_dir(directory)?;
         outcome.artifacts.push(ProvisionedArtifact {
             path: directory.clone(),
@@ -179,6 +183,7 @@ pub fn execute(
         (&service_file, service_template.as_str()),
         (&timer_file, DEFAULT_SYSTEMD_TIMER_TEMPLATE),
     ] {
+        dependencies.cancellation.check()?;
         let state = dependencies.provisioner.ensure_file(file, contents)?;
         outcome.artifacts.push(ProvisionedArtifact {
             path: file.clone(),
@@ -187,6 +192,7 @@ pub fn execute(
     }
 
     if request.root_override.is_none() {
+        dependencies.cancellation.check()?;
         dependencies.provisioner.enable_systemd_timer()?;
         outcome.systemd_enabled = true;
     }
@@ -331,6 +337,7 @@ mod tests {
         let outcome = execute(
             &request(None),
             &InitDependencies {
+                cancellation: &crate::ports::NoCancellation,
                 paths: &Paths,
                 provisioner: &provisioner,
             },
@@ -350,6 +357,7 @@ mod tests {
         let outcome = execute(
             &request(Some(PathBuf::from("/sandbox"))),
             &InitDependencies {
+                cancellation: &crate::ports::NoCancellation,
                 paths: &Paths,
                 provisioner: &provisioner,
             },

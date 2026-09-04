@@ -49,7 +49,7 @@ fn run_interactive_kidobo<F>(
     after_prompt: F,
 ) -> (Option<i32>, String, String)
 where
-    F: FnOnce(),
+    F: FnOnce(&mut std::process::Child),
 {
     let mut child = kidobo_with_root_command(root, args)
         .stdin(Stdio::piped())
@@ -94,7 +94,7 @@ where
         );
     }
 
-    after_prompt();
+    after_prompt(&mut child);
     let mut stdin = child.stdin.take().expect("stdin pipe");
     use std::io::Write;
     stdin
@@ -195,6 +195,19 @@ set -euo pipefail
 
 if [[ -n "${KIDOBO_TEST_SUDO_TOUCHED:-}" ]]; then
   : > "${KIDOBO_TEST_SUDO_TOUCHED}"
+fi
+
+if [[ -n "${KIDOBO_TEST_SUDO_LOG:-}" ]]; then
+  printf '%s\n' "$*" >> "${KIDOBO_TEST_SUDO_LOG}"
+fi
+
+if [[ "${KIDOBO_TEST_INTERRUPT_AT_RESTORE:-0}" == "1" && "${2:-}" == "ipset" && "${3:-}" == "restore" && ! -f "${KIDOBO_ROOT}/interrupted-restore" ]]; then
+  : > "${KIDOBO_ROOT}/interrupted-restore"
+  kill -INT "${PPID}"
+  if [[ "${KIDOBO_TEST_FAIL_INTERRUPTED_RESTORE:-0}" == "1" ]]; then
+    echo "injected interrupted restore failure" >&2
+    exit 9
+  fi
 fi
 
 if [[ "${KIDOBO_TEST_FAIL_SUDO:-0}" == "1" ]]; then
@@ -1025,6 +1038,180 @@ fn sync_lock_held_fails_before_invoking_sudo() {
 }
 
 #[test]
+fn invalid_configuration_prevents_all_blocklist_mutations() {
+    for config in [
+        "not valid = [",
+        "unknown_key = true",
+        "[ipset]\nmaxelem=0\n",
+    ] {
+        for command in [
+            vec!["ban", "203.0.113.7"],
+            vec!["unban", "203.0.113.7"],
+            vec!["ban", "--file"],
+            vec!["unban", "--file"],
+            vec!["unban", "--asn", "64500"],
+        ] {
+            let initial = "203.0.113.0/24\n";
+            let root = create_root(config, initial);
+            let targets = root.path().join("targets.txt");
+            fs::write(&targets, "203.0.113.7\n").expect("targets");
+            let asn_cache = root.path().join("cache/asn/64500.iplist");
+            fs::create_dir_all(asn_cache.parent().expect("parent")).expect("asn dir");
+            fs::write(&asn_cache, initial).expect("asn cache");
+            let mut args = command;
+            if args.last() == Some(&"--file") {
+                args.push(targets.to_str().expect("UTF-8 fixture"));
+            }
+            let output = run_kidobo_with_root(root.path(), &args);
+            assert_eq!(output.status.code(), Some(1), "{args:?}: {output:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("config parse/validation failed")
+            );
+            assert!(!String::from_utf8_lossy(&output.stdout).contains("[y/N]"));
+            assert_eq!(
+                read_to_string_with_limit(
+                    &root.path().join("data/blocklist.txt"),
+                    BLOCKLIST_READ_LIMIT
+                )
+                .expect("blocklist"),
+                initial
+            );
+            assert_eq!(
+                read_to_string_with_limit(&root.path().join("config/config.toml"), 65536)
+                    .expect("config"),
+                config
+            );
+            assert_eq!(
+                read_to_string_with_limit(&asn_cache, 1024).expect("cache"),
+                initial
+            );
+        }
+    }
+}
+
+#[test]
+fn unban_revalidates_configuration_after_the_prompt() {
+    let initial = "203.0.113.0/24\n";
+    let root = create_lookup_root(initial);
+    let (code, _, stderr) =
+        run_interactive_kidobo(root.path(), &["unban", "203.0.113.7"], "yes\n", |_| {
+            fs::write(
+                root.path().join("config/config.toml"),
+                "[ipset]\nmaxelem=0\n",
+            )
+            .expect("invalidate config");
+        });
+    assert_eq!(code, Some(1));
+    assert!(stderr.contains("config parse/validation failed"));
+    assert_eq!(
+        read_to_string_with_limit(
+            &root.path().join("data/blocklist.txt"),
+            BLOCKLIST_READ_LIMIT
+        )
+        .expect("blocklist"),
+        initial
+    );
+}
+
+#[test]
+fn sigint_cancels_idle_and_partial_unban_prompts_without_mutating() {
+    for partial in ["", "y"] {
+        let initial = "203.0.113.0/24\n203.0.113.7\n";
+        let root = create_lookup_root(initial);
+        let (code, stdout, stderr) =
+            run_interactive_kidobo(root.path(), &["unban", "203.0.113.7"], "", |child| {
+                child
+                    .stdin
+                    .as_mut()
+                    .expect("stdin")
+                    .write_all(partial.as_bytes())
+                    .expect("partial response");
+                assert!(
+                    Command::new("kill")
+                        .args(["-INT", &child.id().to_string()])
+                        .status()
+                        .expect("SIGINT")
+                        .success()
+                );
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while child.try_wait().expect("poll child").is_none() {
+                    if Instant::now() >= deadline {
+                        child.kill().expect("kill hung fixture");
+                        child.wait().expect("reap fixture");
+                        panic!("SIGINT did not cancel the prompt while stdin remained open");
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+            });
+        assert_eq!(code, Some(130), "{stderr}");
+        assert!(!stdout.contains("removed "));
+        assert_eq!(
+            read_to_string_with_limit(
+                &root.path().join("data/blocklist.txt"),
+                BLOCKLIST_READ_LIMIT
+            )
+            .expect("blocklist"),
+            initial
+        );
+    }
+}
+
+#[test]
+fn sigint_during_first_replacement_finishes_enforcement_and_preserves_failures() {
+    for fail in [false, true] {
+        let root = create_root(
+            "[ipset]\nset_name='kidobo'\nenable_ipv6=true\n[safe]\ninclude_github_meta=false\n",
+            "203.0.113.0/24\n2001:db8::/64\n",
+        );
+        let fake_sudo = write_fake_sudo_script(&root);
+        let log = root.path().join("sudo.log");
+        let output = kidobo_with_root_command(root.path(), &["sync"])
+            .env(
+                "PATH",
+                path_with_bin_prefix(fake_sudo.parent().expect("parent")),
+            )
+            .env("KIDOBO_TEST_SUDO_LOG", &log)
+            .env("KIDOBO_TEST_INTERRUPT_AT_RESTORE", "1")
+            .env(
+                "KIDOBO_TEST_FAIL_INTERRUPTED_RESTORE",
+                if fail { "1" } else { "0" },
+            )
+            .output()
+            .expect("fixture sync");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(130), "{stderr}");
+        assert!(!stderr.contains("sync completed:"));
+        let log = read_to_string_with_limit(&log, 65536).expect("command log");
+        if fail {
+            assert!(
+                stderr.contains("injected interrupted restore failure"),
+                "{stderr}"
+            );
+            assert_eq!(
+                log.lines()
+                    .filter(|line| line.contains("ipset restore"))
+                    .count(),
+                1
+            );
+        } else {
+            assert_eq!(
+                log.lines()
+                    .filter(|line| line.contains("ipset restore"))
+                    .count(),
+                2
+            );
+            for family in ["iptables", "ip6tables"] {
+                let state = root.path().join(format!("cache/test-{family}/INPUT"));
+                assert_eq!(
+                    read_to_string_with_limit(&state, 65536).expect("INPUT"),
+                    "-A INPUT -j kidobo-input\n"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn sync_sigint_exits_with_130() {
     let root = create_sync_root(
         "[ipset]\nset_name='kidobo'\nenable_ipv6=false\n[safe]\ninclude_github_meta=false\n",
@@ -1032,6 +1219,7 @@ fn sync_sigint_exits_with_130() {
     let fake_sudo = write_fake_sudo_script(&root);
     let touched = root.path().join("sudo-touched");
     let sleep_marker = root.path().join("sudo-sleep-once.marker");
+    let command_log = root.path().join("sudo.log");
 
     let mut command = kidobo_with_root_command(root.path(), &["sync"]);
     command.env(
@@ -1041,11 +1229,19 @@ fn sync_sigint_exits_with_130() {
     command.env("KIDOBO_TEST_SUDO_TOUCHED", &touched);
     command.env("KIDOBO_TEST_SLEEP_ONCE", "1");
     command.env("KIDOBO_TEST_SLEEP_MARKER", &sleep_marker);
+    command.env("KIDOBO_TEST_SUDO_LOG", &command_log);
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
 
     let child = command.spawn().expect("spawn sync");
-    thread::sleep(Duration::from_millis(200));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !sleep_marker.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "sync did not enter the fake runner"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
 
     let signal_status = Command::new("kill")
         .args(["-INT", &child.id().to_string()])
@@ -1064,6 +1260,9 @@ fn sync_sigint_exits_with_130() {
         touched.exists(),
         "test did not reach command execution before SIGINT"
     );
+    let commands = read_to_string_with_limit(&command_log, 65536).expect("command log");
+    assert!(!commands.contains("ipset restore"));
+    assert!(!commands.contains("-I INPUT"));
 }
 
 #[test]
@@ -1718,7 +1917,7 @@ fn interactive_unban_decline_removes_exact_but_preserves_partial_matches() {
     let blocklist = root.path().join("data/blocklist.txt");
 
     let (code, stdout, stderr) =
-        run_interactive_kidobo(root.path(), &["unban", "203.0.113.7"], "n\n", || {});
+        run_interactive_kidobo(root.path(), &["unban", "203.0.113.7"], "n\n", |_| {});
 
     assert_eq!(code, Some(0), "interactive unban failed: {stderr}");
     assert!(stdout.contains("removed 1 blocklist entries for 203.0.113.7/32"));
@@ -1737,7 +1936,7 @@ fn interactive_unban_accept_removes_exact_and_partial_matches() {
     let blocklist = root.path().join("data/blocklist.txt");
 
     let (code, stdout, stderr) =
-        run_interactive_kidobo(root.path(), &["unban", "203.0.113.7"], "yes\n", || {});
+        run_interactive_kidobo(root.path(), &["unban", "203.0.113.7"], "yes\n", |_| {});
 
     assert_eq!(code, Some(0), "interactive unban failed: {stderr}");
     assert!(stdout.contains("removed 2 blocklist entries for 203.0.113.7/32"));
@@ -1754,7 +1953,7 @@ fn interactive_unban_target_detects_blocklist_change_after_preview() {
     let externally_updated = "203.0.112.0/23\n198.51.100.0/24\n";
 
     let (code, _stdout, stderr) =
-        run_interactive_kidobo(root.path(), &["unban", "203.0.113.7"], "y\n", || {
+        run_interactive_kidobo(root.path(), &["unban", "203.0.113.7"], "y\n", |_| {
             fs::write(&blocklist, externally_updated).expect("external blocklist update");
         });
 
@@ -1782,7 +1981,7 @@ fn interactive_unban_file_detects_blocklist_change_after_preview() {
         root.path(),
         &["unban", "--file", target_path.as_str()],
         "y\n",
-        || {
+        |_| {
             fs::write(&blocklist, externally_updated).expect("external blocklist update");
         },
     );

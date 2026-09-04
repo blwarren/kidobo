@@ -16,11 +16,12 @@ pub fn run_doctor_command(io: &mut CliIo<'_>) -> Result<(), KidoboError> {
     let report = doctor::execute(
         &path_resolution_input_from_process(None),
         &DoctorDependencies {
+            cancellation: &crate::cli::interrupt::SigintCancellation,
             paths: &paths,
             configs: &configs,
             probes: &probes,
         },
-    );
+    )?;
     let json = render_report(&report)?;
     writeln!(io.stdout, "{json}").map_err(|error| KidoboError::CliIo {
         reason: error.to_string(),

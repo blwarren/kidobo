@@ -8,7 +8,7 @@ mod interrupt;
 mod sync;
 
 use std::env;
-use std::io::{self, BufRead, IsTerminal, Write};
+use std::io::{self, IsTerminal, Write};
 use std::process::ExitCode;
 
 use clap::Parser;
@@ -17,11 +17,32 @@ use clap::error::ErrorKind;
 use crate::error::KidoboError;
 
 pub struct CliIo<'a> {
-    pub input: &'a mut dyn BufRead,
+    pub input: &'a mut dyn PromptInput,
     pub stdout: &'a mut dyn Write,
     pub stderr: &'a mut dyn Write,
     pub stdout_is_terminal: bool,
     pub no_color: bool,
+}
+
+pub trait PromptInput {
+    fn read_response(&mut self) -> Result<String, KidoboError>;
+}
+
+struct StdinPrompt(std::io::Stdin);
+
+impl PromptInput for StdinPrompt {
+    fn read_response(&mut self) -> Result<String, KidoboError> {
+        kidobo_adapters::prompt::read_line_interruptibly(&self.0, &interrupt::SigintCancellation)
+            .map_err(|error| {
+                if error.kind() == io::ErrorKind::Interrupted {
+                    KidoboError::Interrupted
+                } else {
+                    KidoboError::BlocklistPrompt {
+                        reason: error.to_string(),
+                    }
+                }
+            })
+    }
 }
 
 pub fn run() -> ExitCode {
@@ -50,10 +71,9 @@ pub fn run() -> ExitCode {
         return ExitCode::from(130);
     }
 
-    let stdin = io::stdin();
     let mut stdout = io::stdout();
     let stdout_is_terminal = stdout.is_terminal();
-    let mut input = stdin.lock();
+    let mut input = StdinPrompt(io::stdin());
     let dispatch_result = commands::dispatch_with(
         cli.command,
         &mut CliIo {
@@ -66,6 +86,17 @@ pub fn run() -> ExitCode {
     );
 
     if interrupt::was_interrupted() {
+        if let Err(error) = &dispatch_result
+            && !matches!(
+                error,
+                KidoboError::Interrupted
+                    | KidoboError::Application {
+                        source: kidobo_app::AppError::Interrupted
+                    }
+            )
+        {
+            report_error(&mut stderr, error);
+        }
         return ExitCode::from(130);
     }
 

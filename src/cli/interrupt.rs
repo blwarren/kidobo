@@ -6,6 +6,14 @@ use crate::error::KidoboError;
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 static SIGNAL_INSTALL_RESULT: OnceLock<Result<(), String>> = OnceLock::new();
 
+pub struct SigintCancellation;
+
+impl kidobo_app::ports::Cancellation for SigintCancellation {
+    fn is_cancelled(&self) -> bool {
+        was_interrupted()
+    }
+}
+
 pub fn install_handler() -> Result<(), KidoboError> {
     let result = SIGNAL_INSTALL_RESULT.get_or_init(|| {
         ctrlc::set_handler(|| {

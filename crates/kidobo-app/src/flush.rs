@@ -80,6 +80,8 @@ pub trait FlushBackend {
 
 /// Ports required by the flush workflow.
 pub struct FlushDependencies<'a> {
+    /// Cooperative cancellation outside a started mutation.
+    pub cancellation: &'a dyn crate::ports::Cancellation,
     /// Runtime path resolver.
     pub paths: &'a dyn PathResolver,
     /// Validated configuration repository.
@@ -100,6 +102,7 @@ pub fn execute(
     request: &FlushRequest,
     dependencies: &FlushDependencies<'_>,
 ) -> Result<FlushOutcome, AppError> {
+    dependencies.cancellation.check()?;
     let requirement = if request.cache_only {
         ConfigRequirement::Optional
     } else {
@@ -109,6 +112,7 @@ pub fn execute(
     let _lock = dependencies.locks.acquire(&paths.lock_file)?;
 
     if request.cache_only {
+        dependencies.cancellation.check()?;
         dependencies
             .backend
             .clear_remote_cache(&paths.remote_cache_dir)
@@ -123,6 +127,8 @@ pub fn execute(
     }
 
     let config = dependencies.configs.load(&paths.config_file)?;
+    dependencies.cancellation.check()?;
+    // After cleanup starts, every scoped step is attempted even when cancellation arrives.
     let mut outcome = FlushOutcome::default();
     attempt(
         &mut outcome,
@@ -260,6 +266,12 @@ mod tests {
         }
     }
 
+    impl crate::ports::Cancellation for Backend {
+        fn is_cancelled(&self) -> bool {
+            !self.events.lock().expect("events").is_empty()
+        }
+    }
+
     fn request(cache_only: bool) -> FlushRequest {
         FlushRequest {
             paths: PathResolutionInput {
@@ -272,6 +284,41 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_during_flush_does_not_skip_remaining_cleanup() {
+        let backend = Backend {
+            events: Mutex::new(Vec::new()),
+            fail: true,
+        };
+        let outcome = execute(
+            &request(false),
+            &FlushDependencies {
+                cancellation: &backend,
+                paths: &Paths,
+                configs: &Configs,
+                locks: &Locks,
+                backend: &backend,
+            },
+        )
+        .expect("complete cleanup ledger");
+        assert_eq!(outcome.failed.len(), 5);
+        assert_eq!(backend.events.lock().expect("events").len(), 5);
+        assert!(matches!(
+            execute(
+                &request(false),
+                &FlushDependencies {
+                    cancellation: &backend,
+                    paths: &Paths,
+                    configs: &Configs,
+                    locks: &Locks,
+                    backend: &backend
+                }
+            ),
+            Err(AppError::Interrupted)
+        ));
+        assert_eq!(backend.events.lock().expect("events").len(), 5);
+    }
+
+    #[test]
     fn full_flush_attempts_every_cleanup_in_order() {
         let backend = Backend {
             events: Mutex::new(Vec::new()),
@@ -280,6 +327,7 @@ mod tests {
         let outcome = execute(
             &request(false),
             &FlushDependencies {
+                cancellation: &crate::ports::NoCancellation,
                 paths: &Paths,
                 configs: &Configs,
                 locks: &Locks,
@@ -310,6 +358,7 @@ mod tests {
         let outcome = execute(
             &request(false),
             &FlushDependencies {
+                cancellation: &crate::ports::NoCancellation,
                 paths: &Paths,
                 configs: &Configs,
                 locks: &Locks,
@@ -331,6 +380,7 @@ mod tests {
         execute(
             &request(true),
             &FlushDependencies {
+                cancellation: &crate::ports::NoCancellation,
                 paths: &Paths,
                 configs: &Configs,
                 locks: &Locks,

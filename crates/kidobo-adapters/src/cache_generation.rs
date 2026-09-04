@@ -52,11 +52,12 @@ enum CommitStage {
     ManifestCommitted,
 }
 
-/// Fully written generation whose manifest has not yet selected it.
+/// Fresh generation or deferred repair admitted before its promotion.
 ///
 /// Dropping an unpromoted generation removes a newly published directory when possible. A
 /// content-addressed directory that already existed is left untouched because another selected
-/// manifest may still reference it.
+/// manifest may still reference it. A repair retains staging data until promotion and removes only
+/// that staging directory when abandoned.
 #[derive(Debug)]
 pub(crate) struct StagedGeneration {
     store_root: PathBuf,
@@ -64,6 +65,13 @@ pub(crate) struct StagedGeneration {
     previous: Option<String>,
     remove_on_drop: bool,
     promoted: bool,
+    repair: Option<GenerationRepair>,
+}
+
+#[derive(Debug)]
+struct GenerationRepair {
+    staging_directory: PathBuf,
+    files: Vec<GenerationFileLimit>,
 }
 
 impl StagedGeneration {
@@ -76,11 +84,54 @@ impl StagedGeneration {
     where
         F: FnMut(CommitStage) -> io::Result<()>,
     {
+        if let Some(repair) = &self.repair {
+            let destination = self
+                .store_root
+                .join(GENERATIONS_DIRECTORY)
+                .join(&self.generation_id);
+            for member in &repair.files {
+                let contents = read_bytes_with_limit(
+                    &repair.staging_directory.join(member.name),
+                    member.read_limit,
+                )?;
+                let target = destination.join(member.name);
+                if read_bytes_with_limit(&target, member.read_limit)
+                    .ok()
+                    .as_deref()
+                    != Some(contents.as_slice())
+                {
+                    write_bytes_atomic(&target, &contents)?;
+                }
+            }
+            sync_directory(&destination)?;
+            if !generation_contents_match(
+                &GenerationCandidate {
+                    id: self.generation_id.clone(),
+                    directory: destination,
+                },
+                &repair.files,
+            ) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "repaired cache generation failed verification",
+                ));
+            }
+        }
         let manifest = GenerationManifest {
             version: CACHE_SCHEMA_VERSION,
             current: self.generation_id.clone(),
             previous: self.previous.clone(),
         };
+        let selected = generation_candidates(&self.store_root);
+        if selected
+            .first()
+            .is_some_and(|candidate| candidate.id == manifest.current)
+            && selected.get(1).map(|candidate| &candidate.id) == manifest.previous.as_ref()
+        {
+            self.promoted = true;
+            self.remove_on_drop = false;
+            return Ok(());
+        }
         let manifest_bytes = serde_json::to_vec_pretty(&manifest)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         write_bytes_atomic(&self.store_root.join(MANIFEST_FILE_NAME), &manifest_bytes)?;
@@ -94,6 +145,9 @@ impl StagedGeneration {
 
 impl Drop for StagedGeneration {
     fn drop(&mut self) {
+        if let Some(repair) = &self.repair {
+            let _remove_result = fs::remove_dir_all(&repair.staging_directory);
+        }
         if !self.promoted && self.remove_on_drop {
             let directory = self
                 .store_root
@@ -304,13 +358,40 @@ where
         hook(CommitStage::Staged)?;
 
         let generation_directory = generations_root.join(&generation_id);
+        let files = ordered_files
+            .iter()
+            .map(|file| GenerationFileLimit {
+                name: file.name,
+                read_limit: file.contents.len(),
+            })
+            .collect::<Vec<_>>();
+        let mut repair = None;
         let remove_on_drop = if generation_directory.exists() {
-            fs::remove_dir_all(&staging_directory)?;
+            if generation_contents_match(
+                &GenerationCandidate {
+                    id: generation_id.clone(),
+                    directory: generation_directory,
+                },
+                &files,
+            ) {
+                fs::remove_dir_all(&staging_directory)?;
+            } else {
+                repair = Some(GenerationRepair {
+                    staging_directory: staging_directory.clone(),
+                    files,
+                });
+            }
             false
         } else {
             fs::rename(&staging_directory, &generation_directory)?;
             sync_directory(&generations_root)?;
             true
+        };
+        let selected = generation_candidates(store_root);
+        let previous = if previous == Some(generation_id.as_str()) {
+            selected.get(1).map(|candidate| candidate.id.as_str())
+        } else {
+            previous
         };
         let previous = previous
             .filter(|candidate| is_generation_id(candidate) && *candidate != generation_id)
@@ -321,6 +402,7 @@ where
             previous,
             remove_on_drop,
             promoted: false,
+            repair,
         };
         hook(CommitStage::Published)?;
         Ok(staged)
@@ -428,6 +510,118 @@ mod tests {
             previous,
         )
         .expect("commit")
+    }
+
+    #[test]
+    fn unchanged_refresh_preserves_previous_and_rotation_back_to_previous() {
+        let temp = TempDir::new().expect("tempdir");
+        let first = commit(temp.path(), b"first", None);
+        let second = commit(temp.path(), b"second", Some(&first));
+        commit(temp.path(), b"second", Some(&second));
+        let candidates = generation_candidates(temp.path());
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| &candidate.id)
+                .collect::<Vec<_>>(),
+            [&second, &first]
+        );
+        assert!(candidates[1].directory.join("payload").exists());
+        commit(temp.path(), b"first", Some(&second));
+        let candidates = generation_candidates(temp.path());
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| &candidate.id)
+                .collect::<Vec<_>>(),
+            [&first, &second]
+        );
+    }
+
+    #[test]
+    fn identical_response_repairs_only_after_admission() {
+        for missing in [false, true] {
+            let temp = TempDir::new().expect("tempdir");
+            let previous = commit(temp.path(), b"previous", None);
+            let current = commit(temp.path(), b"current", Some(&previous));
+            let candidates = generation_candidates(temp.path());
+            let payload = candidates[0].directory.join("payload");
+            if missing {
+                std::fs::remove_file(&payload).expect("remove");
+            } else {
+                std::fs::write(&payload, b"corrupt").expect("corrupt");
+            }
+            let files = [GenerationFile {
+                name: "payload",
+                contents: b"current",
+            }];
+            let stage = stage_generation(temp.path(), &files, Some(&previous)).expect("stage");
+            assert_ne!(
+                read_bytes_with_limit(&payload, 64).ok().as_deref(),
+                Some(b"current".as_slice())
+            );
+            drop(stage);
+            assert_ne!(
+                read_bytes_with_limit(&payload, 64).ok().as_deref(),
+                Some(b"current".as_slice())
+            );
+            assert_eq!(
+                read_bytes_with_limit(&candidates[1].directory.join("payload"), 64)
+                    .expect("previous"),
+                b"previous"
+            );
+            stage_generation(temp.path(), &files, Some(&previous))
+                .expect("stage")
+                .promote()
+                .expect("repair");
+            assert_eq!(
+                read_bytes_with_limit(&payload, 64).expect("repaired"),
+                b"current"
+            );
+            assert_eq!(generation_candidates(temp.path())[0].id, current);
+            assert_eq!(generation_candidates(temp.path())[1].id, previous);
+            assert_eq!(
+                std::fs::read_dir(temp.path().join(GENERATIONS_DIRECTORY))
+                    .expect("generations")
+                    .count(),
+                2
+            );
+        }
+    }
+
+    #[test]
+    fn repair_failure_preserves_previous_and_removes_staging() {
+        let temp = TempDir::new().expect("tempdir");
+        let previous = commit(temp.path(), b"previous", None);
+        commit(temp.path(), b"current", Some(&previous));
+        let candidates = generation_candidates(temp.path());
+        let payload = candidates[0].directory.join("payload");
+        std::fs::remove_file(&payload).expect("remove");
+        std::fs::create_dir(&payload).expect("block atomic replacement");
+        assert!(
+            stage_generation(
+                temp.path(),
+                &[GenerationFile {
+                    name: "payload",
+                    contents: b"current"
+                }],
+                Some(&previous)
+            )
+            .expect("stage")
+            .promote()
+            .is_err()
+        );
+        assert_eq!(generation_candidates(temp.path()), candidates);
+        assert_eq!(
+            read_bytes_with_limit(&candidates[1].directory.join("payload"), 64).expect("previous"),
+            b"previous"
+        );
+        assert_eq!(
+            std::fs::read_dir(temp.path().join(GENERATIONS_DIRECTORY))
+                .expect("generations")
+                .count(),
+            2
+        );
     }
 
     #[test]

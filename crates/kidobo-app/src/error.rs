@@ -8,6 +8,17 @@ use thiserror::Error;
 /// Failure returned by an application workflow or port.
 #[derive(Debug, Error)]
 pub enum AppError {
+    /// The caller cancelled work at a safe workflow boundary.
+    #[error("operation interrupted by SIGINT")]
+    Interrupted,
+    /// A fresh source could not be staged and no admissible cache was available.
+    #[error("cache staging failed for `{provider}` without a usable fallback: {reason}")]
+    CacheStaging {
+        /// Source provider identifier.
+        provider: &'static str,
+        /// Persistence diagnostic.
+        reason: String,
+    },
     /// Compatibility-sensitive runtime paths could not be resolved.
     #[error("path resolution failed: {reason}")]
     PathResolution {

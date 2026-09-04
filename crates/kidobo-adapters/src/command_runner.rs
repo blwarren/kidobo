@@ -2,7 +2,6 @@
 
 use std::io::Read;
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::thread;
 use std::time::{Duration, Instant};
 
 use thiserror::Error;
@@ -13,7 +12,9 @@ use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
 
 use crate::command_common::display_command;
-use crate::limited_io::read_to_end_with_limit;
+use nix::fcntl::{FcntlArg, OFlag, fcntl};
+use nix::poll::{PollFd, PollFlags, poll};
+use std::os::fd::AsFd;
 
 /// Default upper bound for one external command.
 pub const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
@@ -171,63 +172,121 @@ impl CommandExecutor for SystemCommandExecutor {
                 reason: err.to_string(),
             })?;
 
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| CommandRunnerError::Output {
-                command: command.clone(),
-                reason: "stdout pipe was not available".to_string(),
-            })?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| CommandRunnerError::Output {
-                command: command.clone(),
-                reason: "stderr pipe was not available".to_string(),
-            })?;
-
-        let stdout_reader = spawn_output_reader(stdout);
-        let stderr_reader = spawn_output_reader(stderr);
-
-        let started = Instant::now();
-        loop {
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    let stdout = join_output_reader(stdout_reader, &command)?;
-                    let stderr = join_output_reader(stderr_reader, &command)?;
-
-                    return Ok(CommandResult {
-                        status: ProcessStatus::from_exit_status(status),
-                        stdout: String::from_utf8_lossy(&stdout).to_string(),
-                        stderr: String::from_utf8_lossy(&stderr).to_string(),
-                    });
-                }
-                Ok(None) => {
-                    if started.elapsed() >= request.timeout {
-                        terminate_child_process_tree(&mut child);
-                        best_effort_join_output_reader(stdout_reader);
-                        best_effort_join_output_reader(stderr_reader);
-
-                        return Err(CommandRunnerError::Timeout {
-                            command,
-                            timeout_ms: duration_millis_u64(request.timeout),
-                        });
-                    }
-
-                    thread::sleep(Duration::from_millis(10));
-                }
-                Err(err) => {
-                    terminate_child_process_tree(&mut child);
-                    best_effort_join_output_reader(stdout_reader);
-                    best_effort_join_output_reader(stderr_reader);
-
-                    return Err(CommandRunnerError::Poll {
-                        command,
-                        reason: err.to_string(),
-                    });
-                }
-            }
+        let result = collect_output(&mut child, request, &command);
+        if result.is_err() {
+            terminate_child_process_tree(&mut child);
         }
+        result
+    }
+}
+
+fn collect_output(
+    child: &mut Child,
+    request: &CommandRequest,
+    command: &str,
+) -> Result<CommandResult, CommandRunnerError> {
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| CommandRunnerError::Output {
+            command: command.to_string(),
+            reason: "stdout pipe was not available".to_string(),
+        })?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| CommandRunnerError::Output {
+            command: command.to_string(),
+            reason: "stderr pipe was not available".to_string(),
+        })?;
+
+    let output_error = |error: std::io::Error| CommandRunnerError::Output {
+        command: command.to_string(),
+        reason: error.to_string(),
+    };
+    set_nonblocking(&stdout).map_err(output_error)?;
+    set_nonblocking(&stderr).map_err(output_error)?;
+    let mut stdout_bytes = Vec::new();
+    let mut stderr_bytes = Vec::new();
+    let mut stdout_eof = false;
+    let mut stderr_eof = false;
+    let mut status = None;
+    let started = Instant::now();
+    loop {
+        let remaining = request.timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Err(CommandRunnerError::Timeout {
+                command: command.to_string(),
+                timeout_ms: duration_millis_u64(request.timeout),
+            });
+        }
+        if status.is_none() {
+            status = child.try_wait().map_err(|error| CommandRunnerError::Poll {
+                command: command.to_string(),
+                reason: error.to_string(),
+            })?;
+        }
+        if !stdout_eof {
+            stdout_eof = drain_output(&mut stdout, &mut stdout_bytes).map_err(output_error)?;
+        }
+        if !stderr_eof {
+            stderr_eof = drain_output(&mut stderr, &mut stderr_bytes).map_err(output_error)?;
+        }
+        if let Some(status) = status.filter(|_| stdout_eof && stderr_eof) {
+            return Ok(CommandResult {
+                status: ProcessStatus::from_exit_status(status),
+                stdout: String::from_utf8_lossy(&stdout_bytes).into_owned(),
+                stderr: String::from_utf8_lossy(&stderr_bytes).into_owned(),
+            });
+        }
+        let mut pipes = Vec::with_capacity(2);
+        if !stdout_eof {
+            pipes.push(PollFd::new(stdout.as_fd(), PollFlags::POLLIN));
+        }
+        if !stderr_eof {
+            pipes.push(PollFd::new(stderr.as_fd(), PollFlags::POLLIN));
+        }
+        let wait_ms = u16::try_from(remaining.as_millis().min(10)).unwrap_or(10);
+        match poll(&mut pipes, wait_ms) {
+            Ok(_) | Err(nix::errno::Errno::EINTR) => {}
+            Err(error) => return Err(output_error(error.into())),
+        }
+    }
+}
+
+fn set_nonblocking(pipe: &impl AsFd) -> std::io::Result<()> {
+    let flags = OFlag::from_bits_retain(fcntl(pipe, FcntlArg::F_GETFL)?);
+    fcntl(pipe, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))?;
+    Ok(())
+}
+
+// Read one chunk per stream so continuously writable stdout cannot starve stderr or the deadline.
+fn drain_output(pipe: &mut impl Read, contents: &mut Vec<u8>) -> std::io::Result<bool> {
+    let mut buffer = [0; 8192];
+    match pipe.read(&mut buffer) {
+        Ok(0) => Ok(true),
+        Ok(count) => {
+            if count > DEFAULT_COMMAND_OUTPUT_LIMIT.saturating_sub(contents.len()) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("command output exceeds {DEFAULT_COMMAND_OUTPUT_LIMIT} byte limit"),
+                ));
+            }
+            let bytes = buffer
+                .get(..count)
+                .ok_or_else(|| std::io::Error::other("pipe read exceeded buffer length"))?;
+            contents.extend_from_slice(bytes);
+            Ok(false)
+        }
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -239,36 +298,6 @@ fn terminate_child_process_tree(child: &mut Child) {
 
     let _direct_kill_result = child.kill();
     let _wait_result = child.wait();
-}
-
-fn spawn_output_reader<R>(mut reader: R) -> thread::JoinHandle<std::io::Result<Vec<u8>>>
-where
-    R: Read + Send + 'static,
-{
-    thread::spawn(move || {
-        read_to_end_with_limit(&mut reader, DEFAULT_COMMAND_OUTPUT_LIMIT, |limit| {
-            format!("command output exceeds {limit} byte limit")
-        })
-    })
-}
-
-fn join_output_reader(
-    handle: thread::JoinHandle<std::io::Result<Vec<u8>>>,
-    command: &str,
-) -> Result<Vec<u8>, CommandRunnerError> {
-    let result = handle.join().map_err(|_| CommandRunnerError::Output {
-        command: command.to_string(),
-        reason: "output reader thread panicked".to_string(),
-    })?;
-
-    result.map_err(|err| CommandRunnerError::Output {
-        command: command.to_string(),
-        reason: err.to_string(),
-    })
-}
-
-fn best_effort_join_output_reader(handle: thread::JoinHandle<std::io::Result<Vec<u8>>>) {
-    let _join_result = handle.join();
 }
 
 /// Command runner that prepends noninteractive `sudo -n` to every request.
@@ -510,6 +539,47 @@ mod tests {
             }
             _ => panic!("expected spawn error"),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deadline_includes_pipes_inherited_after_the_child_exits() {
+        for script in [
+            "sleep 2 2>/dev/null & exit 0",
+            "sleep 2 >/dev/null & exit 0",
+        ] {
+            let started = std::time::Instant::now();
+            let result = SystemCommandExecutor.execute(&CommandRequest {
+                program: "sh".to_string(),
+                args: vec!["-c".to_string(), script.to_string()],
+                timeout: Duration::from_millis(100),
+            });
+            assert!(
+                matches!(
+                    result,
+                    Err(CommandRunnerError::Timeout {
+                        timeout_ms: 100,
+                        ..
+                    })
+                ),
+                "{result:?}"
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(1),
+                "pipe collection outlived its deadline"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn both_output_streams_are_drained_before_returning() {
+        let result =
+            run_system_shell("(yes out | head -n 20000) & (yes err | head -n 20000 >&2) & wait")
+                .expect("output");
+        assert!(result.status.success());
+        assert_eq!(result.stdout.lines().count(), 20000);
+        assert_eq!(result.stderr.lines().count(), 20000);
     }
 
     #[cfg(unix)]
