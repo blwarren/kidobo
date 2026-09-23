@@ -78,34 +78,24 @@ Configure your sources and safelist:
 sudoedit /etc/kidobo/config.toml
 ```
 
+See the [configuration guide](docs/configuration.md) for every key, default,
+and limit.
+
 Check prerequisites and system wiring before changing source state:
 
 ```bash
 sudo kidobo doctor
 ```
 
-Add local entries (optional):
-
-Use commands:
+Add a local entry (optional):
 
 ```bash
 sudo kidobo ban 203.0.113.7
-sudo kidobo unban 203.0.113.7
-sudo kidobo ban --file targets.txt
-sudo kidobo unban --file targets.txt --yes
-sudo kidobo ban --asn 213412
-sudo kidobo unban --asn AS213412
 ```
 
-`ban --asn` loads or resolves the ASN prefixes and caches them before updating
-`[asn].banned`. A stale cache can be used when refresh fails. These commands
-change source state only; they do not change live firewall enforcement.
-
-Or edit the local blocklist file directly:
-
-```bash
-echo "203.0.113.0/24" | sudo tee -a /var/lib/kidobo/blocklist.txt
-```
+`ban` and `unban` change source state only. Run `sync` to change live
+enforcement. See the [operations guide](docs/operations.md) for file and ASN
+bans, offline lookup, the timer, and failure recovery.
 
 Apply blocklists to `ipset` and firewall rules after any source or configuration
 change:
@@ -118,22 +108,12 @@ Check whether targets match (offline):
 
 ```bash
 kidobo lookup 203.0.113.7
-kidobo lookup --file targets.txt
-kidobo lookup --file targets.txt --format tsv
 ```
 
-Remove kidobo firewall/ipset artifacts (optional):
-
-```bash
-sudo kidobo flush
-sudo kidobo flush --cache-only
-```
-
-`flush` attempts every cleanup step and exits with status `1` if any live
-firewall, ipset, or cache artifact could not be removed. The installer preserves
-the binary, configuration, data, cache, and generated units whenever the
-config-aware flush fails, even if its direct default-name recovery cleanup
-succeeds. Artifact removal starts only after a successful config-aware flush.
+Lookup is offline and reports source overlaps, not the live enforced set.
+`sudo kidobo flush` removes managed firewall/ipset artifacts and remote cache;
+read the [operations guide](docs/operations.md#when-a-command-fails) before
+using it for recovery or uninstall.
 
 ## Minimal Config
 
@@ -157,19 +137,9 @@ banned = []
 cache_stale_after_secs = 86400
 ```
 
-Useful options:
-
-- `ipset.set_name_v6`: optional, defaults to `<set_name>-v6`
-- `ipset.enable_ipv6`: default `true`
-- `ipset.chain_action`: `DROP` (default) or `REJECT`
-- `ipset.maxelem`: range `[1, 500000]`
-- `remote.timeout_secs`: range `[1, 3600]`
-- `asn.banned`: ASN bans loaded from cache or resolved to prefixes during `sync`
-- `asn.cache_stale_after_secs`: ASN prefix cache refresh threshold
-  (default `86400`, range `[1, 604800]`)
-
 Unknown configuration keys are rejected at every level so misspellings cannot
 silently select defaults. IPv4 and IPv6 set names must always be distinct.
+The [configuration guide](docs/configuration.md) covers all accepted keys.
 
 ## Defaults
 
@@ -180,83 +150,15 @@ silently select defaults. IPv4 and IPv6 set names must always be distinct.
   - `/etc/systemd/system/kidobo-sync.service`
   - `/etc/systemd/system/kidobo-sync.timer`
 
-`kidobo init` creates missing files and systemd units.
-At default paths it also runs `systemctl daemon-reload` and enables
-`kidobo-sync.timer`, and writes `KIDOBO_LOG_FORMAT=journal` into
-`kidobo-sync.service`.
-For default systemd units, `init` requires an installed `kidobo` binary at
-`/usr/local/bin/kidobo` or `/usr/bin/kidobo`; it will not generate units from
-an arbitrary build or `cargo run` path.
+`kidobo init` creates missing files and systemd units. At default paths it
+enables the one-shot sync timer. See the [operations guide](docs/operations.md)
+for timer and logging details.
 
-## Notes
+## More information
 
-- IP/CIDR `ban` and `unban` commands update the local blocklist. ASN bans load
-  and cache prefixes before updating `[asn].banned`; ASN unbans remove the
-  configuration entry and make a best-effort cache cleanup. `--file` accepts
-  one strict IP/CIDR target per line. No ban or unban changes live enforcement
-  before `sync`. These commands require valid configuration; interactive unban
-  validates it again after confirmation and before writing.
-- `lookup` is offline-only and reports raw overlaps with the local blocklist,
-  cached remote sources, configured `safe.ips`, compatible cached GitHub meta
-  safelist data, and cached prefixes for currently configured ASN bans. It
-  never fetches sources or invokes `bgpq4`.
-- Safelist lookup rows identify exemptions; lookup does not inspect live ipset
-  state or calculate the final post-safelist firewall set. Missing or invalid
-  config still permits lookup against the local blocklist and cached remote
-  sources. Lookup warns on stderr when config-backed coverage or a configured
-  GitHub/ASN cache is unavailable.
-- Lookup prints a readable results table by default, including explicit match
-  status and summary counts for both single targets and files. Long source URLs
-  wrap without being truncated. Use `--format tsv` for the legacy tab-separated
-  output intended for scripts; color is limited to interactive terminals and
-  disabled when `NO_COLOR` is set. Target fields use the stable 1.x escaping
-  `\\`, `\t`, `\r`, `\n`, `\xNN`, and `\u{…}` so control characters cannot
-  create terminal sequences or additional TSV records.
-- `sync` canonicalizes a valid local blocklist, preserving only the leading
-  comment/header section before canonical entries. Invalid non-header local
-  lines now fail `sync`; they are not silently dropped or rewritten away.
-- Remote responses containing only whitespace or comments are treated as an
-  intentional empty feed. A non-empty response with no valid CIDRs, or GitHub
-  metadata missing a selected category, is treated as a soft fetch failure and
-  does not replace the last usable cache.
-- A remote or GitHub cache staging failure uses validated cached data and warns.
-  If no cached data passes the applicable checks, sync fails before replacing
-  either firewall set. Unchanged refreshes retain the previous generation;
-  identical fresh data can repair a corrupted generation after admission.
-- Remote HTTP bodies default to an 8 MiB limit. The
-  `KIDOBO_MAX_HTTP_BODY_BYTES` override is capped at 32 MiB, while GitHub
-  metadata remains capped at 8 MiB. Feed line, unique-CIDR, and aggregate
-  budgets scale with `ipset.maxelem`; an aggregate-budget failure aborts before
-  enforcement.
-- GitHub metadata safelists accept at most 4,096 distinct entries, reject IPv4
-  prefixes broader than `/8` and IPv6 prefixes broader than `/16`, and limit
-  each family's collapsed coverage to one-sixteenth. A batch that would erase
-  a nonempty enabled family is rejected in favor of a compatible previous
-  generation or the operator-controlled safelist.
-- Remote fetches follow at most ten redirects, and only when the destination
-  keeps the configured URL's scheme, host, and effective port. A blocked
-  redirect is a soft fetch failure and does not replace the last usable cache.
-- Ipset replacement is atomic per set, not across both address families. IPv6
-  and IPv4 are capacity-checked before either set is replaced, but their swaps
-  are separate operations.
-- Ctrl-C exits with status 130. Prompts cancel without waiting for a response;
-  other operations stop at safe boundaries after active I/O completes or reaches
-  its configured timeout. Once sync begins replacing sets, it finishes enforcement
-  and cleanup unless an operational error prevents completion. Full flush also
-  finishes all scoped cleanup attempts once cleanup begins.
-- `doctor` is read-only by default. It checks whether the remote cache path is
-  structurally plausible without creating directories or writing probe files;
-  plausible permissions are reported as `SKIP` because effective access is not
-  mutated to prove writability.
-- `KIDOBO_ROOT` relocates config, data, cache, and generated systemd paths under
-  a custom root. `init` does not call `systemctl` when this override is present,
-  which also makes an unprivileged isolated setup possible when the root is
-  writable. The installer rejects an explicitly empty value for `--init`, tries
-  a writable custom root without sudo first, and preserves the exact value if
-  elevation is required.
-
-The supported 1.x compatibility promises are documented in
-[docs/compatibility.md](docs/compatibility.md).
+- [Configuration](docs/configuration.md): keys, defaults, limits, and paths.
+- [Operations](docs/operations.md): routine commands, timer, logs, and recovery.
+- [1.x compatibility contract](docs/compatibility.md): stable operator interfaces.
 
 ## Development
 
