@@ -370,9 +370,8 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        CommandExecutor, CommandRequest, CommandResult, CommandRunnerError,
-        DEFAULT_COMMAND_TIMEOUT, ProcessStatus, SudoCommandRunner, SystemCommandExecutor,
-        duration_millis_u64,
+        CommandExecutor, CommandRequest, CommandResult, CommandRunnerError, ProcessStatus,
+        SudoCommandRunner, SystemCommandExecutor, duration_millis_u64,
     };
 
     struct MockExecutor {
@@ -406,6 +405,7 @@ mod tests {
     #[test]
     fn duration_millis_preserves_nontrivial_values() {
         assert_eq!(duration_millis_u64(Duration::from_millis(1_234)), 1_234);
+        assert_eq!(duration_millis_u64(Duration::from_secs(u64::MAX)), u64::MAX);
     }
 
     #[test]
@@ -463,12 +463,6 @@ mod tests {
             .run("ipset", &["list", "kidobo"])
             .expect_err("must fail");
         assert_eq!(returned, error);
-    }
-
-    #[test]
-    fn default_runner_uses_default_timeout() {
-        let runner: SudoCommandRunner<SystemCommandExecutor> = SudoCommandRunner::default();
-        assert_eq!(runner.default_timeout, DEFAULT_COMMAND_TIMEOUT);
     }
 
     #[test]

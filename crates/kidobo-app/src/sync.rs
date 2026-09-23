@@ -1468,6 +1468,14 @@ mod tests {
 
         assert_eq!(outcome.ipv4_entries, 1);
         assert_eq!(outcome.sources[1].entries, 1);
+        assert_eq!(
+            enforcement
+                .replacements
+                .lock()
+                .expect("replacements")
+                .as_slice(),
+            &[(AddressFamily::Ipv4, vec![cidr("192.0.2.128/25")])]
+        );
         assert!(!events(&ledger).iter().any(|event| event == "promote"));
         assert!(
             observer
@@ -1520,6 +1528,14 @@ mod tests {
         )
         .expect("sync");
 
+        assert_eq!(
+            enforcement
+                .replacements
+                .lock()
+                .expect("replacements")
+                .as_slice(),
+            &[(AddressFamily::Ipv4, vec![cidr("192.0.2.128/25")])]
+        );
         let ledger = events(&ledger);
         let promotion = ledger
             .iter()

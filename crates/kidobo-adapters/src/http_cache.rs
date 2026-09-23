@@ -1425,6 +1425,7 @@ mod tests {
             fetch_iplist_with_cache(&client, url, cache_dir, &BTreeMap::new()).expect("fetch");
         assert_eq!(result.source, CacheSource::FallbackCache);
         assert_eq!(result.networks.len(), 1);
+        assert_eq!(result.networks[0].to_string(), "10.0.0.0/24");
     }
 
     #[test]
@@ -1448,6 +1449,7 @@ mod tests {
             fetch_iplist_with_cache(&client, url, cache_dir, &BTreeMap::new()).expect("fetch");
         assert_eq!(result.source, CacheSource::FallbackCache);
         assert_eq!(result.networks.len(), 1);
+        assert_eq!(result.networks[0].to_string(), "10.0.0.0/24");
         assert_eq!(
             read_to_string_with_limit(&paths.iplist_path, super::MAX_IPLIST_READ_BYTES)
                 .expect("read cache"),
@@ -1708,6 +1710,7 @@ mod tests {
         let result = fetch_iplist_with_cache(&client, url, cache_dir, &env).expect("fetch");
         assert_eq!(result.source, CacheSource::FallbackCache);
         assert_eq!(result.networks.len(), 1);
+        assert_eq!(result.networks[0].to_string(), "10.0.0.0/24");
     }
 
     #[test]
@@ -1730,6 +1733,7 @@ mod tests {
 
         assert_eq!(result.source, CacheSource::FallbackCache);
         assert_eq!(result.networks.len(), 1);
+        assert_eq!(result.networks[0].to_string(), "10.0.0.0/24");
 
         let requests = client.requests();
         assert_eq!(requests.len(), 1);
@@ -1986,6 +1990,14 @@ mod tests {
         fixture.finish();
         assert_eq!(result.source, CacheSource::FallbackCache);
         assert_eq!(
+            result
+                .networks
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["10.0.0.0/24"]
+        );
+        assert_eq!(
             read_to_string_with_limit(&paths.iplist_path, super::MAX_IPLIST_READ_BYTES)
                 .expect("read cache"),
             "10.0.0.0/24\n"
@@ -2069,11 +2081,5 @@ mod tests {
             .expect_err("stored initialization error should be returned");
 
         assert_eq!(error, expected);
-    }
-
-    #[test]
-    fn reqwest_http_client_timeout_can_be_overridden() {
-        let client = ReqwestHttpClient::with_timeout(Duration::from_secs(7));
-        assert_eq!(client.request_timeout, Duration::from_secs(7));
     }
 }

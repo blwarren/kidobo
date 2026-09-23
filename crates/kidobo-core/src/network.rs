@@ -841,8 +841,20 @@ mod tests {
         ]);
 
         let separated = split_by_family(&parsed);
-        assert_eq!(separated.ipv4.len(), 2);
-        assert_eq!(separated.ipv6.len(), 1);
+        assert_eq!(
+            separated.ipv4,
+            [
+                Ipv4Cidr::from_parts(0x0a00_0001, 32),
+                Ipv4Cidr::from_parts(0xc633_6400, 24),
+            ]
+        );
+        assert_eq!(
+            separated.ipv6,
+            [Ipv6Cidr::from_parts(
+                0x2001_0db8_0000_0000_0000_0000_0000_0001,
+                128,
+            )]
+        );
     }
 
     #[test]
@@ -1664,6 +1676,15 @@ mod tests {
     #[test]
     fn parse_lines_non_strict_ignores_invalid_lines() {
         let parsed = parse_lines_non_strict(["10.0.0.1", "not-valid", "2001:db8::/32"]);
-        assert_eq!(parsed.len(), 2);
+        assert_eq!(
+            parsed,
+            vec![
+                CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a00_0001, 32)),
+                CanonicalCidr::V6(Ipv6Cidr::from_parts(
+                    0x2001_0db8_0000_0000_0000_0000_0000_0000,
+                    32
+                )),
+            ]
+        );
     }
 }

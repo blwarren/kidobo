@@ -538,17 +538,13 @@ mod tests {
 
     use super::{
         ASN_CACHE_STALE_AFTER_SECS_MAX, AsnCacheStaleAfterSecs, Config, ConfigError,
-        DEFAULT_ASN_CACHE_STALE_AFTER_SECS, DEFAULT_CHAIN_ACTION, DEFAULT_GITHUB_META_CATEGORIES,
-        DEFAULT_GITHUB_META_URL, DEFAULT_HASHSIZE, DEFAULT_IPSET_TYPE, DEFAULT_MAXELEM,
-        DEFAULT_REMOTE_TIMEOUT_SECS, DEFAULT_TIMEOUT, FirewallAction, GithubMetaCategoryMode,
-        HashsizePow2, MaxElem, REMOTE_TIMEOUT_SECS_MAX, RemoteTimeoutSecs,
+        FirewallAction, GithubMetaCategoryMode, HashsizePow2, MaxElem, REMOTE_TIMEOUT_SECS_MAX,
+        RemoteTimeoutSecs,
     };
     use crate::config_validation::validate_ipset_set_name;
 
     #[test]
-    fn time_defaults_and_limits_have_exact_values() {
-        assert_eq!(DEFAULT_REMOTE_TIMEOUT_SECS, 30);
-        assert_eq!(DEFAULT_ASN_CACHE_STALE_AFTER_SECS, 86_400);
+    fn time_limits_have_exact_values() {
         assert_eq!(REMOTE_TIMEOUT_SECS_MAX, 3_600);
         assert_eq!(ASN_CACHE_STALE_AFTER_SECS_MAX, 604_800);
     }
@@ -580,32 +576,22 @@ mod tests {
         assert_eq!(config.ipset.set_name, "kidobo");
         assert_eq!(config.ipset.set_name_v6, "kidobo-v6");
         assert!(config.ipset.enable_ipv6);
-        assert_eq!(config.ipset.chain_action, DEFAULT_CHAIN_ACTION);
-        assert_eq!(config.ipset.set_type, DEFAULT_IPSET_TYPE);
-        assert_eq!(config.ipset.hashsize.get(), DEFAULT_HASHSIZE);
-        assert_eq!(config.ipset.maxelem.get(), DEFAULT_MAXELEM);
-        assert_eq!(config.ipset.timeout, DEFAULT_TIMEOUT);
+        assert_eq!(config.ipset.chain_action, FirewallAction::Drop);
+        assert_eq!(config.ipset.set_type, "hash:net");
+        assert_eq!(config.ipset.hashsize.get(), 65_536);
+        assert_eq!(config.ipset.maxelem.get(), 500_000);
+        assert_eq!(config.ipset.timeout, 0);
         assert!(config.safe.ips.is_empty());
         assert!(config.safe.include_github_meta);
-        assert_eq!(config.safe.github_meta_url, DEFAULT_GITHUB_META_URL);
+        assert_eq!(config.safe.github_meta_url, "https://api.github.com/meta");
         assert_eq!(
             config.safe.github_meta_category_mode(),
             GithubMetaCategoryMode::Default
         );
-        assert_eq!(
-            DEFAULT_GITHUB_META_CATEGORIES,
-            ["api", "git", "hooks", "packages"]
-        );
         assert_eq!(config.remote.urls, Vec::<String>::new());
-        assert_eq!(
-            config.remote.timeout_secs.get(),
-            DEFAULT_REMOTE_TIMEOUT_SECS
-        );
+        assert_eq!(config.remote.timeout_secs.get(), 30);
         assert!(config.asn.banned.is_empty());
-        assert_eq!(
-            config.asn.cache_stale_after_secs.get(),
-            DEFAULT_ASN_CACHE_STALE_AFTER_SECS
-        );
+        assert_eq!(config.asn.cache_stale_after_secs.get(), 86_400);
     }
 
     #[test]

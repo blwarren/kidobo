@@ -681,24 +681,6 @@ mod tests {
     }
 
     #[test]
-    fn restore_script_sorts_descending_distinct_entries() {
-        let mut script = Vec::new();
-        write_restore_script(
-            &mut script,
-            &test_spec(IpsetFamily::Inet),
-            "kidobo-temp",
-            &["203.0.113.0/24", "10.0.0.0/24"],
-        )
-        .expect("write restore script");
-        let script = String::from_utf8(script).expect("restore script is utf8");
-
-        assert!(
-            script.find("add kidobo-temp 10.0.0.0/24")
-                < script.find("add kidobo-temp 203.0.113.0/24")
-        );
-    }
-
-    #[test]
     fn restore_script_deduplicates_sorted_entries() {
         let mut script = Vec::new();
         write_restore_script(
@@ -902,9 +884,12 @@ mod tests {
         assert_eq!(invocations.len(), 3);
         assert_eq!(invocations[0].0, "ipset");
         assert_eq!(invocations[0].1[0], "destroy");
+        let temp_name = &invocations[0].1[1];
+        assert!(temp_name.starts_with("kidobo-"));
+        assert_eq!(temp_name.len(), 15);
         assert_eq!(invocations[1].1[0], "restore");
         assert_eq!(invocations[1].1[1], "-file");
-        assert_eq!(invocations[2].1[0], "destroy");
+        assert_eq!(invocations[2].1, vec!["destroy", temp_name]);
         assert!(
             invocations
                 .iter()
@@ -914,9 +899,15 @@ mod tests {
 
         let scripts = runner.restore_scripts();
         assert_eq!(scripts.len(), 1);
-        assert!(scripts[0].contains("create"));
-        assert!(scripts[0].contains("swap"));
-        assert!(scripts[0].contains("add"));
+        assert_eq!(
+            scripts[0],
+            format!(
+                "create {temp_name} hash:net family inet hashsize 65536 maxelem 500000 timeout 0\n\
+                 add {temp_name} 10.0.0.0/24\n\
+                 add {temp_name} 198.51.100.7/32\n\
+                 swap {temp_name} kidobo\n"
+            )
+        );
         assert!(
             runner
                 .restore_script_paths()

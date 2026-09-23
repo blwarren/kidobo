@@ -911,27 +911,22 @@ mod tests {
         .expect("load");
 
         assert_eq!(result.source, GithubMetaSource::Network);
-        assert_eq!(result.networks.len(), 5);
-        assert_has(
-            &result,
-            CanonicalCidr::V4(
-                Ipv4Cidr::new(std::net::Ipv4Addr::from(0xc01e_fc00_u32), 22)
-                    .expect("valid test CIDR"),
-            ),
+        let mut networks = result
+            .networks
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        networks.sort();
+        assert_eq!(
+            networks,
+            [
+                "10.0.0.0/24",
+                "192.30.252.0/22",
+                "198.51.100.7/32",
+                "2001:db8::1/128",
+                "203.0.113.0/24",
+            ]
         );
-        assert_has(
-            &result,
-            CanonicalCidr::V6(
-                Ipv6Cidr::new(
-                    std::net::Ipv6Addr::from(0x2001_0db8_0000_0000_0000_0000_0000_0001_u128),
-                    128,
-                )
-                .expect("valid test CIDR"),
-            ),
-        );
-        assert!(!result.networks.contains(&CanonicalCidr::V4(
-            Ipv4Cidr::new(std::net::Ipv4Addr::from(0xcb00_7200_u32), 24).expect("valid test CIDR")
-        )));
 
         let requests = client.requests();
         assert_eq!(requests.len(), 1);
@@ -1048,6 +1043,9 @@ mod tests {
                 assert!(prepared.staging_failure.is_some());
                 assert!(prepared.pending_promotion.is_none());
                 assert_eq!(prepared.primary.networks.len(), usize::from(raw != b"{}"));
+                if raw != b"{}" {
+                    assert_eq!(prepared.primary.networks[0].to_string(), "203.0.113.0/24");
+                }
             } else {
                 assert!(result.is_err());
             }
@@ -1139,6 +1137,7 @@ mod tests {
         .expect("load");
 
         assert_eq!(result.source, GithubMetaSource::FallbackCache);
+        assert_eq!(result.networks[0].to_string(), "10.0.0.0/24");
         assert_eq!(
             read_bytes_with_limit(
                 &temp.path().join(GITHUB_META_RAW_CACHE_FILE),
@@ -1455,6 +1454,7 @@ mod tests {
 
         assert_eq!(result.source, GithubMetaSource::FallbackCache);
         assert_eq!(result.networks.len(), 1);
+        assert_eq!(result.networks[0].to_string(), "192.30.252.0/22");
     }
 
     #[test]
@@ -1503,6 +1503,7 @@ mod tests {
         fixture.finish();
         assert_eq!(result.source, GithubMetaSource::FallbackCache);
         assert_eq!(result.networks.len(), 1);
+        assert_eq!(result.networks[0].to_string(), "192.30.252.0/22");
         assert_eq!(
             read_bytes_with_limit(
                 &temp.path().join(GITHUB_META_RAW_CACHE_FILE),
@@ -1971,7 +1972,12 @@ mod tests {
 
         let networks = parse_and_extract_networks(raw.as_bytes(), &CategorySelection::All)
             .expect("one-sixteenth coverage is permitted");
-        assert_eq!(networks.len(), 16);
+        assert_eq!(
+            networks.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            (0..16)
+                .map(|octet| format!("{octet}.0.0.0/8"))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

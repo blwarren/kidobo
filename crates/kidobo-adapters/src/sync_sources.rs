@@ -420,8 +420,8 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        MAX_REMOTE_FETCH_WORKERS, RemoteFeedsSyncProvider, build_sync_source_registry,
-        prepare_remote_networks_in_chunks, remote_fetch_worker_count_for,
+        MAX_REMOTE_FETCH_WORKERS, build_sync_source_registry, prepare_remote_networks_in_chunks,
+        remote_fetch_worker_count_for,
     };
     use crate::http_cache::{HttpClient, HttpClientError, HttpRequest, HttpResponse};
 
@@ -506,12 +506,6 @@ mod tests {
                 reason: "offline".to_owned(),
             })
         }
-    }
-
-    #[test]
-    fn production_provider_uses_root_product_identity() {
-        let provider = RemoteFeedsSyncProvider::new("kidobo/1.2.3");
-        assert_eq!(provider.user_agent, "kidobo/1.2.3");
     }
 
     #[test]

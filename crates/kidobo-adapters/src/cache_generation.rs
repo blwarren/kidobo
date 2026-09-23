@@ -681,6 +681,12 @@ mod tests {
         assert!(result.is_err());
         let candidates = generation_candidates(temp.path());
         assert_eq!(candidates.len(), 2);
+        assert_ne!(candidates[0].id, old);
+        assert_eq!(
+            read_bytes_with_limit(&candidates[0].directory.join("payload"), 16)
+                .expect("read current"),
+            b"new"
+        );
         assert_eq!(candidates[1].id, old);
         assert_eq!(
             read_bytes_with_limit(&candidates[1].directory.join("payload"), 16)
