@@ -1,35 +1,50 @@
 # kidobo
 
-`kidobo` is a one-shot Linux firewall blocklist manager.
-It builds IPv4/IPv6 blocklists from local and remote sources, subtracts
-safelist entries, atomically replaces each managed `ipset`, and maintains
-deterministic `iptables`/`ip6tables` wiring.
+Kidobo is a command-line tool for managing IP blocklists on Linux servers. It
+combines a local blocklist with configured remote feeds and ASN prefixes,
+removes safelisted addresses, and loads the result into a managed IPv4 `ipset`
+and, when enabled, an IPv6 `ipset`. Managed `iptables` rules apply the IPv4 set
+to incoming traffic; `ip6tables` does the same for IPv6 when enabled.
 
-## Features
+Kidobo runs once per command. It does not run a background process; the
+optional systemd timer invokes `sync` periodically. Editing source files or
+configuration alone does not change the firewall; `sync` applies those changes.
 
-- Manages local and remote IPv4/IPv6 blocklists.
-- Deduplicates, merges, and minimizes CIDR entries before enforcement.
-- Carves operator-defined safe IP/CIDR ranges out of blocklists.
-- Uses kernel `ipset` matching with normalized `iptables`/`ip6tables` rules.
-- Supports local IP/CIDR and ASN bans through the CLI or configuration files.
+## How synchronization works
+
+- Kidobo validates configuration, loads local entries, configured HTTP feeds,
+  and ASN prefixes, then computes separate IPv4 and IPv6 blocklists.
+- It merges overlapping entries, subtracts configured safelist ranges,
+  and produces a minimal set of CIDRs for each family.
+- It checks both enabled families against their configured capacity before
+  replacing either set. Each `ipset` replacement is atomic; the IPv4 and IPv6
+  replacements are separate operations.
+- It establishes new firewall enforcement before removing old managed rules.
+  A failed source refresh uses a compatible validated cache when available;
+  errors that prevent a safe update stop `sync` with a nonzero exit status.
+
+Kidobo creates a managed chain for each enabled family and a jump to it from
+`INPUT`. `doctor` checks the host without changing firewall state, and `lookup`
+examines local and cached sources without contacting the network or reading
+live firewall state.
 
 ## Install
 
-Install latest release:
+Install the latest release:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/blwarren/kidobo/main/scripts/install.sh | sudo bash
 ```
 
-Install a specific release:
+To install a specific binary release:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/blwarren/kidobo/main/scripts/install.sh | sudo bash -s -- --version v0.14.1
 ```
 
-The command above pins the binary release while still using the installer from
-the mutable `main` branch. To pin both, use the same release tag in the installer
-URL and argument:
+That command pins the binary but retrieves the installer from the mutable
+`main` branch. To use the installer from the same release, substitute a release
+tag in both places:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/blwarren/kidobo/vX.Y.Z/scripts/install.sh | sudo bash -s -- --version vX.Y.Z
@@ -47,10 +62,10 @@ Uninstall:
 curl -fsSL https://raw.githubusercontent.com/blwarren/kidobo/main/scripts/install.sh | sudo bash -s -- --uninstall
 ```
 
-Security note: piping a script to `sudo bash` is convenient, but for a stricter
-install policy, download and review a tag-pinned installer before running it.
-The installer verifies the requested checksum and binary version in a staged
-file before atomically replacing an existing installation.
+For a controlled server deployment, download and review a tag-pinned installer
+before running it with elevated privileges. The installer checks the selected
+archive's checksum and the staged binary's version before replacing an
+existing installation.
 
 ## Requirements
 
@@ -81,7 +96,7 @@ sudoedit /etc/kidobo/config.toml
 See the [configuration guide](docs/configuration.md) for every key, default,
 and limit.
 
-Check prerequisites and system wiring before changing source state:
+Check configuration and host prerequisites:
 
 ```bash
 sudo kidobo doctor
@@ -97,8 +112,8 @@ sudo kidobo ban 203.0.113.7
 enforcement. See the [operations guide](docs/operations.md) for file and ASN
 bans, offline lookup, the timer, and failure recovery.
 
-Apply blocklists to `ipset` and firewall rules after any source or configuration
-change:
+Apply the configured blocklists. Repeat this after changing sources or
+configuration:
 
 ```bash
 sudo kidobo sync
@@ -137,8 +152,9 @@ banned = []
 cache_stale_after_secs = 86400
 ```
 
-Unknown configuration keys are rejected at every level so misspellings cannot
-silently select defaults. IPv4 and IPv6 set names must always be distinct.
+The initial configuration has no remote blocklist URLs or ASN bans. Add the
+sources you intend to enforce. Unknown keys are rejected, and IPv4 and IPv6
+set names must be distinct.
 The [configuration guide](docs/configuration.md) covers all accepted keys.
 
 ## Defaults
