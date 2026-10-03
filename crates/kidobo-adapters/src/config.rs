@@ -7,7 +7,7 @@ use kidobo_app::AppError;
 use kidobo_app::ports::ConfigRepository;
 use kidobo_core::config::Config;
 
-const CONFIG_READ_LIMIT: usize = 64 * 1024;
+pub(crate) const CONFIG_READ_LIMIT: usize = 64 * 1024;
 
 /// Boundedly reads and validates required configuration.
 ///

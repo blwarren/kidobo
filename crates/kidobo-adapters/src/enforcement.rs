@@ -9,7 +9,8 @@ use kidobo_core::network::CanonicalCidr;
 
 use crate::command_runner::{SudoCommandRunner, SystemCommandExecutor};
 use crate::ipset::{
-    IpsetCommandRunner, IpsetFamily, IpsetSetSpec, atomic_replace_ipset_values, ensure_ipset_exists,
+    IpsetCommandRunner, IpsetFamily, IpsetSetSpec, atomic_replace_ipset_values,
+    ensure_ipset_exists, is_missing_set_result,
 };
 use crate::iptables::{
     ChainAction, FirewallFamily, cleanup_firewall_wiring, ensure_firewall_artifacts_for_families,
@@ -90,13 +91,25 @@ where
             return notices;
         }
 
-        if let Err(error) =
-            IpsetCommandRunner::run(&self.runner, "ipset", &["destroy", &plan.ipv6.set_name])
-        {
-            notices.push(Notice::warning(format!(
+        match IpsetCommandRunner::run(&self.runner, "ipset", &["destroy", &plan.ipv6.set_name]) {
+            Ok(result) if result.status.success() || is_missing_set_result(&result) => {}
+            Ok(result) => {
+                let diagnostic = result.stderr.trim();
+                notices.push(Notice::warning(format!(
+                    "disabled IPv6 ipset cleanup failed softly for {}: status {:?}: {}",
+                    plan.ipv6.set_name,
+                    result.status,
+                    if diagnostic.is_empty() {
+                        "no stderr"
+                    } else {
+                        diagnostic
+                    },
+                )));
+            }
+            Err(error) => notices.push(Notice::warning(format!(
                 "disabled IPv6 ipset cleanup failed softly for {}: {error}",
                 plan.ipv6.set_name
-            )));
+            ))),
         }
         notices
     }
@@ -197,6 +210,117 @@ mod tests {
             hashsize: 1024,
             maxelem: 100,
             timeout: 0,
+        }
+    }
+
+    struct CleanupRunner {
+        recording: Runner,
+        result: Result<CommandResult, CommandRunnerError>,
+        fail_firewall: bool,
+    }
+
+    impl IpsetCommandRunner for CleanupRunner {
+        fn run(&self, command: &str, args: &[&str]) -> Result<CommandResult, CommandRunnerError> {
+            self.recording.run(command, args);
+            self.result.clone()
+        }
+    }
+
+    impl FirewallCommandRunner for CleanupRunner {
+        fn run(&self, command: &str, args: &[&str]) -> Result<CommandResult, CommandRunnerError> {
+            let result = self.recording.run(command, args);
+            if self.fail_firewall {
+                Err(CommandRunnerError::Spawn {
+                    command: command.to_string(),
+                    reason: "firewall unavailable".to_string(),
+                })
+            } else {
+                Ok(result)
+            }
+        }
+    }
+
+    #[test]
+    fn disabled_ipv6_cleanup_reports_unsuccessful_destroy_and_continues_after_firewall_error() {
+        let output = |status, stderr: &str| {
+            Ok(CommandResult {
+                status,
+                stdout: String::new(),
+                stderr: stderr.to_string(),
+            })
+        };
+        let cases = [
+            (output(ProcessStatus::Exited(0), ""), None),
+            (
+                output(ProcessStatus::Exited(1), "The set does not exist"),
+                None,
+            ),
+            (
+                output(ProcessStatus::Exited(1), "Set is in use"),
+                Some("Set is in use"),
+            ),
+            (output(ProcessStatus::Exited(2), ""), Some("no stderr")),
+            (
+                output(ProcessStatus::Exited(2), "does not exist"),
+                Some("does not exist"),
+            ),
+            #[cfg(unix)]
+            (output(ProcessStatus::Signaled(9), ""), Some("no stderr")),
+            (
+                Err(CommandRunnerError::Spawn {
+                    command: "ipset".to_string(),
+                    reason: "unavailable".to_string(),
+                }),
+                Some("unavailable"),
+            ),
+        ];
+        for (result, diagnostic) in cases {
+            for fail_firewall in [false, true] {
+                let backend = CommandEnforcementBackend::new(CleanupRunner {
+                    recording: Runner(RefCell::new(Vec::new())),
+                    result: result.clone(),
+                    fail_firewall,
+                });
+                let notices = backend.cleanup_disabled_ipv6(&EnforcementPlan {
+                    ipv4: set(AddressFamily::Ipv4, "kidobo"),
+                    ipv6: set(AddressFamily::Ipv6, "kidobo-v6"),
+                    enable_ipv6: false,
+                    chain_action: FirewallAction::Drop,
+                });
+                assert_eq!(
+                    notices.len(),
+                    usize::from(diagnostic.is_some()) + usize::from(fail_firewall)
+                );
+                assert!(
+                    notices
+                        .iter()
+                        .all(|notice| notice.level == kidobo_app::source::NoticeLevel::Warning)
+                );
+                if let Some(diagnostic) = diagnostic {
+                    let notice = notices.last().expect("ipset warning");
+                    assert!(
+                        notice
+                            .message
+                            .contains("disabled IPv6 ipset cleanup failed softly for kidobo-v6")
+                    );
+                    assert!(notice.message.contains(diagnostic), "{}", notice.message);
+                    if let Ok(result) = &result {
+                        assert!(
+                            notice.message.contains(&format!("{:?}", result.status)),
+                            "{}",
+                            notice.message
+                        );
+                    }
+                }
+                let calls = backend.runner.recording.0.borrow();
+                assert_eq!(
+                    calls.last(),
+                    Some(&(
+                        "ipset".to_string(),
+                        vec!["destroy".to_string(), "kidobo-v6".to_string()]
+                    ))
+                );
+            }
         }
     }
 

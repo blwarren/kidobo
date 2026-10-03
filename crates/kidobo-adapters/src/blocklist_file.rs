@@ -7,7 +7,9 @@ use std::time::UNIX_EPOCH;
 
 use log::warn;
 
-use crate::limited_io::{read_to_string_with_limit, write_string_atomic};
+use crate::limited_io::{
+    read_to_string_with_limit, write_string_atomic, write_string_atomic_with_limit,
+};
 use kidobo_app::AppError;
 use kidobo_app::blocklist::BlocklistRepository;
 use kidobo_core::blocklist::canonicalize_blocklist;
@@ -60,9 +62,11 @@ impl BlocklistRepository for FileBlocklistRepository {
             contents.push_str(entry);
             contents.push('\n');
         }
-        write_string_atomic(path, &contents).map_err(|error| AppError::BlocklistWrite {
-            path: path.to_path_buf(),
-            reason: error.to_string(),
+        write_string_atomic_with_limit(path, &contents, BLOCKLIST_READ_LIMIT).map_err(|error| {
+            AppError::BlocklistWrite {
+                path: path.to_path_buf(),
+                reason: error.to_string(),
+            }
         })
     }
 
@@ -161,9 +165,11 @@ pub fn write_blocklist_lines<S: AsRef<str>>(path: &Path, lines: &[S]) -> Result<
         contents.push('\n');
     }
 
-    write_string_atomic(path, &contents).map_err(|err| AppError::BlocklistWrite {
-        path: path.to_path_buf(),
-        reason: err.to_string(),
+    write_string_atomic_with_limit(path, &contents, BLOCKLIST_READ_LIMIT).map_err(|err| {
+        AppError::BlocklistWrite {
+            path: path.to_path_buf(),
+            reason: err.to_string(),
+        }
     })
 }
 
@@ -205,9 +211,11 @@ pub fn normalize_local_blocklist(path: &Path) -> Result<(), AppError> {
         canonicalize_blocklist(&original).map_err(|err| map_invalid_blocklist_line(path, err))?;
 
     if normalized != original {
-        write_string_atomic(path, &normalized).map_err(|err| AppError::BlocklistWrite {
-            path: path.to_path_buf(),
-            reason: err.to_string(),
+        write_string_atomic_with_limit(path, &normalized, BLOCKLIST_READ_LIMIT).map_err(|err| {
+            AppError::BlocklistWrite {
+                path: path.to_path_buf(),
+                reason: err.to_string(),
+            }
         })?;
     }
 
@@ -317,6 +325,119 @@ mod tests {
 
     fn read(path: &std::path::Path) -> String {
         read_to_string_with_limit(path, super::BLOCKLIST_READ_LIMIT).expect("read")
+    }
+
+    fn assert_contents(actual: &str, expected: &str) {
+        // Avoid dumping a 16 MiB fixture when a boundary assertion fails.
+        assert_eq!(actual.len(), expected.len());
+        assert_eq!(
+            actual
+                .bytes()
+                .zip(expected.bytes())
+                .position(|(a, b)| a != b),
+            None
+        );
+    }
+
+    #[test]
+    fn append_enforces_serialized_byte_limit_and_preserves_rejected_file() {
+        for trailing_newline in [false, true] {
+            for size in [
+                super::BLOCKLIST_READ_LIMIT - 1,
+                super::BLOCKLIST_READ_LIMIT,
+                super::BLOCKLIST_READ_LIMIT + 1,
+            ] {
+                let temp = TempDir::new().expect("tempdir");
+                let path = temp.path().join("blocklist");
+                let entry = "192.0.2.1/32";
+                let original_len = size - entry.len() - 1 - usize::from(!trailing_newline);
+                let mut original = format!(
+                    "#é{}",
+                    "x".repeat(original_len - 3 - usize::from(trailing_newline))
+                );
+                if trailing_newline {
+                    original.push('\n');
+                }
+                fs::write(&path, &original).expect("fixture");
+                let result = FileBlocklistRepository.append_entries(
+                    &path,
+                    &[entry.to_string()],
+                    true,
+                    trailing_newline,
+                );
+                if size > super::BLOCKLIST_READ_LIMIT {
+                    assert!(matches!(
+                        result,
+                        Err(kidobo_app::AppError::BlocklistWrite { .. })
+                    ));
+                    assert_contents(&read(&path), &original);
+                } else {
+                    result.expect("within limit");
+                    let expected = format!(
+                        "{}{}{}\n",
+                        original,
+                        if trailing_newline { "" } else { "\n" },
+                        entry
+                    );
+                    assert_contents(&read(&path), &expected);
+                    assert_eq!(expected.len(), size);
+                    BlocklistDocument::load(&path).expect("readable");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn replacement_enforces_serialized_byte_limit() {
+        for size in [
+            super::BLOCKLIST_READ_LIMIT - 1,
+            super::BLOCKLIST_READ_LIMIT,
+            super::BLOCKLIST_READ_LIMIT + 1,
+        ] {
+            let temp = TempDir::new().expect("tempdir");
+            let path = temp.path().join("blocklist");
+            fs::write(&path, "192.0.2.0/24\n").expect("fixture");
+            let line = format!("#é{}", "x".repeat(size - 4));
+            let result = FileBlocklistRepository.write_lines(&path, std::slice::from_ref(&line));
+            if size > super::BLOCKLIST_READ_LIMIT {
+                assert!(matches!(
+                    result,
+                    Err(kidobo_app::AppError::BlocklistWrite { .. })
+                ));
+                assert_eq!(read(&path), "192.0.2.0/24\n");
+            } else {
+                result.expect("within limit");
+                assert_contents(&read(&path), &format!("{line}\n"));
+                BlocklistDocument::load(&path).expect("readable");
+            }
+        }
+    }
+
+    #[test]
+    fn normalization_growth_enforces_serialized_byte_limit() {
+        for size in [
+            super::BLOCKLIST_READ_LIMIT - 1,
+            super::BLOCKLIST_READ_LIMIT,
+            super::BLOCKLIST_READ_LIMIT + 1,
+        ] {
+            let temp = TempDir::new().expect("tempdir");
+            let path = temp.path().join("blocklist");
+            let header = format!("#é{}\n", "x".repeat(size - 5 - "192.0.2.1/32\n".len()));
+            let original = format!("{header}192.0.2.1");
+            fs::write(&path, &original).expect("fixture");
+            let result = super::normalize_local_blocklist(&path);
+            if size > super::BLOCKLIST_READ_LIMIT {
+                assert!(matches!(
+                    result,
+                    Err(kidobo_app::AppError::BlocklistWrite { .. })
+                ));
+                assert_contents(&read(&path), &original);
+            } else {
+                result.expect("within limit");
+                assert_contents(&read(&path), &format!("{header}\n192.0.2.1/32\n"));
+                BlocklistDocument::load(&path).expect("readable");
+            }
+        }
     }
 
     #[test]

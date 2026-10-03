@@ -61,6 +61,25 @@ where
     Ok(contents)
 }
 
+/// Rejects oversized UTF-8 content before creating or replacing any file.
+///
+/// # Errors
+///
+/// Returns an I/O error when the content exceeds the byte limit or atomic writing fails.
+pub(crate) fn write_string_atomic_with_limit(
+    path: &Path,
+    contents: &str,
+    max_bytes: usize,
+) -> io::Result<()> {
+    if contents.len() > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("file exceeds {max_bytes} byte limit"),
+        ));
+    }
+    write_string_atomic(path, contents)
+}
+
 /// Atomically replaces a UTF-8 file through a sibling temporary file.
 ///
 /// # Errors

@@ -447,7 +447,7 @@ fn sorted_unique_entries<T: Ord>(entries: &[T]) -> Vec<&T> {
     sorted_entries
 }
 
-fn is_missing_set_result(result: &CommandResult) -> bool {
+pub(crate) fn is_missing_set_result(result: &CommandResult) -> bool {
     result.status.code() == Some(1)
         && result
             .stderr

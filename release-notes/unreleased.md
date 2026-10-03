@@ -20,3 +20,11 @@
   output.
 - Publish a static Linux x86_64 artifact and verify it on Debian 11 and Alpine
   3.22 before release drafting.
+- Expand full-family blocklists into supported ipset entries and account for
+  both entries during capacity checks before replacing either family.
+- Reject configuration and blocklist writes that would exceed their read limits,
+  preserving the original files when serialized output is too large.
+- Support ASN ban and unban updates in inline TOML tables while preserving
+  unrelated configuration.
+- Warn when disabled-IPv6 ipset cleanup returns an unsuccessful status, while
+  continuing to treat already-missing sets as successful cleanup.

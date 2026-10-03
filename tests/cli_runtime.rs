@@ -238,7 +238,13 @@ case "${cmd}" in
         echo "The set with the given name does not exist" >&2
         exit 1
         ;;
-      create|restore)
+      restore)
+        if [[ -n "${KIDOBO_TEST_RESTORE_LOG:-}" ]]; then
+          cat "${3}" >> "${KIDOBO_TEST_RESTORE_LOG}"
+        fi
+        exit 0
+        ;;
+      create)
         exit 0
         ;;
       *)
@@ -1157,6 +1163,49 @@ fn sigint_cancels_idle_and_partial_unban_prompts_without_mutating() {
 }
 
 #[test]
+fn sync_full_families_emit_supported_restore_entries() {
+    let root = create_root(
+        "[ipset]\nset_name='kidobo'\nenable_ipv6=true\nmaxelem=2\n[safe]\ninclude_github_meta=false\n",
+        "0.0.0.0/1\n128.0.0.0/1\n::/1\n8000::/1\n",
+    );
+    let fake_sudo = write_fake_sudo_script(&root);
+    let restore_log = root.path().join("restore.log");
+    let output = kidobo_with_root_command(root.path(), &["sync"])
+        .env(
+            "PATH",
+            path_with_bin_prefix(fake_sudo.parent().expect("bin")),
+        )
+        .env("KIDOBO_TEST_RESTORE_LOG", &restore_log)
+        .output()
+        .expect("sync");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let scripts = read_to_string_with_limit(&restore_log, 65536).expect("restore scripts");
+    let entries: Vec<_> = scripts
+        .lines()
+        .filter_map(|line| {
+            line.strip_prefix("add ")
+                .map(|entry| entry.split_once(' ').expect("set and network").1)
+        })
+        .collect();
+    assert_eq!(
+        entries,
+        vec!["::/1", "8000::/1", "0.0.0.0/1", "128.0.0.0/1"]
+    );
+    let creates: Vec<_> = scripts
+        .lines()
+        .filter(|line| line.starts_with("create "))
+        .collect();
+    assert_eq!(creates.len(), 2);
+    assert!(creates[0].contains("hash:net family inet6 "));
+    assert!(creates[1].contains("hash:net family inet "));
+}
+
+#[test]
 fn sigint_during_first_replacement_finishes_enforcement_and_preserves_failures() {
     for fail in [false, true] {
         let root = create_root(
@@ -1768,6 +1817,38 @@ fn ban_asn_lock_failure_does_not_resolve_prefixes() {
         !touched.exists(),
         "ASN resolution should not run after lock acquisition fails"
     );
+}
+
+#[test]
+fn inline_asn_ban_and_unban_preserve_configuration() {
+    let root = create_root(
+        "asn = { banned = [64512], cache_stale_after_secs = 123 }\n# keep\n[ipset]\nset_name='kidobo'\n",
+        "",
+    );
+    let fake_bgpq4 = write_fake_bgpq4_script(&root);
+    for (args, expected) in [
+        (vec!["ban", "--asn", "64513"], vec![64512, 64513]),
+        (vec!["unban", "--asn", "64512"], vec![64513]),
+    ] {
+        let mut command = kidobo_with_root_command(root.path(), &args);
+        command.env(
+            "PATH",
+            path_with_bin_prefix(fake_bgpq4.parent().expect("bin")),
+        );
+        let output = command.output().expect("command");
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let rendered = read_to_string_with_limit(&root.path().join("config/config.toml"), 65536)
+            .expect("config");
+        assert!(rendered.starts_with("asn = {"));
+        assert!(rendered.contains("# keep\n[ipset]\nset_name='kidobo'"));
+        let config = kidobo_core::config::Config::from_toml_str(&rendered).expect("valid config");
+        assert_eq!(config.asn.banned, expected);
+    }
 }
 
 #[test]

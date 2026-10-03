@@ -2,7 +2,7 @@
 
 use kidobo_core::AddressFamily;
 use kidobo_core::config::{Config, FirewallAction};
-use kidobo_core::network::CanonicalCidr;
+use kidobo_core::network::{CanonicalCidr, Ipv4Cidr, Ipv6Cidr};
 use kidobo_core::sync::compute_effective_blocklists;
 
 use crate::AppError;
@@ -124,9 +124,9 @@ pub struct SourceSummary {
 /// Successful synchronization result.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncOutcome {
-    /// Number of effective IPv4 CIDRs installed.
+    /// Number of effective IPv4 CIDRs; a /0 uses two kernel entries.
     pub ipv4_entries: usize,
-    /// Number of effective IPv6 CIDRs installed.
+    /// Number of effective IPv6 CIDRs; a /0 uses two kernel entries.
     pub ipv6_entries: usize,
     /// Per-provider load summaries in registry order.
     pub sources: Vec<SourceSummary>,
@@ -241,10 +241,14 @@ pub fn execute(
         .observer
         .stage_completed("compute_effective_blocklists");
 
+    let ipv4_entries =
+        prepare_enforcement_entries(effective.ipv4.iter().copied().map(CanonicalCidr::V4));
+    let ipv6_entries =
+        prepare_enforcement_entries(effective.ipv6.iter().copied().map(CanonicalCidr::V6));
     if enforcement_plan.enable_ipv6 {
-        ensure_within_capacity(&enforcement_plan.ipv6, effective.ipv6.len())?;
+        ensure_within_capacity(&enforcement_plan.ipv6, ipv6_entries.len())?;
     }
-    ensure_within_capacity(&enforcement_plan.ipv4, effective.ipv4.len())?;
+    ensure_within_capacity(&enforcement_plan.ipv4, ipv4_entries.len())?;
 
     dependencies.cancellation.check()?;
     promote_pending_caches(
@@ -254,7 +258,12 @@ pub fn execute(
     )?;
     dependencies.cancellation.check()?;
 
-    apply_enforcement(&enforcement_plan, &effective, dependencies)?;
+    apply_enforcement(
+        &enforcement_plan,
+        &ipv4_entries,
+        &ipv6_entries,
+        dependencies,
+    )?;
 
     Ok(SyncOutcome {
         ipv4_entries: effective.ipv4.len(),
@@ -263,33 +272,53 @@ pub fn execute(
     })
 }
 
+// hash:net cannot represent /0. Keep the core result minimal and use the same
+// expanded entries for capacity preflight and replacement.
+#[expect(clippy::expect_used, reason = "constant /1 prefixes are always valid")]
+fn prepare_enforcement_entries(
+    entries: impl IntoIterator<Item = CanonicalCidr>,
+) -> Vec<CanonicalCidr> {
+    entries
+        .into_iter()
+        .flat_map(|entry| match entry {
+            CanonicalCidr::V4(cidr) if cidr.prefix() == 0 => [
+                Some(CanonicalCidr::V4(
+                    Ipv4Cidr::new(0_u32.into(), 1).expect("valid /1"),
+                )),
+                Some(CanonicalCidr::V4(
+                    Ipv4Cidr::new((1_u32 << 31).into(), 1).expect("valid /1"),
+                )),
+            ],
+            CanonicalCidr::V6(cidr) if cidr.prefix() == 0 => [
+                Some(CanonicalCidr::V6(
+                    Ipv6Cidr::new(0_u128.into(), 1).expect("valid /1"),
+                )),
+                Some(CanonicalCidr::V6(
+                    Ipv6Cidr::new((1_u128 << 127).into(), 1).expect("valid /1"),
+                )),
+            ],
+            _ => [Some(entry), None],
+        })
+        .flatten()
+        .collect()
+}
+
 // Finish enforcement once the first replacement starts, including wiring and cleanup.
 fn apply_enforcement(
     enforcement_plan: &EnforcementPlan,
-    effective: &kidobo_core::sync::EffectiveBlocklists,
+    ipv4_entries: &[CanonicalCidr],
+    ipv6_entries: &[CanonicalCidr],
     dependencies: &SyncDependencies<'_>,
 ) -> Result<(), AppError> {
     if enforcement_plan.enable_ipv6 {
-        let entries = effective
-            .ipv6
-            .iter()
-            .copied()
-            .map(CanonicalCidr::V6)
-            .collect::<Vec<_>>();
         dependencies
             .enforcement
-            .replace_set(&enforcement_plan.ipv6, &entries)?;
+            .replace_set(&enforcement_plan.ipv6, ipv6_entries)?;
         dependencies.observer.stage_completed("apply_ipv6_ipset");
     }
-    let entries = effective
-        .ipv4
-        .iter()
-        .copied()
-        .map(CanonicalCidr::V4)
-        .collect::<Vec<_>>();
     dependencies
         .enforcement
-        .replace_set(&enforcement_plan.ipv4, &entries)?;
+        .replace_set(&enforcement_plan.ipv4, ipv4_entries)?;
     dependencies.observer.stage_completed("apply_ipv4_ipset");
 
     dependencies.enforcement.activate(enforcement_plan)?;
@@ -1275,6 +1304,181 @@ mod tests {
                 .iter()
                 .any(|event| event.starts_with("replace"))
         );
+    }
+
+    #[test]
+    fn full_family_safelists_are_carved_before_enforcement_preparation() {
+        for erase in [false, true] {
+            let ledger = Ledger::default();
+            let sources = registry(
+                &ledger,
+                vec![
+                    provider(
+                        &ledger,
+                        "candidate",
+                        SourceRole::Candidate,
+                        FailurePolicy::Required,
+                        vec![cidr("0.0.0.0/0"), cidr("::/0")],
+                    ),
+                    provider(
+                        &ledger,
+                        "safe",
+                        SourceRole::Safelist,
+                        FailurePolicy::Required,
+                        if erase {
+                            vec![cidr("0.0.0.0/0"), cidr("::/0")]
+                        } else {
+                            vec![cidr("128.0.0.0/1"), cidr("8000::/1")]
+                        },
+                    ),
+                ],
+            );
+            let enforcement = FakeEnforcement {
+                ledger: Arc::clone(&ledger),
+                fail_at: None,
+                replacements: Mutex::new(Vec::new()),
+            };
+            let outcome = execute_with(
+                &ledger,
+                config(true, 1),
+                &sources,
+                &enforcement,
+                &RecordingObserver::default(),
+            )
+            .expect("carved sets fit");
+            assert_eq!(
+                (outcome.ipv4_entries, outcome.ipv6_entries),
+                if erase { (0, 0) } else { (1, 1) }
+            );
+            assert_eq!(
+                *enforcement.replacements.lock().expect("replacements"),
+                vec![
+                    (
+                        AddressFamily::Ipv6,
+                        if erase { vec![] } else { vec![cidr("::/1")] }
+                    ),
+                    (
+                        AddressFamily::Ipv4,
+                        if erase {
+                            vec![]
+                        } else {
+                            vec![cidr("0.0.0.0/1")]
+                        }
+                    ),
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn full_family_networks_expand_only_for_enforcement() {
+        for enable_ipv6 in [false, true] {
+            let ledger = Ledger::default();
+            let sources = registry(
+                &ledger,
+                vec![provider(
+                    &ledger,
+                    "candidate",
+                    SourceRole::Candidate,
+                    FailurePolicy::Required,
+                    vec![
+                        cidr("0.0.0.0/1"),
+                        cidr("128.0.0.0/1"),
+                        cidr("::/1"),
+                        cidr("8000::/1"),
+                    ],
+                )],
+            );
+            let enforcement = FakeEnforcement {
+                ledger: Arc::clone(&ledger),
+                fail_at: None,
+                replacements: Mutex::new(Vec::new()),
+            };
+            let outcome = execute_with(
+                &ledger,
+                config(enable_ipv6, 2),
+                &sources,
+                &enforcement,
+                &RecordingObserver::default(),
+            )
+            .expect("expanded sets fit");
+            assert_eq!(
+                (outcome.ipv4_entries, outcome.ipv6_entries),
+                (1, usize::from(enable_ipv6))
+            );
+            let mut expected = Vec::new();
+            if enable_ipv6 {
+                expected.push((AddressFamily::Ipv6, vec![cidr("::/1"), cidr("8000::/1")]));
+            }
+            expected.push((
+                AddressFamily::Ipv4,
+                vec![cidr("0.0.0.0/1"), cidr("128.0.0.0/1")],
+            ));
+            assert_eq!(
+                *enforcement.replacements.lock().expect("replacements"),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn expanded_capacity_rejection_precedes_promotion_and_both_replacements() {
+        for (family, networks) in [
+            (
+                "ipv4",
+                vec![
+                    cidr("0.0.0.0/1"),
+                    cidr("128.0.0.0/1"),
+                    cidr("2001:db8::/64"),
+                ],
+            ),
+            (
+                "ipv6",
+                vec![cidr("192.0.2.0/24"), cidr("::/1"), cidr("8000::/1")],
+            ),
+        ] {
+            let ledger = Ledger::default();
+            let mut sources = SyncSourceRegistry::new();
+            sources
+                .register(DeferredSource {
+                    ledger: Arc::clone(&ledger),
+                    descriptor: SyncSourceDescriptor {
+                        id: "deferred",
+                        role: SourceRole::Candidate,
+                        failure_policy: FailurePolicy::Required,
+                    },
+                    primary: networks,
+                    fallback: None,
+                    fail_promotion: false,
+                })
+                .expect("source");
+            let enforcement = FakeEnforcement {
+                ledger: Arc::clone(&ledger),
+                fail_at: None,
+                replacements: Mutex::new(Vec::new()),
+            };
+            let error = execute_with(
+                &ledger,
+                config(true, 1),
+                &sources,
+                &enforcement,
+                &RecordingObserver::default(),
+            )
+            .expect_err("expanded capacity");
+            assert!(matches!(error, AppError::IpsetCapacityExceeded {
+                family: actual, entries: 2, maxelem: 1, ..
+            } if actual == family));
+            assert!(!events(&ledger).iter().any(|event| event == "promote"
+                || event.starts_with("replace")
+                || event == "activate"));
+            assert!(
+                enforcement
+                    .replacements
+                    .lock()
+                    .expect("replacements")
+                    .is_empty()
+            );
+        }
     }
 
     #[test]
