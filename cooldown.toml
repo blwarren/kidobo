@@ -6,3 +6,8 @@ lockfile-baseline = "floor"
 
 [registry]
 global-min-publish-age = "7 days"
+
+# Accept the replacement for yanked 0.8.3 without relaxing other cooldowns.
+[[allow.exact]]
+crate = "yoke-derive"
+version = "0.8.4"
