@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+
+## [0.14.2] - 2026-10-03
+
 - Stage remote and GitHub cache generations until both address families pass
   semantic and capacity checks, preventing rejected refreshes from replacing a
   usable cache.

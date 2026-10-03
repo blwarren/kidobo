@@ -39,7 +39,7 @@ curl -fsSL https://raw.githubusercontent.com/blwarren/kidobo/main/scripts/instal
 To install a specific binary release:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/blwarren/kidobo/main/scripts/install.sh | sudo bash -s -- --version v0.14.1
+curl -fsSL https://raw.githubusercontent.com/blwarren/kidobo/main/scripts/install.sh | sudo bash -s -- --version v0.14.2
 ```
 
 That command pins the binary but retrieves the installer from the mutable
