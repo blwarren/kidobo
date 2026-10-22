@@ -477,7 +477,6 @@ fn promote_pending_caches(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn admit_external_safelists(
     candidates: &[CanonicalCidr],
     safelist: &mut Vec<CanonicalCidr>,

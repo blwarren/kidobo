@@ -16,9 +16,10 @@ use tempfile::TempDir;
 const BLOCKLIST_READ_LIMIT: usize = 16 * 1024 * 1024;
 
 fn kidobo_binary() -> PathBuf {
-    env::var_os("KIDOBO_TEST_BINARY")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_kidobo")))
+    env::var_os("KIDOBO_TEST_BINARY").map_or_else(
+        || PathBuf::from(env!("CARGO_BIN_EXE_kidobo")),
+        PathBuf::from,
+    )
 }
 
 fn run_kidobo(args: &[&str]) -> Output {
@@ -98,7 +99,6 @@ where
 
     after_prompt(&mut child);
     let mut stdin = child.stdin.take().expect("stdin pipe");
-    use std::io::Write;
     stdin
         .write_all(response.as_bytes())
         .expect("write prompt response");
@@ -170,7 +170,8 @@ fn read_to_string_with_limit(path: &Path, limit: usize) -> io::Result<String> {
     }
 
     let mut file = fs::File::open(path)?;
-    let mut bytes = Vec::with_capacity(len as usize);
+    let mut bytes =
+        Vec::with_capacity(usize::try_from(len).expect("file length is within usize limit"));
     file.read_to_end(&mut bytes)?;
     String::from_utf8(bytes).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
 }
@@ -199,6 +200,10 @@ fn path_with_bin_prefix(bin_dir: &Path) -> String {
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "keep the stateful fake command's embedded shell fixture alongside its installation"
+)]
 fn write_fake_sudo_script(temp: &TempDir) -> PathBuf {
     let bin_dir = temp.path().join("bin");
     fs::create_dir_all(&bin_dir).expect("create fake bin dir");
@@ -745,7 +750,7 @@ fn lookup_source_loading_failure_emits_no_human_table() {
     fs::create_dir(root.path().join("data/blocklist.txt")).expect("unreadable source");
     let output = run_kidobo_with_root(root.path(), &["lookup", "203.0.113.7"]);
     assert_eq!(output.status.code(), Some(1));
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout, b"");
 }
 
 #[cfg(target_os = "linux")]
@@ -1564,6 +1569,10 @@ fn sync_sigint_exits_with_130() {
 }
 
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "keep the feed, bounded child wait, and warning assertions in one deadlock regression"
+)]
 fn sync_remote_worker_warning_does_not_deadlock() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind remote feed listener");
     listener
@@ -2659,13 +2668,13 @@ fn temporary_file_ban_uses_one_deadline_and_invalid_batch_writes_nothing() {
         !temporary_bans_path(invalid_root.path()).exists(),
         "invalid file batch must not create or update temporary state"
     );
-    assert!(
+    assert_eq!(
         read_to_string_with_limit(
             &invalid_root.path().join("data/blocklist.txt"),
             BLOCKLIST_READ_LIMIT,
         )
-        .expect("permanent blocklist")
-        .is_empty()
+        .expect("permanent blocklist"),
+        ""
     );
 }
 
@@ -2835,13 +2844,13 @@ fn unban_removes_temporary_only_and_mixed_permanent_temporary_matches() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("file targets also match the following blocklist entries:"));
     assert!(stdout.contains("auto-approving removal of partial matches"));
-    assert!(
+    assert_eq!(
         read_to_string_with_limit(
             &mixed.path().join("data/blocklist.txt"),
             BLOCKLIST_READ_LIMIT
         )
-        .expect("permanent state after unban")
-        .is_empty()
+        .expect("permanent state after unban"),
+        ""
     );
     assert!(
         FileTemporaryBanRepository

@@ -30,6 +30,10 @@ fn io_cause<'a>(mut error: &'a (dyn Error + 'static)) -> &'a io::Error {
 }
 
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "keep the recording provisioner and complete path-resolution matrix in one contract test"
+)]
 fn init_uses_the_resolved_root_for_all_provisioning() {
     use std::cell::{Cell, RefCell};
     use std::path::{Path, PathBuf};

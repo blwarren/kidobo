@@ -1,16 +1,4 @@
-#![forbid(unsafe_code)]
-#![deny(dead_code)]
 #![deny(missing_docs)]
-#![deny(clippy::all)]
-#![deny(
-    clippy::allow_attributes_without_reason,
-    clippy::assertions_on_result_states,
-    clippy::cargo_common_metadata,
-    clippy::wildcard_dependencies
-)]
-
-//! Command-line composition, rendering, logging, and exit mapping for Kidobo.
-#![warn(clippy::pedantic)]
 #![cfg_attr(
     not(test),
     deny(
@@ -40,6 +28,8 @@
         clippy::redundant_clone
     )
 )]
+
+//! Command-line composition, rendering, logging, and exit mapping for Kidobo.
 
 mod cli;
 pub mod error;

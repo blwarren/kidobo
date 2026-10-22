@@ -129,7 +129,10 @@ mod tests {
                 .to_string()
                 .contains("byte limit")
         );
-        assert!(repository.load(root.path()).is_err());
+        assert!(matches!(
+            repository.load(root.path()),
+            Err(AppError::TemporaryBans { path, .. }) if path == root.path()
+        ));
     }
 
     #[test]

@@ -40,16 +40,18 @@ checks does not establish that the aggregate recipe ran.
 
 ### Lint coverage
 
-`collection_is_never_read`, `needless_collect`, and `needless_pass_by_ref_mut` are denied for
-every package and target. The three internal packages inherit these checks from
-`workspace.lints`; the root package declares them in its package lint table so its binary,
-integration tests, and benchmark receive them alongside its library.
+Every package uses `[lints] workspace = true` to inherit the shared policy in `Cargo.toml`.
+This covers libraries, the binary, integration tests, and benchmarks. The policy forbids unsafe
+code, denies dead code and `clippy::all`, and warns on `clippy::pedantic`; `just lint` denies
+all warnings. It also denies `allow_attributes_without_reason`, `assertions_on_result_states`,
+`cargo_common_metadata`, `wildcard_dependencies`, `collection_is_never_read`, `needless_collect`,
+and `needless_pass_by_ref_mut`.
 
-The rest of the root package's policy currently lives in `src/lib.rs`. Those crate attributes
-do not cover separate binary, integration-test, or benchmark targets. Consolidating the shared
-policy into `workspace.lints` and opting the root package into inheritance requires reviewing
-the additional diagnostics in those targets first. Keep production-only panic and output
-restrictions conditional when consolidating policy, so tests retain their existing exemptions.
+Library roots retain `missing_docs` and conditional production restrictions in
+`cfg_attr(not(test), deny(...))`. Tests and benchmarks may use assertions, `expect`, and diagnostic
+output. Use function-local lint expectations with a reason (`#[expect(lint, reason = "...")]`)
+so obsolete exceptions produce warnings. A cohesive scenario or embedded shell fixture can justify
+a length exception; avoid extracting helpers solely to meet a line limit.
 
 ## Safety-critical regressions
 

@@ -1,8 +1,4 @@
-#![forbid(unsafe_code)]
-#![deny(dead_code)]
 #![deny(missing_docs)]
-#![deny(clippy::all)]
-#![warn(clippy::pedantic)]
 #![cfg_attr(
     not(test),
     deny(

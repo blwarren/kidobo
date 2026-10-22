@@ -22,7 +22,7 @@ const BENCH_REMOTE_IPLIST_READ_LIMIT: usize = 16 * 1024 * 1024;
 fn generate_ipv4_cidrs(count: usize) -> Vec<Ipv4Cidr> {
     let mut cidrs = Vec::with_capacity(count);
     for i in 0..count {
-        let idx = i as u32;
+        let idx = u32::try_from(i).expect("benchmark index fits IPv4 address");
         let network = (10_u32 << 24) | ((idx & 0x00ff_ffff) << 8);
         cidrs.push(Ipv4Cidr::new(Ipv4Addr::from(network), 24).expect("valid benchmark prefix"));
     }
@@ -33,7 +33,7 @@ fn generate_ipv6_cidrs(count: usize) -> Vec<Ipv6Cidr> {
     let mut cidrs = Vec::with_capacity(count);
     for i in 0..count {
         let idx = i as u128;
-        let network = 0x20010db8000000000000000000000000_u128 | (idx << 64);
+        let network = 0x2001_0db8_0000_0000_0000_0000_0000_0000_u128 | (idx << 64);
         cidrs.push(Ipv6Cidr::new(Ipv6Addr::from(network), 64).expect("valid benchmark prefix"));
     }
     cidrs
@@ -60,7 +60,8 @@ fn deterministic_shuffle<T>(data: &mut [T]) {
         state ^= state << 7;
         state ^= state >> 9;
         state ^= state << 8;
-        let j = (state as usize) % (i + 1);
+        let bound = u64::try_from(i + 1).expect("slice length fits u64");
+        let j = usize::try_from(state % bound).expect("shuffle index is within slice");
         data.swap(i, j);
     }
 }
@@ -68,9 +69,11 @@ fn deterministic_shuffle<T>(data: &mut [T]) {
 fn generate_disjoint_ipv4_hosts(count: usize) -> Vec<Ipv4Cidr> {
     let mut out = Vec::with_capacity(count);
     for i in 0..count {
-        out.push(
-            Ipv4Cidr::new(Ipv4Addr::from((i as u32) * 4), 32).expect("valid benchmark prefix"),
-        );
+        let address = u32::try_from(i)
+            .expect("benchmark index fits IPv4 address")
+            .checked_mul(4)
+            .expect("benchmark address fits IPv4");
+        out.push(Ipv4Cidr::new(Ipv4Addr::from(address), 32).expect("valid benchmark prefix"));
     }
     out
 }
@@ -78,7 +81,8 @@ fn generate_disjoint_ipv4_hosts(count: usize) -> Vec<Ipv4Cidr> {
 fn generate_contiguous_ipv4_hosts(count: usize) -> Vec<Ipv4Cidr> {
     let mut out = Vec::with_capacity(count);
     for i in 0..count {
-        out.push(Ipv4Cidr::new(Ipv4Addr::from(i as u32), 32).expect("valid benchmark prefix"));
+        let address = u32::try_from(i).expect("benchmark index fits IPv4 address");
+        out.push(Ipv4Cidr::new(Ipv4Addr::from(address), 32).expect("valid benchmark prefix"));
     }
     out
 }
@@ -312,7 +316,7 @@ fn repeat_vec<T: Clone>(values: &[T], scale: usize) -> Vec<T> {
 }
 
 fn env_truthy(name: &str) -> bool {
-    std::env::var(name).ok().is_some_and(|raw| {
+    std::env::var(name).is_ok_and(|raw| {
         matches!(
             raw.trim().to_ascii_lowercase().as_str(),
             "1" | "true" | "yes" | "on"
@@ -344,7 +348,8 @@ fn read_to_string_with_limit(path: &Path, limit: usize) -> io::Result<String> {
     }
 
     let mut file = fs::File::open(path)?;
-    let mut bytes = Vec::with_capacity(len as usize);
+    let mut bytes =
+        Vec::with_capacity(usize::try_from(len).expect("file length is within usize limit"));
     file.read_to_end(&mut bytes)?;
     String::from_utf8(bytes).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
 }
@@ -473,8 +478,7 @@ fn fetch_remote_cache_from_config(root: &Path, config: &Config) {
 fn load_real_world_dataset() -> Option<RealWorldDataset> {
     let root = std::env::var("KIDOBO_BENCH_ROOT")
         .ok()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(".local-scenarios/real"));
+        .map_or_else(|| PathBuf::from(".local-scenarios/real"), PathBuf::from);
 
     let config_path = find_real_world_config(&root)?;
     let config_text = read_to_string_with_limit(&config_path, BENCH_BLOCKLIST_READ_LIMIT).ok()?;
@@ -555,6 +559,11 @@ fn benchmark_real_world(c: &mut Criterion) {
         return;
     };
 
+    benchmark_real_world_fixed(c, &dataset);
+    benchmark_real_world_scaled(c, &dataset);
+}
+
+fn benchmark_real_world_fixed(c: &mut Criterion, dataset: &RealWorldDataset) {
     let mut collapse_group = c.benchmark_group("real_world_collapse_ipv4");
     collapse_group.throughput(Throughput::Elements(dataset.ipv4_cidrs.len() as u64));
     let source_sorted_concat = dataset
@@ -612,7 +621,9 @@ fn benchmark_real_world(c: &mut Criterion) {
         });
     });
     effective_group.finish();
+}
 
+fn benchmark_real_world_scaled(c: &mut Criterion, dataset: &RealWorldDataset) {
     let scales = [1_usize, 2_usize, 5_usize, 10_usize];
 
     let mut collapse_scaled_group = c.benchmark_group("real_world_collapse_ipv4_scaled");

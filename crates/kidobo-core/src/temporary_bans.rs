@@ -288,8 +288,14 @@ mod tests {
             duration.expires_at(maximum - 3600).expect("boundary"),
             maximum
         );
-        assert!(duration.expires_at(maximum - 3599).is_err());
-        assert!(duration.expires_at(u64::MAX).is_err());
+        assert!(matches!(
+            duration.expires_at(maximum - 3599),
+            Err(TemporaryBanError::InvalidExpiry)
+        ));
+        assert!(matches!(
+            duration.expires_at(u64::MAX),
+            Err(TemporaryBanError::InvalidExpiry)
+        ));
     }
 
     #[test]
@@ -362,16 +368,25 @@ mod tests {
             state
         );
         state.asns.insert(0, 1);
-        assert!(serialize_temporary_bans(&state).is_err());
+        assert!(matches!(
+            serialize_temporary_bans(&state),
+            Err(TemporaryBanError::InvalidState { .. })
+        ));
         state.asns.clear();
         for expiry in [0, u64::MAX] {
             state.asns.insert(64496, expiry);
-            assert!(serialize_temporary_bans(&state).is_err());
+            assert!(matches!(
+                serialize_temporary_bans(&state),
+                Err(TemporaryBanError::InvalidExpiry)
+            ));
         }
         state.asns.clear();
         state
             .ips
             .insert(parse_ip_cidr_strict("203.0.113.1").expect("ip"), 0);
-        assert!(serialize_temporary_bans(&state).is_err());
+        assert!(matches!(
+            serialize_temporary_bans(&state),
+            Err(TemporaryBanError::InvalidExpiry)
+        ));
     }
 }

@@ -164,6 +164,9 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let cache = temp.path().join("cache");
         fs::write(&cache, "file").expect("write");
-        assert!(ensure_cache_path_ready(&cache).is_err());
+        assert!(matches!(
+            ensure_cache_path_ready(&cache),
+            Err(super::CacheWritableError::NotDirectory { path }) if path == cache
+        ));
     }
 }

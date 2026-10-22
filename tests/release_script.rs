@@ -89,7 +89,7 @@ fn assert_success(output: &Output, context: &str) {
 }
 
 struct ReleaseFixture {
-    _temp: TempDir,
+    temp: TempDir,
     repo: PathBuf,
     remote: PathBuf,
     fake_bin: PathBuf,
@@ -100,6 +100,10 @@ struct ReleaseFixture {
 }
 
 impl ReleaseFixture {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "keep the isolated repository setup and embedded release-tool fakes in one fixture"
+    )]
     fn new() -> Self {
         let temp = TempDir::new().expect("tempdir");
         let repo = temp.path().join("repo");
@@ -303,7 +307,7 @@ fi
         );
 
         Self {
-            _temp: temp,
+            temp,
             repo,
             remote,
             fake_bin,
@@ -793,7 +797,7 @@ fn publisher_packages_the_validated_candidate_from_each_target_directory() {
         let mut command = fixture.publisher_command();
         if let Some(directory) = target_directory {
             let path = if directory == "absolute" {
-                fixture._temp.path().join("absolute build with spaces")
+                fixture.temp.path().join("absolute build with spaces")
             } else {
                 PathBuf::from(directory)
             };

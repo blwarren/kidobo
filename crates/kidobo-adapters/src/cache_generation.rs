@@ -657,19 +657,17 @@ mod tests {
         let payload = candidates[0].directory.join("payload");
         std::fs::remove_file(&payload).expect("remove");
         std::fs::create_dir(&payload).expect("block atomic replacement");
-        assert!(
-            stage_generation(
-                temp.path(),
-                &[GenerationFile {
-                    name: "payload",
-                    contents: b"current"
-                }],
-                Some(&previous)
-            )
-            .expect("stage")
-            .promote()
-            .is_err()
-        );
+        stage_generation(
+            temp.path(),
+            &[GenerationFile {
+                name: "payload",
+                contents: b"current",
+            }],
+            Some(&previous),
+        )
+        .expect("stage")
+        .promote()
+        .expect_err("repair must fail while the payload path is a directory");
         assert_eq!(generation_candidates(temp.path()), candidates);
         assert_eq!(
             read_bytes_with_limit(&candidates[1].directory.join("payload"), 64).expect("previous"),
@@ -706,7 +704,9 @@ mod tests {
                 },
             );
 
-            assert!(result.is_err());
+            let error = result.expect_err("injected failure must abort before manifest commit");
+            assert_eq!(error.kind(), io::ErrorKind::Other);
+            assert_eq!(error.to_string(), "injected commit failure");
             let candidates = generation_candidates(temp.path());
             assert_eq!(candidates[0].id, old);
             assert_eq!(
@@ -737,7 +737,9 @@ mod tests {
             },
         );
 
-        assert!(result.is_err());
+        let error = result.expect_err("injected failure must be reported after manifest commit");
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(error.to_string(), "injected post-manifest failure");
         let candidates = generation_candidates(temp.path());
         assert_eq!(candidates.len(), 2);
         assert_ne!(candidates[0].id, old);
