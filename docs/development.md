@@ -113,6 +113,10 @@ Update [release-notes/unreleased.md](../release-notes/unreleased.md) only for us
 impact. Internal testing, instruction, and documentation maintenance alone do not need release notes.
 [CHANGELOG.md](../CHANGELOG.md) is generated and must not be hand-edited.
 
+Group release-note entries under appropriate `###` headings: `Added`, `Changed`, `Deprecated`,
+`Removed`, `Fixed`, or `Security`. Include only categories with entries, and classify each entry by
+its user-visible impact.
+
 After every repository change, run `just release-notes-check`. It normalizes `release-notes/*`,
 regenerates `CHANGELOG.md`, then checks those paths for unstaged differences against the Git index.
 A failure can reflect pre-existing unstaged edits as well as new generator rewrites. Inspect the
