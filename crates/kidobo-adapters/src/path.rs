@@ -27,7 +27,7 @@ pub fn path_resolution_input_from_process(
         ENV_KIDOBO_ROOT,
         ENV_KIDOBO_TEST_SANDBOX,
         ENV_KIDOBO_DISABLE_TEST_SANDBOX,
-        crate::http_cache::ENV_KIDOBO_MAX_HTTP_BODY_BYTES,
+        crate::http_client::ENV_KIDOBO_MAX_HTTP_BODY_BYTES,
     ]
     .into_iter()
     .filter_map(|key| env::var_os(key).map(|value| (OsString::from(key), value)))

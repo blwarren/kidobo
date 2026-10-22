@@ -4,7 +4,9 @@ use std::path::Path;
 use std::time::Duration;
 
 use kidobo_app::AppError;
-use kidobo_app::blocklist::{AsnConfigUpdate, AsnOperations, AsnPrefixBatch};
+use kidobo_app::blocklist::{
+    AsnCacheRemover, AsnConfigEditor, AsnConfigUpdate, AsnPrefixBatch, AsnPrefixLoader,
+};
 
 use crate::asn::{Bgpq4AsnPrefixResolver, delete_asn_cache_file, load_asn_prefixes_with_cache};
 use crate::config_edit::update_asn_bans;
@@ -13,7 +15,7 @@ use crate::config_edit::update_asn_bans;
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SystemAsnOperations;
 
-impl AsnOperations for SystemAsnOperations {
+impl AsnPrefixLoader for SystemAsnOperations {
     fn load_prefixes(
         &self,
         asn: u32,
@@ -28,7 +30,9 @@ impl AsnOperations for SystemAsnOperations {
             stale: loaded.stale,
         })
     }
+}
 
+impl AsnConfigEditor for SystemAsnOperations {
     fn update_config(
         &self,
         config_path: &Path,
@@ -41,7 +45,9 @@ impl AsnOperations for SystemAsnOperations {
             removed: update.removed,
         })
     }
+}
 
+impl AsnCacheRemover for SystemAsnOperations {
     fn delete_cache(&self, asn: u32, cache_dir: &Path) -> Result<bool, AppError> {
         delete_asn_cache_file(asn, cache_dir).map_err(map_asn_error)
     }

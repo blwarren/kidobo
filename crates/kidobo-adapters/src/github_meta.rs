@@ -15,7 +15,7 @@ use crate::cache_generation::{
 };
 use crate::cached_fetch::{read_optional_json_lossy, read_validated_bytes_lossy};
 use crate::hash::sha256_hex;
-use crate::http_cache::{HttpClient, HttpResponse, max_http_body_bytes};
+use crate::http_client::{HttpClient, HttpResponse, max_http_body_bytes};
 use crate::http_fetch::{ConditionalFetchResult, fetch_with_conditional_cache};
 use kidobo_core::config::{
     DEFAULT_GITHUB_META_CATEGORIES, DEFAULT_GITHUB_META_URL, GithubMetaCategoryMode,
@@ -716,8 +716,8 @@ mod tests {
     };
     use crate::cache_generation::generation_candidates;
     use crate::hash::sha256_hex;
-    use crate::http_cache::test_support::CrossOriginRedirectFixture;
-    use crate::http_cache::{
+    use crate::http_client::test_support::CrossOriginRedirectFixture;
+    use crate::http_client::{
         HttpClient, HttpClientError, HttpRequest, HttpResponse, ReqwestHttpClient,
     };
     use crate::limited_io::read_bytes_with_limit;

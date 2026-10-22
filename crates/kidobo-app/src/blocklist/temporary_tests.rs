@@ -13,8 +13,9 @@ use kidobo_core::temporary_bans::TemporaryBans;
 
 use crate::AppError;
 use crate::blocklist::{
-    AsnBanRequest, AsnConfigUpdate, AsnOperations, AsnPrefixBatch, BanChange,
-    BlocklistDependencies, BlocklistRepository, execute_ban_asn, execute_unban_asn,
+    AsnBanDependencies, AsnBanRequest, AsnCacheRemover, AsnConfigEditor, AsnConfigUpdate,
+    AsnPrefixBatch, AsnPrefixLoader, AsnUnbanDependencies, AsnUnbanRequest, BanChange,
+    BlocklistRepository, execute_ban_asn, execute_unban_asn,
 };
 use crate::paths::{ConfigRequirement, PathResolutionInput, ResolvedPaths};
 use crate::ports::{ConfigRepository, LockGuard, LockManager, NoCancellation, PathResolver};
@@ -56,16 +57,29 @@ impl Harness {
         }
     }
 
-    fn dependencies(&self) -> BlocklistDependencies<'_> {
-        BlocklistDependencies {
+    fn ban_dependencies(&self) -> AsnBanDependencies<'_> {
+        AsnBanDependencies {
             cancellation: &NoCancellation,
             paths: self,
             configs: self,
             locks: self,
             repository: self,
-            asn: self,
+            prefix_loader: self,
+            config_editor: self,
             temporary_bans: self,
             clock: self,
+        }
+    }
+
+    fn unban_dependencies(&self) -> AsnUnbanDependencies<'_> {
+        AsnUnbanDependencies {
+            cancellation: &NoCancellation,
+            paths: self,
+            configs: self,
+            locks: self,
+            temporary_bans: self,
+            config_editor: self,
+            cache_remover: self,
         }
     }
 
@@ -156,7 +170,7 @@ impl TemporaryBanRepository for Harness {
     }
 }
 
-impl AsnOperations for Harness {
+impl AsnPrefixLoader for Harness {
     fn load_prefixes(&self, asn: u32, _: &Path, _: Duration) -> Result<AsnPrefixBatch, AppError> {
         self.record(Event::Resolve(asn));
         self.now.set(self.now.get() + 60);
@@ -171,7 +185,9 @@ impl AsnOperations for Harness {
             stale: false,
         })
     }
+}
 
+impl AsnConfigEditor for Harness {
     fn update_config(
         &self,
         path: &Path,
@@ -199,7 +215,9 @@ impl AsnOperations for Harness {
                 .collect(),
         })
     }
+}
 
+impl AsnCacheRemover for Harness {
     fn delete_cache(&self, asn: u32, _: &Path) -> Result<bool, AppError> {
         self.record(Event::CacheDelete(asn));
         Ok(self.caches.borrow_mut().remove(&asn))
@@ -239,6 +257,14 @@ fn request(tokens: &[&str], duration: Option<&str>) -> AsnBanRequest {
     }
 }
 
+fn unban_request(tokens: &[&str]) -> AsnUnbanRequest {
+    let ban = request(tokens, None);
+    AsnUnbanRequest {
+        paths: ban.paths,
+        tokens: ban.tokens,
+    }
+}
+
 #[test]
 fn second_asn_resolution_failure_does_not_save_any_ban() {
     let fixture = Harness::new();
@@ -247,7 +273,7 @@ fn second_asn_resolution_failure_does_not_save_any_ban() {
     let original = fixture.state.borrow().clone();
     let result = execute_ban_asn(
         &request(&["AS64496", "64497"], Some("3h")),
-        &fixture.dependencies(),
+        &fixture.ban_dependencies(),
     );
     assert!(matches!(result, Err(AppError::Asn { .. })));
     assert_eq!(*fixture.state.borrow(), original);
@@ -269,8 +295,12 @@ fn invalid_asn_tokens_fail_before_lock_or_any_side_effects() {
     let fixture = Harness::new();
     let request = request(&["AS64496", "AS0"], None);
     for result in [
-        execute_ban_asn(&request, &fixture.dependencies()).map(|_| ()),
-        execute_unban_asn(&request, &fixture.dependencies()).map(|_| ()),
+        execute_ban_asn(&request, &fixture.ban_dependencies()).map(|_| ()),
+        execute_unban_asn(
+            &unban_request(&["AS64496", "AS0"]),
+            &fixture.unban_dependencies(),
+        )
+        .map(|_| ()),
     ] {
         let error = result.expect_err("invalid ASN");
         assert_eq!(
@@ -296,7 +326,7 @@ fn temporary_asn_batch_samples_one_deadline_after_validation_and_preserves_ip_ba
     let original_ips = fixture.state.borrow().ips.clone();
     let outcome = execute_ban_asn(
         &request(&["aS64497", "AS64496", "As64496", "64497"], Some("1h")),
-        &fixture.dependencies(),
+        &fixture.ban_dependencies(),
     )
     .expect("temporary ban");
     assert_eq!(
@@ -337,8 +367,11 @@ fn temporary_asn_batch_samples_one_deadline_after_validation_and_preserves_ip_ba
 fn already_permanent_asn_cannot_be_downgraded_and_does_not_save_temporary_state() {
     let fixture = Harness::new();
     fixture.permanent_asns.borrow_mut().extend([64496, 64498]);
-    let outcome = execute_ban_asn(&request(&["AS64496"], Some("1h")), &fixture.dependencies())
-        .expect("permanent ban retained");
+    let outcome = execute_ban_asn(
+        &request(&["AS64496"], Some("1h")),
+        &fixture.ban_dependencies(),
+    )
+    .expect("permanent ban retained");
     assert_eq!(
         outcome.temporary_changes,
         [BanChange::AlreadyPermanent("AS64496".to_owned())]
@@ -357,11 +390,17 @@ fn already_permanent_asn_cannot_be_downgraded_and_does_not_save_temporary_state(
 #[test]
 fn repeating_temporary_asn_ban_replaces_deadline_with_a_shorter_one() {
     let fixture = Harness::new();
-    execute_ban_asn(&request(&["AS64496"], Some("2d")), &fixture.dependencies())
-        .expect("first ban");
+    execute_ban_asn(
+        &request(&["AS64496"], Some("2d")),
+        &fixture.ban_dependencies(),
+    )
+    .expect("first ban");
     let first_deadline = fixture.state.borrow().asns[&64496];
-    let outcome = execute_ban_asn(&request(&["AS64496"], Some("1h")), &fixture.dependencies())
-        .expect("reschedule");
+    let outcome = execute_ban_asn(
+        &request(&["AS64496"], Some("1h")),
+        &fixture.ban_dependencies(),
+    )
+    .expect("reschedule");
     assert_eq!(fixture.state.borrow().asns[&64496], 4720);
     assert!(first_deadline > fixture.state.borrow().asns[&64496]);
     assert_eq!(
@@ -384,8 +423,9 @@ fn partial_asn_unban_keeps_shared_cache_until_retry_completes_both_stores() {
         .extend([(64496, 5000), (64497, 6000)]);
     fixture.caches.borrow_mut().extend([64496, 64497]);
     fixture.fail_config_write.set(true);
-    let unban = request(&["AS64496", "64497"], None);
-    let error = execute_unban_asn(&unban, &fixture.dependencies()).expect_err("partial failure");
+    let unban = unban_request(&["AS64496", "64497"]);
+    let error =
+        execute_unban_asn(&unban, &fixture.unban_dependencies()).expect_err("partial failure");
     let AppError::PartialBanUpdate {
         completed, pending, ..
     } = error
@@ -415,7 +455,7 @@ fn partial_asn_unban_keeps_shared_cache_until_retry_completes_both_stores() {
 
     fixture.events.borrow_mut().clear();
     fixture.fail_config_write.set(false);
-    let outcome = execute_unban_asn(&unban, &fixture.dependencies()).expect("retry");
+    let outcome = execute_unban_asn(&unban, &fixture.unban_dependencies()).expect("retry");
     assert_eq!(outcome.removed, [64496, 64497]);
     assert_eq!(outcome.deleted_cache_files, 2);
     assert!(fixture.state.borrow().asns.is_empty());
@@ -441,7 +481,7 @@ fn temporary_save_failure_prevents_asn_config_and_cache_changes() {
     fixture.caches.borrow_mut().insert(64496);
     fixture.fail_temporary_save.set(true);
     let original = fixture.state.borrow().clone();
-    let result = execute_unban_asn(&request(&["AS64496"], None), &fixture.dependencies());
+    let result = execute_unban_asn(&unban_request(&["AS64496"]), &fixture.unban_dependencies());
     assert!(matches!(result, Err(AppError::TemporaryBans { .. })));
     assert_eq!(*fixture.state.borrow(), original);
     assert_eq!(*fixture.permanent_asns.borrow(), BTreeSet::from([64496]));
@@ -458,7 +498,7 @@ fn temporary_only_asn_unban_succeeds_without_rewriting_permanent_config() {
     fixture.state.borrow_mut().asns.insert(64496, 5000);
     fixture.caches.borrow_mut().insert(64496);
     fixture.fail_config_write.set(true);
-    let outcome = execute_unban_asn(&request(&["AS64496"], None), &fixture.dependencies())
+    let outcome = execute_unban_asn(&unban_request(&["AS64496"]), &fixture.unban_dependencies())
         .expect("temporary-only unban");
     assert_eq!(outcome.removed, [64496]);
     assert_eq!(outcome.deleted_cache_files, 1);

@@ -14,8 +14,9 @@ use kidobo_adapters::temporary_bans::{FileTemporaryBanRepository, SystemClock};
 use kidobo_app::AppError;
 use kidobo_app::blocklist::BanDuration;
 use kidobo_app::blocklist::{
-    self, AsnBanRequest, BanChange, BanOutcome, BanRequest, BlocklistDependencies, BlocklistInput,
-    UnbanDecision, UnbanRequest,
+    self, AsnBanDependencies, AsnBanRequest, AsnUnbanDependencies, AsnUnbanRequest, BanChange,
+    BanDependencies, BanOutcome, BanRequest, BlocklistInput, UnbanApplyDependencies, UnbanDecision,
+    UnbanPreparationDependencies, UnbanRequest,
 };
 
 pub fn run_ban_command(
@@ -25,7 +26,6 @@ pub fn run_ban_command(
     duration: Option<BanDuration>,
     io: &mut CliIo<'_>,
 ) -> Result<(), KidoboError> {
-    let dependencies = production_dependencies();
     let paths = path_resolution_input_from_process(None);
     if let Some(tokens) = asn {
         let outcome = blocklist::execute_ban_asn(
@@ -34,7 +34,7 @@ pub fn run_ban_command(
                 tokens: tokens.to_vec(),
                 duration,
             },
-            &dependencies,
+            &asn_ban_dependencies(),
         )?;
         for notice in &outcome.notices {
             warn!("{}", notice.message);
@@ -73,7 +73,7 @@ pub fn run_ban_command(
             input,
             duration,
         },
-        &dependencies,
+        &ban_dependencies(),
     )?;
     let (changes, notices) = match outcome {
         BanOutcome::Applied(changes) => (changes, Vec::new()),
@@ -101,16 +101,14 @@ pub fn run_unban_command(
     yes: bool,
     io: &mut CliIo<'_>,
 ) -> Result<(), KidoboError> {
-    let dependencies = production_dependencies();
     let paths = path_resolution_input_from_process(None);
     if let Some(tokens) = asn {
         let outcome = blocklist::execute_unban_asn(
-            &AsnBanRequest {
+            &AsnUnbanRequest {
                 paths,
                 tokens: tokens.to_vec(),
-                duration: None,
             },
-            &dependencies,
+            &asn_unban_dependencies(),
         )?;
         for notice in &outcome.notices {
             warn!("{}", notice.message);
@@ -134,7 +132,7 @@ pub fn run_unban_command(
     let input = command_input(target, file)?;
     let file_mode = matches!(input, BlocklistInput::File(_));
     let request = UnbanRequest { paths, input };
-    let preparation = blocklist::prepare_unban(&request, &dependencies)?;
+    let preparation = blocklist::prepare_unban(&request, &unban_preparation_dependencies())?;
     let preview = match preparation {
         blocklist::UnbanPreparation::Ready(preview) => preview,
         blocklist::UnbanPreparation::InvalidTargets(targets) => {
@@ -151,7 +149,7 @@ pub fn run_unban_command(
         &request,
         &preview,
         &UnbanDecision { remove_partial },
-        &dependencies,
+        &unban_apply_dependencies(),
     )?;
     if outcome.total_removed() == 0 {
         if file_mode && outcome.had_partial_matches {
@@ -201,21 +199,62 @@ pub fn run_unban_command(
     Ok(())
 }
 
-fn production_dependencies() -> BlocklistDependencies<'static> {
-    static PATHS: SystemPathResolver = SystemPathResolver;
-    static CONFIGS: FileConfigRepository = FileConfigRepository;
-    static LOCKS: FileLockManager = FileLockManager;
-    static REPOSITORY: FileBlocklistRepository = FileBlocklistRepository;
-    static ASN: SystemAsnOperations = SystemAsnOperations;
-    BlocklistDependencies {
+fn ban_dependencies() -> BanDependencies<'static> {
+    BanDependencies {
         cancellation: &crate::cli::interrupt::SigintCancellation,
-        paths: &PATHS,
-        configs: &CONFIGS,
-        locks: &LOCKS,
-        repository: &REPOSITORY,
-        asn: &ASN,
+        paths: &SystemPathResolver,
+        configs: &FileConfigRepository,
+        locks: &FileLockManager,
+        repository: &FileBlocklistRepository,
         temporary_bans: &FileTemporaryBanRepository,
         clock: &SystemClock,
+    }
+}
+
+fn unban_preparation_dependencies() -> UnbanPreparationDependencies<'static> {
+    UnbanPreparationDependencies {
+        cancellation: &crate::cli::interrupt::SigintCancellation,
+        paths: &SystemPathResolver,
+        configs: &FileConfigRepository,
+        repository: &FileBlocklistRepository,
+        temporary_bans: &FileTemporaryBanRepository,
+    }
+}
+
+fn unban_apply_dependencies() -> UnbanApplyDependencies<'static> {
+    UnbanApplyDependencies {
+        cancellation: &crate::cli::interrupt::SigintCancellation,
+        paths: &SystemPathResolver,
+        configs: &FileConfigRepository,
+        locks: &FileLockManager,
+        repository: &FileBlocklistRepository,
+        temporary_bans: &FileTemporaryBanRepository,
+    }
+}
+
+fn asn_ban_dependencies() -> AsnBanDependencies<'static> {
+    AsnBanDependencies {
+        cancellation: &crate::cli::interrupt::SigintCancellation,
+        paths: &SystemPathResolver,
+        configs: &FileConfigRepository,
+        locks: &FileLockManager,
+        repository: &FileBlocklistRepository,
+        temporary_bans: &FileTemporaryBanRepository,
+        clock: &SystemClock,
+        prefix_loader: &SystemAsnOperations,
+        config_editor: &SystemAsnOperations,
+    }
+}
+
+fn asn_unban_dependencies() -> AsnUnbanDependencies<'static> {
+    AsnUnbanDependencies {
+        cancellation: &crate::cli::interrupt::SigintCancellation,
+        paths: &SystemPathResolver,
+        configs: &FileConfigRepository,
+        locks: &FileLockManager,
+        temporary_bans: &FileTemporaryBanRepository,
+        config_editor: &SystemAsnOperations,
+        cache_remover: &SystemAsnOperations,
     }
 }
 

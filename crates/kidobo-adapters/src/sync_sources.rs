@@ -20,7 +20,8 @@ use crate::blocklist_file::{
 };
 use crate::cache_generation::StagedGeneration;
 use crate::github_meta::prepare_github_meta_safelist;
-use crate::http_cache::{HttpClient, ReqwestHttpClient, prepare_iplist_with_cache};
+use crate::http_cache::prepare_iplist_with_cache;
+use crate::http_client::{HttpClient, ReqwestHttpClient};
 
 struct CancellableHttpClient<'a, C: ?Sized> {
     inner: &'a C,
@@ -30,13 +31,13 @@ struct CancellableHttpClient<'a, C: ?Sized> {
 impl<C: HttpClient + ?Sized> HttpClient for CancellableHttpClient<'_, C> {
     fn fetch(
         &self,
-        request: crate::http_cache::HttpRequest,
-    ) -> Result<crate::http_cache::HttpResponse, crate::http_cache::HttpClientError> {
-        self.cancellation
-            .check()
-            .map_err(|error| crate::http_cache::HttpClientError::Request {
+        request: crate::http_client::HttpRequest,
+    ) -> Result<crate::http_client::HttpResponse, crate::http_client::HttpClientError> {
+        self.cancellation.check().map_err(|error| {
+            crate::http_client::HttpClientError::Request {
                 reason: error.to_string(),
-            })?;
+            }
+        })?;
         self.inner.fetch(request)
     }
 }
@@ -472,7 +473,7 @@ mod tests {
         MAX_REMOTE_FETCH_WORKERS, build_sync_source_registry, prepare_remote_networks_in_chunks,
         remote_fetch_worker_count_for,
     };
-    use crate::http_cache::{HttpClient, HttpClientError, HttpRequest, HttpResponse};
+    use crate::http_client::{HttpClient, HttpClientError, HttpRequest, HttpResponse};
 
     struct DelayedClient {
         in_flight: AtomicUsize,

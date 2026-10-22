@@ -33,6 +33,12 @@ adapters or Clap.
 locks, bgpq4, ipset, iptables, and systemd. Adapter errors are mapped to application port errors at the
 boundary.
 
+Within the adapters, `http_client` owns bounded HTTP transport, TLS initialization, request timeouts,
+same-origin redirects, and the body-size environment override. Both `http_fetch` (conditional request
+policy) and the source adapters consume its transport types. `http_cache` owns remote-feed parsing,
+validation, fallback, and generation persistence; GitHub metadata retains its own admission and cache
+policy. Transport does not depend on either source's cache implementation.
+
 The root package parses arguments, reads confirmations, renders human/TSV/JSON output, maps exit codes,
 and composes production dependencies. `CliIo` supplies injected input, output, error, terminal, and color
 capabilities for command-dispatch tests. Logger and SIGINT handler installation remain in the production
@@ -50,6 +56,21 @@ wrapper. Domain and workflow decisions belong in the inner crates.
 
 Do not add a global runtime supertrait or universal virtual filesystem. A use case should receive only the
 capabilities it needs.
+
+## Ban and unban workflows
+
+`kidobo-app::blocklist` exposes shared types and re-exports the interfaces of private `ban`, `unban`,
+and `asn` modules. Each workflow receives its own dependency struct: IP ban, unban preparation, unban
+application, ASN ban, or ASN unban. ASN prefix loading, configuration editing, and cache removal are
+separate ports implemented by the same production adapter. ASN unban has a distinct request without a
+duration, and receives neither a clock nor a prefix loader.
+
+IP unban preparation reads the current sources without acquiring the process lock. Application acquires
+the lock, reloads configuration and sources, and revalidates the preview before writing. Temporary ASN
+deadlines are sampled once after prefix resolution. Two-store removals write temporary state first and
+permanent state second, retaining explicit partial-update diagnostics. ASN cache cleanup follows the
+source updates while the lock remains held. Workflow-specific interfaces preserve these ordering and
+cancellation boundaries; they do not introduce a shared transaction or global runtime abstraction.
 
 ## Source registries
 

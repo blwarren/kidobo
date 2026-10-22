@@ -47,6 +47,7 @@ pub mod flush;
 pub mod github_meta;
 pub mod hash;
 pub mod http_cache;
+pub mod http_client;
 pub mod http_fetch;
 pub mod init;
 pub mod ipset;

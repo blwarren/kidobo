@@ -3,7 +3,7 @@
 use log::warn;
 use reqwest::StatusCode;
 
-use crate::http_cache::{HttpClient, HttpRequest, HttpResponse};
+use crate::http_client::{HttpClient, HttpRequest, HttpResponse};
 
 /// Policy result from conditional HTTP fetching with soft cache fallback.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,7 +75,7 @@ mod tests {
     use reqwest::StatusCode;
 
     use super::{ConditionalFetchResult, fetch_with_conditional_cache};
-    use crate::http_cache::{HttpClient, HttpClientError, HttpRequest, HttpResponse};
+    use crate::http_client::{HttpClient, HttpClientError, HttpRequest, HttpResponse};
 
     struct MockHttpClient {
         responses: RefCell<VecDeque<Result<HttpResponse, HttpClientError>>>,
