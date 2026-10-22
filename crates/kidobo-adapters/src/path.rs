@@ -62,6 +62,7 @@ impl PathResolver for SystemPathResolver {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BasePaths {
+    root_override: Option<PathBuf>,
     config_dir: PathBuf,
     config_file: PathBuf,
     data_dir: PathBuf,
@@ -78,6 +79,7 @@ impl BasePaths {
         let cache_dir = root.join("cache");
 
         Self {
+            root_override: Some(root.to_path_buf()),
             config_file: config_dir.join("config.toml"),
             config_dir,
             blocklist_file: data_dir.join("blocklist.txt"),
@@ -90,6 +92,7 @@ impl BasePaths {
 
     fn system() -> Self {
         Self {
+            root_override: None,
             config_dir: PathBuf::from("/etc/kidobo"),
             config_file: PathBuf::from("/etc/kidobo/config.toml"),
             data_dir: PathBuf::from("/var/lib/kidobo"),
@@ -161,6 +164,7 @@ fn resolve_paths_with_policy(
         .map_or_else(|| base.config_dir.clone(), Path::to_path_buf);
 
     Ok(ResolvedPaths {
+        root_override: base.root_override,
         config_dir,
         config_file,
         data_dir: base.data_dir,

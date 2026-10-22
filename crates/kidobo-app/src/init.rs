@@ -61,8 +61,6 @@ WantedBy=timers.target
 pub struct InitRequest {
     /// Runtime path inputs.
     pub paths: PathResolutionInput,
-    /// Alternate filesystem root; when present, live systemd enablement is skipped.
-    pub root_override: Option<PathBuf>,
     /// Trusted executable paths considered in order.
     pub executable_candidates: Vec<PathBuf>,
 }
@@ -152,7 +150,7 @@ pub fn execute(
     let executable = dependencies
         .provisioner
         .resolve_installed_executable(&request.executable_candidates)?;
-    let systemd_dir = request.root_override.as_ref().map_or_else(
+    let systemd_dir = paths.root_override.as_ref().map_or_else(
         || PathBuf::from(DEFAULT_SYSTEMD_DIR),
         |root| root.join("systemd/system"),
     );
@@ -175,7 +173,7 @@ pub fn execute(
     }
 
     let service_template =
-        build_systemd_service_template(&executable, request.root_override.as_deref());
+        build_systemd_service_template(&executable, paths.root_override.as_deref());
     for (file, contents) in [
         (&paths.config_file, DEFAULT_CONFIG_TEMPLATE),
         (&paths.blocklist_file, DEFAULT_BLOCKLIST_TEMPLATE),
@@ -191,7 +189,7 @@ pub fn execute(
         });
     }
 
-    if request.root_override.is_none() {
+    if paths.root_override.is_none() {
         dependencies.cancellation.check()?;
         dependencies.provisioner.enable_systemd_timer()?;
         outcome.systemd_enabled = true;
@@ -263,7 +261,7 @@ mod tests {
     use crate::paths::{ConfigRequirement, PathResolutionInput, ResolvedPaths};
     use crate::ports::PathResolver;
 
-    struct Paths;
+    struct Paths(Option<PathBuf>);
     impl PathResolver for Paths {
         fn resolve(
             &self,
@@ -271,6 +269,7 @@ mod tests {
             _requirement: ConfigRequirement,
         ) -> Result<ResolvedPaths, AppError> {
             Ok(ResolvedPaths {
+                root_override: self.0.clone(),
                 config_dir: PathBuf::from("/root/config"),
                 config_file: PathBuf::from("/root/config/config.toml"),
                 data_dir: PathBuf::from("/root/data"),
@@ -319,14 +318,13 @@ mod tests {
         }
     }
 
-    fn request(root_override: Option<PathBuf>) -> InitRequest {
+    fn request() -> InitRequest {
         InitRequest {
             paths: PathResolutionInput {
                 explicit_config_path: None,
                 temp_dir: PathBuf::from("/tmp"),
                 env: std::collections::BTreeMap::new(),
             },
-            root_override,
             executable_candidates: vec![PathBuf::from("/usr/local/bin/kidobo")],
         }
     }
@@ -335,10 +333,10 @@ mod tests {
     fn provisions_all_artifacts_and_enables_systemd_on_host() {
         let provisioner = Provisioner::default();
         let outcome = execute(
-            &request(None),
+            &request(),
             &InitDependencies {
                 cancellation: &crate::ports::NoCancellation,
-                paths: &Paths,
+                paths: &Paths(None),
                 provisioner: &provisioner,
             },
         )
@@ -355,10 +353,10 @@ mod tests {
     fn root_override_skips_live_systemd_commands() {
         let provisioner = Provisioner::default();
         let outcome = execute(
-            &request(Some(PathBuf::from("/sandbox"))),
+            &request(),
             &InitDependencies {
                 cancellation: &crate::ports::NoCancellation,
-                paths: &Paths,
+                paths: &Paths(Some(PathBuf::from("/sandbox"))),
                 provisioner: &provisioner,
             },
         )

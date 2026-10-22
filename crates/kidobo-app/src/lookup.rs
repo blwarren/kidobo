@@ -160,6 +160,7 @@ mod tests {
         ) -> Result<ResolvedPaths, AppError> {
             assert_eq!(requirement, ConfigRequirement::Optional);
             Ok(ResolvedPaths {
+                root_override: Some(PathBuf::from("/root")),
                 config_dir: PathBuf::from("/root/config"),
                 config_file: PathBuf::from("/root/config/config.toml"),
                 data_dir: PathBuf::from("/root/data"),

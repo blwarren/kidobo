@@ -97,7 +97,10 @@ pub fn write_string_atomic(path: &Path, contents: &str) -> io::Result<()> {
 /// Returns an I/O error when temporary-file creation, writing, synchronization, permission
 /// preservation, replacement, or parent-directory synchronization fails.
 pub fn write_bytes_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
     let existing_permissions = match fs::metadata(path) {
         Ok(metadata) => Some(metadata.permissions()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,

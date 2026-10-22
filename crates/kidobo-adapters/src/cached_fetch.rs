@@ -3,32 +3,10 @@
 use std::path::Path;
 
 use log::warn;
-use serde::Serialize;
 use serde::de::DeserializeOwned;
-use thiserror::Error;
 
 use crate::hash::sha256_hex;
-use crate::limited_io::{read_bytes_with_limit, write_bytes_atomic};
-
-/// Failure while serializing or atomically writing a cache JSON document.
-#[derive(Debug, Error)]
-pub enum WriteJsonError {
-    /// The value could not be encoded as JSON.
-    #[error("failed to serialize JSON: {source}")]
-    Serialize {
-        /// Serializer diagnostic.
-        #[source]
-        source: serde_json::Error,
-    },
-
-    /// Encoded JSON could not be atomically persisted.
-    #[error("failed to write JSON file: {source}")]
-    Write {
-        /// Filesystem diagnostic.
-        #[source]
-        source: std::io::Error,
-    },
-}
+use crate::limited_io::read_bytes_with_limit;
 
 #[must_use]
 /// Reads a bounded optional cache file, logging and returning `None` when unusable.
@@ -95,52 +73,16 @@ pub fn read_validated_bytes_lossy(
     Some(bytes)
 }
 
-/// Creates the parent cache directory and atomically writes bytes.
-///
-/// # Errors
-///
-/// Returns an I/O error when the parent cannot be created or the destination cannot be replaced.
-pub fn write_bytes_atomic_in_cache(path: &Path, bytes: &[u8]) -> Result<(), std::io::Error> {
-    ensure_parent_dir(path)?;
-    write_bytes_atomic(path, bytes)
-}
-
-/// Serializes pretty JSON and atomically writes it to the cache.
-///
-/// # Errors
-///
-/// Returns [`WriteJsonError::Serialize`] when encoding fails or [`WriteJsonError::Write`] when the
-/// cache cannot be replaced.
-pub fn write_json_pretty_atomic<T>(path: &Path, value: &T) -> Result<(), WriteJsonError>
-where
-    T: Serialize,
-{
-    let bytes = serde_json::to_vec_pretty(value)
-        .map_err(|err| WriteJsonError::Serialize { source: err })?;
-    write_bytes_atomic_in_cache(path, &bytes).map_err(|err| WriteJsonError::Write { source: err })
-}
-
-fn ensure_parent_dir(path: &Path) -> Result<(), std::io::Error> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
 
-    use serde::{Deserialize, Serialize};
+    use serde::Deserialize;
     use tempfile::TempDir;
 
-    use super::{
-        read_optional_json_lossy, read_validated_bytes_lossy, write_bytes_atomic_in_cache,
-        write_json_pretty_atomic,
-    };
-    use crate::limited_io::read_bytes_with_limit;
+    use super::{read_optional_bytes_lossy, read_optional_json_lossy, read_validated_bytes_lossy};
 
-    #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+    #[derive(Debug, Deserialize, PartialEq, Eq)]
     struct SampleJson {
         value: String,
     }
@@ -164,26 +106,21 @@ mod tests {
     }
 
     #[test]
-    fn writes_and_reads_cache_helpers() {
+    fn reads_cache_helpers() {
         let temp = TempDir::new().expect("tempdir");
         let raw_path = temp.path().join("cache/raw.bin");
         let json_path = temp.path().join("cache/meta.json");
 
-        write_bytes_atomic_in_cache(&raw_path, b"payload").expect("write bytes");
-        write_json_pretty_atomic(
-            &json_path,
-            &SampleJson {
-                value: "ok".to_string(),
-            },
-        )
-        .expect("write json");
+        fs::create_dir_all(raw_path.parent().expect("cache parent")).expect("mkdir cache");
+        fs::write(&raw_path, b"payload").expect("write raw fixture");
+        fs::write(&json_path, br#"{"value":"ok"}"#).expect("write json fixture");
 
         let json = read_optional_json_lossy::<SampleJson>(&json_path, 1024, "json cache file")
             .expect("read json");
 
         assert_eq!(
-            read_bytes_with_limit(&raw_path, 1024).expect("read raw"),
-            b"payload"
+            read_optional_bytes_lossy(&raw_path, 1024, "raw cache file"),
+            Some(b"payload".to_vec())
         );
         assert_eq!(
             json,

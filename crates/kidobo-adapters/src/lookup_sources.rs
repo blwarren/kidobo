@@ -249,6 +249,7 @@ mod tests {
 
     fn test_paths(root: &std::path::Path) -> ResolvedPaths {
         ResolvedPaths {
+            root_override: Some(root.to_path_buf()),
             config_dir: root.join("config"),
             config_file: root.join("config/config.toml"),
             data_dir: root.join("data"),

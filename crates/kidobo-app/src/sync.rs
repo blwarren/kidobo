@@ -608,6 +608,7 @@ mod tests {
     fn test_paths() -> ResolvedPaths {
         let root = PathBuf::from("/test-root");
         ResolvedPaths {
+            root_override: Some(root.clone()),
             config_dir: root.join("config"),
             config_file: root.join("config/config.toml"),
             data_dir: root.join("data"),

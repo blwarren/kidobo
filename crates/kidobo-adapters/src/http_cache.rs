@@ -321,16 +321,6 @@ fn read_response_body_capped(
 /// Failure to read legacy cache data or commit a validated v2 generation.
 #[derive(Debug, Error)]
 pub enum HttpCacheError {
-    /// Normalized CIDR cache write failed.
-    #[error("failed to write iplist cache {path}: {source}")]
-    WriteIplist {
-        /// Cache path.
-        path: PathBuf,
-        /// Filesystem diagnostic.
-        #[source]
-        source: std::io::Error,
-    },
-
     /// Cache metadata or v2 manifest write failed.
     #[error("failed to write metadata cache {path}: {source}")]
     WriteMetadata {
@@ -339,16 +329,6 @@ pub enum HttpCacheError {
         /// Serialization or filesystem diagnostic.
         #[source]
         source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
-    /// Raw response cache write failed.
-    #[error("failed to write raw cache {path}: {source}")]
-    WriteRaw {
-        /// Cache path.
-        path: PathBuf,
-        /// Filesystem diagnostic.
-        #[source]
-        source: std::io::Error,
     },
 
     /// Selected normalized CIDR cache could not be read safely.
@@ -1023,6 +1003,7 @@ pub(crate) mod test_support {
 mod tests {
     use std::cell::RefCell;
     use std::collections::{BTreeMap, VecDeque};
+    use std::error::Error;
     use std::fmt::Write as _;
     use std::fs;
     use std::io::{Read, Write};
@@ -1183,9 +1164,26 @@ mod tests {
                 );
                 assert!(result.pending_promotion.is_none());
             } else {
+                let Err(error) = result else {
+                    panic!("a staging error without cache must remain fatal");
+                };
+                let super::HttpCacheError::WriteMetadata { path, source } = &error else {
+                    panic!("expected metadata staging failure, got {error:?}");
+                };
+                assert_eq!(
+                    path,
+                    &super::remote_generation_store(temp.path(), url).join("current.json")
+                );
+                let io_error = source
+                    .downcast_ref::<std::io::Error>()
+                    .expect("staging error must retain its filesystem cause");
+                assert_eq!(io_error.kind(), std::io::ErrorKind::NotADirectory);
+                assert!(io_error.raw_os_error().is_some());
                 assert!(
-                    result.is_err(),
-                    "a staging error without cache must remain fatal"
+                    Error::source(&error)
+                        .and_then(|cause| cause.downcast_ref::<std::io::Error>())
+                        .is_some(),
+                    "HTTP cache error must expose the staging I/O error in its source chain"
                 );
             }
         }

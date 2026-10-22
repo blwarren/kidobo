@@ -1,3 +1,6 @@
 - Preserve non-UTF-8 temporary directory paths when restoring ipsets during sync.
 - Report filesystem failures instead of treating unreadable configuration, blocklists, or caches as missing, and stop sync before enforcement when the local blocklist cannot be read.
 - Preserve files and cache generations when their metadata or selection manifest cannot be inspected, and distinguish inspection failures from missing paths in doctor reports.
+- Keep automatically sandboxed initialization's systemd units inside the selected root and skip live timer activation.
+- Reject ASN cache refreshes above 8 MiB before replacing cached data or updating ASN bans.
+- Support bare relative filenames in atomic writes without reporting an error after replacement.

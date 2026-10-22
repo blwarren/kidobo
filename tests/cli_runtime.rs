@@ -2074,6 +2074,60 @@ fn ban_asn_empty_resolution_leaves_configuration_unchanged() {
 }
 
 #[test]
+fn ban_asn_oversized_resolution_preserves_configuration() {
+    use std::fmt::Write as _;
+
+    let initial_config = "[ipset]\nset_name='kidobo'\n[asn]\nbanned=[]\n";
+    let blocklist = "203.0.113.0/24\n";
+    let root = create_root(initial_config, blocklist);
+    let mut response = String::new();
+    for index in 0..250_000 {
+        writeln!(
+            response,
+            "2001:db8:1111:2222:3333:4444:{:x}:{:x}/128",
+            index / 65_536,
+            index % 65_536
+        )
+        .expect("write fake resolver response");
+    }
+    assert!(response.len() > 8 * 1024 * 1024);
+    assert!(response.len() < 16 * 1024 * 1024);
+    fs::write(root.path().join("asn-response"), response).expect("resolver fixture");
+    let fake_bgpq4 = write_fake_bgpq4_script(&root);
+    fs::write(&fake_bgpq4, "#!/bin/bash\nset -euo pipefail\nif [[ \"$1\" == '-4' ]]; then\n  printf '203.0.113.0/24\\n'\nelse\n  cat \"${KIDOBO_ROOT}/asn-response\"\nfi\n")
+        .expect("write oversized fake resolver");
+    let mut command = kidobo_with_root_command(root.path(), &["ban", "--asn", "64512"]);
+    command.env(
+        "PATH",
+        path_with_bin_prefix(fake_bgpq4.parent().expect("fake bin")),
+    );
+    let output = command.output().expect("run ban --asn");
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("ASN cache write failed"), "{stderr}");
+    assert!(
+        stderr.contains("file exceeds 8388608 byte limit"),
+        "{stderr}"
+    );
+    assert_eq!(
+        read_to_string_with_limit(&root.path().join("config/config.toml"), 1024).expect("config"),
+        initial_config
+    );
+    assert_eq!(
+        read_to_string_with_limit(&root.path().join("data/blocklist.txt"), 1024)
+            .expect("blocklist"),
+        blocklist
+    );
+    assert!(
+        !root
+            .path()
+            .join("cache/asn/as64512.iplist")
+            .try_exists()
+            .expect("cache inspection")
+    );
+}
+
+#[test]
 fn ban_asn_cleanup_failure_warns_without_reverting_config_update() {
     let root = create_root("[ipset]\nset_name='kidobo'\n", "");
     let fake_bgpq4 = write_fake_bgpq4_script(&root);

@@ -9,7 +9,7 @@ use thiserror::Error;
 use crate::command_runner::{
     CommandExecutor, CommandRequest, ProcessStatus, SystemCommandExecutor,
 };
-use crate::limited_io::{read_to_string_with_limit, write_string_atomic};
+use crate::limited_io::{read_to_string_with_limit, write_string_atomic_with_limit};
 use kidobo_core::AddressFamily;
 use kidobo_core::network::{CanonicalCidr, parse_ip_cidr_token};
 
@@ -364,9 +364,11 @@ fn write_asn_cache_file(path: &Path, prefixes: &[CanonicalCidr]) -> Result<(), A
         output.push('\n');
     }
 
-    write_string_atomic(path, &output).map_err(|err| AsnError::CacheWrite {
-        path: path.to_path_buf(),
-        source: err,
+    write_string_atomic_with_limit(path, &output, ASN_CACHE_FILE_READ_LIMIT).map_err(|err| {
+        AsnError::CacheWrite {
+            path: path.to_path_buf(),
+            source: err,
+        }
     })
 }
 
@@ -429,7 +431,7 @@ mod tests {
         CommandExecutor, CommandRequest, CommandResult, CommandRunnerError, ProcessStatus,
     };
     use crate::limited_io::read_to_string_with_limit;
-    use kidobo_core::network::{CanonicalCidr, Ipv4Cidr};
+    use kidobo_core::network::{CanonicalCidr, Ipv4Cidr, Ipv6Cidr, parse_ip_cidr_token};
 
     struct MockResolver {
         responses: VecDeque<Result<Vec<CanonicalCidr>, AsnError>>,
@@ -906,6 +908,107 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["198.51.100.0/24", "203.0.113.0/24"]
         );
+    }
+
+    fn cache_limit_prefixes(tail: &str) -> Vec<CanonicalCidr> {
+        // 190,649 distinct 44-byte lines plus the 22-byte header leave 30 bytes.
+        // The final CIDR varies that remainder by one byte on either side.
+        let mut prefixes = (0..190_649_u32)
+            .map(|index| {
+                CanonicalCidr::V6(
+                    Ipv6Cidr::new(
+                        std::net::Ipv6Addr::new(
+                            0x2001,
+                            0x1234,
+                            0x5678,
+                            0x9abc,
+                            0xdef0,
+                            0x1111,
+                            0x8000 | u16::try_from(index >> 15).expect("high segment"),
+                            0x8000 | u16::try_from(index & 0x7fff).expect("low segment"),
+                        ),
+                        128,
+                    )
+                    .expect("valid CIDR"),
+                )
+            })
+            .collect::<Vec<_>>();
+        prefixes.push(parse_ip_cidr_token(tail).expect("valid tail"));
+        prefixes.sort_unstable();
+        prefixes
+    }
+
+    #[test]
+    fn cache_refresh_accepts_content_up_to_the_serialized_read_limit() {
+        for (tail, bytes) in [
+            (
+                "2001:db8:111:222:3:4:5:6/128",
+                ASN_CACHE_FILE_READ_LIMIT - 1,
+            ),
+            ("2001:db8:1111:222:3:4:5:6/128", ASN_CACHE_FILE_READ_LIMIT),
+        ] {
+            let prefixes = cache_limit_prefixes(tail);
+            let temp = TempDir::new().expect("tempdir");
+            let path = temp.path().join("as64512.iplist");
+            let resolver = Mutex::new(MockResolver::new(vec![Ok(prefixes.clone())]));
+            let loaded =
+                load_asn_prefixes_with_cache(64512, temp.path(), Duration::ZERO, &resolver)
+                    .expect("bounded refresh");
+            assert!(!loaded.stale);
+            assert_eq!(loaded.prefixes, prefixes);
+            assert_eq!(
+                fs::metadata(&path).expect("cache metadata").len(),
+                u64::try_from(bytes).expect("byte count")
+            );
+            let no_refresh = Mutex::new(MockResolver::new(vec![]));
+            let cached = load_asn_prefixes_with_cache(
+                64512,
+                temp.path(),
+                Duration::from_hours(24),
+                &no_refresh,
+            )
+            .expect("read accepted cache");
+            assert_eq!(cached.prefixes, prefixes);
+            assert!(!cached.stale);
+        }
+    }
+
+    #[test]
+    fn oversized_cache_refresh_preserves_existing_or_absent_cache() {
+        let prefixes = cache_limit_prefixes("2001:db8:1111:2222:3:4:5:6/128");
+        for existing in [false, true] {
+            let temp = TempDir::new().expect("tempdir");
+            let path = temp.path().join("as64512.iplist");
+            let original = "# kidobo-asn-cache-v1\n203.0.113.0/24\n";
+            if existing {
+                fs::write(&path, original).expect("seed cache");
+            }
+            let resolver = Mutex::new(MockResolver::new(vec![Ok(prefixes.clone())]));
+            let result =
+                load_asn_prefixes_with_cache(64512, temp.path(), Duration::ZERO, &resolver);
+            let Err(error) = result else {
+                panic!("oversized refresh must be rejected");
+            };
+            match error {
+                AsnError::CacheWrite {
+                    path: failed_path,
+                    source,
+                } => {
+                    assert_eq!(failed_path, path);
+                    assert_eq!(source.kind(), std::io::ErrorKind::InvalidData);
+                }
+                error => panic!("unexpected error: {error}"),
+            }
+            if existing {
+                assert_eq!(
+                    read_to_string_with_limit(&path, ASN_CACHE_FILE_READ_LIMIT)
+                        .expect("retained cache"),
+                    original
+                );
+            } else {
+                assert!(!path.try_exists().expect("inspect cache"));
+            }
+        }
     }
 
     #[test]

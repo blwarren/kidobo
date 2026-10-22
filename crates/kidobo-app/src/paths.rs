@@ -18,6 +18,8 @@ pub struct PathResolutionInput {
 /// Complete set of paths derived before a workflow performs side effects.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedPaths {
+    /// Effective alternate root, including automatic test-sandbox selection.
+    pub root_override: Option<PathBuf>,
     /// Directory containing the active configuration file.
     pub config_dir: PathBuf,
     /// Active configuration file.

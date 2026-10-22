@@ -1,13 +1,10 @@
-use std::ffi::OsStr;
 use std::fmt::Write;
 use std::path::PathBuf;
 
 use crate::cli::CliIo;
 use crate::error::KidoboError;
 use kidobo_adapters::init::SystemInitProvisioner;
-use kidobo_adapters::path::{
-    ENV_KIDOBO_ROOT, SystemPathResolver, path_resolution_input_from_process,
-};
+use kidobo_adapters::path::{SystemPathResolver, path_resolution_input_from_process};
 use kidobo_app::init::{
     self, DEFAULT_KIDOBO_BINARY_PATH, FALLBACK_KIDOBO_BINARY_PATH, InitDependencies, InitOutcome,
     InitRequest, ProvisionState,
@@ -15,16 +12,11 @@ use kidobo_app::init::{
 
 pub fn run_init_command(io: &mut CliIo<'_>) -> Result<(), KidoboError> {
     let paths_input = path_resolution_input_from_process(None);
-    let root_override = paths_input
-        .env
-        .get(OsStr::new(ENV_KIDOBO_ROOT))
-        .map(PathBuf::from);
     let paths = SystemPathResolver;
     let provisioner = SystemInitProvisioner::default();
     let outcome = init::execute(
         &InitRequest {
             paths: paths_input,
-            root_override,
             executable_candidates: vec![
                 PathBuf::from(DEFAULT_KIDOBO_BINARY_PATH),
                 PathBuf::from(FALLBACK_KIDOBO_BINARY_PATH),

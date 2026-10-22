@@ -3,7 +3,6 @@ use std::fs;
 use std::io;
 
 use kidobo_adapters::asn::load_cached_asn_prefixes;
-use kidobo_adapters::cached_fetch::write_json_pretty_atomic;
 use kidobo_adapters::config::load_config_from_file;
 use kidobo_adapters::lock::FileLockManager;
 use kidobo_adapters::lookup_sources::build_offline_lookup_registry;
@@ -28,6 +27,211 @@ fn io_cause<'a>(mut error: &'a (dyn Error + 'static)) -> &'a io::Error {
             .source()
             .expect("filesystem error must retain its I/O cause");
     }
+}
+
+#[test]
+fn init_uses_the_resolved_root_for_all_provisioning() {
+    use std::cell::{Cell, RefCell};
+    use std::path::{Path, PathBuf};
+
+    use kidobo_adapters::path::{
+        ENV_KIDOBO_DISABLE_TEST_SANDBOX, ENV_KIDOBO_ROOT, ENV_KIDOBO_TEST_SANDBOX,
+        SystemPathResolver,
+    };
+    use kidobo_app::init::{self, InitDependencies, InitProvisioner, InitRequest, ProvisionState};
+    use kidobo_app::paths::PathResolutionInput;
+
+    #[derive(Default)]
+    struct Provisioner {
+        directories: RefCell<Vec<PathBuf>>,
+        files: RefCell<Vec<(PathBuf, String)>>,
+        activations: Cell<usize>,
+    }
+    impl InitProvisioner for Provisioner {
+        fn resolve_installed_executable(&self, _: &[PathBuf]) -> Result<PathBuf, AppError> {
+            Ok(PathBuf::from("/usr/local/bin/kidobo"))
+        }
+        fn ensure_dir(&self, path: &Path) -> Result<ProvisionState, AppError> {
+            self.directories.borrow_mut().push(path.to_path_buf());
+            Ok(ProvisionState::Created)
+        }
+        fn ensure_file(&self, path: &Path, contents: &str) -> Result<ProvisionState, AppError> {
+            self.files
+                .borrow_mut()
+                .push((path.to_path_buf(), contents.to_string()));
+            Ok(ProvisionState::Created)
+        }
+        fn enable_systemd_timer(&self) -> Result<(), AppError> {
+            self.activations.set(self.activations.get() + 1);
+            Ok(())
+        }
+    }
+
+    for (explicit, sandbox, disabled) in [
+        (false, false, false),
+        (true, false, false),
+        (false, true, false),
+        (false, true, true),
+        (true, true, false),
+        (true, true, true),
+    ] {
+        let temp = TempDir::new().expect("tempdir");
+        let explicit_root = temp.path().join("explicit");
+        let mut env = std::collections::BTreeMap::new();
+        if explicit {
+            env.insert(ENV_KIDOBO_ROOT.into(), explicit_root.as_os_str().to_owned());
+        }
+        if sandbox {
+            env.insert(ENV_KIDOBO_TEST_SANDBOX.into(), "true".into());
+        }
+        if disabled {
+            env.insert(ENV_KIDOBO_DISABLE_TEST_SANDBOX.into(), "".into());
+        }
+        let expected_root = if explicit {
+            Some(explicit_root.clone())
+        } else if sandbox && !disabled {
+            Some(temp.path().join("kidobo-tests"))
+        } else {
+            None
+        };
+        let directories = expected_root.as_ref().map_or_else(
+            || {
+                vec![
+                    "/etc/kidobo".into(),
+                    "/var/lib/kidobo".into(),
+                    "/var/cache/kidobo/remote".into(),
+                    "/etc/systemd/system".into(),
+                ]
+            },
+            |root| {
+                vec![
+                    root.join("config"),
+                    root.join("data"),
+                    root.join("cache/remote"),
+                    root.join("systemd/system"),
+                ]
+            },
+        );
+        let files = expected_root.as_ref().map_or_else(
+            || {
+                vec![
+                    "/etc/kidobo/config.toml".into(),
+                    "/var/lib/kidobo/blocklist.txt".into(),
+                    "/var/cache/kidobo/sync.lock".into(),
+                    "/etc/systemd/system/kidobo-sync.service".into(),
+                    "/etc/systemd/system/kidobo-sync.timer".into(),
+                ]
+            },
+            |root| {
+                vec![
+                    root.join("config/config.toml"),
+                    root.join("data/blocklist.txt"),
+                    root.join("cache/sync.lock"),
+                    root.join("systemd/system/kidobo-sync.service"),
+                    root.join("systemd/system/kidobo-sync.timer"),
+                ]
+            },
+        );
+        let provisioner = Provisioner::default();
+        let outcome = init::execute(
+            &InitRequest {
+                paths: PathResolutionInput {
+                    explicit_config_path: None,
+                    temp_dir: temp.path().to_path_buf(),
+                    env,
+                },
+                executable_candidates: vec![],
+            },
+            &InitDependencies {
+                cancellation: &NoCancellation,
+                paths: &SystemPathResolver,
+                provisioner: &provisioner,
+            },
+        )
+        .expect("record init");
+        assert_eq!(
+            *provisioner.directories.borrow(),
+            directories,
+            "{explicit}/{sandbox}/{disabled}"
+        );
+        let recorded = provisioner.files.borrow();
+        assert_eq!(
+            recorded
+                .iter()
+                .map(|(path, _)| path.clone())
+                .collect::<Vec<_>>(),
+            files
+        );
+        assert_eq!(
+            provisioner.activations.get(),
+            usize::from(expected_root.is_none())
+        );
+        assert_eq!(outcome.systemd_enabled, expected_root.is_none());
+        let service = &recorded
+            .iter()
+            .find(|(path, _)| path.ends_with("kidobo-sync.service"))
+            .expect("service")
+            .1;
+        if let Some(root) = expected_root {
+            assert!(service.contains(&format!("Environment=\"KIDOBO_ROOT={}\"\n", root.display())));
+        } else {
+            assert!(!service.contains("KIDOBO_ROOT="));
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn atomic_writes_accept_relative_filenames() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+    use std::process::Command;
+
+    use kidobo_adapters::limited_io::{
+        read_bytes_with_limit, read_to_string_with_limit, write_bytes_atomic, write_string_atomic,
+    };
+
+    const CHILD: &str = "KIDOBO_TEST_RELATIVE_ATOMIC_WRITE";
+    if std::env::var_os(CHILD).is_none() {
+        let temp = TempDir::new().expect("tempdir");
+        let output = Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "atomic_writes_accept_relative_filenames",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .current_dir(temp.path())
+            .output()
+            .expect("run isolated relative-path test");
+        assert!(output.status.success(), "{output:?}");
+        return;
+    }
+    fs::create_dir("nested").expect("nested directory");
+    for name in ["bare", "./explicit", "nested/file"] {
+        let path = Path::new(name);
+        write_bytes_atomic(path, b"created").expect("create relative file");
+        assert_eq!(
+            read_bytes_with_limit(path, 1024).expect("created file"),
+            b"created"
+        );
+        fs::set_permissions(path, fs::Permissions::from_mode(0o640)).expect("set permissions");
+        write_string_atomic(path, "replaced").expect("replace relative file");
+        assert_eq!(
+            read_to_string_with_limit(path, 1024).expect("replaced file"),
+            "replaced"
+        );
+        assert_eq!(
+            fs::metadata(path)
+                .expect("permissions")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o640
+        );
+    }
+    assert_eq!(fs::read_dir(".").expect("current directory").count(), 3);
+    assert_eq!(fs::read_dir("nested").expect("nested directory").count(), 1);
 }
 
 #[test]
@@ -101,7 +305,7 @@ fn config_and_target_read_errors_keep_os_codes_and_path_context() {
 
 #[cfg(unix)]
 #[test]
-fn lock_and_cache_write_errors_keep_nested_io_causes() {
+fn lock_errors_keep_nested_io_causes() {
     let temp = TempDir::new().expect("tempdir");
     let blocked = temp.path().join("blocked");
     fs::write(&blocked, b"not a directory").expect("block parent");
@@ -118,11 +322,6 @@ fn lock_and_cache_write_errors_keep_nested_io_causes() {
             .to_string()
             .contains(&blocked.join("nested").display().to_string())
     );
-
-    let path = blocked.join("nested/meta.json");
-    let error = write_json_pretty_atomic(&path, &vec![1]).expect_err("cache parent must fail");
-    assert_eq!(io_cause(&error).kind(), io::ErrorKind::NotADirectory);
-    assert!(io_cause(&error).raw_os_error().is_some());
 }
 
 #[cfg(unix)]
@@ -136,6 +335,7 @@ fn offline_cache_errors_keep_io_causes_through_source_wrappers() {
     assert_eq!(io_cause(&enumeration).kind(), io::ErrorKind::NotADirectory);
     assert!(io_cause(&enumeration).raw_os_error().is_some());
     let paths = ResolvedPaths {
+        root_override: Some(temp.path().to_path_buf()),
         config_dir: temp.path().join("config"),
         config_file: temp.path().join("config/config.toml"),
         data_dir: temp.path().join("data"),
