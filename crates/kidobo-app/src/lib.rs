@@ -45,5 +45,6 @@ pub mod paths;
 pub mod ports;
 pub mod source;
 pub mod sync;
+pub mod temporary_bans;
 
 pub use error::AppError;

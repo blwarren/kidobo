@@ -66,9 +66,20 @@ rejects IPv4 prefixes broader than `/8`, IPv6 prefixes broader than `/16`, and
 collapsed coverage above one-sixteenth of either family's address space.
 
 The local blocklist lives at `/var/lib/kidobo/blocklist.txt` by default. It
-accepts one IP address or CIDR per line. `ban` and `unban` edit that source;
-`asn.banned` is the configuration source for ASN bans. Neither edit changes
-live firewall enforcement until the next `sync`.
+accepts one IP address or CIDR per line. Permanent IP/CIDR bans are recorded
+there; `asn.banned` is the configuration source for permanent ASN bans.
+Temporary entries live separately in `/var/lib/kidobo/temporary-bans.toml`.
+This versioned state file records canonical IP/CIDR or ASN entries with
+absolute Unix expiry times. `init` creates a valid empty file when absent and
+preserves an existing file. `doctor` validates it without changing it. None of
+these source edits changes live firewall enforcement until the next `sync`.
+
+Temporary state uses `version = 1`, `[[ips]]` records with `cidr` and
+`expires_at`, and `[[asns]]` records with `asn` and `expires_at`. Expiry values
+are positive Unix seconds. Reads and writes are limited to 16 MiB; unknown
+fields, unsupported versions, invalid records, and duplicate canonical
+identities are errors. A missing file is an empty source. `unban` updates both
+permanent and temporary sources for the requested target type.
 
 ## Paths and validation
 
@@ -76,11 +87,13 @@ live firewall enforcement until the next `sync`.
 | --- | --- |
 | Configuration | `/etc/kidobo/config.toml` |
 | Local blocklist | `/var/lib/kidobo/blocklist.txt` |
+| Temporary bans | `/var/lib/kidobo/temporary-bans.toml` |
 | Cache | `/var/cache/kidobo` |
 | Generated systemd units | `/etc/systemd/system/kidobo-sync.service` and `/etc/systemd/system/kidobo-sync.timer` |
 
 `KIDOBO_ROOT` relocates these files under a custom root: `config/config.toml`,
-`data/blocklist.txt`, `cache/`, and `systemd/system/`. With this override,
-`init` does not enable a live systemd timer. Set names and configuration keys
-remain subject to the same validation. See the [1.x compatibility
+`data/blocklist.txt`, `data/temporary-bans.toml`, `cache/`, and
+`systemd/system/`. With this override, `init` does not enable a live systemd
+timer. Set names and configuration keys remain subject to the same validation.
+See the [1.x compatibility
 contract](compatibility.md) for the supported operator interface.

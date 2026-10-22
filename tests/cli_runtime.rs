@@ -6,9 +6,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::mpsc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fs2::FileExt;
+use kidobo_adapters::temporary_bans::{FileTemporaryBanRepository, TEMPORARY_BANS_READ_LIMIT};
+use kidobo_app::temporary_bans::TemporaryBanRepository;
 use tempfile::TempDir;
 
 const BLOCKLIST_READ_LIMIT: usize = 16 * 1024 * 1024;
@@ -143,6 +145,19 @@ fn create_lookup_root_without_config(blocklist_contents: &str) -> TempDir {
 
 fn create_sync_root(config_contents: &str) -> TempDir {
     create_root(config_contents, "")
+}
+
+fn temporary_bans_path(root: &Path) -> PathBuf {
+    root.join("data/temporary-bans.toml")
+}
+
+fn future_expiry(seconds: u64) -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time after Unix epoch")
+        .as_secs()
+        .checked_add(seconds)
+        .expect("expiry fits")
 }
 
 fn read_to_string_with_limit(path: &Path, limit: usize) -> io::Result<String> {
@@ -406,6 +421,9 @@ fn flush_cache_only_succeeds_without_config_and_never_invokes_sudo() {
     let remote_cache = root.path().join("cache/remote");
     fs::create_dir_all(&remote_cache).expect("mkdir remote cache");
     fs::write(remote_cache.join("cached.iplist"), "198.51.100.0/24\n").expect("write cache");
+    fs::create_dir_all(root.path().join("data")).expect("mkdir data directory");
+    let temporary_bans = temporary_bans_path(root.path());
+    fs::write(&temporary_bans, "version = 1\n").expect("write temporary-ban state");
     let fake_sudo = write_fake_sudo_script(&root);
     let sudo_marker = root.path().join("sudo-touched");
 
@@ -420,6 +438,11 @@ fn flush_cache_only_succeeds_without_config_and_never_invokes_sudo() {
 
     assert_eq!(output.status.code(), Some(0));
     assert!(!sudo_marker.exists());
+    assert_eq!(
+        read_to_string_with_limit(&temporary_bans, TEMPORARY_BANS_READ_LIMIT)
+            .expect("temporary-ban state preserved"),
+        "version = 1\n"
+    );
     assert!(
         fs::read_dir(&remote_cache)
             .expect("read remote cache")
@@ -467,6 +490,8 @@ fn flush_cache_only_respects_the_nonblocking_lock() {
 #[test]
 fn flush_succeeds_when_transient_firewall_chain_is_absent() {
     let root = create_root("[ipset]\nset_name='kidobo'\n", "");
+    let temporary_bans = temporary_bans_path(root.path());
+    fs::write(&temporary_bans, "version = 1\n").expect("write temporary-ban state");
     let fake_sudo = write_fake_sudo_script(&root);
 
     let mut command = kidobo_with_root_command(root.path(), &["flush"]);
@@ -481,6 +506,11 @@ fn flush_succeeds_when_transient_firewall_chain_is_absent() {
         Some(0),
         "flush rejected already-absent transient chains: {}",
         String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        read_to_string_with_limit(&temporary_bans, TEMPORARY_BANS_READ_LIMIT)
+            .expect("temporary-ban state preserved"),
+        "version = 1\n"
     );
 }
 
@@ -2382,4 +2412,506 @@ fn unban_file_mode_invalid_target_fails_without_writes() {
     let contents =
         read_to_string_with_limit(&blocklist, BLOCKLIST_READ_LIMIT).expect("read blocklist");
     assert_eq!(contents, "203.0.113.0/24\n");
+}
+
+#[test]
+fn temporary_ban_accepts_direct_ipv4_and_ipv6_with_trimmed_duration() {
+    let root = create_root(
+        "[ipset]\nset_name='kidobo'\n[safe]\ninclude_github_meta=false\n",
+        "",
+    );
+    let temporary_file = temporary_bans_path(root.path());
+
+    for (target, duration, expected) in [
+        ("203.0.113.7", " 12H ", "203.0.113.7/32"),
+        ("2001:db8::1/64", "1d", "2001:db8::/64"),
+    ] {
+        let output = run_kidobo_with_root(root.path(), &["ban", target, "--for", duration]);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "temporary ban failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            read_to_string_with_limit(&temporary_file, TEMPORARY_BANS_READ_LIMIT)
+                .expect("temporary state")
+                .contains(&format!("cidr = \"{expected}\"")),
+            "temporary state omitted {expected}"
+        );
+    }
+    assert!(
+        read_to_string_with_limit(
+            &root.path().join("data/blocklist.txt"),
+            BLOCKLIST_READ_LIMIT
+        )
+        .expect("permanent blocklist")
+        .is_empty(),
+        "temporary bans must not edit the permanent blocklist"
+    );
+}
+
+#[test]
+fn temporary_file_ban_uses_one_deadline_and_invalid_batch_writes_nothing() {
+    let root = create_root("[ipset]\nset_name='kidobo'\n", "");
+    let targets = root.path().join("targets.txt");
+    let temporary_file = temporary_bans_path(root.path());
+    fs::write(&targets, "203.0.113.7\n2001:db8::/64\n").expect("write valid targets");
+    let target_path = targets.display().to_string();
+    let output = run_kidobo_with_root(root.path(), &["ban", "--file", &target_path, "--for", "3d"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "temporary file ban failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let state = FileTemporaryBanRepository
+        .load(&temporary_file)
+        .expect("valid temporary state");
+    assert_eq!(state.ips.len(), 2);
+    assert_eq!(
+        state
+            .ips
+            .values()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        1,
+        "one file operation must use one deadline"
+    );
+
+    let invalid_root = create_root("[ipset]\nset_name='kidobo'\n", "");
+    let invalid_targets = invalid_root.path().join("targets.txt");
+    fs::write(&invalid_targets, "203.0.113.7\nnot-an-ip\n").expect("write invalid targets");
+    let invalid_path = invalid_targets.display().to_string();
+    let invalid_output = run_kidobo_with_root(
+        invalid_root.path(),
+        &["ban", "--file", &invalid_path, "--for", "3d"],
+    );
+    assert_eq!(invalid_output.status.code(), Some(1));
+    assert!(
+        !temporary_bans_path(invalid_root.path()).exists(),
+        "invalid file batch must not create or update temporary state"
+    );
+    assert!(
+        read_to_string_with_limit(
+            &invalid_root.path().join("data/blocklist.txt"),
+            BLOCKLIST_READ_LIMIT,
+        )
+        .expect("permanent blocklist")
+        .is_empty()
+    );
+}
+
+#[test]
+fn temporary_asn_ban_uses_stale_cache_without_downgrading_permanent_asn() {
+    let root = create_root(
+        "[ipset]\nset_name='kidobo'\n[safe]\ninclude_github_meta=false\n[asn]\nbanned=[64496]\ncache_stale_after_secs=1\n",
+        "",
+    );
+    let fake_bgpq4 = write_fake_bgpq4_script(&root);
+    fs::write(&fake_bgpq4, "#!/usr/bin/env bash\nexit 1\n").expect("make resolver fail");
+    let cache_dir = root.path().join("cache/asn");
+    fs::create_dir_all(&cache_dir).expect("create ASN cache");
+    for (asn, prefix) in [(64496, "203.0.113.0/24"), (64497, "2001:db8::/48")] {
+        let cache_path = cache_dir.join(format!("as{asn}.iplist"));
+        fs::write(&cache_path, format!("# kidobo-asn-cache-v1\n{prefix}\n"))
+            .expect("write stale ASN cache");
+        fs::File::open(&cache_path)
+            .expect("open ASN cache")
+            .set_times(std::fs::FileTimes::new().set_modified(UNIX_EPOCH))
+            .expect("age ASN cache");
+    }
+
+    let mut command = kidobo_with_root_command(
+        root.path(),
+        &["ban", "--for", "3d", "--asn", "AS64496", "64497"],
+    );
+    command.env(
+        "PATH",
+        path_with_bin_prefix(fake_bgpq4.parent().expect("bgpq4 directory")),
+    );
+    let output = command.output().expect("temporary ASN ban");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "ASN ban failed: {stderr}");
+    assert!(stderr.contains("ASN cache stale fallback used for AS64496"));
+    assert!(stderr.contains("ASN cache stale fallback used for AS64497"));
+
+    let state = FileTemporaryBanRepository
+        .load(&temporary_bans_path(root.path()))
+        .expect("temporary ASN state");
+    assert_eq!(state.asns.keys().copied().collect::<Vec<_>>(), [64497]);
+    let config_text = read_to_string_with_limit(&root.path().join("config/config.toml"), 65_536)
+        .expect("configuration unchanged");
+    assert!(config_text.contains("banned=[64496]"));
+
+    let unban = run_kidobo_with_root(root.path(), &["unban", "--asn", "AS64496", "64497"]);
+    assert_eq!(unban.status.code(), Some(0), "ASN unban failed");
+    assert!(
+        FileTemporaryBanRepository
+            .load(&temporary_bans_path(root.path()))
+            .expect("temporary ASN state after unban")
+            .asns
+            .is_empty()
+    );
+    let config_text = read_to_string_with_limit(&root.path().join("config/config.toml"), 65_536)
+        .expect("configuration after ASN unban");
+    assert!(!config_text.contains("banned=[64496]"));
+}
+
+#[test]
+fn temporary_deadline_can_be_shortened_and_permanent_duplicate_stays_permanent() {
+    let root = create_root("[ipset]\nset_name='kidobo'\n", "203.0.113.9/32\n");
+    let temporary_file = temporary_bans_path(root.path());
+
+    let first = run_kidobo_with_root(root.path(), &["ban", "198.51.100.7", "--for", "30d"]);
+    assert_eq!(first.status.code(), Some(0));
+    let first_state = FileTemporaryBanRepository
+        .load(&temporary_file)
+        .expect("initial temporary state");
+    let first_deadline = *first_state.ips.values().next().expect("first deadline");
+
+    let shortened = run_kidobo_with_root(root.path(), &["ban", "198.51.100.7", "--for", "1h"]);
+    assert_eq!(shortened.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&shortened.stdout).contains("rescheduled temporary ban"));
+    let shortened_state = FileTemporaryBanRepository
+        .load(&temporary_file)
+        .expect("shortened temporary state");
+    let shortened_deadline = *shortened_state
+        .ips
+        .values()
+        .next()
+        .expect("shortened deadline");
+    assert!(shortened_deadline < first_deadline);
+
+    let permanent = run_kidobo_with_root(root.path(), &["ban", "203.0.113.9", "--for", "1d"]);
+    assert_eq!(permanent.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&permanent.stdout).contains("already permanently banned"));
+    let state = FileTemporaryBanRepository
+        .load(&temporary_file)
+        .expect("temporary state after permanent duplicate");
+    assert!(
+        !state
+            .ips
+            .keys()
+            .any(|target| target.to_string() == "203.0.113.9/32")
+    );
+    assert!(
+        read_to_string_with_limit(
+            &root.path().join("data/blocklist.txt"),
+            BLOCKLIST_READ_LIMIT
+        )
+        .expect("permanent source")
+        .contains("203.0.113.9/32")
+    );
+
+    let temporary = run_kidobo_with_root(root.path(), &["ban", "192.0.2.7", "--for", "1d"]);
+    assert_eq!(temporary.status.code(), Some(0));
+    let promoted_target_state = FileTemporaryBanRepository
+        .load(&temporary_file)
+        .expect("temporary state before promotion");
+    let promoted = run_kidobo_with_root(root.path(), &["ban", "192.0.2.7"]);
+    assert_eq!(promoted.status.code(), Some(0));
+    assert!(
+        read_to_string_with_limit(
+            &root.path().join("data/blocklist.txt"),
+            BLOCKLIST_READ_LIMIT
+        )
+        .expect("permanent source after promotion")
+        .contains("192.0.2.7/32"),
+        "permanent ban should promote the target into the permanent source"
+    );
+    assert_eq!(
+        FileTemporaryBanRepository
+            .load(&temporary_file)
+            .expect("temporary state after promotion"),
+        promoted_target_state,
+        "permanent promotion preserves the temporary record until it expires"
+    );
+}
+
+#[test]
+fn unban_removes_temporary_only_and_mixed_permanent_temporary_matches() {
+    let temporary_only = create_root("[ipset]\nset_name='kidobo'\n", "");
+    fs::write(
+        temporary_bans_path(temporary_only.path()),
+        format!(
+            "version = 1\n\n[[ips]]\ncidr = \"203.0.113.7/32\"\nexpires_at = {}\n",
+            future_expiry(86_400)
+        ),
+    )
+    .expect("write temporary-only target");
+    let output = run_kidobo_with_root(temporary_only.path(), &["unban", "203.0.113.7"]);
+    assert_eq!(output.status.code(), Some(0));
+    assert!(
+        FileTemporaryBanRepository
+            .load(&temporary_bans_path(temporary_only.path()))
+            .expect("temporary-only state after unban")
+            .ips
+            .is_empty()
+    );
+
+    let mixed = create_root("[ipset]\nset_name='kidobo'\n", "198.51.100.9/32\n");
+    fs::write(
+        temporary_bans_path(mixed.path()),
+        format!(
+            "version = 1\n\n[[ips]]\ncidr = \"198.51.100.9/32\"\nexpires_at = {}\n\n[[ips]]\ncidr = \"203.0.113.0/24\"\nexpires_at = {}\n",
+            future_expiry(86_400),
+            future_expiry(86_400)
+        ),
+    )
+    .expect("write mixed targets");
+    let targets = mixed.path().join("targets.txt");
+    fs::write(&targets, "198.51.100.9\n203.0.113.8\n").expect("write unban targets");
+    let target_path = targets.display().to_string();
+    let output = run_kidobo_with_root(mixed.path(), &["unban", "--file", &target_path, "--yes"]);
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("file targets also match the following blocklist entries:"));
+    assert!(stdout.contains("auto-approving removal of partial matches"));
+    assert!(
+        read_to_string_with_limit(
+            &mixed.path().join("data/blocklist.txt"),
+            BLOCKLIST_READ_LIMIT
+        )
+        .expect("permanent state after unban")
+        .is_empty()
+    );
+    assert!(
+        FileTemporaryBanRepository
+            .load(&temporary_bans_path(mixed.path()))
+            .expect("temporary state after mixed unban")
+            .ips
+            .is_empty()
+    );
+}
+
+#[test]
+fn temporary_state_doctor_reports_bad_and_oversized_data_without_rewriting_it() {
+    let root = create_root("[ipset]\nset_name='kidobo'\n", "");
+    let temporary_file = temporary_bans_path(root.path());
+    let fake_sudo = write_fake_sudo_script(&root);
+    let path = path_with_bin_prefix(fake_sudo.parent().expect("sudo parent"));
+
+    let missing_output = kidobo_with_root_command(root.path(), &["doctor"])
+        .env("PATH", &path)
+        .output()
+        .expect("doctor missing optional state");
+    let report: serde_json::Value =
+        serde_json::from_slice(&missing_output.stdout).expect("missing-state doctor report");
+    assert_eq!(
+        report["checks"]
+            .as_array()
+            .expect("doctor checks")
+            .iter()
+            .find(|check| check["name"] == "file_temporary_bans")
+            .expect("temporary-ban check")["status"],
+        "OK"
+    );
+    assert!(
+        !temporary_file.exists(),
+        "doctor must accept a missing optional state file without creating it"
+    );
+
+    fs::write(&temporary_file, "malformed temporary state").expect("write malformed state");
+    let malformed_output = kidobo_with_root_command(root.path(), &["doctor"])
+        .env("PATH", &path)
+        .output()
+        .expect("doctor malformed state");
+    assert_eq!(malformed_output.status.code(), Some(1));
+    let report: serde_json::Value =
+        serde_json::from_slice(&malformed_output.stdout).expect("malformed-state doctor report");
+    assert_eq!(
+        report["checks"]
+            .as_array()
+            .expect("doctor checks")
+            .iter()
+            .find(|check| check["name"] == "file_temporary_bans")
+            .expect("temporary-ban check")["status"],
+        "FAIL"
+    );
+    assert_eq!(
+        read_to_string_with_limit(&temporary_file, TEMPORARY_BANS_READ_LIMIT)
+            .expect("malformed state unchanged"),
+        "malformed temporary state"
+    );
+
+    fs::write(&temporary_file, "version = 1\n").expect("write oversized-state prefix");
+    fs::File::options()
+        .write(true)
+        .open(&temporary_file)
+        .expect("open temporary state")
+        .set_len(u64::try_from(TEMPORARY_BANS_READ_LIMIT + 1).expect("size fits u64"))
+        .expect("make temporary state oversized");
+    let oversized_output = kidobo_with_root_command(root.path(), &["doctor"])
+        .env("PATH", &path)
+        .output()
+        .expect("doctor oversized state");
+    assert_eq!(oversized_output.status.code(), Some(1));
+    let report: serde_json::Value =
+        serde_json::from_slice(&oversized_output.stdout).expect("oversized-state doctor report");
+    assert_eq!(
+        report["checks"]
+            .as_array()
+            .expect("doctor checks")
+            .iter()
+            .find(|check| check["name"] == "file_temporary_bans")
+            .expect("temporary-ban check")["status"],
+        "FAIL"
+    );
+    assert_eq!(
+        fs::metadata(&temporary_file)
+            .expect("oversized file metadata")
+            .len(),
+        u64::try_from(TEMPORARY_BANS_READ_LIMIT + 1).expect("size fits u64")
+    );
+}
+
+#[test]
+fn temporary_lookup_uses_active_entries_and_cached_asn_prefixes_only() {
+    let root = create_root(
+        "[ipset]\nset_name='kidobo'\n[safe]\ninclude_github_meta=false\n[asn]\nbanned=[]\n",
+        "",
+    );
+    let temporary_file = temporary_bans_path(root.path());
+    fs::write(
+        &temporary_file,
+        format!(
+            "version = 1\n\n[[ips]]\ncidr = \"203.0.113.7/32\"\nexpires_at = {}\n\n[[ips]]\ncidr = \"198.51.100.9/32\"\nexpires_at = 1\n\n[[asns]]\nasn = 64512\nexpires_at = {}\n\n[[asns]]\nasn = 64513\nexpires_at = 1\n",
+            future_expiry(86_400),
+            future_expiry(86_400)
+        ),
+    )
+    .expect("write temporary lookup state");
+    let cache_dir = root.path().join("cache/asn");
+    fs::create_dir_all(&cache_dir).expect("create lookup ASN cache");
+    fs::write(cache_dir.join("as64512.iplist"), "192.0.2.0/24\n").expect("active ASN cache");
+    fs::write(cache_dir.join("as64513.iplist"), "198.51.100.0/24\n").expect("expired ASN cache");
+    let targets = root.path().join("lookup-targets.txt");
+    fs::write(
+        &targets,
+        "203.0.113.7\n198.51.100.9\n192.0.2.7\n198.51.100.7\n",
+    )
+    .expect("write lookup targets");
+    let fake_bgpq4 = write_fake_bgpq4_script(&root);
+    let touched = root.path().join("bgpq4-touched");
+    let target_path = targets.display().to_string();
+    let mut command = kidobo_with_root_command(
+        root.path(),
+        &["lookup", "--file", &target_path, "--format", "tsv"],
+    );
+    command
+        .env(
+            "PATH",
+            path_with_bin_prefix(fake_bgpq4.parent().expect("bgpq4 parent")),
+        )
+        .env("KIDOBO_TEST_BGPQ4_TOUCHED", &touched);
+    let output = command.output().expect("offline temporary lookup");
+    assert_eq!(output.status.code(), Some(0));
+    assert!(!touched.exists(), "lookup must not invoke bgpq4");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("203.0.113.7\ttemporary:blocklist\t203.0.113.7/32"));
+    assert!(stdout.contains("192.0.2.7\ttemporary:asn:AS64512\t192.0.2.0/24"));
+    assert!(
+        stdout.contains("198.51.100.9\tNO_MATCH"),
+        "expired IP ban should not match: {stdout}"
+    );
+    assert!(
+        stdout.contains("198.51.100.7\tNO_MATCH"),
+        "expired ASN cache should not match: {stdout}"
+    );
+}
+
+#[test]
+fn temporary_timeout_warns_when_recording_and_syncing_active_bans() {
+    let root = create_root(
+        "[ipset]\nset_name='kidobo'\nenable_ipv6=false\ntimeout=30\n[safe]\ninclude_github_meta=false\n",
+        "",
+    );
+    let ban = run_kidobo_with_root(root.path(), &["ban", "203.0.113.7", "--for", "1d"]);
+    assert_eq!(ban.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&ban.stderr).contains("ipset.timeout is nonzero"));
+
+    let fake_sudo = write_fake_sudo_script(&root);
+    let mut command = kidobo_with_root_command(root.path(), &["sync"]);
+    command.env(
+        "PATH",
+        path_with_bin_prefix(fake_sudo.parent().expect("sudo parent")),
+    );
+    let output = command.output().expect("sync with active temporary ban");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "sync failed: {stderr}");
+    assert!(stderr.contains("ipset.timeout is nonzero"));
+}
+
+#[test]
+fn temporary_ban_is_restored_until_expiry_then_pruned_after_sync() {
+    let root = create_root(
+        "[ipset]\nset_name='kidobo'\nenable_ipv6=false\nmaxelem=2\n[safe]\ninclude_github_meta=false\n",
+        "",
+    );
+    let target = "203.0.113.7/32";
+    let temporary_file = temporary_bans_path(root.path());
+    let ban = run_kidobo_with_root(root.path(), &["ban", "203.0.113.7", "--for", "1d"]);
+    assert_eq!(ban.status.code(), Some(0));
+
+    let fake_sudo = write_fake_sudo_script(&root);
+    let restore_log = root.path().join("restore.log");
+    let path = path_with_bin_prefix(fake_sudo.parent().expect("sudo parent"));
+    let mut first_sync = kidobo_with_root_command(root.path(), &["sync"]);
+    first_sync
+        .env("PATH", &path)
+        .env("KIDOBO_TEST_RESTORE_LOG", &restore_log);
+    let first_output = first_sync.output().expect("sync active temporary ban");
+    assert_eq!(
+        first_output.status.code(),
+        Some(0),
+        "first sync failed: {}",
+        String::from_utf8_lossy(&first_output.stderr)
+    );
+    let first_restore = read_to_string_with_limit(&restore_log, 65_536).expect("first restore");
+    assert!(
+        first_restore.contains(target),
+        "first sync did not restore the saved temporary target: {first_restore}"
+    );
+
+    fs::write(
+        &temporary_file,
+        format!("version = 1\n\n[[ips]]\ncidr = \"{target}\"\nexpires_at = 1\n"),
+    )
+    .expect("expire fixture record");
+    fs::write(&restore_log, "").expect("reset restore log");
+    let mut second_sync = kidobo_with_root_command(root.path(), &["sync"]);
+    second_sync
+        .env("PATH", &path)
+        .env("KIDOBO_TEST_RESTORE_LOG", &restore_log);
+    let second_output = second_sync.output().expect("sync expired temporary ban");
+    assert_eq!(
+        second_output.status.code(),
+        Some(0),
+        "second sync failed: {}",
+        String::from_utf8_lossy(&second_output.stderr)
+    );
+    let second_restore = read_to_string_with_limit(&restore_log, 65_536).expect("second restore");
+    assert!(
+        !second_restore.contains(target),
+        "expired target remained in restore input: {second_restore}"
+    );
+    assert!(
+        FileTemporaryBanRepository
+            .load(&temporary_file)
+            .expect("pruned temporary state")
+            .ips
+            .is_empty(),
+        "successful sync should prune expired temporary records"
+    );
+    assert!(
+        read_to_string_with_limit(
+            &root.path().join("data/blocklist.txt"),
+            BLOCKLIST_READ_LIMIT
+        )
+        .expect("permanent source unchanged")
+        .is_empty(),
+        "temporary sync lifecycle must leave the permanent blocklist unchanged"
+    );
 }

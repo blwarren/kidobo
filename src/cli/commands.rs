@@ -23,9 +23,18 @@ pub fn dispatch_with(command: Command, io: &mut CliIo<'_>) -> Result<(), KidoboE
         Command::Sync { timer } => run_sync_command(timer),
         Command::Flush { cache_only } => run_flush_command(cache_only),
         Command::Lookup { ip, file, format } => run_lookup_command(ip, file, format, io),
-        Command::Ban { target, file, asn } => {
-            run_ban_command(target.as_deref(), file.as_deref(), asn.as_deref(), io)
-        }
+        Command::Ban {
+            target,
+            file,
+            asn,
+            duration,
+        } => run_ban_command(
+            target.as_deref(),
+            file.as_deref(),
+            asn.as_deref(),
+            duration,
+            io,
+        ),
         Command::Unban {
             target,
             file,
@@ -62,6 +71,8 @@ fn run_lookup_command(
             configs: &configs,
             target_files: &target_files,
             sources: &sources,
+            clock: &kidobo_adapters::temporary_bans::SystemClock,
+            temporary_bans: &kidobo_adapters::temporary_bans::FileTemporaryBanRepository,
         },
     )?;
 

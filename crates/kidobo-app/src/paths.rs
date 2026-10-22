@@ -36,6 +36,14 @@ pub struct ResolvedPaths {
     pub lock_file: PathBuf,
 }
 
+impl ResolvedPaths {
+    /// Returns the operator-managed temporary-ban state location.
+    #[must_use]
+    pub fn temporary_bans_file(&self) -> PathBuf {
+        self.data_dir.join("temporary-bans.toml")
+    }
+}
+
 /// Whether path resolution must confirm that the configuration exists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigRequirement {

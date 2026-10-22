@@ -6,6 +6,7 @@ use std::ffi::OsString;
 use kidobo_core::config::Config;
 use kidobo_core::lookup::LookupSourceEntry;
 use kidobo_core::network::CanonicalCidr;
+use kidobo_core::temporary_bans::TemporaryBans;
 
 use crate::error::AppError;
 use crate::paths::ResolvedPaths;
@@ -132,6 +133,10 @@ pub struct SyncSourceContext<'a> {
     pub config: &'a Config,
     /// Recognized Kidobo environment values as native strings.
     pub env: &'a std::collections::BTreeMap<OsString, OsString>,
+    /// Temporary records loaded once while holding the sync lock.
+    pub temporary_bans: &'a TemporaryBans,
+    /// Shared expiry cutoff captured immediately after acquiring the lock.
+    pub cutoff: u64,
 }
 
 /// Provider of one candidate or safelist batch for synchronization.
@@ -201,6 +206,10 @@ pub struct OfflineLookupContext<'a> {
     pub paths: &'a ResolvedPaths,
     /// Validated configuration when available; lookup remains usable without it.
     pub config: Option<&'a Config>,
+    /// Temporary records loaded once without modifying operator state.
+    pub temporary_bans: &'a TemporaryBans,
+    /// Shared expiry cutoff for this lookup.
+    pub cutoff: u64,
 }
 
 /// Provider of local or cached entries for the offline-only lookup workflow.

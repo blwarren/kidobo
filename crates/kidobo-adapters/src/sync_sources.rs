@@ -14,7 +14,7 @@ use kidobo_app::source::{
     SyncSourceDescriptor, SyncSourceLoad, SyncSourceProvider, SyncSourceRegistry,
 };
 
-use crate::asn::{Bgpq4AsnPrefixResolver, load_asn_prefixes_with_cache};
+use crate::asn::{AsnPrefixResolver, Bgpq4AsnPrefixResolver, load_asn_prefixes_with_cache};
 use crate::blocklist_file::{
     BlocklistNormalizeResult, load_blocklist_document, normalize_local_blocklist_with_fast_state,
 };
@@ -98,6 +98,27 @@ impl SyncSourceProvider for LocalBlocklistSyncProvider {
             .filter_map(|line| line.canonical)
             .collect();
         Ok(SyncSourceLoad::ready(SyncSourceBatch { networks, notices }))
+    }
+}
+
+/// Required synchronization provider for active operator-managed temporary IP bans.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct TemporaryBlocklistSyncProvider;
+
+impl SyncSourceProvider for TemporaryBlocklistSyncProvider {
+    fn descriptor(&self) -> SyncSourceDescriptor {
+        SyncSourceDescriptor {
+            id: "temporary-blocklist",
+            role: SourceRole::Candidate,
+            failure_policy: FailurePolicy::Required,
+        }
+    }
+
+    fn load(&self, context: &SyncSourceContext<'_>) -> Result<SyncSourceLoad, AppError> {
+        Ok(SyncSourceLoad::ready(SyncSourceBatch {
+            networks: context.temporary_bans.active_ips(context.cutoff),
+            notices: Vec::new(),
+        }))
     }
 }
 
@@ -246,29 +267,45 @@ impl SyncSourceProvider for AsnBansSyncProvider {
     }
 
     fn load(&self, context: &SyncSourceContext<'_>) -> Result<SyncSourceLoad, AppError> {
-        let stale_after =
-            Duration::from_secs(u64::from(context.config.asn.cache_stale_after_secs.get()));
-        let cache_dir = context.paths.cache_dir.join("asn");
         let resolver = Bgpq4AsnPrefixResolver::with_default_timeout();
-        let mut networks = Vec::new();
-        let mut notices = Vec::new();
-        for asn in &context.config.asn.banned {
-            context.cancellation.check()?;
-            let loaded = load_asn_prefixes_with_cache(*asn, &cache_dir, stale_after, &resolver)
-                .map_err(|error| AppError::Asn {
-                    source: Box::new(error),
-                })?;
-            if loaded.stale {
-                notices.push(Notice::warning(format!(
-                    "ASN cache refresh failed; using stale prefixes for AS{asn}"
-                )));
-            }
-            networks.extend(loaded.prefixes);
-        }
-        networks.sort_unstable();
-        networks.dedup();
-        Ok(SyncSourceLoad::ready(SyncSourceBatch { networks, notices }))
+        load_asn_bans(context, &resolver)
     }
+}
+
+fn load_asn_bans(
+    context: &SyncSourceContext<'_>,
+    resolver: &dyn AsnPrefixResolver,
+) -> Result<SyncSourceLoad, AppError> {
+    let stale_after =
+        Duration::from_secs(u64::from(context.config.asn.cache_stale_after_secs.get()));
+    let cache_dir = context.paths.cache_dir.join("asn");
+    let asns = context
+        .config
+        .asn
+        .banned
+        .iter()
+        .copied()
+        .chain(context.temporary_bans.active_asns(context.cutoff))
+        .collect::<BTreeSet<_>>();
+    let mut networks = Vec::new();
+    let mut notices = Vec::new();
+    for asn in asns {
+        context.cancellation.check()?;
+        let loaded = load_asn_prefixes_with_cache(asn, &cache_dir, stale_after, resolver).map_err(
+            |error| AppError::Asn {
+                source: Box::new(error),
+            },
+        )?;
+        if loaded.stale {
+            notices.push(Notice::warning(format!(
+                "ASN cache refresh failed; using stale prefixes for AS{asn}"
+            )));
+        }
+        networks.extend(loaded.prefixes);
+    }
+    networks.sort_unstable();
+    networks.dedup();
+    Ok(SyncSourceLoad::ready(SyncSourceBatch { networks, notices }))
 }
 
 /// Builds the complete registry of synchronization source providers.
@@ -280,6 +317,7 @@ pub fn build_sync_source_registry(product_version: &str) -> Result<SyncSourceReg
     let user_agent = format!("kidobo/{product_version}");
     let mut registry = SyncSourceRegistry::new();
     registry.register(LocalBlocklistSyncProvider)?;
+    registry.register(TemporaryBlocklistSyncProvider)?;
     registry.register(RemoteFeedsSyncProvider::new(&user_agent))?;
     registry.register(ConfigSafelistSyncProvider)?;
     registry.register(GithubMetadataSyncProvider::new(user_agent))?;
@@ -519,6 +557,192 @@ mod tests {
         }
     }
 
+    fn source_paths(root: &std::path::Path) -> kidobo_app::paths::ResolvedPaths {
+        kidobo_app::paths::ResolvedPaths {
+            root_override: Some(root.to_path_buf()),
+            config_dir: root.join("config"),
+            config_file: root.join("config/config.toml"),
+            data_dir: root.join("data"),
+            blocklist_file: root.join("data/blocklist.txt"),
+            cache_dir: root.join("cache"),
+            remote_cache_dir: root.join("cache/remote"),
+            lock_file: root.join("cache/lock"),
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingAsnResolver {
+        calls: std::sync::Mutex<Vec<u32>>,
+        fail: bool,
+    }
+
+    impl crate::asn::AsnPrefixResolver for RecordingAsnResolver {
+        fn resolve_prefixes(
+            &self,
+            asn: u32,
+        ) -> Result<Vec<kidobo_core::network::CanonicalCidr>, crate::asn::AsnError> {
+            self.calls.lock().expect("calls").push(asn);
+            if self.fail {
+                return Err(crate::asn::AsnError::ResolveFailed {
+                    asn,
+                    reason: "injected unavailable resolver".into(),
+                });
+            }
+            Ok(vec![
+                kidobo_core::network::parse_ip_cidr_token(&format!(
+                    "198.51.100.{}/32",
+                    asn - 64511
+                ))
+                .expect("cidr"),
+            ])
+        }
+    }
+
+    #[test]
+    fn temporary_ip_provider_uses_shared_cutoff_and_keeps_active_families_separate() {
+        use kidobo_app::source::{SyncSourceContext, SyncSourceProvider};
+        use kidobo_core::network::parse_ip_cidr_token;
+        let temp = TempDir::new().expect("temporary root");
+        let paths = source_paths(temp.path());
+        let config = kidobo_core::config::Config::from_toml_str("[ipset]\nset_name = 'kidobo'\n")
+            .expect("config");
+        let v4 = parse_ip_cidr_token("198.51.100.0/24").expect("v4");
+        let v6 = parse_ip_cidr_token("2001:db8::/64").expect("v6");
+        let temporary = kidobo_core::temporary_bans::TemporaryBans {
+            ips: [(v4, 100), (v6, 101)].into(),
+            asns: std::collections::BTreeMap::default(),
+        };
+        for (cutoff, expected) in [(99, vec![v4, v6]), (100, vec![v6]), (101, Vec::new())] {
+            let loaded = super::TemporaryBlocklistSyncProvider
+                .load(&SyncSourceContext {
+                    cancellation: &kidobo_app::ports::NoCancellation,
+                    paths: &paths,
+                    config: &config,
+                    env: &std::collections::BTreeMap::default(),
+                    temporary_bans: &temporary,
+                    cutoff,
+                })
+                .expect("temporary source");
+            assert_eq!(loaded.primary.networks, expected);
+        }
+        assert_eq!(temporary.ips[&v4], 100);
+        assert_eq!(temporary.ips[&v6], 101);
+    }
+
+    #[test]
+    fn asn_source_resolves_union_once_and_ignores_expired_temporary_asns() {
+        let temp = TempDir::new().expect("temporary root");
+        let paths = source_paths(temp.path());
+        let config = kidobo_core::config::Config::from_toml_str(
+            "[ipset]\nset_name = 'kidobo'\n[asn]\nbanned = [64512, 64513]\n",
+        )
+        .expect("config");
+        let temporary = kidobo_core::temporary_bans::TemporaryBans {
+            ips: std::collections::BTreeMap::default(),
+            asns: [(64512, 101), (64513, 100), (64514, 101), (64515, 100)].into(),
+        };
+        let resolver = RecordingAsnResolver::default();
+        let loaded = super::load_asn_bans(
+            &kidobo_app::source::SyncSourceContext {
+                cancellation: &kidobo_app::ports::NoCancellation,
+                paths: &paths,
+                config: &config,
+                env: &std::collections::BTreeMap::default(),
+                temporary_bans: &temporary,
+                cutoff: 100,
+            },
+            &resolver,
+        )
+        .expect("ASN source");
+        assert_eq!(
+            *resolver.calls.lock().expect("calls"),
+            [64512, 64513, 64514]
+        );
+        assert_eq!(
+            loaded
+                .primary
+                .networks
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["198.51.100.1/32", "198.51.100.2/32", "198.51.100.3/32"]
+        );
+        assert!(!paths.cache_dir.join("asn/as64515.iplist").exists());
+    }
+
+    #[test]
+    fn temporary_asn_requires_prefixes_and_uses_existing_stale_fallback() {
+        let temp = TempDir::new().expect("temporary root");
+        let paths = source_paths(temp.path());
+        let config = kidobo_core::config::Config::from_toml_str(
+            "[ipset]\nset_name = 'kidobo'\n[asn]\ncache_stale_after_secs = 1\n",
+        )
+        .expect("config");
+        let temporary = kidobo_core::temporary_bans::TemporaryBans {
+            ips: std::collections::BTreeMap::default(),
+            asns: [(64512, 101)].into(),
+        };
+        let context = kidobo_app::source::SyncSourceContext {
+            cancellation: &kidobo_app::ports::NoCancellation,
+            paths: &paths,
+            config: &config,
+            env: &std::collections::BTreeMap::default(),
+            temporary_bans: &temporary,
+            cutoff: 100,
+        };
+        let resolver = RecordingAsnResolver {
+            fail: true,
+            ..RecordingAsnResolver::default()
+        };
+        assert!(matches!(
+            super::load_asn_bans(&context, &resolver),
+            Err(kidobo_app::AppError::Asn { .. })
+        ));
+        std::fs::create_dir_all(paths.cache_dir.join("asn")).expect("cache dir");
+        let cache_path = paths.cache_dir.join("asn/as64512.iplist");
+        std::fs::write(&cache_path, "192.0.2.0/24\n2001:db8::/64\n").expect("stale cache");
+        std::fs::File::options()
+            .write(true)
+            .open(&cache_path)
+            .expect("cache file")
+            .set_times(std::fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH))
+            .expect("old timestamp");
+        let loaded = super::load_asn_bans(&context, &resolver).expect("stale fallback");
+        assert_eq!(
+            loaded
+                .primary
+                .networks
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["192.0.2.0/24", "2001:db8::/64"]
+        );
+        assert_eq!(
+            loaded.primary.notices,
+            [kidobo_app::source::Notice::warning(
+                "ASN cache refresh failed; using stale prefixes for AS64512"
+            )]
+        );
+        assert_eq!(*resolver.calls.lock().expect("calls"), [64512, 64512]);
+        assert_eq!(
+            crate::limited_io::read_to_string_with_limit(&cache_path, 1024)
+                .expect("preserved cache"),
+            "192.0.2.0/24\n2001:db8::/64\n"
+        );
+
+        let mut config_with_overlap = config.clone();
+        config_with_overlap.asn.banned = vec![64512];
+        let overlap = kidobo_app::source::SyncSourceContext {
+            config: &config_with_overlap,
+            ..context
+        };
+        super::load_asn_bans(&overlap, &resolver).expect("overlapping stale fallback");
+        assert_eq!(
+            *resolver.calls.lock().expect("calls"),
+            [64512, 64512, 64512]
+        );
+    }
+
     #[test]
     fn built_in_registry_has_stable_order_roles_and_policies() {
         let descriptors = build_sync_source_registry("1.2.3")
@@ -532,6 +756,11 @@ mod tests {
             [
                 (
                     "local-blocklist",
+                    SourceRole::Candidate,
+                    FailurePolicy::Required
+                ),
+                (
+                    "temporary-blocklist",
                     SourceRole::Candidate,
                     FailurePolicy::Required
                 ),

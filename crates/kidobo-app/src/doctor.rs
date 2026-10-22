@@ -8,6 +8,7 @@ use serde::Serialize;
 use crate::AppError;
 use crate::paths::{ConfigRequirement, PathResolutionInput, ResolvedPaths};
 use crate::ports::{ConfigRepository, PathResolver};
+use crate::temporary_bans::TemporaryBanRepository;
 
 /// Aggregate doctor result used by human and JSON renderers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -121,6 +122,8 @@ pub struct DoctorDependencies<'a> {
     pub paths: &'a dyn PathResolver,
     /// Validated configuration repository.
     pub configs: &'a dyn ConfigRepository,
+    /// Optional temporary-ban file repository.
+    pub temporary_bans: &'a dyn TemporaryBanRepository,
     /// Read-only host probe adapter.
     pub probes: &'a dyn DoctorProbe,
 }
@@ -201,7 +204,12 @@ pub fn execute(
     };
     available.insert("ip6tables", ip6_available);
 
-    push_path_checks(&mut checks, &paths_result, dependencies.probes);
+    push_path_checks(
+        &mut checks,
+        &paths_result,
+        dependencies.probes,
+        dependencies.temporary_bans,
+    );
     dependencies.cancellation.check()?;
     push_sudo_checks(
         &mut checks,
@@ -253,6 +261,7 @@ fn push_path_checks(
     checks: &mut Vec<DoctorCheck>,
     paths: &Result<ResolvedPaths, AppError>,
     probe: &dyn DoctorProbe,
+    temporary_bans: &dyn TemporaryBanRepository,
 ) {
     let Ok(paths) = paths else {
         let reason = match paths {
@@ -260,7 +269,12 @@ fn push_path_checks(
             Err(error) => error.to_string(),
             Ok(_) => String::new(),
         };
-        for name in ["file_config", "file_blocklist", "cache_writable"] {
+        for name in [
+            "file_config",
+            "file_blocklist",
+            "file_temporary_bans",
+            "cache_writable",
+        ] {
             checks.push(fail_check(
                 name,
                 format!("path resolution unavailable: {reason}"),
@@ -278,6 +292,20 @@ fn push_path_checks(
         &paths.blocklist_file,
         probe.path_exists(&paths.blocklist_file),
     ));
+    let temporary_bans_path = paths.temporary_bans_file();
+    checks.push(match temporary_bans.load(&temporary_bans_path) {
+        Ok(_) => ok_check(
+            "file_temporary_bans",
+            format!(
+                "temporary-ban state is valid or absent: {}",
+                temporary_bans_path.display()
+            ),
+        ),
+        Err(error) => fail_check(
+            "file_temporary_bans",
+            format!("failed to parse {}: {error}", temporary_bans_path.display()),
+        ),
+    });
     checks.push(match probe.cache_readiness(&paths.remote_cache_dir) {
         Ok(CacheReadiness::ExistingDirectory) => skip_check(
             "cache_writable",
@@ -429,6 +457,8 @@ mod tests {
     use crate::AppError;
     use crate::paths::{ConfigRequirement, PathResolutionInput, ResolvedPaths};
     use crate::ports::{ConfigRepository, PathResolver};
+    use crate::temporary_bans::TemporaryBanRepository;
+    use kidobo_core::temporary_bans::TemporaryBans;
 
     struct Paths;
     impl PathResolver for Paths {
@@ -455,6 +485,17 @@ mod tests {
         fn load(&self, _path: &Path) -> Result<Config, AppError> {
             Config::from_toml_str("[ipset]\nset_name='kidobo'\nenable_ipv6=false\n")
                 .map_err(AppError::from)
+        }
+    }
+
+    struct TemporaryBansRepository;
+    impl TemporaryBanRepository for TemporaryBansRepository {
+        fn load(&self, _path: &Path) -> Result<TemporaryBans, AppError> {
+            Ok(TemporaryBans::default())
+        }
+
+        fn save(&self, _path: &Path, _state: &TemporaryBans) -> Result<(), AppError> {
+            Ok(())
         }
     }
 
@@ -499,6 +540,7 @@ mod tests {
                 cancellation: &crate::ports::NoCancellation,
                 paths: &Paths,
                 configs: &Configs,
+                temporary_bans: &TemporaryBansRepository,
                 probes: &probes,
             },
         );

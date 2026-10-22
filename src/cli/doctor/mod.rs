@@ -5,6 +5,7 @@ use crate::error::KidoboError;
 use kidobo_adapters::config::FileConfigRepository;
 use kidobo_adapters::doctor::SystemDoctorProbe;
 use kidobo_adapters::path::{SystemPathResolver, path_resolution_input_from_process};
+use kidobo_adapters::temporary_bans::FileTemporaryBanRepository;
 use kidobo_app::doctor::{
     self, DoctorCheckStatus, DoctorDependencies, DoctorOverall, DoctorReport,
 };
@@ -13,12 +14,14 @@ pub fn run_doctor_command(io: &mut CliIo<'_>) -> Result<(), KidoboError> {
     let paths = SystemPathResolver;
     let configs = FileConfigRepository;
     let probes = SystemDoctorProbe::default();
+    let temporary_bans = FileTemporaryBanRepository;
     let report = doctor::execute(
         &path_resolution_input_from_process(None),
         &DoctorDependencies {
             cancellation: &crate::cli::interrupt::SigintCancellation,
             paths: &paths,
             configs: &configs,
+            temporary_bans: &temporary_bans,
             probes: &probes,
         },
     )?;

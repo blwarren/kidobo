@@ -118,6 +118,7 @@ fn init_uses_the_resolved_root_for_all_provisioning() {
                     "/etc/kidobo/config.toml".into(),
                     "/var/lib/kidobo/blocklist.txt".into(),
                     "/var/cache/kidobo/sync.lock".into(),
+                    "/var/lib/kidobo/temporary-bans.toml".into(),
                     "/etc/systemd/system/kidobo-sync.service".into(),
                     "/etc/systemd/system/kidobo-sync.timer".into(),
                 ]
@@ -127,6 +128,7 @@ fn init_uses_the_resolved_root_for_all_provisioning() {
                     root.join("config/config.toml"),
                     root.join("data/blocklist.txt"),
                     root.join("cache/sync.lock"),
+                    root.join("data/temporary-bans.toml"),
                     root.join("systemd/system/kidobo-sync.service"),
                     root.join("systemd/system/kidobo-sync.timer"),
                 ]
@@ -347,6 +349,8 @@ fn offline_cache_errors_keep_io_causes_through_source_wrappers() {
     let error = build_offline_lookup_registry()
         .expect("registry")
         .load(&OfflineLookupContext {
+            temporary_bans: &kidobo_core::temporary_bans::TemporaryBans::default(),
+            cutoff: 100,
             paths: &paths,
             config: None,
             cancellation: &NoCancellation,
@@ -548,6 +552,8 @@ fn local_lookup_and_append_report_unreadable_blocklists() {
     let error = build_offline_lookup_registry()
         .expect("registry")
         .load(&OfflineLookupContext {
+            temporary_bans: &kidobo_core::temporary_bans::TemporaryBans::default(),
+            cutoff: 100,
             paths: &paths,
             config: None,
             cancellation: &NoCancellation,

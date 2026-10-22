@@ -51,6 +51,42 @@ impl OfflineLookupProvider for LocalBlocklistLookupProvider {
     }
 }
 
+/// Offline provider for active temporary IP bans and cached temporary ASN prefixes.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct TemporaryBanLookupProvider;
+
+impl OfflineLookupProvider for TemporaryBanLookupProvider {
+    fn id(&self) -> &'static str {
+        "temporary-bans"
+    }
+
+    fn append_offline(
+        &self,
+        context: &OfflineLookupContext<'_>,
+        entries: &mut Vec<LookupSourceEntry>,
+    ) -> Result<(), AppError> {
+        append_canonical_entries(
+            entries,
+            "temporary:blocklist",
+            context.temporary_bans.active_ips(context.cutoff),
+        );
+        let cache_dir = context.paths.cache_dir.join("asn");
+        for asn in context.temporary_bans.active_asns(context.cutoff) {
+            context.cancellation.check()?;
+            let prefixes = load_cached_asn_prefixes(asn, &cache_dir)
+                .map_err(|error| map_lookup_error(LookupSourceLoadError::from(error)))?;
+            if let Some(prefixes) = prefixes {
+                append_canonical_entries(entries, &format!("temporary:asn:AS{asn}"), prefixes);
+            } else {
+                warn!(
+                    "lookup ASN cache unavailable for temporary AS{asn}; this temporary ASN was not evaluated"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Offline provider for validated v2 and legacy remote-feed caches.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct RemoteCacheLookupProvider;
@@ -182,6 +218,7 @@ impl OfflineLookupProvider for AsnCacheLookupProvider {
 pub fn build_offline_lookup_registry() -> Result<OfflineLookupRegistry, AppError> {
     let mut registry = OfflineLookupRegistry::new();
     registry.register(LocalBlocklistLookupProvider)?;
+    registry.register(TemporaryBanLookupProvider)?;
     registry.register(RemoteCacheLookupProvider)?;
     registry.register(ConfigSafelistLookupProvider)?;
     registry.register(GithubMetaLookupProvider)?;
@@ -265,10 +302,101 @@ mod tests {
         config: Option<&Config>,
     ) -> Result<Vec<kidobo_core::lookup::LookupSourceEntry>, AppError> {
         build_offline_lookup_registry()?.load(&OfflineLookupContext {
+            temporary_bans: &kidobo_core::temporary_bans::TemporaryBans::default(),
+            cutoff: 100,
             paths,
             config,
             cancellation: &kidobo_app::ports::NoCancellation,
         })
+    }
+
+    #[test]
+    fn temporary_lookup_uses_active_records_without_config_and_preserves_cache_files() {
+        use kidobo_core::network::parse_ip_cidr_token;
+        let temp = TempDir::new().expect("tempdir");
+        let paths = test_paths(temp.path());
+        fs::create_dir_all(paths.cache_dir.join("asn/as64513.iplist"))
+            .expect("expired unusable cache");
+        let cache_path = paths.cache_dir.join("asn/as64512.iplist");
+        let cache_text = "192.0.2.0/24\n2001:db8:1::/64\n";
+        fs::write(&cache_path, cache_text).expect("temporary ASN cache");
+        let temporary = kidobo_core::temporary_bans::TemporaryBans {
+            ips: [
+                (parse_ip_cidr_token("198.51.100.0/24").expect("v4"), 101),
+                (parse_ip_cidr_token("2001:db8::/64").expect("v6"), 100),
+            ]
+            .into(),
+            asns: [(64512, 101), (64513, 100), (64514, 101)].into(),
+        };
+        let entries = build_offline_lookup_registry()
+            .expect("registry")
+            .load(&OfflineLookupContext {
+                paths: &paths,
+                config: None,
+                cancellation: &kidobo_app::ports::NoCancellation,
+                temporary_bans: &temporary,
+                cutoff: 100,
+            })
+            .expect("offline temporary sources");
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| (entry.source_label.as_ref(), entry.source_line.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("temporary:asn:AS64512", "192.0.2.0/24"),
+                ("temporary:asn:AS64512", "2001:db8:1::/64"),
+                ("temporary:blocklist", "198.51.100.0/24"),
+            ]
+        );
+        assert_eq!(
+            crate::limited_io::read_to_string_with_limit(&cache_path, 1024)
+                .expect("preserved cache"),
+            cache_text
+        );
+        assert!(!paths.cache_dir.join("asn/as64514.iplist").exists());
+        assert_eq!(temporary.asns[&64513], 100);
+        assert!(!paths.data_dir.exists());
+    }
+
+    #[test]
+    fn lookup_retains_both_source_labels_for_permanent_and_temporary_asn_overlap() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = test_paths(temp.path());
+        fs::create_dir_all(paths.cache_dir.join("asn")).expect("cache dir");
+        fs::write(paths.cache_dir.join("asn/as64512.iplist"), "192.0.2.0/24\n").expect("cache");
+        let config = Config::from_toml_str("[ipset]\nset_name = 'kidobo'\n[safe]\ninclude_github_meta = false\n[asn]\nbanned = [64512]\n").expect("config");
+        let temporary = kidobo_core::temporary_bans::TemporaryBans {
+            ips: std::collections::BTreeMap::default(),
+            asns: [(64512, 101)].into(),
+        };
+        for (cutoff, expected) in [
+            (100, vec!["asn:AS64512", "temporary:asn:AS64512"]),
+            (101, vec!["asn:AS64512"]),
+        ] {
+            let entries = build_offline_lookup_registry()
+                .expect("registry")
+                .load(&OfflineLookupContext {
+                    paths: &paths,
+                    config: Some(&config),
+                    cancellation: &kidobo_app::ports::NoCancellation,
+                    temporary_bans: &temporary,
+                    cutoff,
+                })
+                .expect("lookup");
+            assert_eq!(
+                entries
+                    .iter()
+                    .map(|entry| entry.source_label.as_ref())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            assert!(
+                entries
+                    .iter()
+                    .all(|entry| entry.source_line == "192.0.2.0/24")
+            );
+        }
     }
 
     #[test]
@@ -279,6 +407,7 @@ mod tests {
                 .provider_ids(),
             [
                 "local-blocklist",
+                "temporary-bans",
                 "remote-cache",
                 "config-safelist",
                 "github-meta-cache",

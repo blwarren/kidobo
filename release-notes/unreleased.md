@@ -4,3 +4,4 @@
 - Keep automatically sandboxed initialization's systemd units inside the selected root and skip live timer activation.
 - Reject ASN cache refreshes above 8 MiB before replacing cached data or updating ASN bans.
 - Support bare relative filenames in atomic writes without reporting an error after replacement.
+- Add expiring IP/CIDR and ASN bans stored separately from permanent sources and applied by sync.

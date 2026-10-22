@@ -42,21 +42,58 @@ prints its JSON report to stdout.
 ## Check and change sources
 
 `kidobo lookup 203.0.113.7` and `kidobo lookup --file targets.txt` inspect
-local and compatible cached sources without network access, ASN resolution, or
-firewall changes. Lookup reports raw source overlaps, including safelist
-exemptions; it does not read the live ipset or calculate the final enforced
-set. An invalid or missing configuration limits lookup to the local blocklist
-and cached remote sources and produces warnings for unavailable coverage.
+local, active temporary, and compatible cached sources without network access,
+ASN resolution, or firewall changes. Lookup reports raw source overlaps,
+including safelist exemptions; it does not read the live ipset or calculate
+the final enforced set. An invalid or missing configuration limits lookup to
+the local blocklist, active temporary entries, and cached remote sources and
+produces warnings for unavailable coverage.
 Use `--format tsv` for scripts; see the [compatibility contract](compatibility.md)
 for its record format.
 
-`sudo kidobo ban 203.0.113.7`, `sudo kidobo unban 203.0.113.7`, and their
-`--file` forms edit the local blocklist only. A file supplies one strict IP or
-CIDR target per line. `ban --asn 213412` and `unban --asn AS213412` update
-`[asn].banned`; ASN ban may resolve and cache prefixes, while ASN unban makes
+Without `--for`, `sudo kidobo ban 203.0.113.7` and its `--file` form add
+permanent entries to the local blocklist. A file supplies one strict IP or
+CIDR target per line. Permanent `ban --asn 213412` updates `[asn].banned`;
+ASN ban may resolve and cache prefixes, while ASN unban makes
 a best-effort cache cleanup. `unban --yes` skips confirmation where removal
 would require it. All ban and unban modes require valid configuration and none
 changes enforcement until `sudo kidobo sync` succeeds.
+
+Add an expiring local ban with `sudo kidobo ban 203.0.113.7 --for 12h`,
+`sudo kidobo ban --file targets.txt --for 3d`, or
+`sudo kidobo ban --asn AS64496 64497 --for 7d`. Durations are positive whole
+numbers followed by `h` or `d` (case insensitive); whitespace around the
+duration is ignored and one day is 24 hours. The expiry clock starts when the
+validated change is saved, after ASN resolution when that is required. Banning
+an already temporary entry replaces its deadline, even when the new deadline
+is sooner. A permanent exact duplicate is kept permanent and cannot be
+downgraded by a temporary request. Omitting `--for` keeps the existing
+permanent-ban behavior. A later permanent ban of a temporary target adds it
+to the permanent source and leaves its temporary record to expire naturally.
+
+Temporary IP/CIDR and ASN entries are stored in
+`/var/lib/kidobo/temporary-bans.toml`; they do not alter the blocklist or
+`[asn].banned`. `sync` takes the active/expired snapshot after acquiring its
+lock. An entry is active when its expiry is later than that cutoff, and a
+source edit becomes eligible at the next sync. A ban that expires before its
+first sync is never enforced. Expiration takes effect when a later sync
+successfully replaces the relevant set; delayed or failed syncs can prolong
+enforcement, and another source can continue to
+block the same address. After a fully successful enforcement run, Kidobo
+best-effort removes expired records. Failed enforcement can leave one address
+family updated because IPv4 and IPv6 set replacements are separate.
+
+With a nonzero `ipset.timeout`, the kernel timeout remains in force for every
+set entry. Kidobo warns when adding or renewing a temporary ban and during a
+sync with active temporary entries, because kernel expiry can remove it before
+the recorded deadline.
+
+`unban` removes matching entries from both the permanent and temporary local
+stores. Partial CIDR overlaps are shown and require confirmation; `unban --yes`
+approves their removal. `unban --asn` removes the ASN from both permanent and
+temporary ASN state. Each two-file update writes temporary state first and
+permanent state second, so a failure on the second write can leave a partial
+change. `flush` and `flush --cache-only` preserve the temporary-ban file.
 
 ## When a command fails
 
@@ -77,6 +114,13 @@ changes enforcement until `sudo kidobo sync` succeeds.
 - **ASN refresh warning:** A stale cached prefix list can be used when refresh
   fails. Check `bgpq4` and source connectivity, then rerun `sync` after fixing
   the cause.
+- **Temporary-ban failure:** Check the temporary state with `kidobo doctor`.
+  A missing file means no temporary bans; unreadable or malformed state stops
+  sync before set replacement. If an unban reports a partially completed
+  update, inspect its diagnostic and rerun the unban command.
+- **Kernel-timeout warning:** A nonzero `ipset.timeout` can remove kernel
+  entries before their saved expiry. Use `0` if entries should remain until
+  a sync applies their removal.
 - **Capacity or enforcement failure:** Sync checks every enabled family's
   `maxelem` before swapping either set. A later ipset or firewall error can
   leave an incomplete update; inspect the error and current managed state

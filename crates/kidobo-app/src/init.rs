@@ -3,6 +3,8 @@
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 
+use kidobo_core::temporary_bans::DEFAULT_TEMPORARY_BANS_TEMPLATE;
+
 use crate::AppError;
 use crate::paths::{ConfigRequirement, PathResolutionInput};
 use crate::ports::PathResolver;
@@ -174,10 +176,12 @@ pub fn execute(
 
     let service_template =
         build_systemd_service_template(&executable, paths.root_override.as_deref());
+    let temporary_bans_file = paths.temporary_bans_file();
     for (file, contents) in [
         (&paths.config_file, DEFAULT_CONFIG_TEMPLATE),
         (&paths.blocklist_file, DEFAULT_BLOCKLIST_TEMPLATE),
         (&paths.lock_file, ""),
+        (&temporary_bans_file, DEFAULT_TEMPORARY_BANS_TEMPLATE),
         (&service_file, service_template.as_str()),
         (&timer_file, DEFAULT_SYSTEMD_TIMER_TEMPLATE),
     ] {
@@ -341,7 +345,14 @@ mod tests {
             },
         )
         .expect("init");
-        assert_eq!(outcome.artifacts.len(), 9);
+        assert_eq!(outcome.artifacts.len(), 10);
+        assert!(
+            provisioner
+                .events
+                .lock()
+                .expect("events")
+                .contains(&"file:/root/data/temporary-bans.toml".to_string())
+        );
         assert!(outcome.systemd_enabled);
         assert_eq!(
             provisioner.events.lock().expect("events").last(),

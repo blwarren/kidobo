@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
+use kidobo_app::blocklist::BanDuration;
 use log::LevelFilter;
 
 #[derive(Debug, Parser)]
@@ -86,8 +87,8 @@ pub enum Command {
         cache_only: bool,
     },
     #[command(
-        about = "Add an IP/CIDR entry to the local blocklist",
-        long_about = "Add one IPv4/IPv6 address or CIDR entry to the local blocklist file, add targets from `--file`, or ban one or more ASNs with `--asn`.\n\nThis updates local source data only; run `kidobo sync` to apply changes to firewall/ipset state.",
+        about = "Add permanent or temporary IP/CIDR or ASN bans",
+        long_about = "Ban one IPv4/IPv6 address or CIDR, targets from `--file`, or one or more ASNs with `--asn`.\n\nUse `--for 12h` or `--for 3d` for temporary bans. Durations start when recorded; repeating a temporary ban replaces its deadline, even if shorter. Without `--for`, bans are permanent.\n\nThis updates local source data only; run `kidobo sync` to apply additions and expired-ban removals to firewall/ipset state.",
         group(
             ArgGroup::new("ban_input")
                 .args(["target", "file", "asn"])
@@ -96,6 +97,12 @@ pub enum Command {
         )
     )]
     Ban {
+        #[arg(
+            long = "for",
+            value_name = "DURATION",
+            help = "Ban for whole hours or days (12h, 3d), starting when recorded; applied/removed by sync"
+        )]
+        duration: Option<BanDuration>,
         #[arg(
             value_name = "IP_OR_CIDR",
             help = "Single IPv4/IPv6 address or CIDR to add"
@@ -118,8 +125,8 @@ pub enum Command {
         asn: Option<Vec<String>>,
     },
     #[command(
-        about = "Remove an IP/CIDR entry from the local blocklist",
-        long_about = "Remove one IPv4/IPv6 address or CIDR entry from the local blocklist file, remove targets from `--file`, or remove one or more ASNs with `--asn`.\n\nThis updates local source data only; run `kidobo sync` to apply changes to firewall/ipset state.",
+        about = "Remove permanent and temporary IP/CIDR or ASN bans",
+        long_about = "Remove one IPv4/IPv6 address or CIDR, targets from `--file`, or one or more ASNs with `--asn` from both permanent and temporary local sources.\n\nThis updates local source data only; run `kidobo sync` to apply changes to firewall/ipset state.",
         group(
             ArgGroup::new("unban_input")
                 .args(["target", "file", "asn"])
@@ -157,7 +164,7 @@ pub enum Command {
     },
     #[command(
         about = "Offline lookup across blocklist, safelist, and ASN sources",
-        long_about = "Lookup candidate targets against the local blocklist, cached remote sources, configured safelist entries, cached GitHub safelist entries, and cached prefixes for configured ASN bans.\n\nLookup reports source overlaps, runs offline only, and never fetches or refreshes source data. Config-backed sources are included when the config is valid; local and cached remote lookup remains available without a valid config. Warnings identify config-backed sources that could not be evaluated.",
+        long_about = "Lookup candidate targets against the local blocklist, unexpired temporary bans, cached remote sources, configured safelist entries, cached GitHub safelist entries, and cached prefixes for permanent or temporary ASN bans.\n\nLookup reports source overlaps, runs offline only, and never fetches or refreshes source data. Config-backed sources are included when the config is valid; local, temporary, and cached remote lookup remains available without a valid config. Warnings identify unavailable source coverage. Expired temporary entries may still be enforced until sync applies their removal.",
         group(
             ArgGroup::new("lookup_input")
                 .args(["ip", "file"])
@@ -226,7 +233,9 @@ mod tests {
     fn ban_command_parses_target() {
         let cli = Cli::try_parse_from(["kidobo", "ban", "203.0.113.7"]).expect("ban parse");
         match cli.command {
-            Command::Ban { target, file, asn } => {
+            Command::Ban {
+                target, file, asn, ..
+            } => {
                 assert_eq!(target, Some("203.0.113.7".to_string()));
                 assert!(file.is_none());
                 assert!(asn.is_none());
@@ -239,7 +248,9 @@ mod tests {
     fn ban_command_parses_file_mode() {
         let cli = Cli::try_parse_from(["kidobo", "ban", "--file", "targets.txt"]).expect("parse");
         match cli.command {
-            Command::Ban { target, file, asn } => {
+            Command::Ban {
+                target, file, asn, ..
+            } => {
                 assert!(target.is_none());
                 assert_eq!(file, Some(PathBuf::from("targets.txt")));
                 assert!(asn.is_none());
@@ -292,7 +303,9 @@ mod tests {
         let cli =
             Cli::try_parse_from(["kidobo", "ban", "--asn", "AS213412", "64512"]).expect("parse");
         match cli.command {
-            Command::Ban { target, file, asn } => {
+            Command::Ban {
+                target, file, asn, ..
+            } => {
                 assert!(target.is_none());
                 assert!(file.is_none());
                 assert_eq!(asn, Some(vec!["AS213412".to_string(), "64512".to_string()]));

@@ -7,6 +7,7 @@ use kidobo_adapters::lock::FileLockManager;
 use kidobo_adapters::path::{SystemPathResolver, path_resolution_input_from_process};
 use kidobo_adapters::sync_observer::LoggingSyncObserver;
 use kidobo_adapters::sync_sources::build_sync_source_registry;
+use kidobo_adapters::temporary_bans::{FileTemporaryBanRepository, SystemClock};
 use kidobo_app::sync::{self, SyncDependencies, SyncObserver};
 
 pub fn run_sync_command(timer: bool) -> Result<(), KidoboError> {
@@ -24,6 +25,8 @@ pub fn run_sync_command(timer: bool) -> Result<(), KidoboError> {
             paths: &paths,
             configs: &configs,
             locks: &locks,
+            clock: &SystemClock,
+            temporary_bans: &FileTemporaryBanRepository,
             sources: &sources,
             enforcement: &enforcement,
             observer: &observer,
@@ -43,8 +46,9 @@ pub fn run_sync_command(timer: bool) -> Result<(), KidoboError> {
             .map_or(0, |source| source.entries)
     };
     info!(
-        "sync source counts: internal={} remote={} asn={} safelist={}",
+        "sync source counts: internal={} temporary={} remote={} asn={} safelist={}",
         source_count("local-blocklist"),
+        source_count("temporary-blocklist"),
         source_count("remote-feeds"),
         source_count("asn-bans"),
         source_count("config-safelist") + source_count("github-metadata")

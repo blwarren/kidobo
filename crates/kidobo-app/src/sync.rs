@@ -10,6 +10,7 @@ use crate::paths::{ConfigRequirement, PathResolutionInput};
 use crate::ports::{ConfigRepository, LockManager, PathResolver};
 use crate::source::{FailurePolicy, Notice, SourceRole, SyncSourceContext, SyncSourceRegistry};
 use crate::source::{PendingCachePromotion, SyncSourceBatch, SyncSourceLoad};
+use crate::temporary_bans::{Clock, TemporaryBanRepository, kernel_timeout_notice};
 
 /// Validated kernel-set parameters for one address family.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,6 +143,10 @@ pub struct SyncDependencies<'a> {
     pub configs: &'a dyn ConfigRepository,
     /// Nonblocking process lock manager.
     pub locks: &'a dyn LockManager,
+    /// Time source for one consistent expiry decision per sync.
+    pub clock: &'a dyn Clock,
+    /// Persistent operator-managed temporary bans.
+    pub temporary_bans: &'a dyn TemporaryBanRepository,
     /// Ordered source registry.
     pub sources: &'a SyncSourceRegistry,
     /// Atomic set and fail-closed firewall backend.
@@ -196,7 +201,17 @@ pub fn execute(
 
     let _lock = dependencies.locks.acquire(&paths.lock_file)?;
     dependencies.observer.stage_completed("acquire_lock");
+    let cutoff = dependencies.clock.now_unix_secs()?;
     dependencies.cancellation.check()?;
+
+    let temporary_path = paths.temporary_bans_file();
+    let mut temporary_bans = dependencies.temporary_bans.load(&temporary_path)?;
+    if config.ipset.timeout != 0
+        && (!temporary_bans.active_ips(cutoff).is_empty()
+            || !temporary_bans.active_asns(cutoff).is_empty())
+    {
+        dependencies.observer.notice(&kernel_timeout_notice());
+    }
 
     let enforcement_plan = EnforcementPlan::from_config(&config);
     dependencies
@@ -211,6 +226,8 @@ pub fn execute(
         paths: &paths,
         config: &config,
         env: &request.env,
+        temporary_bans: &temporary_bans,
+        cutoff,
     };
     let LoadedSources {
         mut candidates,
@@ -264,6 +281,16 @@ pub fn execute(
         &ipv6_entries,
         dependencies,
     )?;
+
+    if temporary_bans.prune_expired(cutoff)
+        && let Err(error) = dependencies
+            .temporary_bans
+            .save(&temporary_path, &temporary_bans)
+    {
+        dependencies.observer.notice(&Notice::warning(format!(
+            "sync enforcement completed but expired temporary ban cleanup failed; expired records remain inactive: {error}"
+        )));
+    }
 
     Ok(SyncOutcome {
         ipv4_entries: effective.ipv4.len(),
@@ -564,6 +591,7 @@ mod tests {
     use kidobo_core::AddressFamily;
     use kidobo_core::config::Config;
     use kidobo_core::network::{CanonicalCidr, parse_ip_cidr_token};
+    use kidobo_core::temporary_bans::TemporaryBans;
 
     use super::{
         EnforcementBackend, EnforcementPlan, ManagedSetSpec, SyncDependencies, SyncObserver,
@@ -577,6 +605,7 @@ mod tests {
         SyncSourceContext, SyncSourceDescriptor, SyncSourceLoad, SyncSourceProvider,
         SyncSourceRegistry,
     };
+    use crate::temporary_bans::{Clock, TemporaryBanRepository};
 
     type Ledger = Arc<Mutex<Vec<String>>>;
 
@@ -872,6 +901,94 @@ mod tests {
         enforcement: &FakeEnforcement,
         observer: &RecordingObserver,
     ) -> Result<super::SyncOutcome, AppError> {
+        execute_with_temporary(
+            ledger,
+            config,
+            sources,
+            enforcement,
+            observer,
+            &TemporaryState::default(),
+        )
+    }
+
+    #[derive(Default)]
+    struct TemporaryState {
+        state: Mutex<TemporaryBans>,
+        cutoff: std::sync::atomic::AtomicU64,
+        ledger: Option<Ledger>,
+        fail_load: bool,
+        fail_save: bool,
+    }
+
+    impl Clock for TemporaryState {
+        fn now_unix_secs(&self) -> Result<u64, AppError> {
+            if let Some(ledger) = &self.ledger {
+                record(ledger, "clock");
+            }
+            Ok(self
+                .cutoff
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst))
+        }
+    }
+
+    impl TemporaryBanRepository for TemporaryState {
+        fn load(&self, path: &Path) -> Result<TemporaryBans, AppError> {
+            assert_eq!(path, test_paths().temporary_bans_file());
+            if let Some(ledger) = &self.ledger {
+                record(ledger, "load-temporary");
+            }
+            if self.fail_load {
+                return Err(AppError::Source {
+                    provider: "temporary-bans",
+                    source: Box::new(std::io::Error::other("invalid temporary state")),
+                });
+            }
+            Ok(self.state.lock().expect("temporary state").clone())
+        }
+
+        fn save(&self, path: &Path, state: &TemporaryBans) -> Result<(), AppError> {
+            assert_eq!(path, test_paths().temporary_bans_file());
+            if let Some(ledger) = &self.ledger {
+                record(ledger, "save-temporary");
+            }
+            if self.fail_save {
+                return Err(AppError::Source {
+                    provider: "temporary-bans",
+                    source: Box::new(std::io::Error::other("temporary write failure")),
+                });
+            }
+            *self.state.lock().expect("temporary state") = state.clone();
+            Ok(())
+        }
+    }
+
+    struct TemporarySource;
+
+    impl SyncSourceProvider for TemporarySource {
+        fn descriptor(&self) -> SyncSourceDescriptor {
+            SyncSourceDescriptor {
+                id: "temporary-blocklist",
+                role: SourceRole::Candidate,
+                failure_policy: FailurePolicy::Required,
+            }
+        }
+
+        fn load(&self, context: &SyncSourceContext<'_>) -> Result<SyncSourceLoad, AppError> {
+            Ok(SyncSourceLoad::ready(SyncSourceBatch {
+                networks: context.temporary_bans.active_ips(context.cutoff),
+                notices: Vec::new(),
+            }))
+        }
+    }
+
+    fn execute_with_temporary(
+        ledger: &Ledger,
+        config: Config,
+        sources: &SyncSourceRegistry,
+        enforcement: &FakeEnforcement,
+        observer: &RecordingObserver,
+        temporary: &TemporaryState,
+    ) -> Result<super::SyncOutcome, AppError> {
         let paths = FakePaths {
             ledger: Arc::clone(ledger),
             paths: test_paths(),
@@ -888,11 +1005,326 @@ mod tests {
                 paths: &paths,
                 configs: &configs,
                 locks: &locks,
+                clock: temporary,
+                temporary_bans: temporary,
                 sources,
                 enforcement,
                 observer,
             },
         )
+    }
+
+    #[test]
+    fn temporary_bans_expire_at_one_cutoff_without_renewal_and_preserve_other_sources() {
+        let ledger = Ledger::default();
+        let temporary = TemporaryState {
+            state: Mutex::new(TemporaryBans {
+                ips: [(cidr("198.51.100.0/24"), 100), (cidr("2001:db8::/64"), 101)].into(),
+                asns: [(64512, 100)].into(),
+            }),
+            cutoff: std::sync::atomic::AtomicU64::new(99),
+            ledger: Some(Arc::clone(&ledger)),
+            ..TemporaryState::default()
+        };
+        let mut sources = registry(
+            &ledger,
+            vec![
+                provider(
+                    &ledger,
+                    "permanent",
+                    SourceRole::Candidate,
+                    FailurePolicy::Required,
+                    vec![cidr("198.51.100.0/25")],
+                ),
+                provider(
+                    &ledger,
+                    "safe",
+                    SourceRole::Safelist,
+                    FailurePolicy::Required,
+                    vec![cidr("198.51.100.64/26")],
+                ),
+            ],
+        );
+        sources.register(TemporarySource).expect("temporary source");
+        let enforcement = FakeEnforcement {
+            ledger: Arc::clone(&ledger),
+            fail_at: None,
+            replacements: Mutex::new(Vec::new()),
+        };
+        let observer = RecordingObserver::default();
+
+        for (cutoff, expected_v4, expected_v6) in [
+            (
+                99,
+                vec![cidr("198.51.100.0/26"), cidr("198.51.100.128/25")],
+                vec![cidr("2001:db8::/64")],
+            ),
+            (
+                100,
+                vec![cidr("198.51.100.0/26")],
+                vec![cidr("2001:db8::/64")],
+            ),
+            (101, vec![cidr("198.51.100.0/26")], Vec::new()),
+        ] {
+            ledger.lock().expect("ledger").clear();
+            enforcement
+                .replacements
+                .lock()
+                .expect("replacements")
+                .clear();
+            let outcome = execute_with_temporary(
+                &ledger,
+                config(true, 100),
+                &sources,
+                &enforcement,
+                &observer,
+                &temporary,
+            )
+            .expect("sync");
+            assert_eq!(
+                (outcome.ipv4_entries, outcome.ipv6_entries),
+                (expected_v4.len(), expected_v6.len())
+            );
+            assert_eq!(
+                *enforcement.replacements.lock().expect("replacements"),
+                [
+                    (AddressFamily::Ipv6, expected_v6),
+                    (AddressFamily::Ipv4, expected_v4)
+                ]
+            );
+            assert_temporary_snapshot_order(&ledger, cutoff != 99);
+            let state = temporary.state.lock().expect("temporary state");
+            assert_eq!(
+                state.ips.get(&cidr("2001:db8::/64")),
+                (cutoff < 101).then_some(&101)
+            );
+            assert_eq!(state.asns.get(&64512), (cutoff < 100).then_some(&100));
+        }
+    }
+
+    fn assert_temporary_snapshot_order(ledger: &Ledger, pruned: bool) {
+        let actual = events(ledger);
+        assert_eq!(
+            &actual[..6],
+            [
+                "paths",
+                "config",
+                "lock",
+                "clock",
+                "load-temporary",
+                "ensure"
+            ]
+        );
+        assert_eq!(actual.iter().filter(|event| *event == "clock").count(), 1);
+        assert_eq!(
+            actual
+                .iter()
+                .filter(|event| *event == "load-temporary")
+                .count(),
+            1
+        );
+        if pruned {
+            assert_eq!(
+                &actual[actual.len() - 3..],
+                ["activate", "save-temporary", "unlock"]
+            );
+        } else {
+            assert!(!actual.iter().any(|event| event == "save-temporary"));
+        }
+    }
+
+    #[test]
+    fn temporary_state_failure_stops_sync_before_artifact_mutation() {
+        let ledger = Ledger::default();
+        let temporary = TemporaryState {
+            fail_load: true,
+            ledger: Some(Arc::clone(&ledger)),
+            ..TemporaryState::default()
+        };
+        let enforcement = FakeEnforcement {
+            ledger: Arc::clone(&ledger),
+            fail_at: None,
+            replacements: Mutex::new(Vec::new()),
+        };
+        let error = execute_with_temporary(
+            &ledger,
+            config(true, 100),
+            &SyncSourceRegistry::new(),
+            &enforcement,
+            &RecordingObserver::default(),
+            &temporary,
+        )
+        .expect_err("invalid state");
+        assert!(error.to_string().contains("invalid temporary state"));
+        assert_eq!(
+            events(&ledger),
+            [
+                "paths",
+                "config",
+                "lock",
+                "clock",
+                "load-temporary",
+                "unlock"
+            ]
+        );
+    }
+
+    #[test]
+    fn failed_enforcement_never_prunes_and_cleanup_failure_is_soft() {
+        for fail_at in [Some("replace-v4"), Some("activate"), None] {
+            let ledger = Ledger::default();
+            let temporary = TemporaryState {
+                state: Mutex::new(TemporaryBans {
+                    ips: [(cidr("198.51.100.0/24"), 100)].into(),
+                    asns: [(64512, 100)].into(),
+                }),
+                cutoff: std::sync::atomic::AtomicU64::new(100),
+                ledger: Some(Arc::clone(&ledger)),
+                fail_save: true,
+                ..TemporaryState::default()
+            };
+            let mut sources = SyncSourceRegistry::new();
+            sources.register(TemporarySource).expect("temporary source");
+            let enforcement = FakeEnforcement {
+                ledger: Arc::clone(&ledger),
+                fail_at,
+                replacements: Mutex::new(Vec::new()),
+            };
+            let observer = RecordingObserver::default();
+            let result = execute_with_temporary(
+                &ledger,
+                config(true, 100),
+                &sources,
+                &enforcement,
+                &observer,
+                &temporary,
+            );
+            let actual = events(&ledger);
+            if fail_at.is_some() {
+                assert!(result.is_err());
+                assert!(!actual.iter().any(|event| event == "save-temporary"));
+            } else {
+                assert_eq!(result.expect("cleanup is soft").ipv4_entries, 0);
+                assert_eq!(
+                    &actual[actual.len() - 3..],
+                    ["activate", "save-temporary", "unlock"]
+                );
+                assert!(
+                    observer
+                        .notices
+                        .lock()
+                        .expect("notices")
+                        .iter()
+                        .any(|notice| notice.contains("expired temporary ban cleanup failed"))
+                );
+            }
+            assert_eq!(
+                temporary.state.lock().expect("unchanged state").ips[&cidr("198.51.100.0/24")],
+                100
+            );
+            assert!(
+                enforcement
+                    .replacements
+                    .lock()
+                    .expect("replacements")
+                    .iter()
+                    .all(|(_, entries)| entries.is_empty())
+            );
+        }
+    }
+
+    #[test]
+    fn temporary_candidates_are_subject_to_both_family_capacity_checks() {
+        let ledger = Ledger::default();
+        let temporary = TemporaryState {
+            state: Mutex::new(TemporaryBans {
+                ips: [
+                    (cidr("192.0.2.0/24"), 100),
+                    (cidr("198.51.100.0/24"), 100),
+                    (cidr("2001:db8::/64"), 100),
+                ]
+                .into(),
+                asns: std::collections::BTreeMap::default(),
+            }),
+            ..TemporaryState::default()
+        };
+        let mut sources = SyncSourceRegistry::new();
+        sources.register(TemporarySource).expect("temporary source");
+        let enforcement = FakeEnforcement {
+            ledger: Arc::clone(&ledger),
+            fail_at: None,
+            replacements: Mutex::new(Vec::new()),
+        };
+        let error = execute_with_temporary(
+            &ledger,
+            config(true, 1),
+            &sources,
+            &enforcement,
+            &RecordingObserver::default(),
+            &temporary,
+        )
+        .expect_err("capacity");
+        assert!(matches!(
+            error,
+            AppError::IpsetCapacityExceeded {
+                family: "ipv4",
+                entries: 2,
+                ..
+            }
+        ));
+        assert!(
+            enforcement
+                .replacements
+                .lock()
+                .expect("replacements")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn nonzero_kernel_timeout_warns_for_active_temporary_ip_or_asn_bans_only() {
+        for (ip_expiry, asn_expiry, timeout, warns) in [
+            (101, 100, 30, true),
+            (100, 101, 30, true),
+            (100, 100, 30, false),
+            (101, 101, 0, false),
+        ] {
+            let ledger = Ledger::default();
+            let temporary = TemporaryState {
+                state: Mutex::new(TemporaryBans {
+                    ips: [(cidr("198.51.100.0/24"), ip_expiry)].into(),
+                    asns: [(64512, asn_expiry)].into(),
+                }),
+                cutoff: std::sync::atomic::AtomicU64::new(100),
+                ..TemporaryState::default()
+            };
+            let enforcement = FakeEnforcement {
+                ledger: Arc::clone(&ledger),
+                fail_at: None,
+                replacements: Mutex::new(Vec::new()),
+            };
+            let observer = RecordingObserver::default();
+            let mut config = config(true, 100);
+            config.ipset.timeout = timeout;
+            execute_with_temporary(
+                &ledger,
+                config,
+                &SyncSourceRegistry::new(),
+                &enforcement,
+                &observer,
+                &temporary,
+            )
+            .expect("sync");
+            assert_eq!(
+                observer
+                    .notices
+                    .lock()
+                    .expect("notices")
+                    .iter()
+                    .any(|notice| notice.contains("kernel entries can expire independently")),
+                warns
+            );
+        }
     }
 
     #[test]

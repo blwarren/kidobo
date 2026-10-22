@@ -8,6 +8,33 @@ use thiserror::Error;
 /// Failure returned by an application workflow or port.
 #[derive(Debug, Error)]
 pub enum AppError {
+    /// Temporary ban state could not be read, validated, or persisted.
+    #[error("temporary ban state failed for {path}: {reason}")]
+    TemporaryBans {
+        /// Operator-managed state path.
+        path: PathBuf,
+        /// Persistence or validation diagnostic.
+        reason: String,
+    },
+    /// Wall-clock time could not be represented as a supported Unix timestamp.
+    #[error("could not determine temporary ban time: {reason}")]
+    Clock {
+        /// Clock diagnostic.
+        reason: String,
+    },
+    /// A two-store source mutation confirmed only its first atomic write.
+    #[error(
+        "ban update partially completed: updated {completed}; could not confirm update to {pending}: {source}; rerun the command"
+    )]
+    PartialBanUpdate {
+        /// State path whose update completed.
+        completed: PathBuf,
+        /// State path whose update failed.
+        pending: PathBuf,
+        /// Underlying failure of the pending update.
+        #[source]
+        source: Box<AppError>,
+    },
     /// The caller cancelled work at a safe workflow boundary.
     #[error("operation interrupted by SIGINT")]
     Interrupted,

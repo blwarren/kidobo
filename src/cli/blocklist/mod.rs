@@ -10,7 +10,9 @@ use kidobo_adapters::blocklist_operations::SystemAsnOperations;
 use kidobo_adapters::config::FileConfigRepository;
 use kidobo_adapters::lock::FileLockManager;
 use kidobo_adapters::path::{SystemPathResolver, path_resolution_input_from_process};
+use kidobo_adapters::temporary_bans::{FileTemporaryBanRepository, SystemClock};
 use kidobo_app::AppError;
+use kidobo_app::blocklist::BanDuration;
 use kidobo_app::blocklist::{
     self, AsnBanRequest, BanChange, BanOutcome, BanRequest, BlocklistDependencies, BlocklistInput,
     UnbanDecision, UnbanRequest,
@@ -20,6 +22,7 @@ pub fn run_ban_command(
     target: Option<&str>,
     file: Option<&Path>,
     asn: Option<&[String]>,
+    duration: Option<BanDuration>,
     io: &mut CliIo<'_>,
 ) -> Result<(), KidoboError> {
     let dependencies = production_dependencies();
@@ -29,11 +32,17 @@ pub fn run_ban_command(
             &AsnBanRequest {
                 paths,
                 tokens: tokens.to_vec(),
+                duration,
             },
             &dependencies,
         )?;
         for notice in &outcome.notices {
             warn!("{}", notice.message);
+        }
+        if let Some(duration) = duration {
+            render_ban_changes(&outcome.temporary_changes, Some(duration), io)?;
+            sync_notice(io)?;
+            return Ok(());
         }
         output(
             io,
@@ -58,25 +67,27 @@ pub fn run_ban_command(
 
     let input = command_input(target, file)?;
     let file_mode = matches!(input, BlocklistInput::File(_));
-    let outcome = blocklist::execute_ban(&BanRequest { paths, input }, &dependencies)?;
-    let changes = match outcome {
-        BanOutcome::Applied(changes) => changes,
+    let outcome = blocklist::execute_ban(
+        &BanRequest {
+            paths,
+            input,
+            duration,
+        },
+        &dependencies,
+    )?;
+    let (changes, notices) = match outcome {
+        BanOutcome::Applied(changes) => (changes, Vec::new()),
+        BanOutcome::TemporaryApplied { changes, notices } => (changes, notices),
         BanOutcome::InvalidTargets(targets) => return report_invalid_targets(&targets, io),
         BanOutcome::EmptyFile => {
             output(io, format_args!("no blocklist targets loaded from file"))?;
             return Ok(());
         }
     };
-    for change in &changes {
-        match change {
-            BanChange::Added(value) => {
-                output(io, format_args!("added blocklist entry {value}"))?;
-            }
-            BanChange::AlreadyPresent(value) => {
-                output(io, format_args!("blocklist already contains {value}"))?;
-            }
-        }
+    for notice in notices {
+        warn!("{}", notice.message);
     }
+    render_ban_changes(&changes, duration, io)?;
     if !file_mode || !changes.is_empty() {
         sync_notice(io)?;
     }
@@ -97,6 +108,7 @@ pub fn run_unban_command(
             &AsnBanRequest {
                 paths,
                 tokens: tokens.to_vec(),
+                duration: None,
             },
             &dependencies,
         )?;
@@ -202,6 +214,8 @@ fn production_dependencies() -> BlocklistDependencies<'static> {
         locks: &LOCKS,
         repository: &REPOSITORY,
         asn: &ASN,
+        temporary_bans: &FileTemporaryBanRepository,
+        clock: &SystemClock,
     }
 }
 
@@ -213,6 +227,44 @@ fn command_input(target: Option<&str>, file: Option<&Path>) -> Result<BlocklistI
             input: String::new(),
         }),
     }
+}
+
+fn render_ban_changes(
+    changes: &[BanChange],
+    duration: Option<BanDuration>,
+    io: &mut CliIo<'_>,
+) -> Result<(), KidoboError> {
+    let duration_text = duration
+        .map(|duration| format!(" for {duration}"))
+        .unwrap_or_default();
+    for change in changes {
+        match change {
+            BanChange::TemporaryAdded { target, expires_at } => output(
+                io,
+                format_args!(
+                    "added temporary ban {target}{duration_text} (expires at Unix {expires_at})"
+                ),
+            )?,
+            BanChange::TemporaryRescheduled { target, expires_at } => output(
+                io,
+                format_args!(
+                    "rescheduled temporary ban {target}{duration_text} (expires at Unix {expires_at})"
+                ),
+            )?,
+            BanChange::AlreadyPermanent(target) => {
+                output(io, format_args!("already permanently banned: {target}"))?;
+            }
+            BanChange::AlreadyPresent(target) => {
+                if duration.is_some() {
+                    output(io, format_args!("duplicate temporary ban target: {target}"))?;
+                } else {
+                    output(io, format_args!("blocklist already contains {target}"))?;
+                }
+            }
+            BanChange::Added(target) => output(io, format_args!("added blocklist entry {target}"))?,
+        }
+    }
+    Ok(())
 }
 
 fn report_invalid_targets(targets: &[String], io: &mut CliIo<'_>) -> Result<(), KidoboError> {

@@ -60,10 +60,11 @@ remains deterministic regardless of filesystem iteration order.
 | Provider | Sync role and policy | Offline lookup |
 | --- | --- | --- |
 | Local blocklist | Candidate, required | Local entries |
+| Temporary IP/CIDR bans | Candidate, required; missing state is empty | Active temporary entries |
 | Remote feeds | Candidate, best effort | Compatible cached entries only |
 | Config safelist | Safelist, required | Included with valid config |
 | GitHub metadata | External safelist, best effort with admission checks | Compatible cache only |
-| ASN bans | Candidate, required with stale fallback | Configured ASN caches only |
+| ASN bans | Deduplicated permanent and active temporary ASNs, required with stale fallback | Configured and active temporary ASN caches only |
 
 To add a built-in source, implement the appropriate provider trait, assign a stable unique ID, register it
 in the relevant adapter registry builder, and add role, policy, ordering, fallback, and offline-boundary
@@ -86,16 +87,28 @@ failures may remain soft only where the workflow explicitly documents and tests 
 The application sync use case explicitly preserves this order:
 
 1. Resolve paths and valid config, then acquire the nonblocking lock.
-2. Ensure sets and chains without activating new wiring.
-3. Load every registered source and apply provider failure policy.
-4. Admit externally controlled safelists without allowing them to empty a
+2. Capture the temporary-ban cutoff time and load/validate temporary state
+   once while holding the lock, before preparing firewall artifacts.
+3. Ensure sets and chains without activating new wiring.
+4. Load every registered source and apply provider failure policy. Temporary
+   IP and ASN entries are active only when `expires_at` is later than the
+   captured cutoff; their source edits become eligible at this sync boundary.
+5. Admit externally controlled safelists without allowing them to empty a
    nonempty enabled-family baseline, then compute family-separated effective lists.
-5. Validate both enabled-family capacities before either swap.
-6. Promote every accepted staged cache manifest; any promotion failure aborts.
-7. Atomically replace IPv6, then IPv4.
-8. Activate and normalize fail-closed firewall wiring.
-9. Best-effort clean disabled-family artifacts.
-10. Release the lock before logging the final outcome.
+6. Validate both enabled-family capacities before either swap.
+7. Promote every accepted staged cache manifest; any promotion failure aborts.
+8. Atomically replace IPv6, then IPv4.
+9. Activate and normalize fail-closed firewall wiring.
+10. Best-effort clean disabled-family artifacts and prune expired temporary
+    entries after enforcement succeeds.
+11. Release the lock before logging the final outcome.
+
+Temporary-ban file writes are bounded and atomic. They do not modify the local
+blocklist or `[asn].banned`. Expiration is evaluated at the sync cutoff, so an
+entry that expires during a sync remains eligible until the next sync. The
+per-family replacements remain separate transactions; a later failure can
+leave one family updated. Pruning expired records is best effort and occurs
+only after all enforcement work succeeds.
 
 The enforcement adapter retains the 31-character ipset name constraint, the existing temporary-set
 suffix, restore-and-swap replacement, per-set atomicity, and best-effort temporary-set destruction.

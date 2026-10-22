@@ -42,6 +42,7 @@ pub mod lookup;
 pub mod network;
 mod network_types;
 pub mod sync;
+pub mod temporary_bans;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 /// IP address family used to keep IPv4 and IPv6 processing separate.

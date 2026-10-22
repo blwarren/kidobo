@@ -16,6 +16,11 @@ The compatibility-sensitive surface includes:
   keys remain errors; additions in minor releases receive documented defaults.
 - Default paths under `/etc/kidobo`, `/var/lib/kidobo`, and
   `/var/cache/kidobo`, plus the documented `KIDOBO_ROOT` relocation.
+- Existing permanent `ban` and `unban` forms remain available. `ban --for`
+  adds temporary IP/CIDR or ASN bans in a separate versioned state file;
+  `init` preserves existing temporary state and `doctor` validates it
+  read-only. Temporary records use absolute Unix expiry times and become
+  effective through the existing one-shot `sync` workflow.
 - The `kidobo-sync.service` and `kidobo-sync.timer` names, paths, and one-shot
   timer model. A 1.x release will not turn Kidobo into a resident daemon.
 - Installer checksum and version verification, in-place upgrades, and the rule
