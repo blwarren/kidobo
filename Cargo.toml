@@ -37,8 +37,11 @@ dead_code = "deny"
 unsafe_code = "forbid"
 
 [workspace.lints.clippy]
-all = "deny"
-pedantic = "warn"
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+collection_is_never_read = "deny"
+needless_collect = "deny"
+needless_pass_by_ref_mut = "deny"
 
 [package]
 name = "kidobo"
@@ -52,6 +55,11 @@ homepage = "https://github.com/blwarren/kidobo"
 keywords = ["firewall", "ipset", "iptables", "blocklist", "cli"]
 categories = ["command-line-utilities", "network-programming"]
 rust-version = "1.97.1"
+
+[lints.clippy]
+collection_is_never_read = "deny"
+needless_collect = "deny"
+needless_pass_by_ref_mut = "deny"
 
 [[bin]]
 name = "kidobo"

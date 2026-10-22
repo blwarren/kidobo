@@ -38,6 +38,19 @@ do not add GitHub Actions workflows without explicit approval. Dependency change
 Report which required gates actually ran, their outcomes, and any skipped gates. Running individual
 checks does not establish that the aggregate recipe ran.
 
+### Lint coverage
+
+`collection_is_never_read`, `needless_collect`, and `needless_pass_by_ref_mut` are denied for
+every package and target. The three internal packages inherit these checks from
+`workspace.lints`; the root package declares them in its package lint table so its binary,
+integration tests, and benchmark receive them alongside its library.
+
+The rest of the root package's policy currently lives in `src/lib.rs`. Those crate attributes
+do not cover separate binary, integration-test, or benchmark targets. Consolidating the shared
+policy into `workspace.lints` and opting the root package into inheritance requires reviewing
+the additional diagnostics in those targets first. Keep production-only panic and output
+restrictions conditional when consolidating policy, so tests retain their existing exemptions.
+
 ## Safety-critical regressions
 
 For changes to interval math, safelist subtraction, collapse, lookup, or safety-critical runtime
