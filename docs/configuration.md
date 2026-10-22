@@ -28,7 +28,7 @@ keys are optional. The defaults below apply when a key is omitted.
 | Key | Default | Accepted value |
 | --- | --- | --- |
 | `ipset.set_name` | Required | Nonempty IPv4 set name, at most 31 characters, using only letters, digits, `_`, `-`, or `.`. |
-| `ipset.set_name_v6` | `<set_name>-v6` | Distinct IPv6 set name with the same name rules. Supply an explicit name if the derived name would exceed 31 characters. |
+| `ipset.set_name_v6` | `<set_name>-v6` | Explicit names follow the IPv4 name rules and must be distinct. The derived name must fit the 31-character limit when IPv6 is enabled; supply an explicit name if needed. With IPv6 disabled, an overlong derived name is accepted. |
 | `ipset.enable_ipv6` | `true` | Boolean. When false, sync does not enforce IPv6 and cleans up managed IPv6 artifacts. |
 | `ipset.chain_action` | `DROP` | `DROP` or `REJECT` (case insensitive). |
 | `ipset.set_type` | `hash:net` | Nonempty ipset type using only letters, digits, `:`, `,`, `_`, `-`, or `.`; `hash:net` is the supported managed type. |

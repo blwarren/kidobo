@@ -186,7 +186,8 @@ pub struct IpsetConfig {
     pub enable_ipv6: bool,
     /// Firewall action applied to set matches.
     pub chain_action: FirewallAction,
-    /// Kernel ipset type, currently constrained to the supported network type.
+    /// Nonempty kernel ipset type validated for allowed characters, not supported type names.
+    /// `hash:net` is the supported managed type.
     pub set_type: String,
     /// Initial ipset hash table size.
     pub hashsize: HashsizePow2,

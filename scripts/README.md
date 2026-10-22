@@ -38,18 +38,14 @@ gh auth login
 - `just mutants --shard 1/4`
 
 Use `just update` rather than raw `cargo update`; stable Cargo does not enforce
-the repository's publish-age policy by itself. Dependabot security updates
-bypass the cooldown automatically. For an urgent local security update, add a
-temporary exact-version exception to `cooldown.toml`, run `just update`, and
-remove the exception before committing:
+the repository's publish-age policy by itself. Dependabot's cooldown does not
+apply to security-update PRs, but those PRs must still meet the repository's
+seven-day rule before adoption unless a narrowly scoped exception has a
+documented reason or an explicit user override. Security urgency alone does
+not grant an automatic exception. See the [dependency release-age
+guide](../docs/dependency-release-age.md) for verification and exception handling.
 
-```toml
-[[allow.exact]]
-crate = "affected-crate"
-version = "1.2.3"
-```
-
-Release builds require `musl-gcc` and the pinned
+Publication requires a Linux x86_64 host. Release builds require `musl-gcc` and the pinned
 `x86_64-unknown-linux-musl` Rust target. The compatibility gate additionally
 requires `readelf` and Docker access; it runs only offline Kidobo commands in
 the containers and never invokes firewall or systemd operations.
