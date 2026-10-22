@@ -37,10 +37,7 @@ pub fn run_init_command(io: &mut CliIo<'_>) -> Result<(), KidoboError> {
         },
     )?;
     io.stdout
-        .write_all(render_init_outcome(&outcome).as_bytes())
-        .map_err(|error| KidoboError::CliIo {
-            reason: error.to_string(),
-        })?;
+        .write_all(render_init_outcome(&outcome).as_bytes())?;
     Ok(())
 }
 

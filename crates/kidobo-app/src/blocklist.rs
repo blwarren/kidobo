@@ -76,15 +76,15 @@ pub struct UnbanPreview {
     targets: Vec<CanonicalCidr>,
 }
 
-/// Result of read-only unban preparation under the process lock.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct UnbanPreparation {
-    /// Preview to apply when input was usable.
-    pub preview: Option<UnbanPreview>,
+/// Result of read-only unban preparation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnbanPreparation {
+    /// Valid targets and their current blocklist matches.
+    Ready(UnbanPreview),
     /// Invalid input strings; any invalid target prevents mutation.
-    pub invalid_targets: Vec<String>,
-    /// Whether file input contained no targets.
-    pub empty_file: bool,
+    InvalidTargets(Vec<String>),
+    /// File input contained no targets.
+    EmptyFile,
 }
 
 /// Operator decision controlling removal of partially overlapping entries.
@@ -339,19 +339,18 @@ pub fn prepare_unban(
     dependencies.configs.load(&paths.config_file)?;
     let (targets, invalid_targets, empty_file) =
         parse_input(&request.input, dependencies.repository)?;
-    if !invalid_targets.is_empty() || empty_file {
-        return Ok(UnbanPreparation {
-            preview: None,
-            invalid_targets,
-            empty_file,
-        });
+    if !invalid_targets.is_empty() {
+        return Ok(UnbanPreparation::InvalidTargets(invalid_targets));
+    }
+    if empty_file {
+        return Ok(UnbanPreparation::EmptyFile);
     }
     let document = dependencies.repository.load(&paths.blocklist_file)?;
-    Ok(UnbanPreparation {
-        preview: Some(build_preview(&request.input, targets, &document)),
-        invalid_targets: Vec::new(),
-        empty_file: false,
-    })
+    Ok(UnbanPreparation::Ready(build_preview(
+        &request.input,
+        targets,
+        &document,
+    )))
 }
 
 /// Applies an approved unban preview under the process lock.
@@ -816,11 +815,15 @@ mod tests {
             paths: request_input(),
             input: BlocklistInput::Single("203.0.113.7".to_string()),
         };
-        let preparation = prepare_unban(&request, &dependencies).expect("preview");
+        let super::UnbanPreparation::Ready(preview) =
+            prepare_unban(&request, &dependencies).expect("preview")
+        else {
+            panic!("expected preview");
+        };
         cancelled.store(true, Ordering::SeqCst);
         let result = apply_unban(
             &request,
-            &preparation.preview.expect("preview"),
+            &preview,
             &UnbanDecision {
                 remove_partial: true,
             },
@@ -893,9 +896,11 @@ mod tests {
             paths: request_input(),
             input: BlocklistInput::Single("10.0.0.1".to_string()),
         };
-        let preparation =
-            prepare_unban(&request, &dependencies(&repository, &locks)).expect("preview");
-        let preview = preparation.preview.expect("preview");
+        let super::UnbanPreparation::Ready(preview) =
+            prepare_unban(&request, &dependencies(&repository, &locks)).expect("preview")
+        else {
+            panic!("expected preview");
+        };
         assert_eq!(preview.exact_entries, ["10.0.0.1/32"]);
         assert_eq!(preview.partial_entries, ["10.0.0.0/24"]);
 
@@ -925,10 +930,11 @@ mod tests {
             paths: request_input(),
             input: BlocklistInput::Single("10.0.0.1".to_string()),
         };
-        let preview = prepare_unban(&request, &dependencies(&repository, &locks))
-            .expect("prepare")
-            .preview
-            .expect("preview");
+        let super::UnbanPreparation::Ready(preview) =
+            prepare_unban(&request, &dependencies(&repository, &locks)).expect("prepare")
+        else {
+            panic!("expected preview")
+        };
         *repository.contents.lock().expect("contents") = "10.0.0.0/16\n".to_string();
 
         let error = apply_unban(
@@ -943,6 +949,43 @@ mod tests {
 
         assert!(matches!(error, AppError::BlocklistChanged));
         assert_eq!(*locks.0.lock().expect("locks"), 1);
+    }
+
+    #[test]
+    fn file_unban_distinguishes_empty_invalid_and_ready_without_mutating() {
+        let repository = Repository::new("203.0.113.0/24\n");
+        let locks = Locks::default();
+        let request = UnbanRequest {
+            paths: request_input(),
+            input: BlocklistInput::File(PathBuf::from("targets.txt")),
+        };
+        let dependencies = dependencies(&repository, &locks);
+        assert_eq!(
+            prepare_unban(&request, &dependencies).expect("empty file"),
+            super::UnbanPreparation::EmptyFile
+        );
+
+        *repository.target_lines.lock().expect("targets") =
+            vec!["bad-one".into(), "203.0.113.7".into(), "bad-two".into()];
+        assert_eq!(
+            prepare_unban(&request, &dependencies).expect("invalid file"),
+            super::UnbanPreparation::InvalidTargets(vec!["bad-one".into(), "bad-two".into()])
+        );
+
+        *repository.target_lines.lock().expect("targets") = vec!["198.51.100.7".into()];
+        let super::UnbanPreparation::Ready(preview) =
+            prepare_unban(&request, &dependencies).expect("valid file")
+        else {
+            panic!("valid unmatched targets still need a preview");
+        };
+        assert_eq!(preview.requested_target_count, 1);
+        assert_eq!(preview.exact_entries, Vec::<String>::new());
+        assert_eq!(preview.partial_entries, Vec::<String>::new());
+        assert_eq!(
+            *repository.contents.lock().expect("contents"),
+            "203.0.113.0/24\n"
+        );
+        assert_eq!(*locks.0.lock().expect("locks"), 0);
     }
 
     // Drop records lock release, making the ledger sensitive to deletion occurring one statement

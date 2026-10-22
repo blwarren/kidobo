@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Preserve non-UTF-8 temporary directory paths when restoring ipsets during sync.
 
 ## [0.14.3] - 2026-10-22
 

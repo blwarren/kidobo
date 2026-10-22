@@ -1,18 +1,23 @@
 //! Shared command execution helpers.
 
 use std::env;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::command_runner::{CommandResult, ProcessStatus};
 
 /// Renders a command and its arguments for bounded operator diagnostics.
-pub fn display_command<S: AsRef<str>>(command: &str, args: &[S]) -> String {
+pub fn display_command<S: AsRef<OsStr>>(command: impl AsRef<OsStr>, args: &[S]) -> String {
+    let command = command.as_ref().to_string_lossy();
     if args.is_empty() {
-        command.to_string()
+        command.into_owned()
     } else {
-        let rendered_args = args.iter().map(AsRef::as_ref).collect::<Vec<_>>().join(" ");
+        let rendered_args = args
+            .iter()
+            .map(|arg| arg.as_ref().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(" ");
         format!("{command} {rendered_args}")
     }
 }
@@ -53,10 +58,10 @@ fn is_executable_file(path: &Path) -> bool {
 /// # Errors
 ///
 /// Returns the error produced by `build_error` when the command status is unsuccessful.
-pub fn ensure_command_succeeded<E, F>(
+pub fn ensure_command_succeeded<E, F, S: AsRef<OsStr>>(
     result: CommandResult,
     command: &str,
-    args: &[&str],
+    args: &[S],
     build_error: F,
 ) -> Result<CommandResult, E>
 where

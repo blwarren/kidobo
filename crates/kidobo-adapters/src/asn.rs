@@ -18,7 +18,7 @@ const ASN_CACHE_FILE_WRITE_HEADER: &str = "# kidobo-asn-cache-v1";
 const DEFAULT_BGPQ4_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Failure while validating, resolving, reading, or writing ASN prefixes.
-#[derive(Debug, Error, Clone, PartialEq, Eq)]
+#[derive(Debug, Error)]
 pub enum AsnError {
     /// An operator token is not a positive `u32` ASN.
     #[error("invalid ASN token `{input}`")]
@@ -37,21 +37,23 @@ pub enum AsnError {
     },
 
     /// An existing ASN cache could not be read safely.
-    #[error("ASN cache read failed at {path}: {reason}")]
+    #[error("ASN cache read failed at {path}: {source}")]
     CacheRead {
         /// Cache file path.
         path: PathBuf,
         /// Bounded-read or parse diagnostic.
-        reason: String,
+        #[source]
+        source: std::io::Error,
     },
 
     /// An ASN cache could not be atomically updated.
-    #[error("ASN cache write failed at {path}: {reason}")]
+    #[error("ASN cache write failed at {path}: {source}")]
     CacheWrite {
         /// Cache file path.
         path: PathBuf,
         /// Filesystem diagnostic.
-        reason: String,
+        #[source]
+        source: std::io::Error,
     },
 }
 
@@ -93,17 +95,17 @@ impl<E: CommandExecutor> Bgpq4AsnPrefixResolver<E> {
     fn run_bgpq4(&self, asn: u32, family_flag: &str) -> Result<Vec<CanonicalCidr>, AsnError> {
         let asn_token = format!("AS{asn}");
         let request = CommandRequest {
-            program: "bgpq4".to_string(),
+            program: "bgpq4".into(),
             args: vec![
-                family_flag.to_string(),
-                "-F".to_string(),
-                "%n/%l\n".to_string(),
-                asn_token,
+                family_flag.into(),
+                "-F".into(),
+                "%n/%l\n".into(),
+                asn_token.into(),
             ],
             timeout: self.timeout,
         };
 
-        let command = format!("{} {}", request.program, request.args.join(" "));
+        let command = crate::command_common::display_command(&request.program, &request.args);
         let result = self
             .executor
             .execute(&request)
@@ -300,7 +302,7 @@ pub fn delete_asn_cache_file(asn: u32, cache_dir: &Path) -> Result<bool, AsnErro
 
     fs::remove_file(&path).map_err(|err| AsnError::CacheWrite {
         path: path.clone(),
-        reason: err.to_string(),
+        source: err,
     })?;
     Ok(true)
 }
@@ -328,16 +330,16 @@ fn read_asn_cache_file(path: &Path) -> Result<Option<AsnCacheState>, AsnError> {
 
     let metadata = fs::metadata(path).map_err(|err| AsnError::CacheRead {
         path: path.to_path_buf(),
-        reason: err.to_string(),
+        source: err,
     })?;
     let modified = metadata.modified().map_err(|err| AsnError::CacheRead {
         path: path.to_path_buf(),
-        reason: err.to_string(),
+        source: err,
     })?;
     let contents = read_to_string_with_limit(path, ASN_CACHE_FILE_READ_LIMIT).map_err(|err| {
         AsnError::CacheRead {
             path: path.to_path_buf(),
-            reason: err.to_string(),
+            source: err,
         }
     })?;
 
@@ -352,7 +354,7 @@ fn write_asn_cache_file(path: &Path, prefixes: &[CanonicalCidr]) -> Result<(), A
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|err| AsnError::CacheWrite {
             path: parent.to_path_buf(),
-            reason: err.to_string(),
+            source: err,
         })?;
     }
 
@@ -366,7 +368,7 @@ fn write_asn_cache_file(path: &Path, prefixes: &[CanonicalCidr]) -> Result<(), A
 
     write_string_atomic(path, &output).map_err(|err| AsnError::CacheWrite {
         path: path.to_path_buf(),
-        reason: err.to_string(),
+        source: err,
     })
 }
 
@@ -504,12 +506,7 @@ mod tests {
     #[test]
     fn parse_asn_token_rejects_blank_input() {
         let err = parse_asn_token("   ").expect_err("must fail");
-        assert_eq!(
-            err,
-            AsnError::InvalidAsnToken {
-                input: "   ".to_string()
-            }
-        );
+        assert!(matches!(err, AsnError::InvalidAsnToken { input } if input == "   "));
     }
 
     #[test]
@@ -790,13 +787,7 @@ mod tests {
 
         let err = load_asn_prefixes_with_cache(64512, cache_dir, Duration::from_secs(0), &resolver)
             .expect_err("invalid cache must not be reused");
-        assert_eq!(
-            err,
-            AsnError::ResolveFailed {
-                asn: 64512,
-                reason: "boom".to_string()
-            }
-        );
+        assert!(matches!(err, AsnError::ResolveFailed { asn: 64512, reason } if reason == "boom"));
     }
 
     #[test]
@@ -930,13 +921,7 @@ mod tests {
         let err =
             load_asn_prefixes_with_cache(64512, temp.path(), Duration::from_secs(1), &resolver)
                 .expect_err("must fail");
-        assert_eq!(
-            err,
-            AsnError::ResolveFailed {
-                asn: 64512,
-                reason: "boom".to_string()
-            }
-        );
+        assert!(matches!(err, AsnError::ResolveFailed { asn: 64512, reason } if reason == "boom"));
     }
 
     #[test]

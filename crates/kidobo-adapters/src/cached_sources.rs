@@ -49,7 +49,7 @@ pub fn load_remote_sources(
         collect_offline_remote_generations(remote_cache_dir).map_err(|err| {
             SourceLoadError::CacheDir {
                 path: remote_cache_dir.join("v2/remote"),
-                reason: err.to_string(),
+                source: err,
             }
         })?;
     let generation_hashes = generation_sources
@@ -61,11 +61,11 @@ pub fn load_remote_sources(
         collect_remote_cache_files(remote_cache_dir).map_err(|err| match err {
             RemoteCacheFilesError::ReadDir(err) => SourceLoadError::CacheDir {
                 path: remote_cache_dir.to_path_buf(),
-                reason: err.to_string(),
+                source: err,
             },
             RemoteCacheFilesError::ReadDirEntry(err) => SourceLoadError::CacheDirEntry {
                 path: remote_cache_dir.to_path_buf(),
-                reason: err.to_string(),
+                source: err,
             },
         })?;
 
@@ -91,7 +91,7 @@ pub fn load_remote_sources(
             read_remote_cache_iplist_text(&path, SOURCE_FILE_READ_LIMIT, REMOTE_META_READ_LIMIT)
                 .map_err(|err| SourceLoadError::Source {
                     path: path.clone(),
-                    reason: err.to_string(),
+                    source: err,
                 })?;
 
         sources.push(CachedRemoteSource {
@@ -187,8 +187,8 @@ mod tests {
 
         let err = load_remote_sources(&remote_cache_dir).expect_err("must fail");
         match err {
-            SourceLoadError::Source { reason, .. } => {
-                assert!(reason.contains("hash mismatch"));
+            SourceLoadError::Source { source, .. } => {
+                assert!(source.to_string().contains("hash mismatch"));
             }
             _ => panic!("unexpected error variant"),
         }

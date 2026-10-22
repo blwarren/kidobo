@@ -25,7 +25,7 @@ pub fn load_config_from_file(path: &Path) -> Result<Config, AppError> {
     let contents =
         read_to_string_with_limit(path, CONFIG_READ_LIMIT).map_err(|err| AppError::ConfigRead {
             path: path.to_path_buf(),
-            reason: err.to_string(),
+            source: err,
         })?;
 
     Config::from_toml_str(&contents).map_err(AppError::from)
@@ -94,8 +94,8 @@ mod tests {
 
         let err = load_config_from_file(&config_file).expect_err("must fail");
         match err {
-            AppError::ConfigRead { reason, .. } => {
-                assert!(reason.contains("file exceeds 65536 byte limit"));
+            AppError::ConfigRead { source, .. } => {
+                assert!(source.to_string().contains("file exceeds 65536 byte limit"));
             }
             _ => panic!("expected config read error"),
         }

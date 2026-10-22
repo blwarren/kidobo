@@ -93,7 +93,7 @@ pub trait PendingCachePromotion: Send {
     /// # Errors
     ///
     /// Returns a diagnostic when the cache manifest cannot be promoted.
-    fn promote(self: Box<Self>) -> Result<(), String>;
+    fn promote(self: Box<Self>) -> std::io::Result<()>;
 }
 
 /// Primary source data, an optional validated fallback, and deferred cache selections.

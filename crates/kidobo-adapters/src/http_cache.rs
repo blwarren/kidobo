@@ -322,39 +322,43 @@ fn read_response_body_capped(
 #[derive(Debug, Error)]
 pub enum HttpCacheError {
     /// Normalized CIDR cache write failed.
-    #[error("failed to write iplist cache {path}: {reason}")]
+    #[error("failed to write iplist cache {path}: {source}")]
     WriteIplist {
         /// Cache path.
         path: PathBuf,
         /// Filesystem diagnostic.
-        reason: String,
+        #[source]
+        source: std::io::Error,
     },
 
     /// Cache metadata or v2 manifest write failed.
-    #[error("failed to write metadata cache {path}: {reason}")]
+    #[error("failed to write metadata cache {path}: {source}")]
     WriteMetadata {
         /// Cache path.
         path: PathBuf,
         /// Serialization or filesystem diagnostic.
-        reason: String,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
     },
 
     /// Raw response cache write failed.
-    #[error("failed to write raw cache {path}: {reason}")]
+    #[error("failed to write raw cache {path}: {source}")]
     WriteRaw {
         /// Cache path.
         path: PathBuf,
         /// Filesystem diagnostic.
-        reason: String,
+        #[source]
+        source: std::io::Error,
     },
 
     /// Selected normalized CIDR cache could not be read safely.
-    #[error("failed to read iplist cache {path}: {reason}")]
+    #[error("failed to read iplist cache {path}: {source}")]
     ReadIplist {
         /// Cache path.
         path: PathBuf,
         /// Bounded-read diagnostic.
-        reason: String,
+        #[source]
+        source: std::io::Error,
     },
 }
 
@@ -418,7 +422,7 @@ pub fn fetch_iplist_with_cache(
             .promote()
             .map_err(|err| HttpCacheError::WriteMetadata {
                 path: remote_generation_store(cache_dir, url).join("current.json"),
-                reason: err.to_string(),
+                source: Box::new(err),
             })?;
     }
     Ok(prepared.loaded)
@@ -594,7 +598,7 @@ fn stage_cache(
     let metadata =
         serde_json::to_vec_pretty(meta).map_err(|err| HttpCacheError::WriteMetadata {
             path: remote_generation_store(cache_dir, url).join("current.json"),
-            reason: err.to_string(),
+            source: Box::new(err),
         })?;
     let store = remote_generation_store(cache_dir, url);
     stage_generation(
@@ -617,7 +621,7 @@ fn stage_cache(
     )
     .map_err(|err| HttpCacheError::WriteMetadata {
         path: store.join("current.json"),
-        reason: err.to_string(),
+        source: Box::new(err),
     })
 }
 
@@ -803,7 +807,7 @@ fn read_optional_iplist_networks(
         read_to_string_with_limit(&paths.iplist_path, MAX_IPLIST_READ_BYTES).map_err(|err| {
             HttpCacheError::ReadIplist {
                 path: paths.iplist_path.clone(),
-                reason: err.to_string(),
+                source: err,
             }
         })?;
 

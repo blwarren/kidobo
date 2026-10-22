@@ -1,5 +1,6 @@
 //! Bounded subprocess execution adapter.
 
+use std::ffi::{OsStr, OsString};
 use std::io::Read;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
@@ -28,9 +29,9 @@ const DEFAULT_COMMAND_OUTPUT_LIMIT: usize = 1024 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandRequest {
     /// Program name or path.
-    pub program: String,
+    pub program: OsString,
     /// Arguments passed without shell interpretation.
-    pub args: Vec<String>,
+    pub args: Vec<OsString>,
     /// Maximum execution duration.
     pub timeout: Duration,
 }
@@ -336,13 +337,41 @@ impl<E: CommandExecutor> SudoCommandRunner<E> {
         args: &[&str],
         timeout: Duration,
     ) -> Result<CommandResult, CommandRunnerError> {
+        let args = args.iter().map(OsStr::new).collect::<Vec<_>>();
+        self.run_os_with_timeout(command, &args, timeout)
+    }
+
+    /// Runs native arguments through noninteractive sudo using the default timeout.
+    ///
+    /// # Errors
+    ///
+    /// Returns the wrapped executor's [`CommandRunnerError`].
+    pub fn run_os(
+        &self,
+        command: &str,
+        args: &[&OsStr],
+    ) -> Result<CommandResult, CommandRunnerError> {
+        self.run_os_with_timeout(command, args, self.default_timeout)
+    }
+
+    /// Runs native arguments through noninteractive sudo using an explicit timeout.
+    ///
+    /// # Errors
+    ///
+    /// Returns the wrapped executor's [`CommandRunnerError`].
+    pub fn run_os_with_timeout(
+        &self,
+        command: &str,
+        args: &[&OsStr],
+        timeout: Duration,
+    ) -> Result<CommandResult, CommandRunnerError> {
         let mut sudo_args = Vec::with_capacity(args.len() + 2);
-        sudo_args.push("-n".to_string());
-        sudo_args.push(command.to_string());
-        sudo_args.extend(args.iter().map(|value| (*value).to_string()));
+        sudo_args.push(OsString::from("-n"));
+        sudo_args.push(OsString::from(command));
+        sudo_args.extend(args.iter().map(|value| (*value).to_os_string()));
 
         let request = CommandRequest {
-            program: "sudo".to_string(),
+            program: OsString::from("sudo"),
             args: sudo_args,
             timeout,
         };
@@ -474,10 +503,39 @@ mod tests {
     fn run_system_shell(script: &str) -> Result<CommandResult, CommandRunnerError> {
         let executor = SystemCommandExecutor;
         executor.execute(&CommandRequest {
-            program: "sh".to_string(),
-            args: vec!["-c".to_string(), script.to_string()],
+            program: "sh".into(),
+            args: vec!["-c".into(), script.into()],
             timeout: Duration::from_secs(10),
         })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn system_executor_preserves_non_unicode_program_and_arguments() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("tempdir");
+        let program = temp.path().join(OsString::from_vec(b"shell-\xff".to_vec()));
+        let marker = temp
+            .path()
+            .join(OsString::from_vec(b"marker-\xfe".to_vec()));
+        symlink("/bin/sh", &program).expect("link shell");
+        std::fs::write(&marker, b"marker").expect("write marker");
+        let result = SystemCommandExecutor
+            .execute(&CommandRequest {
+                program: program.into_os_string(),
+                args: vec![
+                    "-c".into(),
+                    "test -f \"$1\"".into(),
+                    "sh".into(),
+                    marker.into_os_string(),
+                ],
+                timeout: Duration::from_secs(5),
+            })
+            .expect("native process request");
+        assert!(result.status.success(), "{result:?}");
     }
 
     #[cfg(unix)]
@@ -521,7 +579,7 @@ mod tests {
         let executor = SystemCommandExecutor;
         let err = executor
             .execute(&CommandRequest {
-                program: "kidobo-definitely-missing-command-for-tests".to_string(),
+                program: "kidobo-definitely-missing-command-for-tests".into(),
                 args: Vec::new(),
                 timeout: Duration::from_secs(1),
             })
@@ -544,8 +602,8 @@ mod tests {
         ] {
             let started = std::time::Instant::now();
             let result = SystemCommandExecutor.execute(&CommandRequest {
-                program: "sh".to_string(),
-                args: vec!["-c".to_string(), script.to_string()],
+                program: "sh".into(),
+                args: vec!["-c".into(), script.into()],
                 timeout: Duration::from_millis(100),
             });
             assert!(
@@ -582,8 +640,8 @@ mod tests {
         let executor = SystemCommandExecutor;
         let err = executor
             .execute(&CommandRequest {
-                program: "sh".to_string(),
-                args: vec!["-c".to_string(), "sleep 1".to_string()],
+                program: "sh".into(),
+                args: vec!["-c".into(), "sleep 1".into()],
                 timeout: Duration::from_millis(1),
             })
             .expect_err("sleep command should time out");
@@ -609,12 +667,12 @@ mod tests {
         let started = std::time::Instant::now();
         let err = executor
             .execute(&CommandRequest {
-                program: "sh".to_string(),
+                program: "sh".into(),
                 args: vec![
-                    "-c".to_string(),
-                    "(sleep 1; touch \"$1\") & wait".to_string(),
-                    "sh".to_string(),
-                    marker.display().to_string(),
+                    "-c".into(),
+                    "(sleep 1; touch \"$1\") & wait".into(),
+                    "sh".into(),
+                    marker.as_os_str().to_owned(),
                 ],
                 timeout: Duration::from_millis(20),
             })

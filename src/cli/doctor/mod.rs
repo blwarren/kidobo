@@ -23,9 +23,7 @@ pub fn run_doctor_command(io: &mut CliIo<'_>) -> Result<(), KidoboError> {
         },
     )?;
     let json = render_report(&report)?;
-    writeln!(io.stdout, "{json}").map_err(|error| KidoboError::CliIo {
-        reason: error.to_string(),
-    })?;
+    writeln!(io.stdout, "{json}")?;
 
     let failed_count = report
         .checks

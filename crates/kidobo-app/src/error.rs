@@ -12,12 +12,13 @@ pub enum AppError {
     #[error("operation interrupted by SIGINT")]
     Interrupted,
     /// A fresh source could not be staged and no admissible cache was available.
-    #[error("cache staging failed for `{provider}` without a usable fallback: {reason}")]
+    #[error("cache staging failed for `{provider}` without a usable fallback: {source}")]
     CacheStaging {
         /// Source provider identifier.
         provider: &'static str,
         /// Persistence diagnostic.
-        reason: String,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
     },
     /// Compatibility-sensitive runtime paths could not be resolved.
     #[error("path resolution failed: {reason}")]
@@ -34,21 +35,23 @@ pub enum AppError {
     },
 
     /// The configuration file could not be read.
-    #[error("failed to read config file {path}: {reason}")]
+    #[error("failed to read config file {path}: {source}")]
     ConfigRead {
         /// Configuration path.
         path: PathBuf,
         /// Filesystem diagnostic.
-        reason: String,
+        #[source]
+        source: std::io::Error,
     },
 
     /// An atomic configuration update could not be completed.
-    #[error("failed to write config file {path}: {reason}")]
+    #[error("failed to write config file {path}: {source}")]
     ConfigWrite {
         /// Configuration path.
         path: PathBuf,
         /// Filesystem diagnostic.
-        reason: String,
+        #[source]
+        source: std::io::Error,
     },
 
     /// Configuration text was malformed or violated domain constraints.
@@ -60,19 +63,21 @@ pub enum AppError {
     },
 
     /// The process lock could not be opened securely or acquired without blocking.
-    #[error("lock operation failed: {reason}")]
+    #[error("lock operation failed: {source}")]
     Lock {
         /// Lock adapter diagnostic.
-        reason: String,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
     },
 
     /// The local blocklist could not be read.
-    #[error("failed to read blocklist file {path}: {reason}")]
+    #[error("failed to read blocklist file {path}: {source}")]
     BlocklistRead {
         /// Blocklist path.
         path: PathBuf,
         /// Filesystem diagnostic.
-        reason: String,
+        #[source]
+        source: std::io::Error,
     },
 
     /// A non-comment local blocklist line is invalid.
@@ -87,12 +92,13 @@ pub enum AppError {
     },
 
     /// An atomic local blocklist update could not be completed.
-    #[error("failed to write blocklist file {path}: {reason}")]
+    #[error("failed to write blocklist file {path}: {source}")]
     BlocklistWrite {
         /// Blocklist path.
         path: PathBuf,
         /// Filesystem diagnostic.
-        reason: String,
+        #[source]
+        source: std::io::Error,
     },
 
     /// One direct blocklist target was invalid.
@@ -103,12 +109,13 @@ pub enum AppError {
     },
 
     /// A blocklist target file could not be read within its bound.
-    #[error("failed to read blocklist targets file {path}: {reason}")]
+    #[error("failed to read blocklist targets file {path}: {source}")]
     BlocklistTargetFileRead {
         /// Target file path.
         path: PathBuf,
         /// Read diagnostic.
-        reason: String,
+        #[source]
+        source: std::io::Error,
     },
 
     /// A mutation was rejected because at least one target was invalid.
@@ -123,19 +130,21 @@ pub enum AppError {
     BlocklistChanged,
 
     /// ASN parsing, resolution, caching, or persistence failed.
-    #[error("ASN operation failed: {reason}")]
+    #[error("ASN operation failed: {source}")]
     Asn {
         /// ASN adapter diagnostic.
-        reason: String,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
     },
 
     /// Cache-only flush could not clear the remote cache.
-    #[error("failed to clear remote cache at {path}: {reason}")]
+    #[error("failed to clear remote cache at {path}: {source}")]
     FlushCacheIo {
         /// Remote cache path.
         path: PathBuf,
         /// Filesystem diagnostic.
-        reason: String,
+        #[source]
+        source: std::io::Error,
     },
 
     /// One or more required full-flush cleanup operations failed.
@@ -170,19 +179,21 @@ pub enum AppError {
     },
 
     /// A lookup target file could not be read within its bound.
-    #[error("failed to read lookup targets file {path}: {reason}")]
+    #[error("failed to read lookup targets file {path}: {source}")]
     LookupTargetFileRead {
         /// Target file path.
         path: PathBuf,
         /// Read diagnostic.
-        reason: String,
+        #[source]
+        source: std::io::Error,
     },
 
     /// Offline lookup sources could not be loaded safely.
-    #[error("lookup source loading failed: {reason}")]
+    #[error("lookup source loading failed: {source}")]
     LookupSourceLoad {
         /// Source loading diagnostic.
-        reason: String,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
     },
 
     /// Firewall preparation, activation, inspection, or cleanup failed.
@@ -193,19 +204,21 @@ pub enum AppError {
     },
 
     /// Managed ipset preparation, replacement, or cleanup failed.
-    #[error("ipset operation failed: {reason}")]
+    #[error("ipset operation failed: {source}")]
     Ipset {
         /// Ipset adapter diagnostic.
-        reason: String,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
     },
 
     /// Initialization filesystem work failed.
-    #[error("initialization I/O failed for {path}: {reason}")]
+    #[error("initialization I/O failed for {path}: {source}")]
     InitIo {
         /// Affected path.
         path: PathBuf,
         /// Filesystem diagnostic.
-        reason: String,
+        #[source]
+        source: std::io::Error,
     },
 
     /// Live systemd initialization command failed.
@@ -225,12 +238,13 @@ pub enum AppError {
     },
 
     /// A registered synchronization source failed according to its policy.
-    #[error("source provider `{provider}` failed: {reason}")]
+    #[error("source provider `{provider}` failed: {source}")]
     Source {
         /// Stable provider identifier.
         provider: &'static str,
         /// Provider diagnostic.
-        reason: String,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
     },
 
     /// Aggregate remote source material exceeded its deterministic admission budget.
@@ -243,12 +257,13 @@ pub enum AppError {
     },
 
     /// A semantically accepted staged cache generation could not be selected before enforcement.
-    #[error("cache promotion failed for source provider `{provider}`: {reason}")]
+    #[error("cache promotion failed for source provider `{provider}`: {source}")]
     CachePromotion {
         /// Stable source provider identifier.
         provider: &'static str,
         /// Cache manifest diagnostic.
-        reason: String,
+        #[source]
+        source: std::io::Error,
     },
 
     /// A source registry contains duplicate stable provider IDs.

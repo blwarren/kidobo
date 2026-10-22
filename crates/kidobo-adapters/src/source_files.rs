@@ -18,12 +18,14 @@ pub const SOURCE_FILE_READ_LIMIT: usize = 16 * 1024 * 1024;
 pub const REMOTE_META_READ_LIMIT: usize = 256 * 1024;
 
 /// Failure while enumerating legacy cached remote sources.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum RemoteCacheFilesError {
     /// The cache directory could not be opened.
-    ReadDir(io::Error),
+    #[error("{0}")]
+    ReadDir(#[source] io::Error),
     /// One cache directory entry could not be read.
-    ReadDirEntry(io::Error),
+    #[error("{0}")]
+    ReadDirEntry(#[source] io::Error),
 }
 
 /// Collects regular `.iplist` files from a remote-cache directory.

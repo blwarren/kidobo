@@ -2,20 +2,24 @@
 
 use std::collections::{BTreeSet, HashSet};
 
+use thiserror::Error;
+
 use crate::network::{
     CanonicalCidr, cidr_overlaps, collapse_ipv4, collapse_ipv6, parse_ip_cidr_strict,
     split_by_family,
 };
 
 /// Error returned when an operator-supplied ban or unban target is invalid.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum BlocklistTargetParseError {
     /// The target is not exactly one valid IP address or CIDR.
+    #[error("target is not exactly one valid IP address or CIDR")]
     Invalid,
 }
 
 /// A non-comment blocklist line that could not be parsed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("invalid blocklist entry at line {line_number}: {content}")]
 pub struct InvalidBlocklistLine {
     /// One-based line number in the original document.
     pub line_number: usize,

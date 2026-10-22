@@ -441,9 +441,9 @@ fn promote_pending_caches(
         pending
             .promotion
             .promote()
-            .map_err(|reason| AppError::CachePromotion {
+            .map_err(|source| AppError::CachePromotion {
                 provider: pending.provider,
-                reason,
+                source,
             })?;
     }
     observer.stage_completed("promote_source_caches");
@@ -691,7 +691,7 @@ mod tests {
             if self.fail {
                 return Err(AppError::Source {
                     provider: self.descriptor.id,
-                    reason: "injected failure".to_string(),
+                    source: Box::new(std::io::Error::other("injected failure")),
                 });
             }
             Ok(SyncSourceLoad::ready(SyncSourceBatch {
@@ -713,10 +713,10 @@ mod tests {
     }
 
     impl PendingCachePromotion for RecordingPromotion {
-        fn promote(self: Box<Self>) -> Result<(), String> {
+        fn promote(self: Box<Self>) -> std::io::Result<()> {
             record(&self.ledger, "promote");
             if self.fail {
-                Err("injected promotion failure".to_string())
+                Err(std::io::Error::other("injected promotion failure"))
             } else {
                 Ok(())
             }
@@ -794,7 +794,7 @@ mod tests {
         fn result_for(&self, stage: &'static str) -> Result<(), AppError> {
             if self.fail_at == Some(stage) {
                 Err(AppError::Ipset {
-                    reason: format!("injected {stage} failure"),
+                    source: Box::new(std::io::Error::other(format!("injected {stage} failure"))),
                 })
             } else {
                 Ok(())
@@ -979,7 +979,7 @@ mod tests {
             fn load(&self, _: &SyncSourceContext<'_>) -> Result<SyncSourceLoad, AppError> {
                 let failure = AppError::CacheStaging {
                     provider: "external",
-                    reason: "injected disk failure".to_string(),
+                    source: Box::new(std::io::Error::other("injected disk failure")),
                 };
                 let Some(networks) = &self.0 else {
                     return Err(failure);

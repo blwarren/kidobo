@@ -37,9 +37,7 @@ impl PromptInput for StdinPrompt {
                 if error.kind() == io::ErrorKind::Interrupted {
                     KidoboError::Interrupted
                 } else {
-                    KidoboError::BlocklistPrompt {
-                        reason: error.to_string(),
-                    }
+                    KidoboError::BlocklistPrompt { source: error }
                 }
             })
     }

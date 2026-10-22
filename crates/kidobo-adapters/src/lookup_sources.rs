@@ -44,7 +44,7 @@ impl OfflineLookupProvider for LocalBlocklistLookupProvider {
             return Ok(());
         }
         append_source_file(&context.paths.blocklist_file, "internal:blocklist", entries)
-            .map_err(|error| map_lookup_error(&error))
+            .map_err(map_lookup_error)
     }
 }
 
@@ -63,7 +63,7 @@ impl OfflineLookupProvider for RemoteCacheLookupProvider {
         entries: &mut Vec<LookupSourceEntry>,
     ) -> Result<(), AppError> {
         let remote_sources = load_remote_sources(&context.paths.remote_cache_dir)
-            .map_err(|error| map_lookup_error(&LookupSourceLoadError::from(error)))?;
+            .map_err(|error| map_lookup_error(LookupSourceLoadError::from(error)))?;
         entries.reserve(
             remote_sources
                 .iter()
@@ -158,7 +158,7 @@ impl OfflineLookupProvider for AsnCacheLookupProvider {
         let cache_dir = context.paths.cache_dir.join("asn");
         for asn in &config.asn.banned {
             let prefixes = load_cached_asn_prefixes(*asn, &cache_dir)
-                .map_err(|error| map_lookup_error(&LookupSourceLoadError::from(error)))?;
+                .map_err(|error| map_lookup_error(LookupSourceLoadError::from(error)))?;
             if let Some(prefixes) = prefixes {
                 append_canonical_entries(entries, &format!("asn:AS{asn}"), prefixes);
             } else {
@@ -186,9 +186,9 @@ pub fn build_offline_lookup_registry() -> Result<OfflineLookupRegistry, AppError
     Ok(registry)
 }
 
-fn map_lookup_error(error: &LookupSourceLoadError) -> AppError {
+fn map_lookup_error(error: LookupSourceLoadError) -> AppError {
     AppError::LookupSourceLoad {
-        reason: error.to_string(),
+        source: Box::new(error),
     }
 }
 
@@ -212,7 +212,7 @@ fn append_source_file(
     let contents = read_to_string_with_limit(path, SOURCE_FILE_READ_LIMIT).map_err(|err| {
         LookupSourceLoadError::from(SourceLoadError::Source {
             path: path.to_path_buf(),
-            reason: err.to_string(),
+            source: err,
         })
     })?;
 

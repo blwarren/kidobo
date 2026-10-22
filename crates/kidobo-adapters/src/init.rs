@@ -71,7 +71,7 @@ impl<R: InitCommandRunner> InitProvisioner for FileInitProvisioner<R> {
         let existed = path.exists();
         fs::create_dir_all(path).map_err(|error| AppError::InitIo {
             path: path.to_path_buf(),
-            reason: error.to_string(),
+            source: error,
         })?;
         Ok(if existed {
             ProvisionState::Preserved
@@ -85,7 +85,10 @@ impl<R: InitCommandRunner> InitProvisioner for FileInitProvisioner<R> {
             if !path.is_file() {
                 return Err(AppError::InitIo {
                     path: path.to_path_buf(),
-                    reason: "path exists but is not a file".to_string(),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "path exists but is not a file",
+                    ),
                 });
             }
             return Ok(ProvisionState::Preserved);
@@ -95,7 +98,7 @@ impl<R: InitCommandRunner> InitProvisioner for FileInitProvisioner<R> {
         }
         write_string_atomic(path, contents).map_err(|error| AppError::InitIo {
             path: path.to_path_buf(),
-            reason: error.to_string(),
+            source: error,
         })?;
         Ok(ProvisionState::Created)
     }

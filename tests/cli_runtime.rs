@@ -1205,6 +1205,59 @@ fn sync_full_families_emit_supported_restore_entries() {
     assert!(creates[1].contains("hash:net family inet "));
 }
 
+#[cfg(unix)]
+#[test]
+fn sync_preserves_non_unicode_restore_paths() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let root = create_root(
+        "[ipset]\nset_name='kidobo'\nenable_ipv6=true\n[safe]\ninclude_github_meta=false\n",
+        "203.0.113.0/24\n2001:db8::/64\n",
+    );
+    let temporary = root.path().join(OsString::from_vec(b"tmp-\xff".to_vec()));
+    fs::create_dir(&temporary).expect("create non-Unicode temporary directory");
+    let fake_sudo = write_fake_sudo_script(&root);
+    let restore_log = root.path().join("restore.log");
+    let output = kidobo_with_root_command(root.path(), &["sync"])
+        .env("TMPDIR", &temporary)
+        .env(
+            "PATH",
+            path_with_bin_prefix(fake_sudo.parent().expect("bin")),
+        )
+        .env("KIDOBO_TEST_RESTORE_LOG", &restore_log)
+        .output()
+        .expect("sync with non-Unicode temporary directory");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let scripts = read_to_string_with_limit(&restore_log, 65536).expect("restore scripts");
+    let entries: Vec<_> = scripts
+        .lines()
+        .filter_map(|line| {
+            line.strip_prefix("add ")
+                .map(|entry| entry.split_once(' ').expect("set and CIDR").1)
+        })
+        .collect();
+    assert_eq!(entries, ["2001:db8::/64", "203.0.113.0/24"]);
+    assert_eq!(
+        scripts
+            .lines()
+            .filter(|line| line.starts_with("swap "))
+            .count(),
+        2
+    );
+    assert_eq!(
+        fs::read_dir(&temporary)
+            .expect("read temporary directory")
+            .count(),
+        0
+    );
+}
+
 #[test]
 fn sigint_during_first_replacement_finishes_enforcement_and_preserves_failures() {
     for fail in [false, true] {

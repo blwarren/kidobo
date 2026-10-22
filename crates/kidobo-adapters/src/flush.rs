@@ -54,8 +54,8 @@ where
         })
     }
 
-    fn clear_remote_cache(&self, path: &Path) -> Result<(), String> {
-        clear_remote_cache_dir(path).map_err(|error| error.to_string())
+    fn clear_remote_cache(&self, path: &Path) -> std::io::Result<()> {
+        clear_remote_cache_dir(path)
     }
 }
 
@@ -107,7 +107,11 @@ mod tests {
     }
 
     impl IpsetCommandRunner for Runner {
-        fn run(&self, _command: &str, _args: &[&str]) -> Result<CommandResult, CommandRunnerError> {
+        fn run_os(
+            &self,
+            _command: &str,
+            _args: &[&std::ffi::OsStr],
+        ) -> Result<CommandResult, CommandRunnerError> {
             Ok(self.response.borrow_mut().take().expect("response"))
         }
     }

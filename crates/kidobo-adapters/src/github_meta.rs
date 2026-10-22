@@ -98,12 +98,13 @@ pub(crate) struct PreparedGithubMetaLoad {
 #[derive(Debug, Error)]
 pub enum GithubMetaLoadError {
     /// A generation member or manifest could not be atomically written.
-    #[error("failed to write github meta cache file {path}: {reason}")]
+    #[error("failed to write github meta cache file {path}: {source}")]
     WriteCacheFile {
         /// Cache generation store path.
         path: PathBuf,
         /// Serialization or filesystem diagnostic.
-        reason: String,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
     },
 }
 
@@ -177,7 +178,7 @@ pub fn load_github_meta_safelist(
                 path: CachePaths::from_cache_dir(cache_dir)
                     .generation_store
                     .join("current.json"),
-                reason: err.to_string(),
+                source: Box::new(err),
             })?;
     }
     Ok(prepared.primary)
@@ -518,12 +519,12 @@ fn stage_cache(
     let sidecar_bytes =
         serde_json::to_vec_pretty(&sidecar).map_err(|err| GithubMetaLoadError::WriteCacheFile {
             path: paths.generation_store.join("current.json"),
-            reason: err.to_string(),
+            source: Box::new(err),
         })?;
     let metadata_bytes =
         serde_json::to_vec_pretty(metadata).map_err(|err| GithubMetaLoadError::WriteCacheFile {
             path: paths.generation_store.join("current.json"),
-            reason: err.to_string(),
+            source: Box::new(err),
         })?;
     stage_generation(
         &paths.generation_store,
@@ -545,7 +546,7 @@ fn stage_cache(
     )
     .map_err(|err| GithubMetaLoadError::WriteCacheFile {
         path: paths.generation_store.join("current.json"),
-        reason: err.to_string(),
+        source: Box::new(err),
     })
 }
 

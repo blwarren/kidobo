@@ -46,11 +46,10 @@ where
     R: IpsetCommandRunner + crate::iptables::FirewallCommandRunner,
 {
     fn ensure_artifacts(&self, plan: &EnforcementPlan) -> Result<(), AppError> {
-        ensure_ipset_exists(&self.runner, &to_ipset_spec(&plan.ipv4))
-            .map_err(|error| map_ipset_error(&error))?;
+        ensure_ipset_exists(&self.runner, &to_ipset_spec(&plan.ipv4)).map_err(map_ipset_error)?;
         if plan.enable_ipv6 {
             ensure_ipset_exists(&self.runner, &to_ipset_spec(&plan.ipv6))
-                .map_err(|error| map_ipset_error(&error))?;
+                .map_err(map_ipset_error)?;
         }
         ensure_firewall_artifacts_for_families(&self.runner, plan.enable_ipv6)
             .map_err(|error| map_firewall_error(&error))
@@ -62,7 +61,7 @@ where
         entries: &[CanonicalCidr],
     ) -> Result<(), AppError> {
         atomic_replace_ipset_values(&self.runner, &to_ipset_spec(spec), entries)
-            .map_err(|error| map_ipset_error(&error))
+            .map_err(map_ipset_error)
     }
 
     fn activate(&self, plan: &EnforcementPlan) -> Result<(), AppError> {
@@ -136,9 +135,9 @@ fn to_chain_action(action: FirewallAction) -> ChainAction {
     }
 }
 
-fn map_ipset_error(error: &crate::ipset::IpsetError) -> AppError {
+fn map_ipset_error(error: crate::ipset::IpsetError) -> AppError {
     AppError::Ipset {
-        reason: error.to_string(),
+        source: Box::new(error),
     }
 }
 
@@ -191,7 +190,16 @@ mod tests {
     }
 
     impl IpsetCommandRunner for Runner {
-        fn run(&self, command: &str, args: &[&str]) -> Result<CommandResult, CommandRunnerError> {
+        fn run_os(
+            &self,
+            command: &str,
+            args: &[&std::ffi::OsStr],
+        ) -> Result<CommandResult, CommandRunnerError> {
+            let args = args
+                .iter()
+                .map(|arg| arg.to_str().expect("text fixture argument"))
+                .collect::<Vec<_>>();
+            let args = args.as_slice();
             Ok(self.run(command, args))
         }
     }
@@ -220,7 +228,16 @@ mod tests {
     }
 
     impl IpsetCommandRunner for CleanupRunner {
-        fn run(&self, command: &str, args: &[&str]) -> Result<CommandResult, CommandRunnerError> {
+        fn run_os(
+            &self,
+            command: &str,
+            args: &[&std::ffi::OsStr],
+        ) -> Result<CommandResult, CommandRunnerError> {
+            let args = args
+                .iter()
+                .map(|arg| arg.to_str().expect("text fixture argument"))
+                .collect::<Vec<_>>();
+            let args = args.as_slice();
             self.recording.run(command, args);
             self.result.clone()
         }

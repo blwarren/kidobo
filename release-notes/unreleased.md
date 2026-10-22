@@ -1,0 +1,1 @@
+- Preserve non-UTF-8 temporary directory paths when restoring ipsets during sync.

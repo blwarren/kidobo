@@ -120,16 +120,17 @@ pub fn run_unban_command(
     let file_mode = matches!(input, BlocklistInput::File(_));
     let request = UnbanRequest { paths, input };
     let preparation = blocklist::prepare_unban(&request, &dependencies)?;
-    report_invalid_targets(&preparation.invalid_targets, io)?;
-    if preparation.empty_file {
-        output(io, format_args!("no blocklist targets loaded from file"))?;
-        return Ok(());
-    }
-    let preview = preparation
-        .preview
-        .ok_or_else(|| AppError::BlocklistTargetParse {
-            input: String::new(),
-        })?;
+    let preview = match preparation {
+        blocklist::UnbanPreparation::Ready(preview) => preview,
+        blocklist::UnbanPreparation::InvalidTargets(targets) => {
+            report_invalid_targets(&targets, io)?;
+            return Ok(());
+        }
+        blocklist::UnbanPreparation::EmptyFile => {
+            output(io, format_args!("no blocklist targets loaded from file"))?;
+            return Ok(());
+        }
+    };
     let remove_partial = confirm_partial_matches(&preview, file_mode, yes, io)?;
     let outcome = blocklist::apply_unban(
         &request,
@@ -261,9 +262,7 @@ fn confirm_partial_matches(
     write!(io.stdout, "Remove these entries as well? [y/N]: ")?;
     io.stdout
         .flush()
-        .map_err(|error| KidoboError::BlocklistPrompt {
-            reason: error.to_string(),
-        })?;
+        .map_err(|error| KidoboError::BlocklistPrompt { source: error })?;
     let response = io.input.read_response()?;
     Ok(matches!(
         response.trim().to_ascii_lowercase().as_str(),
@@ -288,4 +287,59 @@ fn format_asn_list(asns: &[u32]) -> String {
         .map(|asn| format!("AS{asn}"))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::error::Error;
+    use std::io::{self, Write};
+
+    use super::output;
+    use crate::cli::{CliIo, PromptInput};
+    use crate::error::KidoboError;
+
+    struct UnusedInput;
+
+    impl PromptInput for UnusedInput {
+        fn read_response(&mut self) -> Result<String, KidoboError> {
+            panic!("rendering must not read input");
+        }
+    }
+
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::Error::from_raw_os_error(32))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_retains_the_writers_os_error() {
+        let error = output(
+            &mut CliIo {
+                input: &mut UnusedInput,
+                stdout: &mut FailingWriter,
+                stderr: &mut Vec::new(),
+                stdout_is_terminal: false,
+                no_color: true,
+            },
+            format_args!("added blocklist entry 203.0.113.7/32"),
+        )
+        .expect_err("write failure");
+        let source = error
+            .source()
+            .expect("write cause")
+            .downcast_ref::<io::Error>()
+            .expect("typed write cause");
+        assert_eq!(source.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(source.raw_os_error(), Some(32));
+        assert_eq!(error.exit_code(), 1);
+        assert_eq!(error.to_string(), format!("CLI I/O failed: {source}"));
+    }
 }

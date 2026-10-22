@@ -1,7 +1,6 @@
 //! Local blocklist filesystem adapter.
 
 use std::fs;
-use std::ops::Deref;
 use std::path::Path;
 use std::time::UNIX_EPOCH;
 
@@ -21,17 +20,13 @@ const BLOCKLIST_TARGET_FILE_READ_LIMIT: usize = 2 * 1024 * 1024;
 const BLOCKLIST_FAST_STATE_VERSION: &str = "v1";
 const BLOCKLIST_FAST_STATE_READ_LIMIT: usize = 1024;
 
-/// Filesystem-loaded core blocklist document.
-#[derive(Debug, Clone)]
-pub struct BlocklistDocument(CoreBlocklistDocument);
-
 /// Production local blocklist repository using bounded reads and atomic writes.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct FileBlocklistRepository;
 
 impl BlocklistRepository for FileBlocklistRepository {
     fn load(&self, path: &Path) -> Result<CoreBlocklistDocument, AppError> {
-        BlocklistDocument::load(path).map(|document| document.0)
+        load_blocklist_document(path)
     }
 
     fn append_entries(
@@ -49,7 +44,7 @@ impl BlocklistRepository for FileBlocklistRepository {
             read_to_string_with_limit(path, BLOCKLIST_READ_LIMIT).map_err(|error| {
                 AppError::BlocklistRead {
                     path: path.to_path_buf(),
-                    reason: error.to_string(),
+                    source: error,
                 }
             })?
         } else {
@@ -65,7 +60,7 @@ impl BlocklistRepository for FileBlocklistRepository {
         write_string_atomic_with_limit(path, &contents, BLOCKLIST_READ_LIMIT).map_err(|error| {
             AppError::BlocklistWrite {
                 path: path.to_path_buf(),
-                reason: error.to_string(),
+                source: error,
             }
         })
     }
@@ -79,18 +74,10 @@ impl BlocklistRepository for FileBlocklistRepository {
             read_to_string_with_limit(path, BLOCKLIST_TARGET_FILE_READ_LIMIT).map_err(|error| {
                 AppError::BlocklistTargetFileRead {
                     path: path.to_path_buf(),
-                    reason: error.to_string(),
+                    source: error,
                 }
             })?;
         Ok(contents.lines().map(ToString::to_string).collect())
-    }
-}
-
-impl Deref for BlocklistDocument {
-    type Target = CoreBlocklistDocument;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
     }
 }
 
@@ -168,7 +155,7 @@ pub fn write_blocklist_lines<S: AsRef<str>>(path: &Path, lines: &[S]) -> Result<
     write_string_atomic_with_limit(path, &contents, BLOCKLIST_READ_LIMIT).map_err(|err| {
         AppError::BlocklistWrite {
             path: path.to_path_buf(),
-            reason: err.to_string(),
+            source: err,
         }
     })
 }
@@ -182,7 +169,7 @@ pub fn ensure_blocklist_parent(path: &Path) -> Result<(), AppError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|err| AppError::BlocklistWrite {
             path: parent.to_path_buf(),
-            reason: err.to_string(),
+            source: err,
         })?;
     }
 
@@ -203,7 +190,7 @@ pub fn normalize_local_blocklist(path: &Path) -> Result<(), AppError> {
     let original = read_to_string_with_limit(path, BLOCKLIST_READ_LIMIT).map_err(|err| {
         AppError::BlocklistRead {
             path: path.to_path_buf(),
-            reason: err.to_string(),
+            source: err,
         }
     })?;
 
@@ -214,7 +201,7 @@ pub fn normalize_local_blocklist(path: &Path) -> Result<(), AppError> {
         write_string_atomic_with_limit(path, &normalized, BLOCKLIST_READ_LIMIT).map_err(|err| {
             AppError::BlocklistWrite {
                 path: path.to_path_buf(),
-                reason: err.to_string(),
+                source: err,
             }
         })?;
     }
@@ -274,32 +261,28 @@ fn write_blocklist_fast_state(
     write_string_atomic(path, &state.serialize())
 }
 
-impl BlocklistDocument {
-    /// Loads and parses an existing blocklist, treating a missing file as empty.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the file cannot be read within its bound or contains an invalid
-    /// entry.
-    pub fn load(path: &Path) -> Result<Self, AppError> {
-        if !path.exists() {
-            return Ok(Self(CoreBlocklistDocument {
-                lines: Vec::new(),
-                has_content: false,
-                trailing_newline: false,
-            }));
-        }
-
-        let contents = read_to_string_with_limit(path, BLOCKLIST_READ_LIMIT).map_err(|err| {
-            AppError::BlocklistRead {
-                path: path.to_path_buf(),
-                reason: err.to_string(),
-            }
-        })?;
-        CoreBlocklistDocument::parse(&contents)
-            .map(Self)
-            .map_err(|err| map_invalid_blocklist_line(path, err))
+/// Loads and parses an existing blocklist, treating a missing file as empty.
+///
+/// # Errors
+///
+/// Returns an error when the file cannot be read within its bound or contains an invalid
+/// entry.
+pub fn load_blocklist_document(path: &Path) -> Result<CoreBlocklistDocument, AppError> {
+    if !path.exists() {
+        return Ok(CoreBlocklistDocument {
+            lines: Vec::new(),
+            has_content: false,
+            trailing_newline: false,
+        });
     }
+
+    let contents = read_to_string_with_limit(path, BLOCKLIST_READ_LIMIT).map_err(|err| {
+        AppError::BlocklistRead {
+            path: path.to_path_buf(),
+            source: err,
+        }
+    })?;
+    CoreBlocklistDocument::parse(&contents).map_err(|err| map_invalid_blocklist_line(path, err))
 }
 
 fn map_invalid_blocklist_line(path: &Path, err: InvalidBlocklistLine) -> AppError {
@@ -318,8 +301,8 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        BLOCKLIST_TARGET_FILE_READ_LIMIT, BlocklistDocument, BlocklistNormalizeResult,
-        FileBlocklistRepository, normalize_local_blocklist_with_fast_state,
+        BLOCKLIST_TARGET_FILE_READ_LIMIT, BlocklistNormalizeResult, FileBlocklistRepository,
+        load_blocklist_document, normalize_local_blocklist_with_fast_state,
     };
     use crate::limited_io::read_to_string_with_limit;
 
@@ -381,7 +364,7 @@ mod tests {
                     );
                     assert_contents(&read(&path), &expected);
                     assert_eq!(expected.len(), size);
-                    BlocklistDocument::load(&path).expect("readable");
+                    load_blocklist_document(&path).expect("readable");
                 }
             }
         }
@@ -408,7 +391,7 @@ mod tests {
             } else {
                 result.expect("within limit");
                 assert_contents(&read(&path), &format!("{line}\n"));
-                BlocklistDocument::load(&path).expect("readable");
+                load_blocklist_document(&path).expect("readable");
             }
         }
     }
@@ -435,7 +418,7 @@ mod tests {
             } else {
                 result.expect("within limit");
                 assert_contents(&read(&path), &format!("{header}\n192.0.2.1/32\n"));
-                BlocklistDocument::load(&path).expect("readable");
+                load_blocklist_document(&path).expect("readable");
             }
         }
     }
@@ -505,7 +488,7 @@ mod tests {
         let original = "# header\n192.0.2.1 trailing\n";
         fs::write(&path, original).expect("write");
 
-        let error = BlocklistDocument::load(&path).expect_err("invalid line must fail");
+        let error = load_blocklist_document(&path).expect_err("invalid line must fail");
 
         assert!(error.to_string().contains("at line 2"));
         assert_eq!(read(&path), original);
@@ -528,6 +511,65 @@ mod tests {
             BlocklistNormalizeResult::SkippedUnchanged
         );
         assert_eq!(read(&blocklist), "192.0.2.1/32\n");
+    }
+
+    #[test]
+    fn document_loader_preserves_missing_empty_and_valid_contents() {
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("blocklist.txt");
+        let missing = load_blocklist_document(&path).expect("missing document");
+        assert!(!path.exists());
+        assert_eq!(
+            missing.lines,
+            Vec::<kidobo_core::blocklist::BlocklistLine>::new()
+        );
+        assert!(!missing.has_content);
+        assert!(!missing.trailing_newline);
+
+        fs::write(&path, b"").expect("empty file");
+        assert_eq!(
+            load_blocklist_document(&path).expect("empty document"),
+            missing
+        );
+        for contents in ["# header\n203.0.113.7\n2001:db8::/64\n", "203.0.113.7"] {
+            fs::write(&path, contents).expect("valid file");
+            assert_eq!(
+                load_blocklist_document(&path).expect("valid document"),
+                kidobo_core::blocklist::BlocklistDocument::parse(contents)
+                    .expect("parsed document")
+            );
+            assert_eq!(read(&path), contents);
+        }
+    }
+
+    #[test]
+    fn document_loader_rejects_non_utf8_and_oversized_files_without_rewriting() {
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("blocklist.txt");
+        for contents in [vec![0xff], vec![b'#'; super::BLOCKLIST_READ_LIMIT + 1]] {
+            fs::write(&path, &contents).expect("invalid file");
+            let error = load_blocklist_document(&path).expect_err("invalid document");
+            assert!(
+                matches!(&error, kidobo_app::AppError::BlocklistRead { path: failed_path, source } if failed_path == &path && source.kind() == std::io::ErrorKind::InvalidData)
+            );
+            assert_eq!(
+                std::error::Error::source(&error)
+                    .expect("read cause")
+                    .downcast_ref::<std::io::Error>()
+                    .expect("I/O cause")
+                    .kind(),
+                std::io::ErrorKind::InvalidData
+            );
+            assert_eq!(
+                fs::metadata(&path).expect("metadata").len(),
+                u64::try_from(contents.len()).expect("length")
+            );
+            assert_eq!(
+                crate::limited_io::read_bytes_with_limit(&path, contents.len())
+                    .expect("original bytes"),
+                contents
+            );
+        }
     }
 
     #[test]

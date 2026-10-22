@@ -14,17 +14,19 @@ use crate::limited_io::{read_bytes_with_limit, write_bytes_atomic};
 #[derive(Debug, Error)]
 pub enum WriteJsonError {
     /// The value could not be encoded as JSON.
-    #[error("failed to serialize JSON: {reason}")]
+    #[error("failed to serialize JSON: {source}")]
     Serialize {
         /// Serializer diagnostic.
-        reason: String,
+        #[source]
+        source: serde_json::Error,
     },
 
     /// Encoded JSON could not be atomically persisted.
-    #[error("failed to write JSON file: {reason}")]
+    #[error("failed to write JSON file: {source}")]
     Write {
         /// Filesystem diagnostic.
-        reason: String,
+        #[source]
+        source: std::io::Error,
     },
 }
 
@@ -116,12 +118,9 @@ pub fn write_json_pretty_atomic<T>(path: &Path, value: &T) -> Result<(), WriteJs
 where
     T: Serialize,
 {
-    let bytes = serde_json::to_vec_pretty(value).map_err(|err| WriteJsonError::Serialize {
-        reason: err.to_string(),
-    })?;
-    write_bytes_atomic_in_cache(path, &bytes).map_err(|err| WriteJsonError::Write {
-        reason: err.to_string(),
-    })
+    let bytes = serde_json::to_vec_pretty(value)
+        .map_err(|err| WriteJsonError::Serialize { source: err })?;
+    write_bytes_atomic_in_cache(path, &bytes).map_err(|err| WriteJsonError::Write { source: err })
 }
 
 fn ensure_parent_dir(path: &Path) -> Result<(), std::io::Error> {

@@ -44,17 +44,19 @@ pub enum KidoboError {
     DoctorFailed,
 
     /// Interactive blocklist confirmation could not be read or rendered.
-    #[error("blocklist prompt failed: {reason}")]
+    #[error("blocklist prompt failed: {source}")]
     BlocklistPrompt {
         /// Prompt diagnostic.
-        reason: String,
+        #[source]
+        source: std::io::Error,
     },
 
     /// Standard input or output failed during CLI rendering.
-    #[error("CLI I/O failed: {reason}")]
+    #[error("CLI I/O failed: {source}")]
     CliIo {
         /// I/O diagnostic.
-        reason: String,
+        #[source]
+        source: std::io::Error,
     },
 }
 
@@ -74,9 +76,7 @@ impl KidoboError {
 
 impl From<std::io::Error> for KidoboError {
     fn from(error: std::io::Error) -> Self {
-        Self::CliIo {
-            reason: error.to_string(),
-        }
+        Self::CliIo { source: error }
     }
 }
 
@@ -99,7 +99,7 @@ mod tests {
         let error = std::io::Error::other("write failed");
 
         match KidoboError::from(error) {
-            KidoboError::CliIo { reason } => assert_eq!(reason, "write failed"),
+            KidoboError::CliIo { source } => assert_eq!(source.to_string(), "write failed"),
             other => panic!("expected CLI I/O error, got {other:?}"),
         }
     }

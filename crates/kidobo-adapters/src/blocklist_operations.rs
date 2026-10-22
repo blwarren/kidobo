@@ -18,7 +18,7 @@ pub struct SystemAsnOperations;
 
 impl AsnOperations for SystemAsnOperations {
     fn normalize_tokens(&self, tokens: &[String]) -> Result<Vec<u32>, AppError> {
-        normalize_asn_tokens(tokens).map_err(|error| map_asn_error(&error))
+        normalize_asn_tokens(tokens).map_err(map_asn_error)
     }
 
     fn load_prefixes(
@@ -29,7 +29,7 @@ impl AsnOperations for SystemAsnOperations {
     ) -> Result<AsnPrefixBatch, AppError> {
         let resolver = Bgpq4AsnPrefixResolver::with_default_timeout();
         let loaded = load_asn_prefixes_with_cache(asn, cache_dir, stale_after, &resolver)
-            .map_err(|error| map_asn_error(&error))?;
+            .map_err(map_asn_error)?;
         Ok(AsnPrefixBatch {
             prefixes: loaded.prefixes,
             stale: loaded.stale,
@@ -50,12 +50,12 @@ impl AsnOperations for SystemAsnOperations {
     }
 
     fn delete_cache(&self, asn: u32, cache_dir: &Path) -> Result<bool, AppError> {
-        delete_asn_cache_file(asn, cache_dir).map_err(|error| map_asn_error(&error))
+        delete_asn_cache_file(asn, cache_dir).map_err(map_asn_error)
     }
 }
 
-fn map_asn_error(error: &crate::asn::AsnError) -> AppError {
+fn map_asn_error(error: crate::asn::AsnError) -> AppError {
     AppError::Asn {
-        reason: error.to_string(),
+        source: Box::new(error),
     }
 }

@@ -1,6 +1,7 @@
 //! Atomic ipset adapter.
 
 use std::env;
+use std::ffi::OsStr;
 use std::fmt::Display;
 use std::fs::{self, OpenOptions};
 use std::io::{BufWriter, Write};
@@ -86,21 +87,23 @@ pub enum IpsetError {
     },
 
     /// The complete restore program could not be written and synced.
-    #[error("failed to write ipset restore script {path}: {reason}")]
+    #[error("failed to write ipset restore script {path}: {source}")]
     WriteRestoreScript {
         /// Temporary restore script path.
         path: PathBuf,
         /// Filesystem diagnostic.
-        reason: String,
+        #[source]
+        source: std::io::Error,
     },
 
     /// A private restore program file could not be created exclusively.
-    #[error("failed to create ipset restore script {path}: {reason}")]
+    #[error("failed to create ipset restore script {path}: {source}")]
     CreateRestoreScript {
         /// Temporary restore script path.
         path: PathBuf,
         /// Filesystem diagnostic.
-        reason: String,
+        #[source]
+        source: std::io::Error,
     },
 
     /// Existing-set inspection output was incomplete or inconsistent.
@@ -137,12 +140,21 @@ pub trait IpsetCommandRunner {
     /// # Errors
     ///
     /// Returns [`CommandRunnerError`] when command execution fails.
-    fn run(&self, command: &str, args: &[&str]) -> Result<CommandResult, CommandRunnerError>;
+    fn run(&self, command: &str, args: &[&str]) -> Result<CommandResult, CommandRunnerError> {
+        self.run_os(command, &args.iter().map(OsStr::new).collect::<Vec<_>>())
+    }
+
+    /// Runs one bounded ipset command without requiring Unicode arguments.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CommandRunnerError`] when command execution fails.
+    fn run_os(&self, command: &str, args: &[&OsStr]) -> Result<CommandResult, CommandRunnerError>;
 }
 
 impl<E: CommandExecutor> IpsetCommandRunner for SudoCommandRunner<E> {
-    fn run(&self, command: &str, args: &[&str]) -> Result<CommandResult, CommandRunnerError> {
-        SudoCommandRunner::run(self, command, args)
+    fn run_os(&self, command: &str, args: &[&OsStr]) -> Result<CommandResult, CommandRunnerError> {
+        SudoCommandRunner::run_os(self, command, args)
     }
 }
 
@@ -364,21 +376,31 @@ fn execute_ipset_restore_with_entries<T: Ord + Display>(
     write_restore_script(&mut writer, spec, temp_set_name, entries).map_err(|err| {
         IpsetError::WriteRestoreScript {
             path: script.path.clone(),
-            reason: err.to_string(),
+            source: err,
         }
     })?;
     writer
         .flush()
         .map_err(|err| IpsetError::WriteRestoreScript {
             path: script.path.clone(),
-            reason: err.to_string(),
+            source: err,
         })?;
     drop(writer);
 
-    let path_string = script.path.display().to_string();
-    let restore_result = run_checked(runner, "ipset", &["restore", "-file", &path_string]);
-
-    restore_result.map(|_| ())
+    let args = [
+        OsStr::new("restore"),
+        OsStr::new("-file"),
+        script.path.as_os_str(),
+    ];
+    let result = runner.run_os("ipset", &args)?;
+    ensure_command_succeeded(result, "ipset", &args, |command, status, stderr| {
+        IpsetError::CommandFailed {
+            command,
+            status,
+            stderr,
+        }
+    })
+    .map(|_| ())
 }
 
 struct TempRestoreScript {
@@ -486,10 +508,7 @@ fn create_restore_script_file() -> Result<(std::fs::File, PathBuf), IpsetError> 
                 if should_retry_restore_script_create(&err) {
                     continue;
                 }
-                return Err(IpsetError::CreateRestoreScript {
-                    path,
-                    reason: err.to_string(),
-                });
+                return Err(IpsetError::CreateRestoreScript { path, source: err });
             }
         }
     }
@@ -497,7 +516,10 @@ fn create_restore_script_file() -> Result<(std::fs::File, PathBuf), IpsetError> 
     let path = restore_script_path();
     Err(IpsetError::CreateRestoreScript {
         path,
-        reason: "failed to create a unique temporary restore script path".to_string(),
+        source: std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "failed to create a unique temporary restore script path",
+        ),
     })
 }
 
@@ -577,13 +599,22 @@ mod tests {
     }
 
     impl IpsetCommandRunner for MockRunner {
-        fn run(&self, command: &str, args: &[&str]) -> Result<CommandResult, CommandRunnerError> {
+        fn run_os(
+            &self,
+            command: &str,
+            args: &[&std::ffi::OsStr],
+        ) -> Result<CommandResult, CommandRunnerError> {
             self.invocations.borrow_mut().push((
                 command.to_string(),
-                args.iter().map(|value| (*value).to_string()).collect(),
+                args.iter()
+                    .map(|value| value.to_str().expect("text fixture argument").to_string())
+                    .collect(),
             ));
 
-            if command == "ipset" && args.first() == Some(&"restore") && args.len() == 3 {
+            if command == "ipset"
+                && args.first() == Some(&std::ffi::OsStr::new("restore"))
+                && args.len() == 3
+            {
                 let path = PathBuf::from(args[2]);
                 let script = read_to_string_with_limit(&path, RESTORE_SCRIPT_READ_LIMIT)
                     .expect("restore script readable");

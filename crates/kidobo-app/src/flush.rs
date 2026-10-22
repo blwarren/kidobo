@@ -75,7 +75,7 @@ pub trait FlushBackend {
     /// # Errors
     ///
     /// Returns a diagnostic when the cache directory cannot be cleared.
-    fn clear_remote_cache(&self, path: &Path) -> Result<(), String>;
+    fn clear_remote_cache(&self, path: &Path) -> std::io::Result<()>;
 }
 
 /// Ports required by the flush workflow.
@@ -116,9 +116,9 @@ pub fn execute(
         dependencies
             .backend
             .clear_remote_cache(&paths.remote_cache_dir)
-            .map_err(|reason| AppError::FlushCacheIo {
+            .map_err(|source| AppError::FlushCacheIo {
                 path: paths.remote_cache_dir,
-                reason,
+                source,
             })?;
         return Ok(FlushOutcome {
             completed: vec!["remote cache".to_string()],
@@ -250,8 +250,8 @@ mod tests {
             self.run(&format!("ipset:{set_name}"))
         }
 
-        fn clear_remote_cache(&self, _path: &Path) -> Result<(), String> {
-            self.run("cache")
+        fn clear_remote_cache(&self, _path: &Path) -> std::io::Result<()> {
+            self.run("cache").map_err(std::io::Error::other)
         }
     }
 

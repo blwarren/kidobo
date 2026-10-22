@@ -38,8 +38,12 @@ impl<E: CommandExecutor> DoctorProbe for SystemDoctorProbe<SudoCommandRunner<E>>
         path.exists()
     }
 
-    fn cache_readiness(&self, path: &Path) -> Result<CacheReadiness, String> {
-        ensure_cache_path_ready(path).map_err(|error| error.to_string())
+    fn cache_readiness(
+        &self,
+        path: &Path,
+    ) -> Result<CacheReadiness, Box<dyn std::error::Error + Send + Sync>> {
+        ensure_cache_path_ready(path)
+            .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> { Box::new(error) })
     }
 
     fn run_sudo_probe(&self, command: &str, args: &[&str]) -> Result<(), ProbeFailure> {

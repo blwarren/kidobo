@@ -2,6 +2,8 @@
 
 use std::sync::Arc;
 
+use thiserror::Error;
+
 use crate::network::{
     CanonicalCidr, IntervalU32, IntervalU128, cidr_overlaps as network_cidr_overlaps,
     ipv4_to_interval, ipv6_to_interval, parse_ip_cidr_strict,
@@ -41,11 +43,13 @@ pub struct LookupReport {
 }
 
 /// Reason a strict lookup target could not be parsed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum LookupTargetParseError {
     /// The target is empty after trimming.
+    #[error("lookup target is empty")]
     Empty,
     /// The target is not exactly one IP address or CIDR.
+    #[error("lookup target is not exactly one valid IP address or CIDR")]
     Invalid,
 }
 

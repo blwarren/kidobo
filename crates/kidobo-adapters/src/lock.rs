@@ -13,30 +13,33 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum LockError {
     /// The lock file's parent directory could not be created.
-    #[error("failed to create lock parent directory {path}: {reason}")]
+    #[error("failed to create lock parent directory {path}: {source}")]
     CreateParentDir {
         /// Parent directory path.
         path: PathBuf,
         /// Filesystem diagnostic.
-        reason: String,
+        #[source]
+        source: std::io::Error,
     },
 
     /// The lock file could not be opened securely.
-    #[error("failed to open lock file {path}: {reason}")]
+    #[error("failed to open lock file {path}: {source}")]
     OpenFile {
         /// Lock file path.
         path: PathBuf,
         /// Filesystem diagnostic, including symlink rejection on Unix.
-        reason: String,
+        #[source]
+        source: std::io::Error,
     },
 
     /// The opened lock file could not be hardened to owner-only permissions.
-    #[error("failed to set lock file permissions on {path}: {reason}")]
+    #[error("failed to set lock file permissions on {path}: {source}")]
     SetPermissions {
         /// Lock file path.
         path: PathBuf,
         /// Filesystem diagnostic.
-        reason: String,
+        #[source]
+        source: std::io::Error,
     },
 
     /// Another process currently owns the nonblocking lock.
@@ -44,15 +47,19 @@ pub enum LockError {
     AlreadyHeld {
         /// Contended lock file path.
         path: PathBuf,
+        /// Original nonblocking lock failure.
+        #[source]
+        source: io::Error,
     },
 
     /// The operating-system lock operation failed unexpectedly.
-    #[error("failed to acquire lock {path}: {reason}")]
+    #[error("failed to acquire lock {path}: {source}")]
     Acquire {
         /// Lock file path.
         path: PathBuf,
         /// Locking diagnostic.
-        reason: String,
+        #[source]
+        source: std::io::Error,
     },
 }
 
@@ -76,7 +83,7 @@ impl LockManager for FileLockManager {
                 guard
             })
             .map_err(|error| AppError::Lock {
-                reason: error.to_string(),
+                source: Box::new(error),
             })
     }
 }
@@ -97,7 +104,7 @@ pub fn acquire_non_blocking(path: &Path) -> Result<FileLock, LockError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|err| LockError::CreateParentDir {
             path: parent.to_path_buf(),
-            reason: err.to_string(),
+            source: err,
         })?;
     }
 
@@ -115,7 +122,7 @@ pub fn acquire_non_blocking(path: &Path) -> Result<FileLock, LockError> {
 
     let file = options.open(path).map_err(|err| LockError::OpenFile {
         path: path.to_path_buf(),
-        reason: err.to_string(),
+        source: err,
     })?;
 
     enforce_mode_0600(&file, path)?;
@@ -124,10 +131,11 @@ pub fn acquire_non_blocking(path: &Path) -> Result<FileLock, LockError> {
         Ok(()) => Ok(FileLock { file }),
         Err(err) if is_would_block(&err) => Err(LockError::AlreadyHeld {
             path: path.to_path_buf(),
+            source: err,
         }),
         Err(err) => Err(LockError::Acquire {
             path: path.to_path_buf(),
-            reason: err.to_string(),
+            source: err,
         }),
     }
 }
@@ -144,7 +152,7 @@ fn enforce_mode_0600(file: &File, path: &Path) -> Result<(), LockError> {
         file.set_permissions(fs::Permissions::from_mode(0o600))
             .map_err(|err| LockError::SetPermissions {
                 path: path.to_path_buf(),
-                reason: err.to_string(),
+                source: err,
             })?;
     }
 
@@ -190,7 +198,21 @@ mod tests {
         let _lock = acquire_non_blocking(&path).expect("first lock");
         let err = acquire_non_blocking(&path).expect_err("second lock must fail");
 
-        assert!(matches!(err, LockError::AlreadyHeld { .. }));
+        assert!(
+            matches!(&err, LockError::AlreadyHeld { path: failed_path, source } if failed_path == &path && source.kind() == io::ErrorKind::WouldBlock)
+        );
+        assert_eq!(
+            std::error::Error::source(&err)
+                .expect("contention cause")
+                .downcast_ref::<io::Error>()
+                .expect("I/O cause")
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(
+            err.to_string(),
+            format!("lock already held: {}", path.display())
+        );
     }
 
     #[test]

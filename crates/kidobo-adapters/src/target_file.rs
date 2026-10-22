@@ -19,7 +19,7 @@ impl TargetFileReader for LookupTargetFileReader {
             read_to_string_with_limit(path, LOOKUP_TARGET_READ_LIMIT).map_err(|error| {
                 AppError::LookupTargetFileRead {
                     path: path.to_path_buf(),
-                    reason: error.to_string(),
+                    source: error,
                 }
             })?;
         Ok(contents.lines().map(ToString::to_string).collect())
@@ -69,8 +69,12 @@ mod tests {
             .read_lines(&file)
             .expect_err("must fail");
         match error {
-            AppError::LookupTargetFileRead { reason, .. } => {
-                assert!(reason.contains("file exceeds 2097152 byte limit"));
+            AppError::LookupTargetFileRead { source, .. } => {
+                assert!(
+                    source
+                        .to_string()
+                        .contains("file exceeds 2097152 byte limit")
+                );
             }
             _ => panic!("unexpected error variant"),
         }

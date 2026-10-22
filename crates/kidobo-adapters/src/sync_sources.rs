@@ -16,7 +16,7 @@ use kidobo_app::source::{
 
 use crate::asn::{Bgpq4AsnPrefixResolver, load_asn_prefixes_with_cache};
 use crate::blocklist_file::{
-    BlocklistDocument, BlocklistNormalizeResult, normalize_local_blocklist_with_fast_state,
+    BlocklistNormalizeResult, load_blocklist_document, normalize_local_blocklist_with_fast_state,
 };
 use crate::cache_generation::StagedGeneration;
 use crate::github_meta::prepare_github_meta_safelist;
@@ -41,6 +41,14 @@ impl<C: HttpClient + ?Sized> HttpClient for CancellableHttpClient<'_, C> {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("{url}: {source}")]
+struct RemoteFeedError {
+    url: String,
+    #[source]
+    source: crate::http_cache::HttpCacheError,
+}
+
 /// Maximum number of concurrent remote-feed workers.
 pub const MAX_REMOTE_FETCH_WORKERS: usize = 5;
 const BLOCKLIST_FAST_STATE_FILE: &str = "blocklist-normalize.fast-state";
@@ -48,12 +56,9 @@ const BLOCKLIST_FAST_STATE_FILE: &str = "blocklist-normalize.fast-state";
 struct StagedCachePromotion(StagedGeneration);
 
 impl PendingCachePromotion for StagedCachePromotion {
-    fn promote(self: Box<Self>) -> Result<(), String> {
+    fn promote(self: Box<Self>) -> std::io::Result<()> {
         let Self(generation) = *self;
-        generation
-            .promote()
-            .map(|_| ())
-            .map_err(|error| error.to_string())
+        generation.promote().map(|_| ())
     }
 }
 
@@ -86,7 +91,7 @@ impl SyncSourceProvider for LocalBlocklistSyncProvider {
             })
             .into_iter()
             .collect();
-        let document = BlocklistDocument::load(&context.paths.blocklist_file)?;
+        let document = load_blocklist_document(&context.paths.blocklist_file)?;
         let networks = document
             .lines
             .iter()
@@ -199,7 +204,7 @@ impl SyncSourceProvider for GithubMetadataSyncProvider {
         )
         .map_err(|error| AppError::CacheStaging {
             provider: "github-metadata",
-            reason: error.to_string(),
+            source: Box::new(error),
         })?;
         let fallback = loaded.fallback.map(|fallback| SyncSourceBatch {
             networks: fallback.networks,
@@ -215,7 +220,7 @@ impl SyncSourceProvider for GithubMetadataSyncProvider {
         Ok(SyncSourceLoad {
             fallback_failure: loaded.staging_failure.map(|error| AppError::CacheStaging {
                 provider: "github-metadata",
-                reason: error.to_string(),
+                source: Box::new(error),
             }),
             primary: SyncSourceBatch {
                 networks: loaded.primary.networks,
@@ -251,7 +256,7 @@ impl SyncSourceProvider for AsnBansSyncProvider {
             context.cancellation.check()?;
             let loaded = load_asn_prefixes_with_cache(*asn, &cache_dir, stale_after, &resolver)
                 .map_err(|error| AppError::Asn {
-                    reason: error.to_string(),
+                    source: Box::new(error),
                 })?;
             if loaded.stale {
                 notices.push(Notice::warning(format!(
@@ -333,11 +338,17 @@ where
                                         ..
                                     } => AppError::Source {
                                         provider: "remote-feeds",
-                                        reason: format!("{url}: {error}"),
+                                        source: Box::new(RemoteFeedError {
+                                            url: url.to_string(),
+                                            source: error,
+                                        }),
                                     },
                                     error => AppError::CacheStaging {
                                         provider: "remote-feeds",
-                                        reason: format!("{url}: {error}"),
+                                        source: Box::new(RemoteFeedError {
+                                            url: url.to_string(),
+                                            source: error,
+                                        }),
                                     },
                                 });
                         results
@@ -708,10 +719,26 @@ mod tests {
             100,
             &kidobo_app::ports::NoCancellation,
         );
+        let error = result.err().expect("staging failure must abort");
         assert!(matches!(
-            result,
-            Err(kidobo_app::AppError::CacheStaging { .. })
+            &error,
+            kidobo_app::AppError::CacheStaging {
+                provider: "remote-feeds",
+                ..
+            }
         ));
+        let mut cause: &(dyn std::error::Error + 'static) = &error;
+        let source = loop {
+            if let Some(source) = cause.downcast_ref::<std::io::Error>() {
+                break source;
+            }
+            cause = cause
+                .source()
+                .expect("cache staging must retain its I/O cause");
+        };
+        assert_eq!(source.kind(), std::io::ErrorKind::NotADirectory);
+        assert!(source.raw_os_error().is_some());
+        assert!(error.to_string().contains("https://example.test/feed:"));
     }
 
     #[test]

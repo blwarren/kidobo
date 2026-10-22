@@ -74,7 +74,7 @@ pub fn update_asn_bans(
     write_string_atomic_with_limit(config_path, &rendered, CONFIG_READ_LIMIT).map_err(|err| {
         AppError::ConfigWrite {
             path: config_path.to_path_buf(),
-            reason: err.to_string(),
+            source: err,
         }
     })?;
     Ok(AsnBanUpdateResult { added, removed })
@@ -84,7 +84,7 @@ fn load_config_document(path: &Path) -> Result<DocumentMut, AppError> {
     let contents =
         read_to_string_with_limit(path, CONFIG_READ_LIMIT).map_err(|err| AppError::ConfigRead {
             path: path.to_path_buf(),
-            reason: err.to_string(),
+            source: err,
         })?;
     contents
         .parse::<DocumentMut>()
@@ -251,7 +251,18 @@ mod tests {
                 std::fs::write(&path, &original).expect("fixture");
                 let result = update_asn_bans(&path, &add, &remove);
                 if size > 65536 {
-                    assert!(matches!(result, Err(AppError::ConfigWrite { .. })));
+                    let error = result.expect_err("oversized config must not be persisted");
+                    assert!(
+                        matches!(&error, AppError::ConfigWrite { path: failed_path, source } if failed_path == &path && source.kind() == std::io::ErrorKind::InvalidData)
+                    );
+                    assert_eq!(
+                        std::error::Error::source(&error)
+                            .expect("I/O cause")
+                            .downcast_ref::<std::io::Error>()
+                            .expect("typed I/O cause")
+                            .kind(),
+                        std::io::ErrorKind::InvalidData
+                    );
                     assert_eq!(
                         read_to_string_with_limit(&path, 65536).expect("read"),
                         original

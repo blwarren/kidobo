@@ -96,7 +96,10 @@ pub trait DoctorProbe {
     /// # Errors
     ///
     /// Returns a diagnostic when the relevant filesystem metadata cannot be inspected.
-    fn cache_readiness(&self, path: &Path) -> Result<CacheReadiness, String>;
+    fn cache_readiness(
+        &self,
+        path: &Path,
+    ) -> Result<CacheReadiness, Box<dyn std::error::Error + Send + Sync>>;
 
     /// Runs one bounded, read-only privileged probe.
     ///
@@ -458,7 +461,10 @@ mod tests {
             true
         }
 
-        fn cache_readiness(&self, _path: &Path) -> Result<CacheReadiness, String> {
+        fn cache_readiness(
+            &self,
+            _path: &Path,
+        ) -> Result<CacheReadiness, Box<dyn std::error::Error + Send + Sync>> {
             Ok(CacheReadiness::ExistingDirectory)
         }
 
