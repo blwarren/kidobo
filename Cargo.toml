@@ -4,6 +4,7 @@ members = [
     "crates/kidobo-adapters",
     "crates/kidobo-app",
     "crates/kidobo-core",
+    "tools/distro-e2e",
 ]
 
 [workspace.package]

@@ -24,13 +24,17 @@ fi
 
 release_tag="v${requested_version#v}"
 release_version="${release_tag#v}"
-required_commands=(gh cargo cat cmp date docker git grep head install just mkdir mktemp musl-gcc readelf rm rustup sed sha256sum sort tar uname)
+required_commands=(gh cargo cat cmp date docker git grep head incus install just mkdir mktemp musl-gcc readelf rm rustup sed sha256sum sort tar uname)
 for required_command in "${required_commands[@]}"; do
     if ! command -v "${required_command}" >/dev/null 2>&1; then
         echo "missing required command: ${required_command}" >&2
         exit 1
     fi
 done
+if ! command -v genisoimage >/dev/null 2>&1 && ! command -v mkisofs >/dev/null 2>&1; then
+    echo "Incus agent CD-ROM requires host genisoimage or mkisofs" >&2
+    exit 1
+fi
 if [[ "$(uname -s)" != "Linux" || "$(uname -m)" != "x86_64" ]]; then
     echo "publish-release requires a Linux x86_64 host" >&2
     exit 1
@@ -260,17 +264,21 @@ if ! git diff --quiet || [[ -n "$(git ls-files --others --exclude-standard)" ]];
 fi
 
 echo "[release] packaging locally built artifacts"
-package_root="${temporary_root}/package/${archive_root}"
-mkdir -p "${package_root}" "${artifact_root}"
+mkdir -p "${artifact_root}"
 artifacts_created=true
-install -m 0755 "${candidate_binary}" "${package_root}/kidobo"
-install -m 0644 README.md LICENSE "${package_root}/"
-tar -C "${temporary_root}/package" -czf "${archive_path}" "${archive_root}"
-(
-    cd "${artifact_root}"
-    sha256sum "${archive_name}" > SHA256SUMS
-)
+./scripts/package-release.sh "${candidate_binary}" "${release_tag}" "${artifact_root}"
 install -m 0644 "${release_notes_path}" "${release_notes_copy}"
+
+# Keep the exact tested archive and checksum manifest through publication.
+archive_digest="$(sha256sum "${archive_path}")"
+checksums_digest="$(sha256sum "${checksums_path}")"
+echo "[release] running complete distro lifecycle matrix"
+KIDOBO_E2E_RESULTS_DIR="${repo_root}/target/e2e" just e2e-artifact "${archive_path}" "${release_tag}"
+if [[ "$(sha256sum "${archive_path}")" != "${archive_digest}" \
+    || "$(sha256sum "${checksums_path}")" != "${checksums_digest}" ]]; then
+    echo "release artifacts changed during distro validation" >&2
+    exit 1
+fi
 
 echo
 echo "Release ${release_tag} is ready to publish:"

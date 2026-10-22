@@ -197,11 +197,12 @@ just release-notes-check
 
 `just check` is the fast development loop. Run `just ci` explicitly before every
 push; GitHub does not run project CI for pushes or tags. The complete local gate
-checks formatting, lints, dependency policy, audits, and tests. Coverage,
-strict rustdoc, the isolated release-binary exercise, and static Debian/Alpine
-compatibility run only during publication. The exercises use a temporary
+checks formatting, lints, dependency policy, audits, and tests. Publication additionally
+requires coverage, strict rustdoc, the isolated release-binary exercise, static Debian/Alpine
+compatibility, and the complete [Incus distro lifecycle matrix](docs/e2e.md). The isolated exercises use a temporary
 `KIDOBO_ROOT`, a loopback HTTP feed, and fake privileged commands; they never
-touch the development host's firewall or systemd. Dependabot update
+touch the development host's firewall or systemd. The Incus matrix runs real privileged
+operations only inside disposable VMs. Dependabot update
 PRs are the only GitHub-hosted automation retained. Run
 `just release-notes-check` after every repository change.
 

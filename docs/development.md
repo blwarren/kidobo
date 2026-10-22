@@ -28,7 +28,8 @@ Select checks according to the change:
 `just check` formats, tests, and lints. `just ci` checks formatting, lints, dependency policy,
 advisories, and tests; it satisfies the Rust gate without requiring a separate `just check` run.
 Regardless of the editing checks above, `just ci` must pass locally before a push or merge.
-Coverage, strict rustdoc, the isolated release-binary exercise, and static compatibility checks
+Coverage, strict rustdoc, the isolated release-binary exercise, static compatibility checks,
+and the [Incus distro lifecycle matrix](e2e.md)
 are publication gates; they are not part of `just ci`.
 
 CI/CD remains local. Dependabot version updates are the sole GitHub-hosted automation exception;
@@ -129,5 +130,8 @@ Do not bump versions or create tags unless explicitly requested. When requested,
 The publisher prepares a candidate in a temporary worktree, runs local CI and the release-note check,
 then runs the publication-only gates listed above. The binary exercises use a temporary runtime root,
 loopback feed, fake privileged commands, and Debian/Alpine containers. The publisher packages the
-tested static Linux x86_64 binary and uses GitHub CLI to upload, verify, and publish it. See
-[commands and recovery](../scripts/README.md) for publication prerequisites and recovery steps.
+tested static Linux x86_64 binary, runs the complete Incus VM matrix against that archive,
+and uses GitHub CLI to upload, verify, and publish it. The VM suite operates real guest
+firewalls and systemd only inside disposable VMs. Read [setup and diagnosis](e2e.md) for VM
+requirements and retained run evidence, and [commands and recovery](../scripts/README.md)
+for publication prerequisites and recovery steps.

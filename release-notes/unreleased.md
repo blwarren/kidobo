@@ -12,3 +12,4 @@
 - Accept every ASCII letter case of the AS prefix in ASN ban and unban arguments.
 - Probe only ipset names in doctor and allow initialization to continue when reset-failed reports the sync service is not loaded.
 - Package the validated release candidate from the configured Cargo target directory.
+- Allow an explicit version to be installed from a custom release directory with `KIDOBO_RELEASE_BASE_URL`, retaining checksum and binary verification.

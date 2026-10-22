@@ -1,0 +1,55 @@
+project = "kidobo-e2e"
+profile = "kidobo-e2e"
+network = "kidoboe2e0"
+pool = "kidobo-e2e"
+cpus = 2
+memory = "4GiB"
+disk = "30GiB"
+
+[[distros]]
+id = "debian-12"
+image = "debian/bookworm"
+family = "apt"
+packages = ["bash", "ca-certificates", "curl", "tar", "coreutils", "grep", "kmod", "sudo", "iproute2", "python3", "ipset", "iptables", "bgpq4"]
+
+[[distros]]
+id = "debian-13"
+image = "debian/trixie"
+family = "apt"
+packages = ["bash", "ca-certificates", "curl", "tar", "coreutils", "grep", "kmod", "sudo", "iproute2", "python3", "ipset", "iptables", "bgpq4"]
+
+[[distros]]
+id = "ubuntu-2404"
+image = "ubuntu/noble"
+family = "apt"
+packages = ["bash", "ca-certificates", "curl", "tar", "coreutils", "grep", "kmod", "sudo", "iproute2", "python3", "ipset", "iptables", "bgpq4"]
+
+[[distros]]
+id = "ubuntu-2604"
+image = "ubuntu/resolute"
+family = "apt"
+packages = ["bash", "ca-certificates", "curl", "tar", "coreutils", "grep", "kmod", "sudo", "iproute2", "python3", "ipset", "iptables", "bgpq4"]
+
+[[distros]]
+id = "fedora-44"
+image = "fedora/44"
+family = "dnf"
+packages = ["bash", "ca-certificates", "curl", "tar", "coreutils", "grep", "kmod", "sudo", "iproute", "python3", "ipset", "iptables", "bgpq4", "kernel-modules-extra"]
+
+[[distros]]
+id = "almalinux-9"
+image = "almalinux/9"
+family = "dnf-epel"
+packages = ["bash", "ca-certificates", "curl", "tar", "coreutils", "grep", "kmod", "sudo", "iproute", "python3", "ipset", "iptables", "bgpq4", "epel-release", "dnf-plugins-core", "kernel-modules-extra"]
+
+[[distros]]
+id = "almalinux-10"
+image = "almalinux/10"
+family = "dnf-epel"
+packages = ["bash", "ca-certificates", "curl", "tar", "coreutils", "grep", "kmod", "sudo", "iproute", "python3", "ipset", "iptables", "bgpq4", "epel-release", "dnf-plugins-core", "kernel-modules-extra"]
+
+[[distros]]
+id = "opensuse-leap-16"
+image = "opensuse/16.0"
+family = "zypper"
+packages = ["bash", "ca-certificates", "curl", "tar", "coreutils", "grep", "kmod", "sudo", "iproute2", "python3", "ipset", "iptables", "bgpq4"]

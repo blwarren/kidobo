@@ -2,6 +2,7 @@
 set -euo pipefail
 
 REPO_SLUG="${KIDOBO_REPO_SLUG:-blwarren/kidobo}"
+RELEASE_BASE_URL="${KIDOBO_RELEASE_BASE_URL-}"
 INSTALL_DIR="${KIDOBO_INSTALL_DIR:-/usr/local/bin}"
 BINARY_NAME="kidobo"
 KIDOBO_ROOT_WAS_SET="${KIDOBO_ROOT+x}"
@@ -26,6 +27,7 @@ Options:
 
 Environment:
   KIDOBO_REPO_SLUG   Override GitHub repo slug (default: blwarren/kidobo)
+  KIDOBO_RELEASE_BASE_URL Override release asset base URL; requires --version
   KIDOBO_INSTALL_DIR Override install path (default: /usr/local/bin)
   KIDOBO_ROOT        Override runtime artifact root (matches `kidobo init`)
 EOF
@@ -473,6 +475,10 @@ require_cmd mktemp
 require_cmd mv
 
 if [[ -z "${VERSION}" ]]; then
+    if [[ -n "${RELEASE_BASE_URL}" ]]; then
+        echo "KIDOBO_RELEASE_BASE_URL requires --version" >&2
+        exit 1
+    fi
     VERSION="$(resolve_latest_tag)"
 fi
 
@@ -482,12 +488,16 @@ if [[ ! "${VERSION}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z][0-9A-Za-z.-]*)?
 fi
 
 ARCHIVE="kidobo-${VERSION}-linux-x86_64.tar.gz"
-BASE_URL="https://github.com/${REPO_SLUG}/releases/download/${VERSION}"
+if [[ -n "${RELEASE_BASE_URL}" ]]; then
+    BASE_URL="${RELEASE_BASE_URL%/}"
+else
+    BASE_URL="https://github.com/${REPO_SLUG}/releases/download/${VERSION}"
+fi
 
 workdir="$(mktemp -d)"
 trap cleanup_install_temporary_files EXIT
 
-echo "installing ${BINARY_NAME} ${VERSION} from ${REPO_SLUG}"
+echo "installing ${BINARY_NAME} ${VERSION} from ${BASE_URL}"
 curl -fsSL -o "${workdir}/${ARCHIVE}" "${BASE_URL}/${ARCHIVE}"
 curl -fsSL -o "${workdir}/SHA256SUMS" "${BASE_URL}/SHA256SUMS"
 

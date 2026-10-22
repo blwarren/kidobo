@@ -1,0 +1,24 @@
+[package]
+name = "kidobo-e2e"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Disposable Incus VM lifecycle verification for Kidobo"
+repository = "https://github.com/blwarren/kidobo"
+readme = "../../docs/e2e.md"
+keywords = ["testing", "incus"]
+categories = ["development-tools::testing"]
+
+[lints]
+workspace = true
+
+[dependencies]
+clap.workspace = true
+ctrlc.workspace = true
+nix.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+toml_edit.workspace = true

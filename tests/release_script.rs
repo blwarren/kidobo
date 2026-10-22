@@ -154,6 +154,12 @@ impl ReleaseFixture {
         fs::write(repo.join("CHANGELOG.md"), "# Changelog\n").expect("write changelog");
         fs::write(repo.join(".gitignore"), "/target\n").expect("write gitignore");
         fs::copy(publisher_path(), repo.join("publish-release.sh")).expect("copy publisher");
+        fs::create_dir_all(repo.join("scripts")).expect("mkdir scripts");
+        fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/package-release.sh"),
+            repo.join("scripts/package-release.sh"),
+        )
+        .expect("copy packager");
 
         assert_success(&run_git_at(&repo, &["add", "."]), "stage fixture");
         assert_success(
@@ -195,6 +201,11 @@ printf 'just %s\n' "$*" >> "${KIDOBO_TEST_EVENT_LOG}"
 if [[ -n "${KIDOBO_TEST_READY_MARKER:-}" && "$*" == "release-compat" ]]; then
   : > "${KIDOBO_TEST_READY_MARKER}"
 fi
+if [[ "$1" == "e2e-artifact" ]]; then
+  [[ "${KIDOBO_E2E_RESULTS_DIR}" == "${KIDOBO_TEST_REPO_ROOT}/target/e2e" ]] || exit 46
+  if [[ "${KIDOBO_TEST_FAIL_E2E:-0}" == "1" ]]; then exit 45; fi
+  if [[ "${KIDOBO_TEST_MUTATE_ARCHIVE:-0}" == "1" ]]; then printf corrupt >> "$2"; fi
+fi
 if [[ "$*" == "exercise-release" ]]; then
   binary="${CARGO_TARGET_DIR:-target}/x86_64-unknown-linux-musl/release/kidobo"
   mkdir -p "$(dirname "$binary")"
@@ -207,7 +218,7 @@ fi
 exit 0
 "#,
         );
-        for command in ["docker", "musl-gcc", "readelf"] {
+        for command in ["docker", "genisoimage", "incus", "musl-gcc", "readelf"] {
             write_executable(
                 &fake_bin.join(command),
                 "#!/usr/bin/env bash\nset -euo pipefail\nexit 0\n",
@@ -389,6 +400,7 @@ fi
             .current_dir(&self.repo)
             .env("PATH", path)
             .env_remove("CARGO_TARGET_DIR")
+            .env("KIDOBO_TEST_REPO_ROOT", &self.repo)
             .env("KIDOBO_TEST_EVENT_LOG", &self.event_log)
             .env("KIDOBO_TEST_GIT_LOG", &self.git_log)
             .env("KIDOBO_TEST_GH_LOG", &self.gh_log)
@@ -938,9 +950,9 @@ fn publisher_atomically_pushes_then_verifies_and_publishes_local_artifacts() {
     let edit_position = events
         .find("gh release edit ")
         .expect("draft publication event");
-    assert!(exercise_position < push_position);
     assert!(exercise_position < compatibility_position);
-    assert!(compatibility_position < push_position);
+    let e2e_position = events.find("just e2e-artifact ").expect("distro gate");
+    assert!(compatibility_position < e2e_position && e2e_position < push_position);
     assert!(push_position < create_position);
     assert!(create_position < download_position);
     assert!(download_position < edit_position);
@@ -1024,5 +1036,26 @@ fn publisher_retains_recovery_state_after_post_push_failures() {
                 "failed validation must not attempt publication: {failure_variable}"
             );
         }
+    }
+}
+
+#[test]
+fn distro_gate_failure_or_artifact_changes_prevent_publication() {
+    for variable in ["KIDOBO_TEST_FAIL_E2E", "KIDOBO_TEST_MUTATE_ARCHIVE"] {
+        let fixture = ReleaseFixture::new();
+        let output = fixture
+            .publisher_command()
+            .env(variable, "1")
+            .output()
+            .expect("run failing distro gate");
+        assert!(
+            !output.status.success(),
+            "{variable} must block publication"
+        );
+        assert!(!fixture.tag_exists());
+        let events = read_to_string_with_limit(&fixture.event_log, FIXTURE_LOG_READ_LIMIT);
+        assert!(events.contains("just e2e-artifact "));
+        assert!(!events.contains("git push --atomic "));
+        assert!(!events.contains("gh release create "));
     }
 }

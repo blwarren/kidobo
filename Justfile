@@ -47,6 +47,34 @@ exercise-release: build-release
 release-compat: build-release
     @./scripts/check-release-compat.sh "${CARGO_TARGET_DIR:-target}/x86_64-unknown-linux-musl/release/kidobo"
 
+# Configure suite-owned Incus infrastructure (requires an installed Incus server).
+e2e-setup:
+    @cargo run --locked -p kidobo-e2e -- setup
+
+# Package the current static candidate and exercise every configured distro.
+e2e *args: build-release
+    #!/usr/bin/env bash
+    set -euo pipefail
+    binary="${CARGO_TARGET_DIR:-target}/x86_64-unknown-linux-musl/release/kidobo"
+    version="$("${binary}" --version)"
+    tag="v${version#kidobo }"
+    mkdir -p "target/e2e-candidate/${tag}"
+    output="$(mktemp -d "target/e2e-candidate/${tag}/run-XXXXXXXX")"
+    ./scripts/package-release.sh "${binary}" "${tag}" "${output}"
+    cargo run --locked -p kidobo-e2e -- run --archive "${output}/kidobo-${tag}-linux-x86_64.tar.gz" --tag "${tag}" {{ args }}
+
+# Test the exact archive selected for publication; always run the full matrix.
+e2e-artifact archive tag:
+    @cargo run --locked -p kidobo-e2e -- run --archive "{{ archive }}" --tag "{{ tag }}"
+
+# Exercise genuine GitHub installation of a published release.
+e2e-published tag="latest" *args:
+    @cargo run --locked -p kidobo-e2e -- run --published --tag "{{ tag }}" {{ args }}
+
+# Delete only the recorded VMs belonging to an E2E run.
+e2e-clean run_id:
+    @cargo run --locked -p kidobo-e2e -- clean "{{ run_id }}"
+
 # Build workspace documentation with rustdoc warnings denied.
 rustdoc:
     @env RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps

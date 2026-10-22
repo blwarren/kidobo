@@ -20,6 +20,7 @@ gh auth login
 - `cooldown.toml`: fail-closed seven-day minimum publish age for dependency updates.
 - `scripts/install.sh`: public install/uninstall flow used by operators.
 - `scripts/publish-release.sh`: guarded, transactional release preparation and publication.
+- `scripts/package-release.sh`: shared static archive packaging for candidates and publication.
 - `scripts/check-release-compat.sh`: static ELF and Debian/Alpine release compatibility gate.
 - `scripts/changelog/*`: release-notes normalization and changelog generation.
 - `scripts/perf/*`: benchmark and lookup RSS regression tooling.
@@ -32,6 +33,11 @@ gh auth login
 - `just coverage` (release-only 90% minimum for stable region, function, and line metrics)
 - `just exercise-release` (release-only build and isolated binary exercise)
 - `just release-compat` (release-only static ELF, Debian 11, and Alpine 3.22 gate)
+- `just e2e-setup` (configure suite-owned Incus infrastructure; see [distro testing](../docs/e2e.md))
+- `just e2e` (build, package, and test the candidate across the complete distro matrix)
+- `just e2e-artifact ARCHIVE TAG` (run the full candidate matrix against an existing archive)
+- `just e2e-published [tag]` (test a published release; default latest)
+- `just e2e-clean RUN_ID` (clean recorded VMs for one run)
 - `just rustdoc` (workspace documentation with warnings denied)
 - `just update` (install the pinned cooldown tool, update dependencies at least seven days old, and test)
 - `just udeps` (manual nightly-toolchain dependency-usage audit)
@@ -52,6 +58,11 @@ Publication requires a Linux x86_64 host. Release builds require `musl-gcc` and 
 `x86_64-unknown-linux-musl` Rust target. The compatibility gate additionally
 requires `readelf` and Docker access; it runs only offline Kidobo commands in
 the containers and never invokes firewall or systemd operations.
+Publication also requires configured Incus VM access, a host `genisoimage` or `mkisofs` utility
+for agent configuration disks, and a passing full distro lifecycle matrix,
+run against the exact packaged archive before pushing refs or uploading assets. E2E command
+logs and frozen guest inputs remain under the original checkout's `target/e2e/<run-id>/`,
+including when the publisher removes its temporary worktree.
 Packaging reads the validated candidate binary from `CARGO_TARGET_DIR` when
 set, or `target` otherwise. Relative target directories resolve inside the
 candidate worktree; recovery artifacts retain the location below.

@@ -92,6 +92,9 @@ while [[ $# -gt 0 ]]; do
   url="$1"
   shift
 done
+if [[ -n "${KIDOBO_TEST_CURL_LOG:-}" ]]; then
+  printf '%s\n' "${url}" >> "${KIDOBO_TEST_CURL_LOG}"
+fi
 cp "${KIDOBO_TEST_RELEASE_DIR}/${url##*/}" "${output}"
 "#,
     );
@@ -502,6 +505,69 @@ fn installer_validates_checksum_and_installs_the_verified_binary() {
         .expect("run installed binary");
     assert!(installed_version.status.success());
     assert_eq!(installed_version.stdout, b"kidobo 9.8.7\n");
+}
+
+#[test]
+fn installer_uses_explicit_release_base_url_for_assets() {
+    let temp = TempDir::new().expect("tempdir");
+    let install_dir = temp.path().join("bin");
+    fs::create_dir_all(&install_dir).expect("mkdir install");
+    let release_dir = prepare_release_fixture(
+        &temp,
+        r#"#!/usr/bin/env bash
+[[ "${1:-}" == "--version" ]]
+printf 'kidobo 9.8.7\n'
+"#,
+    );
+    let request_log = temp.path().join("curl-requests");
+    let base_url = "http://127.0.0.1:8765/releases/v9.8.7/";
+
+    let output = installer_command(&temp, &release_dir, &install_dir)
+        .env("KIDOBO_RELEASE_BASE_URL", base_url)
+        .env("KIDOBO_TEST_CURL_LOG", &request_log)
+        .output()
+        .expect("run installer");
+
+    assert!(
+        output.status.success(),
+        "installer failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        read_to_string_with_limit(&request_log, FIXTURE_FILE_READ_LIMIT),
+        format!(
+            "http://127.0.0.1:8765/releases/v9.8.7/kidobo-{TEST_VERSION}-linux-x86_64.tar.gz\nhttp://127.0.0.1:8765/releases/v9.8.7/SHA256SUMS\n"
+        )
+    );
+}
+
+#[test]
+fn installer_requires_explicit_version_with_release_base_url() {
+    let temp = TempDir::new().expect("tempdir");
+    let release_dir =
+        prepare_release_fixture(&temp, "#!/usr/bin/env bash\nprintf 'kidobo 9.8.7\\n'\n");
+    let install_dir = temp.path().join("bin");
+    fs::create_dir_all(&install_dir).expect("mkdir install");
+    let request_log = temp.path().join("curl-requests");
+    let mut command = Command::new(installer_path());
+    command
+        .env(
+            "KIDOBO_RELEASE_BASE_URL",
+            "http://127.0.0.1:8765/releases/latest",
+        )
+        .env("KIDOBO_INSTALL_DIR", &install_dir)
+        .env("KIDOBO_TEST_RELEASE_DIR", &release_dir)
+        .env("KIDOBO_TEST_CURL_LOG", &request_log)
+        .env("PATH", path_with_prefix(&temp.path().join("fake-bin")));
+
+    let output = command.output().expect("run installer");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("KIDOBO_RELEASE_BASE_URL requires --version")
+    );
+    assert!(!request_log.exists());
 }
 
 #[test]
