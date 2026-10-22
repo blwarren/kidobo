@@ -4,10 +4,6 @@ set -euo pipefail
 REPO_SLUG="${KIDOBO_REPO_SLUG:-blwarren/kidobo}"
 INSTALL_DIR="${KIDOBO_INSTALL_DIR:-/usr/local/bin}"
 BINARY_NAME="kidobo"
-KIDOBO_CHAIN_NAME="kidobo-input"
-KIDOBO_STAGING_CHAIN_NAME="kidobo-input-stage"
-DEFAULT_SET_NAME="kidobo"
-DEFAULT_SET_NAME_V6="kidobo-v6"
 KIDOBO_ROOT_WAS_SET="${KIDOBO_ROOT+x}"
 KIDOBO_ROOT_OVERRIDE="${KIDOBO_ROOT-}"
 INIT_AFTER_INSTALL=0
@@ -295,13 +291,13 @@ resolve_uninstall_paths() {
     SYSTEMD_TIMER_PATH="${SYSTEMD_DIR}/kidobo-sync.timer"
 }
 
-run_flush_best_effort() {
+run_config_aware_flush() {
     if [[ ! -x "${TARGET_PATH}" ]]; then
         echo "${BINARY_NAME} binary not found at ${TARGET_PATH}; skipping flush command"
         return 1
     fi
 
-    echo "running ${BINARY_NAME} flush (best effort)"
+    echo "running ${BINARY_NAME} flush"
     if [[ -n "${KIDOBO_ROOT_OVERRIDE}" ]]; then
         if "${TARGET_PATH}" flush; then
             return 0
@@ -318,99 +314,41 @@ run_flush_best_effort() {
         return 0
     fi
 
-    echo "warning: ${BINARY_NAME} flush failed; continuing with direct fallback cleanup" >&2
+    echo "${BINARY_NAME} flush failed; no direct firewall cleanup was attempted" >&2
     return 1
 }
 
-cleanup_firewall_chain_family() {
-    local binary="$1"
-    if ! has_cmd "${binary}"; then
-        echo "failed to confirm cleanup: ${binary} is unavailable" >&2
+read_systemd_unit_state() {
+    local unit="$1"
+    local output
+    SYSTEMD_UNIT_LOAD=""
+    SYSTEMD_UNIT_ACTIVE=""
+    SYSTEMD_UNIT_JOB=""
+    if ! output="$(run_with_optional_sudo systemctl show --all \
+        --property=LoadState --property=ActiveState --property=Job "${unit}")"; then
+        echo "failed to inspect ${unit}; uninstall cannot safely continue" >&2
         return 1
     fi
-
-    local failed=0
-    local chain_name
-    local output
-    for chain_name in "${KIDOBO_STAGING_CHAIN_NAME}" "${KIDOBO_CHAIN_NAME}"; do
-        while true; do
-            if output="$(run_with_optional_sudo "${binary}" -w 5 -D INPUT -j "${chain_name}" 2>&1)"; then
-                continue
-            fi
-            if [[ "${output}" == *"Bad rule"* || "${output}" == *"does a matching rule exist"* ]]; then
-                break
-            fi
-            echo "failed to remove ${binary} INPUT jump to ${chain_name}: ${output:-no diagnostic output}" >&2
-            failed=1
-            break
-        done
-    done
-
-    for chain_name in "${KIDOBO_STAGING_CHAIN_NAME}" "${KIDOBO_CHAIN_NAME}"; do
-        cleanup_allow_missing_chain "flush ${binary} chain ${chain_name}" \
-            "${binary}" -w 5 -F "${chain_name}" || failed=1
-        cleanup_allow_missing_chain "delete ${binary} chain ${chain_name}" \
-            "${binary}" -w 5 -X "${chain_name}" || failed=1
-    done
-    return "${failed}"
-}
-
-cleanup_default_ipsets() {
-    if ! has_cmd ipset; then
-        echo "failed to confirm cleanup: ipset is unavailable" >&2
+    local property value
+    while IFS='=' read -r property value; do
+        case "${property}" in
+            LoadState) SYSTEMD_UNIT_LOAD="${value}" ;;
+            ActiveState) SYSTEMD_UNIT_ACTIVE="${value}" ;;
+            Job) SYSTEMD_UNIT_JOB="${value:-0}" ;;
+        esac
+    done <<< "${output}"
+    if [[ -z "${SYSTEMD_UNIT_LOAD}" || -z "${SYSTEMD_UNIT_ACTIVE}" ||
+          ! "${SYSTEMD_UNIT_JOB}" =~ ^[0-9]+$ ]]; then
+        echo "incomplete or invalid state for ${unit}; uninstall cannot safely continue" >&2
         return 1
     fi
-
-    local failed=0
-    cleanup_allow_missing_set "destroy ipset ${DEFAULT_SET_NAME}" \
-        ipset destroy "${DEFAULT_SET_NAME}" || failed=1
-    cleanup_allow_missing_set "destroy ipset ${DEFAULT_SET_NAME_V6}" \
-        ipset destroy "${DEFAULT_SET_NAME_V6}" || failed=1
-    return "${failed}"
 }
 
-cleanup_allow_missing_chain() {
-    local description="$1"
-    shift
-    local output
-    if output="$(run_with_optional_sudo "$@" 2>&1)"; then
-        return 0
+restore_uninstall_timer() {
+    if [[ "$1" == 1 ]] && ! run_with_optional_sudo systemctl start kidobo-sync.timer; then
+        echo "failed to restore previously active kidobo-sync.timer; runtime artifacts were preserved" >&2
+        return 1
     fi
-    if [[ "${output}" == *"No chain/target/match by that name"* ]]; then
-        return 0
-    fi
-    echo "failed to ${description}: ${output:-no diagnostic output}" >&2
-    return 1
-}
-
-cleanup_allow_missing_set() {
-    local description="$1"
-    shift
-    local output
-    if output="$(run_with_optional_sudo "$@" 2>&1)"; then
-        return 0
-    fi
-    if [[ "${output}" == *"does not exist"* ]]; then
-        return 0
-    fi
-    echo "failed to ${description}: ${output:-no diagnostic output}" >&2
-    return 1
-}
-
-disable_systemd_timer_best_effort() {
-    if [[ -n "${KIDOBO_ROOT_OVERRIDE}" ]]; then
-        return
-    fi
-
-    if ! has_cmd systemctl; then
-        echo "warning: systemctl is unavailable; skipping timer disable/reset" >&2
-        return
-    fi
-
-    warn_best_effort "disable kidobo-sync.timer" \
-        systemctl disable --now kidobo-sync.timer
-    warn_best_effort "reset failed state for kidobo-sync.service" \
-        systemctl reset-failed kidobo-sync.service
 }
 
 reload_systemd_best_effort() {
@@ -431,20 +369,52 @@ uninstall_artifacts() {
 
     echo "uninstalling ${BINARY_NAME} artifacts"
 
-    if ! run_flush_best_effort; then
-        local cleanup_failed=0
-        cleanup_firewall_chain_family iptables || cleanup_failed=1
-        cleanup_firewall_chain_family ip6tables || cleanup_failed=1
-        cleanup_default_ipsets || cleanup_failed=1
-        if [[ "${cleanup_failed}" -ne 0 ]]; then
-            echo "uninstall aborted: live firewall cleanup could not be confirmed; runtime artifacts were preserved" >&2
-        else
-            echo "uninstall aborted: config-aware flush failed; default recovery cleanup was attempted and runtime artifacts were preserved" >&2
+    local timer_was_active=0
+    local timer_present=0
+    if [[ -z "${KIDOBO_ROOT_OVERRIDE}" ]]; then
+        if ! has_cmd systemctl || ! read_systemd_unit_state kidobo-sync.timer; then
+            echo "uninstall aborted: timer state could not be confirmed; runtime artifacts were preserved" >&2
+            return 1
         fi
+        case "${SYSTEMD_UNIT_LOAD}/${SYSTEMD_UNIT_ACTIVE}/${SYSTEMD_UNIT_JOB}" in
+            not-found/inactive/0) ;;
+            loaded/active/0) timer_present=1; timer_was_active=1 ;;
+            loaded/inactive/0|loaded/failed/0) timer_present=1 ;;
+            *)
+                echo "uninstall aborted: timer state is uncertain or has a pending job; runtime artifacts were preserved" >&2
+                return 1
+                ;;
+        esac
+        if [[ "${timer_present}" == 1 ]] && ! run_with_optional_sudo systemctl stop kidobo-sync.timer; then
+            restore_uninstall_timer "${timer_was_active}" || true
+            echo "uninstall aborted: timer could not be stopped; runtime artifacts were preserved" >&2
+            return 1
+        fi
+        if ! read_systemd_unit_state kidobo-sync.service; then
+            restore_uninstall_timer "${timer_was_active}" || true
+            return 1
+        fi
+        case "${SYSTEMD_UNIT_LOAD}/${SYSTEMD_UNIT_ACTIVE}/${SYSTEMD_UNIT_JOB}" in
+            loaded/inactive/0|loaded/failed/0|not-found/inactive/0) ;;
+            *)
+                restore_uninstall_timer "${timer_was_active}" || true
+                echo "uninstall aborted: sync service is active, has a pending job, or its state is uncertain; runtime artifacts were preserved" >&2
+                return 1
+                ;;
+        esac
+    fi
+
+    if ! run_config_aware_flush; then
+        restore_uninstall_timer "${timer_was_active}" || true
+        echo "uninstall aborted: config-aware flush failed; runtime artifacts were preserved" >&2
         return 1
     fi
 
-    disable_systemd_timer_best_effort
+    if [[ "${timer_present}" == 1 ]] && ! run_with_optional_sudo systemctl disable kidobo-sync.timer; then
+        restore_uninstall_timer "${timer_was_active}" || true
+        echo "uninstall aborted: timer could not be disabled; runtime artifacts were preserved" >&2
+        return 1
+    fi
     remove_path "${SYSTEMD_TIMER_PATH}" "systemd timer"
     remove_path "${SYSTEMD_SERVICE_PATH}" "systemd service"
     reload_systemd_best_effort

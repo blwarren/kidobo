@@ -40,8 +40,9 @@ The compatibility-sensitive surface includes:
   `summary: total_ips=N matched_ips=N matched_pct=N%`.
 - Single-target misses retain the existing empty stdout behavior.
 
-Target identity remains raw inside core lookup. At every output boundary it is
-encoded so one target cannot add terminal commands, fields, or records:
+Target identity and source text remain raw inside core lookup. At the human
+and TSV output boundaries, targets, source labels, and matched entries are
+encoded exactly once so they cannot add terminal commands, fields, or records:
 
 - backslash: `\\`
 - tab, carriage return, and newline: `\t`, `\r`, and `\n`

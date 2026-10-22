@@ -9,6 +9,13 @@
 - Reject ASN cache refreshes above 8 MiB before replacing cached data or updating ASN bans.
 - Support bare relative filenames in atomic writes without reporting an error after replacement.
 - Add expiring IP/CIDR and ASN bans stored separately from permanent sources and applied by sync.
+- Abort uninstall when work is active or config-aware cleanup fails, preserve installed files, and restore a previously active timer before artifact removal on failure.
+- Reject normalized remote cache refreshes above 16 MiB before publication, using a validated fallback when available or stopping sync before set replacement.
+- Stream lookup matches with bounded retention and escape control characters in targets, source labels, and matched entries in human and TSV output.
+- Deduplicate canonical unban targets and index overlap checks for large batches while preserving confirmation and temporary-first persistence.
+- Accept every ASCII letter case of the AS prefix in ASN ban and unban arguments.
+- Probe only ipset names in doctor and allow initialization to continue when reset-failed reports the sync service is not loaded.
+- Package the validated release candidate from the configured Cargo target directory.
 
 ## [0.14.3] - 2026-10-22
 

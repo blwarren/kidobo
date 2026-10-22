@@ -14,7 +14,9 @@ use kidobo_adapters::config::FileConfigRepository;
 use kidobo_adapters::lookup_sources::build_offline_lookup_registry;
 use kidobo_adapters::path::{SystemPathResolver, path_resolution_input_from_process};
 use kidobo_adapters::target_file::LookupTargetFileReader;
-use kidobo_app::lookup::{self, LookupDependencies, LookupInput, LookupOutcome, LookupRequest};
+use kidobo_app::lookup::{
+    self, LookupDependencies, LookupInput, LookupRequest, LookupSourceEntry, LookupSummary,
+};
 
 pub fn dispatch_with(command: Command, io: &mut CliIo<'_>) -> Result<(), KidoboError> {
     match command {
@@ -63,6 +65,13 @@ fn run_lookup_command(
     let configs = FileConfigRepository;
     let target_files = LookupTargetFileReader;
     let sources = build_offline_lookup_registry()?;
+    let mut renderer = LookupRenderer {
+        format,
+        color: should_color_lookup(io.stdout_is_terminal, io.no_color),
+        header_written: false,
+        unmatched_targets: Vec::new(),
+        output: io.stdout,
+    };
     let outcome = lookup::execute(
         &request,
         &LookupDependencies {
@@ -74,20 +83,14 @@ fn run_lookup_command(
             clock: &kidobo_adapters::temporary_bans::SystemClock,
             temporary_bans: &kidobo_adapters::temporary_bans::FileTemporaryBanRepository,
         },
+        |target, matches| renderer.emit(target, matches),
     )?;
 
     for notice in &outcome.notices {
         warn!("{}", notice.message);
     }
 
-    match format {
-        LookupFormat::Human => write_human_lookup(
-            &outcome,
-            should_color_lookup(io.stdout_is_terminal, io.no_color),
-            io.stdout,
-        ),
-        LookupFormat::Tsv => write_tsv_lookup(&outcome, io.stdout),
-    }?;
+    renderer.finish(&outcome)?;
 
     for invalid in &outcome.invalid_targets {
         writeln!(
@@ -112,90 +115,98 @@ const LOOKUP_STATUS_WIDTH: usize = 8;
 const LOOKUP_SOURCE_WIDTH: usize = 44;
 const LOOKUP_ENTRY_WIDTH: usize = 30;
 
-fn write_human_lookup(
-    outcome: &LookupOutcome,
+struct LookupRenderer<'a> {
+    format: LookupFormat,
     color: bool,
-    output: &mut dyn std::io::Write,
-) -> Result<(), KidoboError> {
-    writeln!(output, "{}", lookup_table_border('┌', '┬', '┐'))?;
-    for row in format_lookup_table_row(["Target", "Status", "Source", "Matched Entry"], false) {
-        writeln!(output, "{row}")?;
-    }
-    writeln!(output, "{}", lookup_table_border('├', '┼', '┤'))?;
+    header_written: bool,
+    unmatched_targets: Vec<String>,
+    output: &'a mut dyn std::io::Write,
+}
 
-    let total_count = outcome.targets.len();
-    let matched_count = outcome
-        .targets
-        .iter()
-        .filter(|target| !target.matches.is_empty())
-        .count();
-    for target in &outcome.targets {
-        let encoded_target = encode_lookup_field(&target.target);
-        if target.matches.is_empty() {
-            for row in format_lookup_table_row([&encoded_target, "NO MATCH", "—", "—"], color) {
-                writeln!(output, "{row}")?;
+impl LookupRenderer<'_> {
+    fn human_header(&mut self) -> Result<(), KidoboError> {
+        if !self.header_written {
+            writeln!(self.output, "{}", lookup_table_border('┌', '┬', '┐'))?;
+            for row in
+                format_lookup_table_row(["Target", "Status", "Source", "Matched Entry"], false)
+            {
+                writeln!(self.output, "{row}")?;
             }
-        } else {
-            for source in &target.matches {
-                for row in format_lookup_table_row(
-                    [
-                        &encoded_target,
-                        "MATCH",
-                        source.source_label.as_ref(),
-                        &source.matched_source_entry,
-                    ],
-                    color,
-                ) {
-                    writeln!(output, "{row}")?;
+            writeln!(self.output, "{}", lookup_table_border('├', '┼', '┤'))?;
+            self.header_written = true;
+        }
+        Ok(())
+    }
+
+    fn emit(&mut self, target: &str, matches: &[&LookupSourceEntry]) -> Result<(), KidoboError> {
+        let encoded_target = encode_lookup_field(target);
+        match self.format {
+            LookupFormat::Human => {
+                self.human_header()?;
+                if matches.is_empty() {
+                    for row in
+                        format_lookup_table_row([&encoded_target, "NO MATCH", "—", "—"], self.color)
+                    {
+                        writeln!(self.output, "{row}")?;
+                    }
+                }
+                for source in matches {
+                    let label = encode_lookup_field(&source.source_label);
+                    let entry = encode_lookup_field(&source.source_line);
+                    for row in format_lookup_table_row(
+                        [&encoded_target, "MATCH", &label, &entry],
+                        self.color,
+                    ) {
+                        writeln!(self.output, "{row}")?;
+                    }
+                }
+            }
+            LookupFormat::Tsv => {
+                for source in matches {
+                    writeln!(
+                        self.output,
+                        "{}\t{}\t{}",
+                        encoded_target,
+                        encode_lookup_field(&source.source_label),
+                        encode_lookup_field(&source.source_line)
+                    )?;
+                }
+                if matches.is_empty() {
+                    self.unmatched_targets.push(encoded_target);
                 }
             }
         }
+        Ok(())
     }
 
-    writeln!(output, "{}", lookup_table_border('└', '┴', '┘'))?;
-    let unmatched_count = total_count.saturating_sub(matched_count);
-    writeln!(
-        output,
-        "\nSummary\n  Targets:    {total_count}\n  Matched:    {matched_count}\n  Unmatched:  {unmatched_count}\n  Match rate: {}",
-        percent_str(matched_count, total_count)
-    )?;
-    Ok(())
-}
-
-fn write_tsv_lookup(
-    outcome: &LookupOutcome,
-    output: &mut dyn std::io::Write,
-) -> Result<(), KidoboError> {
-    for target in &outcome.targets {
-        let encoded_target = encode_lookup_field(&target.target);
-        for source in &target.matches {
-            writeln!(
-                output,
-                "{}\t{}\t{}",
-                encoded_target, source.source_label, source.matched_source_entry
-            )?;
-        }
-    }
-
-    if outcome.file_mode {
-        for target in &outcome.targets {
-            if target.matches.is_empty() {
-                writeln!(output, "{}\tNO_MATCH", encode_lookup_field(&target.target))?;
+    fn finish(&mut self, summary: &LookupSummary) -> Result<(), KidoboError> {
+        let total_count = summary.total_count;
+        let matched_count = summary.matched_count;
+        match self.format {
+            LookupFormat::Human => {
+                self.human_header()?;
+                writeln!(self.output, "{}", lookup_table_border('└', '┴', '┘'))?;
+                let unmatched_count = total_count.saturating_sub(matched_count);
+                writeln!(
+                    self.output,
+                    "\nSummary\n  Targets:    {total_count}\n  Matched:    {matched_count}\n  Unmatched:  {unmatched_count}\n  Match rate: {}",
+                    percent_str(matched_count, total_count)
+                )?;
             }
+            LookupFormat::Tsv if summary.file_mode => {
+                for target in &self.unmatched_targets {
+                    writeln!(self.output, "{target}\tNO_MATCH")?;
+                }
+                writeln!(
+                    self.output,
+                    "summary: total_ips={total_count} matched_ips={matched_count} matched_pct={}",
+                    percent_str(matched_count, total_count)
+                )?;
+            }
+            LookupFormat::Tsv => {}
         }
-        let matched_count = outcome
-            .targets
-            .iter()
-            .filter(|target| !target.matches.is_empty())
-            .count();
-        writeln!(
-            output,
-            "summary: total_ips={} matched_ips={matched_count} matched_pct={}",
-            outcome.targets.len(),
-            percent_str(matched_count, outcome.targets.len())
-        )?;
+        Ok(())
     }
-    Ok(())
 }
 
 fn encode_lookup_field(value: &str) -> String {
@@ -311,6 +322,61 @@ mod tests {
         color_lookup_status, encode_lookup_field, format_lookup_table_row, should_color_lookup,
         wrap_lookup_cell,
     };
+
+    #[test]
+    fn renderers_encode_each_field_once_and_preserve_writer_errors() {
+        use kidobo_app::lookup::LookupSourceEntry;
+        struct BrokenWriter;
+        impl std::io::Write for BrokenWriter {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let source = LookupSourceEntry {
+            source_label: std::sync::Arc::from("label\t\u{1b}\\"),
+            source_line: "203.0.113.7\r\u{85}\\".to_string(),
+            cidr: kidobo_core::network::parse_ip_cidr_token("203.0.113.7").expect("cidr"),
+        };
+        for format in [super::LookupFormat::Human, super::LookupFormat::Tsv] {
+            let mut output = Vec::new();
+            let mut renderer = super::LookupRenderer {
+                format,
+                color: false,
+                header_written: false,
+                unmatched_targets: Vec::new(),
+                output: &mut output,
+            };
+            renderer
+                .emit("\t203.0.113.7\n", &[&source])
+                .expect("render");
+            let stdout = String::from_utf8(output).expect("UTF-8");
+            assert!(stdout.contains(r"\t203.0.113.7\n"));
+            assert!(stdout.contains(r"label\t\x1B\\"));
+            assert!(stdout.contains(r"203.0.113.7\r\u{85}\\"));
+            assert!(!stdout.contains('\u{1b}'));
+
+            let mut broken = BrokenWriter;
+            let mut renderer = super::LookupRenderer {
+                format,
+                color: false,
+                header_written: false,
+                unmatched_targets: Vec::new(),
+                output: &mut broken,
+            };
+            match renderer
+                .emit("203.0.113.7", &[&source])
+                .expect_err("writer fails")
+            {
+                crate::error::KidoboError::CliIo { source } => {
+                    assert_eq!(source.kind(), std::io::ErrorKind::BrokenPipe);
+                }
+                other => panic!("unexpected error: {other:?}"),
+            }
+        }
+    }
 
     #[test]
     fn lookup_color_requires_terminal_without_no_color() {

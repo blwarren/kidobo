@@ -49,7 +49,9 @@ the final enforced set. An invalid or missing configuration limits lookup to
 the local blocklist, active temporary entries, and cached remote sources and
 produces warnings for unavailable coverage.
 Use `--format tsv` for scripts; see the [compatibility contract](compatibility.md)
-for its record format.
+for its record format. Results stream as targets are processed, so a large
+number of overlaps does not require retaining all matches. Targets, source
+labels, and matched entries escape control characters in both output formats.
 
 Without `--for`, `sudo kidobo ban 203.0.113.7` and its `--file` form add
 permanent entries to the local blocklist. A file supplies one strict IP or
@@ -58,6 +60,8 @@ ASN ban may resolve and cache prefixes, while ASN unban makes
 a best-effort cache cleanup. `unban --yes` skips confirmation where removal
 would require it. All ban and unban modes require valid configuration and none
 changes enforcement until `sudo kidobo sync` succeeds.
+ASN arguments accept bare numbers or an `AS` prefix in any ASCII letter case,
+such as `AS64496`, `as64496`, `As64496`, and `aS64496`.
 
 Add an expiring local ban with `sudo kidobo ban 203.0.113.7 --for 12h`,
 `sudo kidobo ban --file targets.txt --for 3d`, or
@@ -89,8 +93,9 @@ sync with active temporary entries, because kernel expiry can remove it before
 the recorded deadline.
 
 `unban` removes matching entries from both the permanent and temporary local
-stores. Partial CIDR overlaps are shown and require confirmation; `unban --yes`
-approves their removal. `unban --asn` removes the ASN from both permanent and
+stores. Repeated targets that identify the same canonical network count once
+in an unban request. Partial CIDR overlaps are shown and require confirmation;
+`unban --yes` approves their removal. `unban --asn` removes the ASN from both permanent and
 temporary ASN state. Each two-file update writes temporary state first and
 permanent state second, so a failure on the second write can leave a partial
 change. `flush` and `flush --cache-only` preserve the temporary-ban file.
@@ -109,8 +114,11 @@ change. `flush` and `flush --cache-only` preserve the temporary-ban file.
   staging fails and no validated fallback exists, sync stops before replacing
   either set. Remote HTTP bodies default to an 8 MiB limit; the
   `KIDOBO_MAX_HTTP_BODY_BYTES` override is capped at 32 MiB, while GitHub
-  metadata remains capped at 8 MiB. Fix the source or cache problem and rerun
-  `sync`.
+  metadata remains capped at 8 MiB. Normalized remote lists must fit within
+  16 MiB, even when the HTTP body limit is higher. An oversized normalized
+  refresh uses a validated fallback with a warning; without one, sync stops
+  before publishing that cache or replacing either set. Fix the source or cache
+  problem and rerun `sync`.
 - **ASN refresh warning:** A stale cached prefix list can be used when refresh
   fails. Check `bgpq4` and source connectivity, then rerun `sync` after fixing
   the cause.
@@ -139,3 +147,18 @@ failure; `2` for command-line usage errors; and `130` for SIGINT. After SIGINT,
 an active sync enforcement or full-flush cleanup section finishes its scoped
 work unless an operational error prevents it. Check the final diagnostic
 before deciding whether to retry.
+
+## Uninstall safely
+
+Do not start manual Kidobo commands while uninstall is running. At default
+paths, uninstall records whether the timer is active and stops scheduling
+before checking that the service has no active run or pending job. It aborts
+if work is active or that state cannot be established; it never stops an
+active sync. Wait for existing work to finish and retry.
+
+The installer must complete config-aware `flush` before disabling the timer
+or removing artifacts. A missing binary, invalid configuration, held lock, or
+cleanup failure preserves the installed files. If uninstall fails before
+artifact removal, it restarts the timer only when it was previously active
+and reports any restoration failure. With `KIDOBO_ROOT`, uninstall skips host
+systemd operations and applies cleanup to the selected root.

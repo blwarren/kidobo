@@ -17,16 +17,9 @@ const ASN_CACHE_FILE_READ_LIMIT: usize = 8 * 1024 * 1024;
 const ASN_CACHE_FILE_WRITE_HEADER: &str = "# kidobo-asn-cache-v1";
 const DEFAULT_BGPQ4_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Failure while validating, resolving, reading, or writing ASN prefixes.
+/// Failure while resolving, reading, or writing ASN prefixes.
 #[derive(Debug, Error)]
 pub enum AsnError {
-    /// An operator token is not a positive `u32` ASN.
-    #[error("invalid ASN token `{input}`")]
-    InvalidAsnToken {
-        /// Original token.
-        input: String,
-    },
-
     /// `bgpq4` could not produce a non-empty, family-correct prefix set.
     #[error("failed to resolve ASN {asn} prefixes via bgpq4: {reason}")]
     ResolveFailed {
@@ -168,55 +161,6 @@ pub struct CachedAsnPrefixes {
     pub prefixes: Vec<CanonicalCidr>,
     /// Whether stale cache was used after refresh failure.
     pub stale: bool,
-}
-
-/// Parses, sorts, and deduplicates ASN tokens.
-///
-/// # Errors
-///
-/// Returns [`AsnError::InvalidAsnToken`] for the first empty, malformed, or zero-valued token.
-pub fn normalize_asn_tokens<I, S>(tokens: I) -> Result<Vec<u32>, AsnError>
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<str>,
-{
-    let mut normalized = Vec::new();
-    for token in tokens {
-        normalized.push(parse_asn_token(token.as_ref())?);
-    }
-    normalized.sort_unstable();
-    normalized.dedup();
-    Ok(normalized)
-}
-
-/// Parses a positive ASN with an optional case-insensitive `AS` prefix.
-///
-/// # Errors
-///
-/// Returns [`AsnError::InvalidAsnToken`] when the input is empty, malformed, zero, or outside the
-/// `u32` range.
-pub fn parse_asn_token(input: &str) -> Result<u32, AsnError> {
-    let trimmed = input.trim();
-    if trimmed.is_empty() {
-        return Err(AsnError::InvalidAsnToken {
-            input: input.to_string(),
-        });
-    }
-
-    let normalized = trimmed
-        .strip_prefix("AS")
-        .or_else(|| trimmed.strip_prefix("as"))
-        .unwrap_or(trimmed);
-
-    let asn = normalized
-        .parse::<u32>()
-        .ok()
-        .filter(|value| *value > 0)
-        .ok_or_else(|| AsnError::InvalidAsnToken {
-            input: input.to_string(),
-        })?;
-
-    Ok(asn)
 }
 
 /// Loads fresh ASN prefixes or falls back to a stale bounded cache.
@@ -425,7 +369,6 @@ mod tests {
     use super::{
         ASN_CACHE_FILE_READ_LIMIT, AsnError, AsnPrefixResolver, Bgpq4AsnPrefixResolver,
         CachedAsnPrefixes, delete_asn_cache_file, load_asn_prefixes_with_cache,
-        normalize_asn_tokens, parse_asn_token,
     };
     use crate::command_runner::{
         CommandExecutor, CommandRequest, CommandResult, CommandRunnerError, ProcessStatus,
@@ -482,31 +425,6 @@ mod tests {
                 .pop_front()
                 .expect("response")
         }
-    }
-
-    #[test]
-    fn parse_asn_token_accepts_bare_and_as_prefixed() {
-        assert_eq!(parse_asn_token("213412").expect("parse"), 213_412);
-        assert_eq!(parse_asn_token("AS213412").expect("parse"), 213_412);
-        assert_eq!(parse_asn_token("as213412").expect("parse"), 213_412);
-    }
-
-    #[test]
-    fn normalize_asn_tokens_dedupes_and_sorts() {
-        let values = normalize_asn_tokens(["AS64513", "64512", "64513"]).expect("normalize");
-        assert_eq!(values, vec![64512, 64513]);
-    }
-
-    #[test]
-    fn parse_asn_token_rejects_invalid_values() {
-        let err = parse_asn_token("AS0").expect_err("must fail");
-        assert!(matches!(err, AsnError::InvalidAsnToken { .. }));
-    }
-
-    #[test]
-    fn parse_asn_token_rejects_blank_input() {
-        let err = parse_asn_token("   ").expect_err("must fail");
-        assert!(matches!(err, AsnError::InvalidAsnToken { input } if input == "   "));
     }
 
     #[test]

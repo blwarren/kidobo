@@ -350,7 +350,7 @@ fn push_sudo_checks(
     cancellation: &dyn crate::ports::Cancellation,
 ) -> Result<(), AppError> {
     for (name, binary, arguments) in [
-        ("sudo_probe_ipset", "ipset", &["list"][..]),
+        ("sudo_probe_ipset", "ipset", &["list", "-name"][..]),
         ("sudo_probe_iptables", "iptables", &["-S"][..]),
     ] {
         cancellation.check()?;

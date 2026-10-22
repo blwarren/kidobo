@@ -208,6 +208,7 @@ release_worktree="${temporary_root}/worktree"
 echo "[release] preparing ${release_tag} in a temporary worktree"
 git worktree add --quiet --detach "${release_worktree}" "${base_commit}"
 cd "${release_worktree}"
+candidate_binary="${CARGO_TARGET_DIR:-target}/x86_64-unknown-linux-musl/release/kidobo"
 
 sed -i "0,/^version = \"${current_version}\"$/s//version = \"${release_version}\"/" Cargo.toml
 echo "[release] updating Cargo.lock"
@@ -262,7 +263,7 @@ echo "[release] packaging locally built artifacts"
 package_root="${temporary_root}/package/${archive_root}"
 mkdir -p "${package_root}" "${artifact_root}"
 artifacts_created=true
-install -m 0755 target/x86_64-unknown-linux-musl/release/kidobo "${package_root}/kidobo"
+install -m 0755 "${candidate_binary}" "${package_root}/kidobo"
 install -m 0644 README.md LICENSE "${package_root}/"
 tar -C "${temporary_root}/package" -czf "${archive_path}" "${archive_root}"
 (

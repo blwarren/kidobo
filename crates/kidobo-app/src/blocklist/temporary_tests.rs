@@ -157,22 +157,6 @@ impl TemporaryBanRepository for Harness {
 }
 
 impl AsnOperations for Harness {
-    fn normalize_tokens(&self, tokens: &[String]) -> Result<Vec<u32>, AppError> {
-        let numbers = tokens
-            .iter()
-            .map(|token| {
-                token
-                    .strip_prefix("AS")
-                    .unwrap_or(token)
-                    .parse::<u32>()
-                    .map_err(|source| AppError::Asn {
-                        source: Box::new(source),
-                    })
-            })
-            .collect::<Result<BTreeSet<_>, _>>()?;
-        Ok(numbers.into_iter().collect())
-    }
-
     fn load_prefixes(&self, asn: u32, _: &Path, _: Duration) -> Result<AsnPrefixBatch, AppError> {
         self.record(Event::Resolve(asn));
         self.now.set(self.now.get() + 60);
@@ -281,6 +265,27 @@ fn second_asn_resolution_failure_does_not_save_any_ban() {
 }
 
 #[test]
+fn invalid_asn_tokens_fail_before_lock_or_any_side_effects() {
+    let fixture = Harness::new();
+    let request = request(&["AS64496", "AS0"], None);
+    for result in [
+        execute_ban_asn(&request, &fixture.dependencies()).map(|_| ()),
+        execute_unban_asn(&request, &fixture.dependencies()).map(|_| ()),
+    ] {
+        let error = result.expect_err("invalid ASN");
+        assert_eq!(
+            error.to_string(),
+            "ASN operation failed: invalid ASN token `AS0`"
+        );
+        assert!(matches!(error, AppError::Asn { .. }));
+    }
+    assert!(fixture.events.borrow().is_empty());
+    assert!(fixture.state.borrow().asns.is_empty());
+    assert!(fixture.permanent_asns.borrow().is_empty());
+    assert!(fixture.caches.borrow().is_empty());
+}
+
+#[test]
 fn temporary_asn_batch_samples_one_deadline_after_validation_and_preserves_ip_bans() {
     let fixture = Harness::new();
     fixture
@@ -290,7 +295,7 @@ fn temporary_asn_batch_samples_one_deadline_after_validation_and_preserves_ip_ba
         .insert(parse_ip_cidr_strict("2001:db8::/48").expect("prefix"), 9999);
     let original_ips = fixture.state.borrow().ips.clone();
     let outcome = execute_ban_asn(
-        &request(&["AS64496", "64497"], Some("1h")),
+        &request(&["aS64497", "AS64496", "As64496", "64497"], Some("1h")),
         &fixture.dependencies(),
     )
     .expect("temporary ban");

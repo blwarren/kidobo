@@ -20,8 +20,9 @@ kidobo-adapters
 ```
 
 `kidobo-core` owns canonicalization, family splitting, interval merging, safelist subtraction, minimal
-CIDR regeneration, lookup, and configuration parsing/validation from in-memory text. It performs no
-filesystem, network, process, clock, or terminal I/O. It uses `url::Url` only for deterministic
+CIDR regeneration, indexed unban classification, ASN token parsing, lookup, and configuration
+parsing/validation from in-memory text. It performs no filesystem, network, process, clock, or
+terminal I/O. It uses `url::Url` only for deterministic
 configuration validation; HTTP clients and transport remain in `kidobo-adapters`.
 
 `kidobo-app` owns command sequencing and failure policy. Its public-in-workspace interfaces are typed
@@ -56,6 +57,11 @@ Sync and offline lookup use separate registries so lookup cannot acquire an HTTP
 Registration order is provider evaluation order, IDs must be unique, and application code applies required
 versus best-effort policy. Offline entries are sorted by source label and source line before lookup so output
 remains deterministic regardless of filesystem iteration order.
+
+Lookup emits borrowed matches one target at a time through a fallible callback.
+The application returns counts and diagnostics; the CLI writes rows incrementally
+and retains only unmatched target strings for trailing TSV records. Cancellation
+is checked between target batches, and output errors stop further processing.
 
 | Provider | Sync role and policy | Offline lookup |
 | --- | --- | --- |

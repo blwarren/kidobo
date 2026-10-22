@@ -81,18 +81,6 @@ pub fn parse_ip_cidr_token(token: &str) -> Option<CanonicalCidr> {
     }
 }
 
-/// Parses the first token from each input and discards invalid inputs.
-pub fn parse_lines_non_strict<I, S>(inputs: I) -> Vec<CanonicalCidr>
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<str>,
-{
-    inputs
-        .into_iter()
-        .filter_map(|value| parse_ip_cidr_non_strict(value.as_ref()))
-        .collect()
-}
-
 #[must_use]
 /// Separates canonical CIDRs into independent IPv4 and IPv6 vectors.
 ///
@@ -283,7 +271,7 @@ fn intervals_to_ipv6_cidrs_from_merged(intervals: &[IntervalU128]) -> Vec<Ipv6Ci
     out
 }
 
-fn merge_intervals_u32_owned(mut intervals: Vec<IntervalU32>) -> Vec<IntervalU32> {
+pub(crate) fn merge_intervals_u32_owned(mut intervals: Vec<IntervalU32>) -> Vec<IntervalU32> {
     if intervals.is_empty() {
         return Vec::new();
     }
@@ -377,7 +365,7 @@ fn radix_sort_intervals_u32_by_start(intervals: &mut [IntervalU32]) -> bool {
     true
 }
 
-fn merge_intervals_u128_owned(mut intervals: Vec<IntervalU128>) -> Vec<IntervalU128> {
+pub(crate) fn merge_intervals_u128_owned(mut intervals: Vec<IntervalU128>) -> Vec<IntervalU128> {
     if intervals.is_empty() {
         return Vec::new();
     }
@@ -595,8 +583,8 @@ mod tests {
         intervals_to_ipv6_cidrs, ipv4_mask, ipv4_to_interval, ipv6_mask, ipv6_to_interval,
         is_aligned_u32, is_aligned_u128, largest_prefix_u32, largest_prefix_u128,
         merge_intervals_u32, merge_intervals_u128, parse_ip_cidr_non_strict,
-        parse_lines_non_strict, radix_sort_intervals_u32_by_start, split_by_family,
-        subtract_safelist_ipv4, subtract_safelist_ipv6,
+        radix_sort_intervals_u32_by_start, split_by_family, subtract_safelist_ipv4,
+        subtract_safelist_ipv6,
     };
 
     fn all_intervals_u32(base: u32, width: u32) -> Vec<IntervalU32> {
@@ -829,16 +817,16 @@ mod tests {
 
         assert!(parse_ip_cidr_non_strict("not-an-ip").is_none());
         assert!(parse_ip_cidr_non_strict(" ").is_none());
+        assert_eq!(
+            parse_ip_cidr_non_strict("198.51.100.0/24 trailing"),
+            Some(CanonicalCidr::V4(Ipv4Cidr::from_parts(0xc633_6400, 24)))
+        );
     }
 
     #[test]
     fn split_by_family_is_strict() {
-        let parsed = parse_lines_non_strict([
-            "10.0.0.1",
-            "2001:db8::1",
-            "invalid",
-            "198.51.100.0/24 trailing",
-        ]);
+        let parsed = ["10.0.0.1", "2001:db8::1", "198.51.100.0/24"]
+            .map(|token| parse_ip_cidr_non_strict(token).expect("valid CIDR"));
 
         let separated = split_by_family(&parsed);
         assert_eq!(
@@ -1669,21 +1657,6 @@ mod tests {
             vec![
                 Ipv6Cidr::from_parts(base, 127),
                 Ipv6Cidr::from_parts(base + 4, 127),
-            ]
-        );
-    }
-
-    #[test]
-    fn parse_lines_non_strict_ignores_invalid_lines() {
-        let parsed = parse_lines_non_strict(["10.0.0.1", "not-valid", "2001:db8::/32"]);
-        assert_eq!(
-            parsed,
-            vec![
-                CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a00_0001, 32)),
-                CanonicalCidr::V6(Ipv6Cidr::from_parts(
-                    0x2001_0db8_0000_0000_0000_0000_0000_0000,
-                    32
-                )),
             ]
         );
     }

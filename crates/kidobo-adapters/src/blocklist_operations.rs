@@ -6,10 +6,7 @@ use std::time::Duration;
 use kidobo_app::AppError;
 use kidobo_app::blocklist::{AsnConfigUpdate, AsnOperations, AsnPrefixBatch};
 
-use crate::asn::{
-    Bgpq4AsnPrefixResolver, delete_asn_cache_file, load_asn_prefixes_with_cache,
-    normalize_asn_tokens,
-};
+use crate::asn::{Bgpq4AsnPrefixResolver, delete_asn_cache_file, load_asn_prefixes_with_cache};
 use crate::config_edit::update_asn_bans;
 
 /// Production ASN operations backed by `bgpq4`, cache files, and atomic config edits.
@@ -17,10 +14,6 @@ use crate::config_edit::update_asn_bans;
 pub struct SystemAsnOperations;
 
 impl AsnOperations for SystemAsnOperations {
-    fn normalize_tokens(&self, tokens: &[String]) -> Result<Vec<u32>, AppError> {
-        normalize_asn_tokens(tokens).map_err(map_asn_error)
-    }
-
     fn load_prefixes(
         &self,
         asn: u32,

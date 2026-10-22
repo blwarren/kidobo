@@ -35,6 +35,7 @@
 
 //! Pure deterministic domain logic for Kidobo.
 
+pub mod asn;
 pub mod blocklist;
 pub mod config;
 mod config_validation;

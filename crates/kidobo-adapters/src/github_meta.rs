@@ -124,13 +124,10 @@ struct CachePaths {
 
 #[derive(Debug, Clone)]
 struct GithubMetaCache {
-    raw: Option<Vec<u8>>,
     networks: Option<Vec<CanonicalCidr>>,
     meta: Option<GithubMetaCacheMetadata>,
-    sidecar: Option<GithubMetaCategorySidecar>,
     generation_id: Option<String>,
-    previous_networks: Option<Vec<CanonicalCidr>>,
-    previous_meta: Option<GithubMetaCacheMetadata>,
+    previous: Option<GithubMetaLoadResult>,
 }
 
 impl CachePaths {
@@ -208,14 +205,14 @@ pub(crate) fn prepare_github_meta_safelist(
                         source: GithubMetaSource::CacheNotModified,
                         metadata,
                     },
-                    fallback: cache.into_previous_result(),
+                    fallback: cache.previous,
                     pending_promotion: None,
                 })
             } else {
-                Ok(prepared_github_fallback(cache, &selection))
+                Ok(prepared_github_fallback(cache))
             }
         }
-        ConditionalFetchResult::FallbackCache => Ok(prepared_github_fallback(cache, &selection)),
+        ConditionalFetchResult::FallbackCache => Ok(prepared_github_fallback(cache)),
         ConditionalFetchResult::Network(response) => handle_network_response(
             response,
             &paths,
@@ -276,14 +273,9 @@ fn read_github_meta_cache(
         };
         let mut cache =
             read_github_meta_cache_files(&generation_paths, selection, github_meta_url, true);
-        if cache.raw.is_some()
-            && cache.networks.is_some()
-            && cache.meta.is_some()
-            && cache.sidecar.is_some()
-        {
+        if cache.networks.is_some() {
             if let Some(mut primary) = selected {
-                primary.previous_networks = cache.networks;
-                primary.previous_meta = cache.meta;
+                primary.previous = cache.into_fallback_result();
                 return primary;
             }
             cache.generation_id = Some(candidate.id);
@@ -293,8 +285,7 @@ fn read_github_meta_cache(
 
     let legacy = read_github_meta_cache_files(paths, selection, github_meta_url, false);
     if let Some(mut primary) = selected {
-        primary.previous_networks = legacy.networks;
-        primary.previous_meta = legacy.meta;
+        primary.previous = legacy.into_fallback_result();
         primary
     } else {
         legacy
@@ -347,21 +338,28 @@ fn read_github_meta_cache_files(
         None
     };
 
-    let networks = if cache_scope_compatible(selection, sidecar.as_ref()) {
-        raw.as_deref()
-            .and_then(|contents| parse_and_extract_networks(contents, selection))
+    let networks = if require_metadata && (meta.is_none() || sidecar.is_none()) {
+        None
+    } else if cache_scope_compatible(selection, sidecar.as_ref()) {
+        raw.as_deref().and_then(|contents| {
+            let networks = parse_and_extract_networks(contents, selection);
+            if networks.is_none() {
+                warn!("github meta cache is invalid JSON or category data; ignoring stale cache");
+            }
+            networks
+        })
     } else {
+        if raw.is_some() {
+            warn!("github meta cache scope is incompatible with current category filter");
+        }
         None
     };
 
     GithubMetaCache {
-        raw,
         networks,
         meta,
-        sidecar,
         generation_id: None,
-        previous_networks: None,
-        previous_meta: None,
+        previous: None,
     }
 }
 
@@ -372,11 +370,11 @@ impl GithubMetaCache {
         })
     }
 
-    fn into_previous_result(self) -> Option<GithubMetaLoadResult> {
-        self.previous_networks.map(|networks| GithubMetaLoadResult {
+    fn into_fallback_result(self) -> Option<GithubMetaLoadResult> {
+        self.networks.map(|networks| GithubMetaLoadResult {
             networks,
             source: GithubMetaSource::FallbackCache,
-            metadata: self.previous_meta,
+            metadata: self.meta,
         })
     }
 }
@@ -394,7 +392,7 @@ fn handle_network_response(
             "github meta fetch failed: unexpected status {}",
             response.status
         );
-        return Ok(prepared_github_fallback(cached, selection));
+        return Ok(prepared_github_fallback(cached));
     }
 
     if response.body.len() > max_bytes {
@@ -403,12 +401,12 @@ fn handle_network_response(
             response.body.len(),
             max_bytes
         );
-        return Ok(prepared_github_fallback(cached, selection));
+        return Ok(prepared_github_fallback(cached));
     }
 
     let Some(networks) = parse_and_extract_networks(&response.body, selection) else {
         warn!("github meta fetch failed: response body has invalid JSON or category data");
-        return Ok(prepared_github_fallback(cached, selection));
+        return Ok(prepared_github_fallback(cached));
     };
 
     let metadata = GithubMetaCacheMetadata {
@@ -427,7 +425,7 @@ fn handle_network_response(
     ) {
         Ok(promotion) => promotion,
         Err(error) => {
-            let mut fallback = prepared_github_fallback(cached, selection);
+            let mut fallback = prepared_github_fallback(cached);
             if fallback.primary.source == GithubMetaSource::Empty {
                 return Err(error);
             }
@@ -437,11 +435,7 @@ fn handle_network_response(
         }
     };
 
-    let fallback = cached.networks.map(|networks| GithubMetaLoadResult {
-        networks,
-        source: GithubMetaSource::FallbackCache,
-        metadata: cached.meta,
-    });
+    let fallback = cached.into_fallback_result();
     Ok(PreparedGithubMetaLoad {
         primary: GithubMetaLoadResult {
             networks,
@@ -496,81 +490,26 @@ fn stage_cache(
     })
 }
 
-fn prepared_github_fallback(
-    cached: GithubMetaCache,
-    selection: &CategorySelection,
-) -> PreparedGithubMetaLoad {
+fn prepared_github_fallback(cached: GithubMetaCache) -> PreparedGithubMetaLoad {
     let GithubMetaCache {
-        raw,
         networks,
         meta,
-        sidecar,
-        previous_networks,
-        previous_meta,
+        previous,
         generation_id: _,
     } = cached;
+    let (networks, source) = match networks {
+        Some(networks) => (networks, GithubMetaSource::FallbackCache),
+        None => (Vec::new(), GithubMetaSource::Empty),
+    };
     PreparedGithubMetaLoad {
-        primary: cache_fallback(
-            raw.as_deref(),
+        primary: GithubMetaLoadResult {
             networks,
-            meta,
-            sidecar.as_ref(),
-            selection,
-            GithubMetaSource::FallbackCache,
-        ),
-        fallback: previous_networks.map(|networks| GithubMetaLoadResult {
-            networks,
-            source: GithubMetaSource::FallbackCache,
-            metadata: previous_meta,
-        }),
+            source,
+            metadata: meta,
+        },
+        fallback: previous,
         pending_promotion: None,
         staging_failure: None,
-    }
-}
-
-fn cache_fallback(
-    cached_raw: Option<&[u8]>,
-    cached_networks: Option<Vec<CanonicalCidr>>,
-    cached_meta: Option<GithubMetaCacheMetadata>,
-    cached_sidecar: Option<&GithubMetaCategorySidecar>,
-    selection: &CategorySelection,
-    source: GithubMetaSource,
-) -> GithubMetaLoadResult {
-    let Some(raw) = cached_raw else {
-        return GithubMetaLoadResult {
-            networks: Vec::new(),
-            source: GithubMetaSource::Empty,
-            metadata: cached_meta,
-        };
-    };
-
-    if !cache_scope_compatible(selection, cached_sidecar) {
-        warn!("github meta cache scope is incompatible with current category filter");
-        return GithubMetaLoadResult {
-            networks: Vec::new(),
-            source: GithubMetaSource::Empty,
-            metadata: cached_meta,
-        };
-    }
-
-    let networks = if let Some(networks) = cached_networks {
-        networks
-    } else {
-        let Some(networks) = parse_and_extract_networks(raw, selection) else {
-            warn!("github meta cache is invalid JSON; ignoring stale cache");
-            return GithubMetaLoadResult {
-                networks: Vec::new(),
-                source: GithubMetaSource::Empty,
-                metadata: cached_meta,
-            };
-        };
-        networks
-    };
-
-    GithubMetaLoadResult {
-        networks,
-        source,
-        metadata: cached_meta,
     }
 }
 
@@ -1827,6 +1766,114 @@ mod tests {
 
         let requests = client.requests();
         assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1].if_none_match, None);
+        assert_eq!(requests[1].if_modified_since, None);
+    }
+
+    #[test]
+    fn cached_state_keeps_empty_current_and_previous_on_304() {
+        let temp = TempDir::new().expect("tempdir");
+        for raw in [
+            br#"{"hooks":["192.0.2.0/24"]}"#.as_slice(),
+            br"{}".as_slice(),
+        ] {
+            load_github_meta_safelist(
+                &MockHttpClient::new(vec![Ok(network_response(raw))]),
+                temp.path(),
+                TEST_GITHUB_META_URL,
+                &GithubMetaCategoryMode::All,
+                &BTreeMap::new(),
+            )
+            .expect("seed generation");
+        }
+        let store = CachePaths::from_cache_dir(temp.path()).generation_store;
+        let manifest =
+            read_bytes_with_limit(&store.join("current.json"), 16 * 1024).expect("manifest");
+        let prepared = prepare_github_meta_safelist(
+            &MockHttpClient::new(vec![Ok(HttpResponse {
+                status: StatusCode::NOT_MODIFIED,
+                body: Vec::new(),
+                etag: None,
+                last_modified: None,
+            })]),
+            temp.path(),
+            TEST_GITHUB_META_URL,
+            &GithubMetaCategoryMode::All,
+            &BTreeMap::new(),
+        )
+        .expect("cached empty generation");
+        assert_eq!(prepared.primary.source, GithubMetaSource::CacheNotModified);
+        assert_eq!(prepared.primary.networks, []);
+        assert_eq!(
+            prepared
+                .fallback
+                .expect("previous generation")
+                .networks
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["192.0.2.0/24"]
+        );
+        assert!(prepared.pending_promotion.is_none());
+        assert_eq!(
+            super::load_cached_github_meta_safelist(
+                temp.path(),
+                TEST_GITHUB_META_URL,
+                &GithubMetaCategoryMode::All
+            ),
+            Some(Vec::new())
+        );
+        assert_eq!(
+            read_bytes_with_limit(&store.join("current.json"), 16 * 1024).expect("manifest"),
+            manifest
+        );
+    }
+
+    #[test]
+    fn cached_state_keeps_validators_when_invalid_payload_requires_refetch() {
+        let temp = TempDir::new().expect("tempdir");
+        let raw = b"invalid JSON";
+        fs::write(temp.path().join(GITHUB_META_RAW_CACHE_FILE), raw).expect("raw cache");
+        fs::write(
+            temp.path().join(GITHUB_META_META_CACHE_FILE),
+            serde_json::to_vec(&GithubMetaCacheMetadata {
+                url: TEST_GITHUB_META_URL.to_string(),
+                etag: Some("cached-etag".to_string()),
+                last_modified: None,
+                sha256_raw: sha256_hex(raw),
+            })
+            .expect("metadata JSON"),
+        )
+        .expect("metadata cache");
+        let client = MockHttpClient::new(vec![
+            Ok(HttpResponse {
+                status: StatusCode::NOT_MODIFIED,
+                body: Vec::new(),
+                etag: None,
+                last_modified: None,
+            }),
+            Ok(network_response(br#"{"hooks":["192.0.2.0/24"]}"#)),
+        ]);
+        let loaded = load_github_meta_safelist(
+            &client,
+            temp.path(),
+            TEST_GITHUB_META_URL,
+            &GithubMetaCategoryMode::All,
+            &BTreeMap::new(),
+        )
+        .expect("unconditional refresh");
+        assert_eq!(loaded.source, GithubMetaSource::Network);
+        assert_eq!(
+            loaded
+                .networks
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["192.0.2.0/24"]
+        );
+        let requests = client.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].if_none_match.as_deref(), Some("cached-etag"));
         assert_eq!(requests[1].if_none_match, None);
         assert_eq!(requests[1].if_modified_since, None);
     }

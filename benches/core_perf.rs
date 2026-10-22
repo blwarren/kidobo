@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use kidobo_core::blocklist::UnbanTargetIndex;
 use kidobo_core::config::Config;
 use kidobo_core::lookup::{LookupSourceEntry, run_lookup};
 use kidobo_core::network::{
@@ -220,6 +221,40 @@ fn benchmark_subtract_safelist(c: &mut Criterion) {
         });
     }
 
+    group.finish();
+}
+
+fn benchmark_unban(c: &mut Criterion) {
+    let mut group = c.benchmark_group("plan_unban");
+    let repeated =
+        vec![parse_ip_cidr_strict("203.0.113.7").expect("valid benchmark target"); 10_000];
+    let distinct = (0..10_000_u32)
+        .map(|offset| {
+            CanonicalCidr::V4(
+                Ipv4Cidr::new(Ipv4Addr::from(0xcb00_0000 + offset), 32)
+                    .expect("valid benchmark target"),
+            )
+        })
+        .collect::<Vec<_>>();
+    for source_count in [10_000_usize, 100_000_usize] {
+        let entries = generate_disjoint_ipv4_hosts(source_count)
+            .into_iter()
+            .map(|cidr| Some(CanonicalCidr::V4(cidr)))
+            .collect::<Vec<_>>();
+        for (label, targets) in [("repeated", &repeated), ("distinct", &distinct)] {
+            group.throughput(Throughput::Elements((entries.len() + targets.len()) as u64));
+            group.bench_with_input(
+                BenchmarkId::new(label, source_count),
+                targets,
+                |b, targets| {
+                    b.iter(|| {
+                        let index = UnbanTargetIndex::new(black_box(targets.clone()));
+                        black_box(index.plan(black_box(&entries).iter().copied()));
+                    });
+                },
+            );
+        }
+    }
     group.finish();
 }
 
@@ -639,6 +674,7 @@ criterion_group!(
     benchmark_real_world,
     benchmark_effective_blocklists,
     benchmark_subtract_safelist,
-    benchmark_lookup
+    benchmark_lookup,
+    benchmark_unban
 );
 criterion_main!(core_perf);

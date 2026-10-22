@@ -52,6 +52,9 @@ Publication requires a Linux x86_64 host. Release builds require `musl-gcc` and 
 `x86_64-unknown-linux-musl` Rust target. The compatibility gate additionally
 requires `readelf` and Docker access; it runs only offline Kidobo commands in
 the containers and never invokes firewall or systemd operations.
+Packaging reads the validated candidate binary from `CARGO_TARGET_DIR` when
+set, or `target` otherwise. Relative target directories resolve inside the
+candidate worktree; recovery artifacts retain the location below.
 
 ## GitHub Automation
 

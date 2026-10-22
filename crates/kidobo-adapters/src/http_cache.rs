@@ -575,12 +575,24 @@ fn stage_cache(
     meta: &RemoteCacheMetadata,
     previous_generation: Option<&str>,
 ) -> Result<StagedGeneration, HttpCacheError> {
+    let store = remote_generation_store(cache_dir, url);
+    if iplist.len() > MAX_IPLIST_READ_BYTES {
+        return Err(HttpCacheError::WriteMetadata {
+            path: store.join("current.json"),
+            source: Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "normalized iplist size {} exceeds {MAX_IPLIST_READ_BYTES} byte limit",
+                    iplist.len()
+                ),
+            )),
+        });
+    }
     let metadata =
         serde_json::to_vec_pretty(meta).map_err(|err| HttpCacheError::WriteMetadata {
-            path: remote_generation_store(cache_dir, url).join("current.json"),
+            path: store.join("current.json"),
             source: Box::new(err),
         })?;
-    let store = remote_generation_store(cache_dir, url);
     stage_generation(
         &store,
         &[
@@ -1061,6 +1073,145 @@ mod tests {
             body: body.to_vec(),
             etag: None,
             last_modified: None,
+        }
+    }
+
+    fn normalized_limit_body(tail: &str) -> String {
+        let mut body = String::new();
+        for index in 0..381_300_u32 {
+            writeln!(
+                body,
+                "2001:1234:5678:9abc:def0:1111:{:x}:{:x}/128",
+                0x8000 | (index >> 15),
+                0x8000 | (index & 0x7fff)
+            )
+            .expect("write full-width IPv6 entry");
+        }
+        body.push_str(tail);
+        body
+    }
+
+    #[test]
+    fn normalized_cache_limit_accepts_readable_boundary_generations() {
+        let env = BTreeMap::from([(
+            ENV_KIDOBO_MAX_HTTP_BODY_BYTES.into(),
+            MAX_HTTP_BODY_BYTES.to_string().into(),
+        )]);
+        for (tail, expected_bytes) in [
+            ("2001:db8:1::/64", super::MAX_IPLIST_READ_BYTES - 1),
+            ("2001:db8:11::/64", super::MAX_IPLIST_READ_BYTES),
+        ] {
+            let temp = TempDir::new().expect("tempdir");
+            let url = "https://example.test/large-feed";
+            let body = normalized_limit_body(tail);
+            assert_eq!(body.len(), expected_bytes);
+            let client = MockHttpClient::new(vec![Ok(network_response_for_test(body.as_bytes()))]);
+            let prepared = prepare_iplist_with_cache(&client, url, temp.path(), &env, 500_000)
+                .expect("prepare boundary generation");
+            assert_eq!(prepared.loaded.source, CacheSource::Network);
+            assert_eq!(prepared.loaded.networks.len(), 381_301);
+            prepared
+                .pending_promotion
+                .expect("pending promotion")
+                .promote()
+                .expect("promote boundary generation");
+            assert_eq!(
+                fs::metadata(current_generation_dir(temp.path(), url).join("iplist"))
+                    .expect("iplist metadata")
+                    .len(),
+                u64::try_from(expected_bytes).expect("byte count")
+            );
+            let offline = crate::cached_sources::load_remote_sources(temp.path())
+                .expect("offline cache read");
+            assert_eq!(offline.len(), 1);
+            assert_eq!(
+                offline[0]
+                    .entries
+                    .iter()
+                    .map(|entry| entry.cidr)
+                    .collect::<Vec<_>>(),
+                prepared.loaded.networks
+            );
+            let unavailable = MockHttpClient::new(vec![Err(HttpClientError::Request {
+                reason: "offline".to_string(),
+            })]);
+            let fallback = prepare_iplist_with_cache(&unavailable, url, temp.path(), &env, 500_000)
+                .expect("read boundary fallback");
+            assert_eq!(fallback.loaded.source, CacheSource::FallbackCache);
+            assert_eq!(fallback.loaded.networks, prepared.loaded.networks);
+            assert!(fallback.pending_promotion.is_none());
+        }
+    }
+
+    #[test]
+    fn normalized_cache_limit_rejection_preserves_selected_or_absent_cache() {
+        let body = normalized_limit_body("2001:db8:111::/64");
+        assert_eq!(body.len(), super::MAX_IPLIST_READ_BYTES + 1);
+        let env = BTreeMap::from([(
+            ENV_KIDOBO_MAX_HTTP_BODY_BYTES.into(),
+            MAX_HTTP_BODY_BYTES.to_string().into(),
+        )]);
+        for existing in [true, false] {
+            let temp = TempDir::new().expect("tempdir");
+            let url = "https://example.test/large-feed";
+            if existing {
+                for seed in [b"192.0.2.0/24".as_slice(), b"198.51.100.0/24".as_slice()] {
+                    fetch_iplist_with_cache(
+                        &MockHttpClient::new(vec![Ok(network_response_for_test(seed))]),
+                        url,
+                        temp.path(),
+                        &env,
+                    )
+                    .expect("seed selected cache");
+                }
+            }
+            let store = remote_generation_store(temp.path(), url);
+            let selected = generation_candidates(&store);
+            let manifest_before =
+                read_bytes_with_limit(&store.join("current.json"), 16 * 1024).ok();
+            let client = MockHttpClient::new(vec![Ok(network_response_for_test(body.as_bytes()))]);
+            let result = prepare_iplist_with_cache(&client, url, temp.path(), &env, 500_000);
+            if existing {
+                let prepared = result.expect("validated fallback");
+                assert_eq!(prepared.loaded.source, CacheSource::FallbackCache);
+                assert_eq!(
+                    prepared
+                        .loaded
+                        .networks
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>(),
+                    ["198.51.100.0/24"]
+                );
+                assert!(prepared.pending_promotion.is_none());
+                assert_eq!(
+                    fs::read_dir(store.join("generations"))
+                        .expect("generations")
+                        .count(),
+                    2
+                );
+            } else {
+                let Err(super::HttpCacheError::WriteMetadata { source, .. }) = result else {
+                    panic!("oversized normalized content without fallback must fail");
+                };
+                assert_eq!(
+                    source
+                        .downcast_ref::<std::io::Error>()
+                        .expect("I/O cause")
+                        .kind(),
+                    std::io::ErrorKind::InvalidData
+                );
+                assert_eq!(
+                    source.to_string(),
+                    "normalized iplist size 16777217 exceeds 16777216 byte limit"
+                );
+                assert!(!store.exists());
+            }
+            assert_eq!(generation_candidates(&store), selected);
+            assert_eq!(
+                read_bytes_with_limit(&store.join("current.json"), 16 * 1024).ok(),
+                manifest_before
+            );
         }
     }
 

@@ -1,10 +1,8 @@
-//! Deterministic offline lookup workflow and presentation-oriented outcomes.
+//! Deterministic offline lookup with borrowed match batches and a compact summary.
 
+pub use kidobo_core::lookup::LookupSourceEntry;
+use kidobo_core::lookup::try_run_lookup_by_target;
 use std::path::PathBuf;
-use std::sync::Arc;
-
-use kidobo_core::lookup::run_lookup_by_target;
-use kidobo_core::network::CanonicalCidr;
 
 use crate::AppError;
 use crate::paths::{ConfigRequirement, PathResolutionInput};
@@ -30,31 +28,13 @@ pub struct LookupRequest {
     pub input: LookupInput,
 }
 
-/// One source entry overlapping a valid lookup target.
+/// Counts and diagnostics after every valid target has been emitted.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LookupSourceMatch {
-    /// Stable operator-visible source label.
-    pub source_label: Arc<str>,
-    /// Original matched source line.
-    pub matched_source_entry: String,
-    /// Canonical CIDR used for overlap matching.
-    pub matched_cidr: CanonicalCidr,
-}
-
-/// A valid lookup target and its deterministic matches.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LookupTargetOutcome {
-    /// Original target text.
-    pub target: String,
-    /// Source matches sorted by source identity and entry.
-    pub matches: Vec<LookupSourceMatch>,
-}
-
-/// Complete offline lookup result.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LookupOutcome {
-    /// Valid targets and their matches in deterministic target order.
-    pub targets: Vec<LookupTargetOutcome>,
+pub struct LookupSummary {
+    /// Number of unique valid target strings.
+    pub total_count: usize,
+    /// Number of valid targets with at least one match.
+    pub matched_count: usize,
     /// Sorted, unique invalid target strings.
     pub invalid_targets: Vec<String>,
     /// Whether targets came from a file rather than one direct argument.
@@ -86,11 +66,13 @@ pub struct LookupDependencies<'a> {
 /// # Errors
 ///
 /// Returns an error when paths cannot be resolved, a target file cannot be read, or a required
-/// offline source cannot be loaded. Configuration-loading failures remain soft notices.
-pub fn execute(
+/// offline source cannot be loaded, cancellation is requested, or the callback fails.
+/// Callback errors retain their type. Configuration-loading failures remain soft notices.
+pub fn execute<E: From<AppError>>(
     request: &LookupRequest,
     dependencies: &LookupDependencies<'_>,
-) -> Result<LookupOutcome, AppError> {
+    mut emit: impl FnMut(&str, &[&LookupSourceEntry]) -> Result<(), E>,
+) -> Result<LookupSummary, E> {
     dependencies.cancellation.check()?;
     let paths = dependencies
         .paths
@@ -124,23 +106,21 @@ pub fn execute(
     let source_entries = dependencies.sources.load(&context)?;
     dependencies.cancellation.check()?;
 
-    let mut target_outcomes = Vec::with_capacity(targets.len());
-    let invalid_targets = run_lookup_by_target(&targets, &source_entries, |target, matches| {
-        target_outcomes.push(LookupTargetOutcome {
-            target: target.to_string(),
-            matches: matches
-                .iter()
-                .map(|source| LookupSourceMatch {
-                    source_label: Arc::clone(&source.source_label),
-                    matched_source_entry: source.source_line.clone(),
-                    matched_cidr: source.cidr,
-                })
-                .collect(),
-        });
-    });
+    let mut total_count = 0;
+    let mut matched_count = 0;
+    let invalid_targets =
+        try_run_lookup_by_target(&targets, &source_entries, |target, matches| {
+            dependencies.cancellation.check()?;
+            emit(target, matches)?;
+            total_count += 1;
+            matched_count += usize::from(!matches.is_empty());
+            dependencies.cancellation.check()?;
+            Ok::<(), E>(())
+        })?;
 
-    Ok(LookupOutcome {
-        targets: target_outcomes,
+    Ok(LookupSummary {
+        total_count,
+        matched_count,
         invalid_targets,
         file_mode,
         notices,
@@ -253,6 +233,61 @@ mod tests {
     }
 
     #[test]
+    fn lookup_stops_on_a_typed_callback_error_or_cancellation_between_batches() {
+        #[derive(Debug)]
+        enum SinkError {
+            Application(AppError),
+            Output(std::io::Error),
+        }
+        impl From<AppError> for SinkError {
+            fn from(error: AppError) -> Self {
+                Self::Application(error)
+            }
+        }
+        for cancel in [false, true] {
+            let cancellation = std::sync::atomic::AtomicBool::new(false);
+            let mut sources = OfflineLookupRegistry::new();
+            sources.register(CachedSource).expect("register");
+            let mut emitted = Vec::new();
+            let result = execute(
+                &LookupRequest {
+                    paths: path_input(),
+                    input: LookupInput::File(PathBuf::from("targets")),
+                },
+                &LookupDependencies {
+                    cancellation: &cancellation,
+                    paths: &Paths,
+                    configs: &MissingConfig,
+                    target_files: &Targets,
+                    sources: &sources,
+                    clock: &TemporaryState,
+                    temporary_bans: &TemporaryState,
+                },
+                |target, _| {
+                    emitted.push(target.to_string());
+                    if cancel {
+                        cancellation.store(true, std::sync::atomic::Ordering::SeqCst);
+                        Ok(())
+                    } else {
+                        Err(SinkError::Output(std::io::Error::from(
+                            std::io::ErrorKind::BrokenPipe,
+                        )))
+                    }
+                },
+            );
+            assert_eq!(emitted, ["198.51.100.8"]);
+            match result.expect_err("must stop after first batch") {
+                SinkError::Application(AppError::Interrupted) => assert!(cancel),
+                SinkError::Output(error) => {
+                    assert!(!cancel);
+                    assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+                }
+                other @ SinkError::Application(_) => panic!("unexpected error: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn lookup_captures_one_clock_and_state_snapshot_without_writes_or_valid_config() {
         #[derive(Default)]
         struct Snapshot {
@@ -309,6 +344,7 @@ mod tests {
         sources
             .register(SnapshotProvider)
             .expect("temporary source");
+        let mut batches = Vec::new();
         let outcome = execute(
             &LookupRequest {
                 paths: path_input(),
@@ -323,25 +359,32 @@ mod tests {
                 clock: &snapshot,
                 temporary_bans: &snapshot,
             },
+            |target, matches| {
+                batches.push((
+                    target.to_string(),
+                    matches
+                        .iter()
+                        .map(|entry| (*entry).clone())
+                        .collect::<Vec<_>>(),
+                ));
+                Ok::<(), AppError>(())
+            },
         )
         .expect("lookup");
+        assert_eq!(outcome.total_count, 2);
+        assert_eq!(outcome.matched_count, 1);
         assert_eq!(snapshot.clock_calls.get(), 1);
         assert_eq!(snapshot.load_calls.get(), 1);
-        assert_eq!(
-            outcome.targets[0].matches[0].source_label.as_ref(),
-            "temporary:blocklist"
-        );
-        assert_eq!(
-            outcome.targets[0].matches[0].matched_source_entry,
-            "198.51.100.0/24"
-        );
-        assert_eq!(outcome.targets[1].matches.len(), 0);
+        assert_eq!(batches[0].1[0].source_label.as_ref(), "temporary:blocklist");
+        assert_eq!(batches[0].1[0].source_line, "198.51.100.0/24");
+        assert_eq!(batches[1].1.len(), 0);
     }
 
     #[test]
     fn lookup_returns_typed_matches_invalid_targets_and_config_notice() {
         let mut sources = OfflineLookupRegistry::new();
         sources.register(CachedSource).expect("register");
+        let mut batches = Vec::new();
         let outcome = execute(
             &LookupRequest {
                 paths: path_input(),
@@ -356,19 +399,26 @@ mod tests {
                 clock: &TemporaryState,
                 temporary_bans: &TemporaryState,
             },
+            |target, matches| {
+                batches.push((
+                    target.to_string(),
+                    matches
+                        .iter()
+                        .map(|entry| (*entry).clone())
+                        .collect::<Vec<_>>(),
+                ));
+                Ok::<(), AppError>(())
+            },
         )
         .expect("lookup");
 
         assert!(outcome.file_mode);
-        assert_eq!(outcome.targets.len(), 2);
-        assert_eq!(outcome.targets[0].target, "198.51.100.8");
-        assert_eq!(outcome.targets[0].matches.len(), 1);
-        assert_eq!(
-            outcome.targets[0].matches[0].source_label.as_ref(),
-            "cache:test"
-        );
-        assert_eq!(outcome.targets[1].target, "203.0.113.8");
-        assert_eq!(outcome.targets[1].matches.len(), 0);
+        assert_eq!(outcome.total_count, 2);
+        assert_eq!(batches[0].0, "198.51.100.8");
+        assert_eq!(batches[0].1.len(), 1);
+        assert_eq!(batches[0].1[0].source_label.as_ref(), "cache:test");
+        assert_eq!(batches[1].0, "203.0.113.8");
+        assert_eq!(batches[1].1.len(), 0);
         assert_eq!(outcome.invalid_targets, ["invalid"]);
         assert_eq!(outcome.notices.len(), 1);
         assert!(

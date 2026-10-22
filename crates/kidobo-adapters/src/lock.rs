@@ -129,7 +129,7 @@ pub fn acquire_non_blocking(path: &Path) -> Result<FileLock, LockError> {
 
     match file.try_lock_exclusive() {
         Ok(()) => Ok(FileLock { file }),
-        Err(err) if is_would_block(&err) => Err(LockError::AlreadyHeld {
+        Err(err) if err.kind() == io::ErrorKind::WouldBlock => Err(LockError::AlreadyHeld {
             path: path.to_path_buf(),
             source: err,
         }),
@@ -138,10 +138,6 @@ pub fn acquire_non_blocking(path: &Path) -> Result<FileLock, LockError> {
             source: err,
         }),
     }
-}
-
-fn is_would_block(err: &io::Error) -> bool {
-    err.kind() == io::ErrorKind::WouldBlock
 }
 
 fn enforce_mode_0600(file: &File, path: &Path) -> Result<(), LockError> {
@@ -171,15 +167,7 @@ mod tests {
 
     use crate::limited_io::read_bytes_with_limit;
 
-    use super::{LockError, acquire_non_blocking, is_would_block};
-
-    #[test]
-    fn would_block_classifier_rejects_other_io_errors() {
-        assert!(is_would_block(&io::Error::from(io::ErrorKind::WouldBlock)));
-        assert!(!is_would_block(&io::Error::from(
-            io::ErrorKind::PermissionDenied
-        )));
-    }
+    use super::{LockError, acquire_non_blocking};
 
     #[test]
     fn acquires_non_blocking_lock() {

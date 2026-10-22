@@ -649,6 +649,151 @@ fn lookup_tsv_single_no_match_preserves_empty_legacy_output() {
 }
 
 #[test]
+fn lookup_escapes_legacy_cache_labels_in_both_formats() {
+    let root = create_lookup_root("");
+    fs::write(
+        root.path().join("cache/remote/feed.iplist"),
+        "203.0.113.7\n",
+    )
+    .expect("write cache");
+    fs::write(
+        root.path().join("cache/remote/feed.meta.json"),
+        serde_json::json!({"url": "feed\t\u{1b}\\label"}).to_string(),
+    )
+    .expect("write metadata");
+    for format in ["tsv", "human"] {
+        let output =
+            run_kidobo_with_root(root.path(), &["lookup", "203.0.113.7", "--format", format]);
+        assert_eq!(output.status.code(), Some(0));
+        let stdout = String::from_utf8(output.stdout).expect("UTF-8 output");
+        assert!(
+            stdout.contains(r"feed\t\x1B\\label"),
+            "unescaped label: {stdout:?}"
+        );
+        assert!(!stdout.contains('\u{1b}'));
+        if format == "tsv" {
+            assert_eq!(stdout, "203.0.113.7\tfeed\\t\\x1B\\\\label\t203.0.113.7\n");
+        }
+    }
+}
+
+#[test]
+fn lookup_escapes_validated_generation_labels_in_both_formats() {
+    use sha2::{Digest, Sha256};
+    let root = create_lookup_root("");
+    let url = "https://feed.test/\t\u{1b}\\";
+    let payload = "203.0.113.7/32\n";
+    let checksum = kidobo_adapters::hash::sha256_hex(payload.as_bytes());
+    let metadata = serde_json::json!({
+        "url": url, "etag": null, "last_modified": null,
+        "sha256_raw": checksum, "sha256_iplist": checksum,
+    })
+    .to_string();
+    let files = [
+        ("iplist", payload),
+        ("meta.json", metadata.as_str()),
+        ("raw", payload),
+    ];
+    let mut hasher = Sha256::new();
+    for (name, contents) in files {
+        hasher.update(name.len().to_le_bytes());
+        hasher.update(name.as_bytes());
+        hasher.update(contents.len().to_le_bytes());
+        hasher.update(contents.as_bytes());
+    }
+    let generation = kidobo_adapters::hash::hex_lower(&hasher.finalize());
+    let store = root
+        .path()
+        .join("cache/remote/v2/remote")
+        .join(kidobo_adapters::http_cache::url_hash_prefix(url));
+    let directory = store.join("generations").join(&generation);
+    fs::create_dir_all(&directory).expect("create generation");
+    for (name, contents) in files {
+        fs::write(directory.join(name), contents).expect("generation member");
+    }
+    fs::write(
+        store.join("current.json"),
+        serde_json::json!({
+            "version": 2, "current": generation, "previous": null,
+        })
+        .to_string(),
+    )
+    .expect("manifest");
+    for format in ["tsv", "human"] {
+        let output =
+            run_kidobo_with_root(root.path(), &["lookup", "203.0.113.7", "--format", format]);
+        assert_eq!(output.status.code(), Some(0));
+        let stdout = String::from_utf8(output.stdout).expect("UTF-8");
+        assert!(
+            stdout.contains(r"https://feed.test/\t\x1B\\"),
+            "missing escaped generation label: {stdout:?}"
+        );
+        assert!(!stdout.contains('\u{1b}'));
+        if format == "tsv" {
+            assert_eq!(
+                stdout,
+                "203.0.113.7\thttps://feed.test/\\t\\x1B\\\\\t203.0.113.7/32\n"
+            );
+        }
+    }
+}
+
+#[test]
+fn lookup_source_loading_failure_emits_no_human_table() {
+    let root = create_lookup_root("");
+    fs::remove_file(root.path().join("data/blocklist.txt")).expect("remove file");
+    fs::create_dir(root.path().join("data/blocklist.txt")).expect("unreadable source");
+    let output = run_kidobo_with_root(root.path(), &["lookup", "203.0.113.7"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn lookup_streams_two_million_matches_within_192_mib() {
+    use std::fmt::Write as _;
+    let mut entries = String::new();
+    for index in 0..1_000 {
+        writeln!(entries, "10.0.{}.{}/32", index / 256, index % 256).expect("entry");
+    }
+    let root = create_lookup_root(&entries);
+    let mut targets = String::new();
+    for index in 0..2_000 {
+        writeln!(targets, "192.0.{}.{}/0", index / 256, index % 256).expect("target");
+    }
+    let target_path = root.path().join("targets.txt");
+    fs::write(&target_path, targets).expect("write targets");
+    let mut child = Command::new("bash")
+        .args(["-c", "ulimit -v 196608; exec \"$@\"", "lookup-memory-test"])
+        .arg(kidobo_binary())
+        .args(["lookup", "--file"])
+        .arg(target_path)
+        .args(["--format", "tsv"])
+        .env("KIDOBO_ROOT", root.path())
+        .env_remove("KIDOBO_TEST_SANDBOX")
+        .env_remove("KIDOBO_DISABLE_TEST_SANDBOX")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn capped lookup");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while child.try_wait().expect("poll capped lookup").is_none() {
+        if Instant::now() >= deadline {
+            child.kill().expect("kill stalled lookup");
+            let _status = child.wait();
+            panic!("capped lookup exceeded 60 seconds");
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let output = child.wait_with_output().expect("wait capped lookup");
+    assert!(
+        output.status.success(),
+        "capped lookup failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn lookup_reports_every_matching_source_without_refreshing_caches() {
     let root = create_root(
         "[ipset]\n\
@@ -852,6 +997,27 @@ fn lookup_human_output_shows_matches_no_matches_and_summary() {
     assert!(
         !stdout.contains("\x1b["),
         "redirected human output must not contain ANSI escapes: {stdout:?}"
+    );
+    assert_eq!(
+        stdout,
+        format!(
+            "{}\n│ {:<30} │ {:<8} │ {:<44} │ {:<30} │\n{}\n│ {:<30} │ {:<8} │ {:<44} │ {:<30} │\n│ {:<30} │ {:<8} │ {:<44} │ {:<30} │\n{}\n\nSummary\n  Targets:    2\n  Matched:    1\n  Unmatched:  1\n  Match rate: 50%\n",
+            expected_borders[0],
+            "Target",
+            "Status",
+            "Source",
+            "Matched Entry",
+            expected_borders[1],
+            "198.51.100.9",
+            "NO MATCH",
+            "—",
+            "—",
+            "203.0.113.7",
+            "MATCH",
+            "internal:blocklist",
+            "203.0.113.7",
+            expected_borders[2],
+        )
     );
 }
 

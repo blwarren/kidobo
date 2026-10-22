@@ -505,7 +505,7 @@ fn create_restore_script_file() -> Result<(std::fs::File, PathBuf), IpsetError> 
         match options.open(&path) {
             Ok(file) => return Ok((file, path)),
             Err(err) => {
-                if should_retry_restore_script_create(&err) {
+                if err.kind() == std::io::ErrorKind::AlreadyExists {
                     continue;
                 }
                 return Err(IpsetError::CreateRestoreScript { path, source: err });
@@ -521,10 +521,6 @@ fn create_restore_script_file() -> Result<(std::fs::File, PathBuf), IpsetError> 
             "failed to create a unique temporary restore script path",
         ),
     })
-}
-
-fn should_retry_restore_script_create(err: &std::io::Error) -> bool {
-    err.kind() == std::io::ErrorKind::AlreadyExists
 }
 
 fn truncate_to_max_bytes(input: &str, max_bytes: usize) -> &str {
@@ -556,14 +552,12 @@ mod tests {
     use std::cell::RefCell;
     use std::collections::VecDeque;
     use std::fs;
-    use std::io;
     use std::path::PathBuf;
 
     use super::{
         IpsetCommandRunner, IpsetError, IpsetFamily, IpsetSetSpec, RESTORE_SCRIPT_READ_LIMIT,
         atomic_replace_ipset_values, ensure_ipset_exists, generate_temp_set_name,
-        is_unsupported_terse_option_result, should_retry_restore_script_create,
-        truncate_to_max_bytes, write_restore_script,
+        is_unsupported_terse_option_result, truncate_to_max_bytes, write_restore_script,
     };
     use crate::command_runner::{CommandResult, CommandRunnerError, ProcessStatus};
     use crate::limited_io::read_to_string_with_limit;
@@ -981,16 +975,6 @@ mod tests {
                 .iter()
                 .all(|path| !path.exists())
         );
-    }
-
-    #[test]
-    fn restore_script_create_retries_only_path_collisions() {
-        assert!(should_retry_restore_script_create(&io::Error::from(
-            io::ErrorKind::AlreadyExists
-        )));
-        assert!(!should_retry_restore_script_create(&io::Error::from(
-            io::ErrorKind::PermissionDenied
-        )));
     }
 
     #[test]

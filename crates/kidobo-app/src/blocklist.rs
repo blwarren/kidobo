@@ -8,9 +8,10 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use kidobo_core::asn::normalize_asn_tokens;
 use kidobo_core::blocklist::{
-    BanClassification, BlocklistDocument, classify_ban_targets, exact_match_indexes,
-    parse_blocklist_target, plan_unban, plan_unban_many,
+    BanClassification, BlocklistDocument, UnbanIndexPlan, UnbanTargetIndex, classify_ban_targets,
+    exact_match_indexes, parse_blocklist_target,
 };
 use kidobo_core::network::CanonicalCidr;
 pub use kidobo_core::temporary_bans::BanDuration;
@@ -105,7 +106,7 @@ pub struct UnbanPreview {
     pub exact_entries: Vec<String>,
     /// Existing entries that overlap but do not exactly match a target.
     pub partial_entries: Vec<String>,
-    targets: Vec<CanonicalCidr>,
+    targets: UnbanTargetIndex,
     temporary_matches: BTreeMap<CanonicalCidr, u64>,
 }
 
@@ -242,13 +243,6 @@ pub trait BlocklistRepository {
 
 /// Resolution, cache, and configuration operations for ASN workflows.
 pub trait AsnOperations {
-    /// Parses, validates, sorts, and deduplicates ASN tokens.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when any token is not a supported autonomous-system number.
-    fn normalize_tokens(&self, tokens: &[String]) -> Result<Vec<u32>, AppError>;
-
     /// Loads prefixes for one ASN, using bounded cache fallback where available.
     ///
     /// # Errors
@@ -450,16 +444,23 @@ pub fn prepare_unban(
         }
         ParsedBlocklistInput::EmptyFile => return Ok(UnbanPreparation::EmptyFile),
     };
+    dependencies.cancellation.check()?;
+    let targets = UnbanTargetIndex::new(targets);
+    dependencies.cancellation.check()?;
     let document = dependencies.repository.load(&paths.blocklist_file)?;
+    dependencies.cancellation.check()?;
     let temporary = dependencies
         .temporary_bans
         .load(&paths.temporary_bans_file())?;
-    Ok(UnbanPreparation::Ready(build_preview(
-        &request.input,
+    let plan = build_unban_plan(&targets, &document, &temporary, dependencies.cancellation)?;
+    Ok(UnbanPreparation::Ready(UnbanPreview {
+        target_label: unban_target_label(&request.input, &targets),
+        requested_target_count: targets.targets().len(),
+        exact_entries: plan.exact_entries,
+        partial_entries: plan.partial_entries,
         targets,
-        &document,
-        &temporary,
-    )))
+        temporary_matches: plan.temporary_matches,
+    }))
 }
 
 /// Applies an approved unban preview under the process lock.
@@ -480,25 +481,31 @@ pub fn apply_unban(
         .resolve(&request.paths, ConfigRequirement::Required)?;
     let _lock = dependencies.locks.acquire(&paths.lock_file)?;
     dependencies.configs.load(&paths.config_file)?;
+    dependencies.cancellation.check()?;
     let document = dependencies.repository.load(&paths.blocklist_file)?;
+    dependencies.cancellation.check()?;
     let temporary_path = paths.temporary_bans_file();
     let mut temporary = dependencies.temporary_bans.load(&temporary_path)?;
-    let current = build_preview(
-        &request.input,
-        preview.targets.clone(),
+    let current = build_unban_plan(
+        &preview.targets,
         &document,
         &temporary,
-    );
-    if current != *preview {
+        dependencies.cancellation,
+    )?;
+    if current.exact_entries != preview.exact_entries
+        || current.partial_entries != preview.partial_entries
+        || current.temporary_matches != preview.temporary_matches
+        || preview.requested_target_count != preview.targets.targets().len()
+        || preview.target_label != unban_target_label(&request.input, &preview.targets)
+    {
         return Err(AppError::BlocklistChanged);
     }
-
-    let line_canonicals = document
-        .lines
-        .iter()
-        .map(|line| line.canonical)
-        .collect::<Vec<_>>();
-    let index_plan = plan_unban_many(&line_canonicals, &preview.targets);
+    let UnbanStatePlan {
+        permanent: index_plan,
+        temporary: temporary_plan,
+        temporary_targets,
+        ..
+    } = current;
     let mut removal_indexes = index_plan
         .exact_indexes
         .iter()
@@ -507,13 +514,6 @@ pub fn apply_unban(
     if decision.remove_partial {
         removal_indexes.extend(index_plan.partial_indexes.iter().copied());
     }
-    let temporary_targets = temporary.ips.keys().copied().collect::<Vec<_>>();
-    let temporary_canonicals = temporary_targets
-        .iter()
-        .copied()
-        .map(Some)
-        .collect::<Vec<_>>();
-    let temporary_plan = plan_unban_many(&temporary_canonicals, &preview.targets);
     let mut temporary_removed = 0;
     for index in temporary_plan.exact_indexes.iter().chain(
         temporary_plan
@@ -579,7 +579,9 @@ pub fn execute_ban_asn(
     let paths = dependencies
         .paths
         .resolve(&request.paths, ConfigRequirement::Required)?;
-    let requested_asns = dependencies.asn.normalize_tokens(&request.tokens)?;
+    let requested_asns = normalize_asn_tokens(&request.tokens).map_err(|source| AppError::Asn {
+        source: Box::new(source),
+    })?;
     let _lock = dependencies.locks.acquire(&paths.lock_file)?;
     let config = dependencies.configs.load(&paths.config_file)?;
     let stale_after = Duration::from_secs(u64::from(config.asn.cache_stale_after_secs.get()));
@@ -667,7 +669,9 @@ pub fn execute_unban_asn(
     let paths = dependencies
         .paths
         .resolve(&request.paths, ConfigRequirement::Required)?;
-    let requested_asns = dependencies.asn.normalize_tokens(&request.tokens)?;
+    let requested_asns = normalize_asn_tokens(&request.tokens).map_err(|source| AppError::Asn {
+        source: Box::new(source),
+    })?;
     let _lock = dependencies.locks.acquire(&paths.lock_file)?;
     let config = dependencies.configs.load(&paths.config_file)?;
     let temporary_path = paths.temporary_bans_file();
@@ -763,33 +767,36 @@ fn parse_input(
     })
 }
 
-fn build_preview(
-    input: &BlocklistInput,
-    targets: Vec<CanonicalCidr>,
+struct UnbanStatePlan {
+    permanent: UnbanIndexPlan,
+    temporary: UnbanIndexPlan,
+    temporary_targets: Vec<CanonicalCidr>,
+    exact_entries: Vec<String>,
+    partial_entries: Vec<String>,
+    temporary_matches: BTreeMap<CanonicalCidr, u64>,
+}
+
+fn build_unban_plan(
+    targets: &UnbanTargetIndex,
     document: &BlocklistDocument,
     temporary: &TemporaryBans,
-) -> UnbanPreview {
-    let line_canonicals = document
-        .lines
-        .iter()
-        .map(|line| line.canonical)
-        .collect::<Vec<_>>();
-    let index_plan = if let [target] = targets.as_slice() {
-        plan_unban(&line_canonicals, *target)
-    } else {
-        plan_unban_many(&line_canonicals, &targets)
-    };
+    cancellation: &dyn crate::ports::Cancellation,
+) -> Result<UnbanStatePlan, AppError> {
+    cancellation.check()?;
+    let index_plan = targets.plan(document.lines.iter().map(|line| line.canonical));
+    cancellation.check()?;
     let mut exact_entries = entries_for_indexes(document, &index_plan.exact_indexes);
     let mut partial_entries = entries_for_indexes(document, &index_plan.partial_indexes);
-    let temporary_targets = temporary.ips.keys().copied().map(Some).collect::<Vec<_>>();
-    let temporary_plan = plan_unban_many(&temporary_targets, &targets);
+    let temporary_targets = temporary.ips.keys().copied().collect::<Vec<_>>();
+    let temporary_plan = targets.plan(temporary_targets.iter().copied().map(Some));
+    cancellation.check()?;
     let mut temporary_matches = BTreeMap::new();
     for (indexes, entries) in [
         (&temporary_plan.exact_indexes, &mut exact_entries),
         (&temporary_plan.partial_indexes, &mut partial_entries),
     ] {
         for index in indexes {
-            if let Some(Some(target)) = temporary_targets.get(*index)
+            if let Some(target) = temporary_targets.get(*index)
                 && let Some(expires_at) = temporary.ips.get(target)
             {
                 temporary_matches.insert(*target, *expires_at);
@@ -801,19 +808,24 @@ fn build_preview(
     }
     exact_entries.sort_unstable();
     partial_entries.sort_unstable();
-    let target_label = match input {
-        BlocklistInput::Single(value) => targets
-            .first()
-            .map_or_else(|| value.clone(), ToString::to_string),
-        BlocklistInput::File(_) => format!("{} file target(s)", targets.len()),
-    };
-    UnbanPreview {
-        target_label,
-        requested_target_count: targets.len(),
+    cancellation.check()?;
+    Ok(UnbanStatePlan {
+        permanent: index_plan,
+        temporary: temporary_plan,
+        temporary_targets,
         exact_entries,
         partial_entries,
-        targets,
         temporary_matches,
+    })
+}
+
+fn unban_target_label(input: &BlocklistInput, targets: &UnbanTargetIndex) -> String {
+    match input {
+        BlocklistInput::Single(value) => targets
+            .targets()
+            .first()
+            .map_or_else(|| value.clone(), ToString::to_string),
+        BlocklistInput::File(_) => format!("{} file target(s)", targets.targets().len()),
     }
 }
 
@@ -1026,10 +1038,6 @@ mod tests {
     struct Asn;
 
     impl AsnOperations for Asn {
-        fn normalize_tokens(&self, _tokens: &[String]) -> Result<Vec<u32>, AppError> {
-            Ok(Vec::new())
-        }
-
         fn load_prefixes(
             &self,
             _asn: u32,
@@ -1570,6 +1578,103 @@ mod tests {
         assert_eq!(*locks.0.lock().expect("locks"), 0);
     }
 
+    #[test]
+    fn file_unban_deduplicates_canonical_targets_before_preview_and_removal() {
+        let repository = Repository::new("203.0.113.0/24\n198.51.100.0/24\n");
+        *repository.target_lines.lock().expect("targets") = vec![
+            "203.0.113.7/24".into(),
+            "203.0.113.0/24".into(),
+            "198.51.100.7".into(),
+            "198.51.100.7/32".into(),
+        ];
+        let locks = Locks::default();
+        let dependencies = dependencies(&repository, &locks);
+        let request = UnbanRequest {
+            paths: request_input(),
+            input: BlocklistInput::File(PathBuf::from("targets.txt")),
+        };
+        let super::UnbanPreparation::Ready(preview) =
+            prepare_unban(&request, &dependencies).expect("preview")
+        else {
+            panic!("valid targets");
+        };
+        assert_eq!(preview.requested_target_count, 2);
+        assert_eq!(preview.target_label, "2 file target(s)");
+        assert_eq!(preview.exact_entries, ["203.0.113.0/24"]);
+        assert_eq!(preview.partial_entries, ["198.51.100.0/24"]);
+
+        let outcome = apply_unban(
+            &request,
+            &preview,
+            &UnbanDecision {
+                remove_partial: false,
+            },
+            &dependencies,
+        )
+        .expect("remove exact matches");
+        assert_eq!(outcome.requested_target_count, 2);
+        assert_eq!(outcome.removed_exact, 1);
+        assert_eq!(outcome.removed_partial, 0);
+        assert_eq!(
+            *repository.contents.lock().expect("contents"),
+            "198.51.100.0/24\n"
+        );
+    }
+
+    #[test]
+    fn unban_uses_fresh_indexes_after_unrelated_source_positions_change() {
+        let repository = Repository::new("203.0.113.7\n198.51.100.0/24\n");
+        let temporary = TemporaryRepository::default();
+        temporary
+            .state
+            .lock()
+            .expect("state")
+            .ips
+            .extend([(cidr("203.0.113.7"), 4600), (cidr("2001:db8::1"), 5000)]);
+        let locks = Locks::default();
+        let mut dependencies = dependencies(&repository, &locks);
+        dependencies.temporary_bans = &temporary;
+        let request = UnbanRequest {
+            paths: request_input(),
+            input: BlocklistInput::Single("203.0.113.7".into()),
+        };
+        let super::UnbanPreparation::Ready(preview) =
+            prepare_unban(&request, &dependencies).expect("preview")
+        else {
+            panic!("valid target");
+        };
+        *repository.contents.lock().expect("contents") =
+            "# new comment\n198.51.100.0/24\n203.0.113.7\n".into();
+        temporary
+            .state
+            .lock()
+            .expect("state")
+            .ips
+            .insert(cidr("192.0.2.1"), 6000);
+
+        let outcome = apply_unban(
+            &request,
+            &preview,
+            &UnbanDecision {
+                remove_partial: false,
+            },
+            &dependencies,
+        )
+        .expect("only unmatched state changed");
+        assert_eq!(outcome.removed_exact, 2);
+        assert_eq!(outcome.removed_partial, 0);
+        assert_eq!(
+            *repository.contents.lock().expect("contents"),
+            "# new comment\n198.51.100.0/24\n"
+        );
+        assert_eq!(
+            temporary.state.lock().expect("state").ips,
+            [(cidr("192.0.2.1"), 6000), (cidr("2001:db8::1"), 5000),]
+                .into_iter()
+                .collect()
+        );
+    }
+
     // Drop records lock release, making the ledger sensitive to deletion occurring one statement
     // too late even though both operations would otherwise succeed in a sequential unit test.
     struct EventGuard(Arc<Mutex<Vec<&'static str>>>);
@@ -1594,10 +1699,6 @@ mod tests {
     struct EventAsn(Arc<Mutex<Vec<&'static str>>>);
 
     impl AsnOperations for EventAsn {
-        fn normalize_tokens(&self, _tokens: &[String]) -> Result<Vec<u32>, AppError> {
-            Ok(vec![64512])
-        }
-
         fn load_prefixes(
             &self,
             _asn: u32,
@@ -1647,7 +1748,7 @@ mod tests {
             &AsnBanRequest {
                 duration: None,
                 paths: request_input(),
-                tokens: vec!["AS64512".to_string()],
+                tokens: vec!["As64512".to_string()],
             },
             &dependencies,
         )

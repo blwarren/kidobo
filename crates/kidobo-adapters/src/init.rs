@@ -139,7 +139,16 @@ fn run_required_systemd_command(
             command: command.clone(),
             reason: error.to_string(),
         })?;
-    if result.status.success() {
+    let unloaded_service_reset = arguments == ["reset-failed", KIDOBO_SYNC_SERVICE_FILE]
+        && result.status.code() == Some(1)
+        && matches!(
+            result.stderr.trim(),
+            "Unit kidobo-sync.service not loaded"
+                | "Unit kidobo-sync.service not loaded."
+                | "Failed to reset failed state of unit kidobo-sync.service: Unit kidobo-sync.service not loaded"
+                | "Failed to reset failed state of unit kidobo-sync.service: Unit kidobo-sync.service not loaded."
+        );
+    if result.status.success() || unloaded_service_reset {
         return Ok(());
     }
     let stderr = result.stderr.trim();
@@ -167,19 +176,39 @@ mod tests {
 
     struct Runner {
         calls: RefCell<Vec<Vec<String>>>,
-        fail_at: Option<usize>,
+        failure: Option<(usize, Failure)>,
     }
+
+    #[derive(Clone, Copy)]
+    enum Failure {
+        Exit,
+        Spawn,
+        Timeout,
+    }
+
     impl InitCommandRunner for Runner {
-        fn run(&self, _command: &str, args: &[&str]) -> Result<CommandResult, CommandRunnerError> {
+        fn run(&self, command: &str, args: &[&str]) -> Result<CommandResult, CommandRunnerError> {
             self.calls
                 .borrow_mut()
                 .push(args.iter().map(|value| (*value).to_string()).collect());
-            if self.fail_at == Some(self.calls.borrow().len()) {
-                return Ok(CommandResult {
-                    status: ProcessStatus::Exited(9),
-                    stdout: String::new(),
-                    stderr: "injected systemd failure".to_string(),
-                });
+            if let Some((at, failure)) = self.failure
+                && at == self.calls.borrow().len()
+            {
+                return match failure {
+                    Failure::Exit => Ok(CommandResult {
+                        status: ProcessStatus::Exited(9),
+                        stdout: String::new(),
+                        stderr: "injected systemd failure".to_string(),
+                    }),
+                    Failure::Spawn => Err(CommandRunnerError::Spawn {
+                        command: command.to_string(),
+                        source: std::io::Error::other("injected spawn failure"),
+                    }),
+                    Failure::Timeout => Err(CommandRunnerError::Timeout {
+                        command: command.to_string(),
+                        timeout_ms: 30_000,
+                    }),
+                };
             }
             Ok(CommandResult {
                 status: ProcessStatus::Exited(0),
@@ -196,7 +225,7 @@ mod tests {
         fs::write(&path, "custom bytes\n").expect("write");
         let provisioner = FileInitProvisioner::new(Runner {
             calls: RefCell::new(Vec::new()),
-            fail_at: None,
+            failure: None,
         });
 
         let state = provisioner
@@ -214,7 +243,7 @@ mod tests {
     fn systemd_enablement_uses_expected_command_sequence() {
         let provisioner = FileInitProvisioner::new(Runner {
             calls: RefCell::new(Vec::new()),
-            fail_at: None,
+            failure: None,
         });
         provisioner.enable_systemd_timer().expect("enable");
         assert_eq!(
@@ -228,18 +257,111 @@ mod tests {
     }
 
     #[test]
-    fn systemd_enablement_maps_nonzero_exit_to_application_error() {
-        let provisioner = FileInitProvisioner::new(Runner {
-            calls: RefCell::new(Vec::new()),
-            fail_at: Some(1),
-        });
+    fn systemd_failures_stop_before_running_later_commands() {
+        let sequence = [
+            vec!["daemon-reload"],
+            vec!["reset-failed", "kidobo-sync.service"],
+            vec!["enable", "--now", "kidobo-sync.timer"],
+        ];
+        for at in 1..=3 {
+            for failure in [Failure::Exit, Failure::Spawn, Failure::Timeout] {
+                let provisioner = FileInitProvisioner::new(Runner {
+                    calls: RefCell::new(Vec::new()),
+                    failure: Some((at, failure)),
+                });
+                let error = provisioner
+                    .enable_systemd_timer()
+                    .expect_err("init failure");
+                assert_eq!(*provisioner.runner.calls.borrow(), sequence[..at]);
+                assert!(
+                    error
+                        .to_string()
+                        .contains(&format!("systemctl {}", sequence[at - 1].join(" ")))
+                );
+                match failure {
+                    Failure::Exit => {
+                        assert!(error.to_string().contains("injected systemd failure"));
+                    }
+                    Failure::Spawn => assert!(error.to_string().contains("injected spawn failure")),
+                    Failure::Timeout => {
+                        assert!(error.to_string().contains("timed out after 30000 ms"));
+                    }
+                }
+            }
+        }
+    }
 
-        let error = provisioner
-            .enable_systemd_timer()
-            .expect_err("daemon-reload failure must stop init");
+    struct ResetRunner {
+        calls: RefCell<Vec<Vec<String>>>,
+        diagnostic: &'static str,
+        status: i32,
+    }
 
-        assert_eq!(provisioner.runner.calls.borrow().len(), 1);
-        assert!(error.to_string().contains("systemctl daemon-reload"));
-        assert!(error.to_string().contains("injected systemd failure"));
+    impl InitCommandRunner for ResetRunner {
+        fn run(&self, _command: &str, args: &[&str]) -> Result<CommandResult, CommandRunnerError> {
+            self.calls
+                .borrow_mut()
+                .push(args.iter().map(|arg| (*arg).to_string()).collect());
+            let is_reset = args.first() == Some(&"reset-failed");
+            Ok(CommandResult {
+                status: ProcessStatus::Exited(if is_reset { self.status } else { 0 }),
+                stdout: String::new(),
+                stderr: if is_reset {
+                    self.diagnostic.to_string()
+                } else {
+                    String::new()
+                },
+            })
+        }
+    }
+
+    #[test]
+    fn unloaded_service_reset_does_not_prevent_timer_enablement() {
+        for diagnostic in [
+            "Unit kidobo-sync.service not loaded",
+            "Unit kidobo-sync.service not loaded.",
+            "Failed to reset failed state of unit kidobo-sync.service: Unit kidobo-sync.service not loaded",
+            "Failed to reset failed state of unit kidobo-sync.service: Unit kidobo-sync.service not loaded.",
+        ] {
+            let provisioner = FileInitProvisioner::new(ResetRunner {
+                calls: RefCell::new(Vec::new()),
+                diagnostic,
+                status: 1,
+            });
+
+            provisioner
+                .enable_systemd_timer()
+                .expect("unloaded service is harmless");
+
+            assert_eq!(
+                *provisioner.runner.calls.borrow(),
+                [
+                    vec!["daemon-reload"],
+                    vec!["reset-failed", "kidobo-sync.service"],
+                    vec!["enable", "--now", "kidobo-sync.timer"],
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn reset_failures_other_than_the_unloaded_service_remain_errors() {
+        for (status, diagnostic) in [
+            (1, "Access denied"),
+            (1, "Unit another.service not loaded."),
+            (1, "Unit kidobo-sync.service not loaded. Access denied."),
+            (2, "Unit kidobo-sync.service not loaded."),
+        ] {
+            let provisioner = FileInitProvisioner::new(ResetRunner {
+                calls: RefCell::new(Vec::new()),
+                diagnostic,
+                status,
+            });
+            let error = provisioner
+                .enable_systemd_timer()
+                .expect_err("genuine failure");
+            assert!(error.to_string().contains(diagnostic));
+            assert_eq!(provisioner.runner.calls.borrow().len(), 2);
+        }
     }
 }

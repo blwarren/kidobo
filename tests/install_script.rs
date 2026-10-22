@@ -164,7 +164,7 @@ if [[ "${name}" == "iptables" || "${name}" == "ip6tables" ]]; then
 fi
 exit 0
 "#;
-    for binary in ["iptables", "ip6tables", "ipset"] {
+    for binary in ["iptables", "ip6tables", "ipset", "systemctl"] {
         write_executable(&fake_bin.join(binary), command_script);
     }
     write_executable(
@@ -172,6 +172,309 @@ exit 0
         "#!/usr/bin/env bash\nset -euo pipefail\n[[ \"${1:-}\" == \"-n\" ]]\nshift\nexec \"$@\"\n",
     );
     fake_bin
+}
+
+struct DefaultUninstallFixture {
+    temp: TempDir,
+    root: PathBuf,
+    install_dir: PathBuf,
+    log: PathBuf,
+}
+
+impl DefaultUninstallFixture {
+    fn new() -> Self {
+        let temp = TempDir::new().expect("tempdir");
+        let root = temp.path().join("root");
+        let install_dir = temp.path().join("bin");
+        let log = temp.path().join("events");
+        for artifact in [
+            "config/config.toml",
+            "data/blocklist.txt",
+            "cache/remote.cache",
+            "systemd/system/kidobo-sync.service",
+            "systemd/system/kidobo-sync.timer",
+        ] {
+            let path = root.join(artifact);
+            fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+            fs::write(path, "preserve").expect("write artifact");
+        }
+        write_executable(
+            &install_dir.join("kidobo"),
+            r#"#!/bin/bash
+printf 'flush\n' >> "$KIDOBO_TEST_EVENTS"
+exit "${KIDOBO_TEST_FLUSH_STATUS:-0}"
+"#,
+        );
+        let fake_bin = temp.path().join("fake-bin");
+        write_executable(
+            &fake_bin.join("systemctl"),
+            r#"#!/bin/bash
+set -euo pipefail
+action="$1"
+unit="${@: -1}"
+printf '%s %s\n' "$action" "$unit" >> "$KIDOBO_TEST_EVENTS"
+case "$action" in
+  show)
+    if [[ "$unit" == "kidobo-sync.timer" ]]; then
+      [[ "${KIDOBO_TEST_TIMER_QUERY_FAIL:-0}" == 0 ]] || exit 1
+      printf 'LoadState=%s\nActiveState=%s\nJob=%s\n' "${KIDOBO_TEST_TIMER_LOAD:-loaded}" "${KIDOBO_TEST_TIMER_ACTIVE:-active}" "${KIDOBO_TEST_TIMER_JOB-}"
+    else
+      [[ "${KIDOBO_TEST_SERVICE_QUERY_FAIL:-0}" == 0 ]] || exit 1
+      printf 'LoadState=%s\nActiveState=%s\nJob=%s\n' "${KIDOBO_TEST_SERVICE_LOAD:-loaded}" "${KIDOBO_TEST_SERVICE_ACTIVE:-inactive}" "${KIDOBO_TEST_SERVICE_JOB-}"
+    fi ;;
+  stop) exit "${KIDOBO_TEST_STOP_STATUS:-0}" ;;
+  start) exit "${KIDOBO_TEST_START_STATUS:-0}" ;;
+  disable) exit "${KIDOBO_TEST_DISABLE_STATUS:-0}" ;;
+  daemon-reload) exit 0 ;;
+  *) echo "unexpected systemctl action" >&2; exit 99 ;;
+esac
+"#,
+        );
+        write_executable(
+            &fake_bin.join("rm"),
+            "#!/bin/bash\nprintf 'remove\\n' >> \"$KIDOBO_TEST_EVENTS\"\nexec /bin/rm \"$@\"\n",
+        );
+        Self {
+            temp,
+            root,
+            install_dir,
+            log,
+        }
+    }
+
+    fn command(&self) -> Command {
+        let mut command = Command::new("bash");
+        command
+            .args([
+                "-c",
+                r#"
+source "$INSTALLER"
+run_with_optional_sudo() { "$@"; }
+sudo() { [[ "$1" == "-n" ]]; shift; "$@"; }
+resolve_uninstall_paths() {
+    CONFIG_DIR="$KIDOBO_TEST_ROOT/config"
+    DATA_DIR="$KIDOBO_TEST_ROOT/data"
+    CACHE_DIR="$KIDOBO_TEST_ROOT/cache"
+    SYSTEMD_DIR="$KIDOBO_TEST_ROOT/systemd/system"
+    SYSTEMD_SERVICE_PATH="$SYSTEMD_DIR/kidobo-sync.service"
+    SYSTEMD_TIMER_PATH="$SYSTEMD_DIR/kidobo-sync.timer"
+}
+uninstall_artifacts
+"#,
+            ])
+            .env("INSTALLER", installer_path())
+            .env_remove("KIDOBO_ROOT")
+            .env("KIDOBO_INSTALL_DIR", &self.install_dir)
+            .env("KIDOBO_TEST_ROOT", &self.root)
+            .env("KIDOBO_TEST_EVENTS", &self.log)
+            .env("PATH", path_with_prefix(&self.temp.path().join("fake-bin")));
+        command
+    }
+
+    fn events(&self) -> Vec<String> {
+        read_to_string_with_limit(&self.log, FIXTURE_FILE_READ_LIMIT)
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn assert_preserved(&self) {
+        for artifact in [
+            "config/config.toml",
+            "data/blocklist.txt",
+            "cache/remote.cache",
+            "systemd/system/kidobo-sync.service",
+            "systemd/system/kidobo-sync.timer",
+        ] {
+            assert_eq!(
+                read_to_string_with_limit(&self.root.join(artifact), FIXTURE_FILE_READ_LIMIT),
+                "preserve"
+            );
+        }
+        assert!(self.install_dir.join("kidobo").exists());
+    }
+}
+
+#[test]
+fn uninstall_stops_scheduling_before_flush_and_disables_only_after_success() {
+    let fixture = DefaultUninstallFixture::new();
+    let output = fixture.command().output().expect("uninstall");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fixture.events(),
+        [
+            "show kidobo-sync.timer",
+            "stop kidobo-sync.timer",
+            "show kidobo-sync.service",
+            "flush",
+            "disable kidobo-sync.timer",
+            "remove",
+            "remove",
+            "daemon-reload daemon-reload",
+            "remove",
+            "remove",
+            "remove",
+            "remove",
+        ]
+    );
+    assert!(!fixture.install_dir.join("kidobo").exists());
+    assert!(!fixture.root.join("config").exists());
+}
+
+#[test]
+fn uninstall_rejects_active_pending_or_unverifiable_service_and_restores_timer() {
+    for (key, value) in [
+        ("KIDOBO_TEST_SERVICE_ACTIVE", "active"),
+        ("KIDOBO_TEST_SERVICE_ACTIVE", "activating"),
+        ("KIDOBO_TEST_SERVICE_ACTIVE", "deactivating"),
+        ("KIDOBO_TEST_SERVICE_JOB", "42"),
+        ("KIDOBO_TEST_SERVICE_JOB", "unknown"),
+        ("KIDOBO_TEST_SERVICE_QUERY_FAIL", "1"),
+    ] {
+        let fixture = DefaultUninstallFixture::new();
+        let output = fixture
+            .command()
+            .env(key, value)
+            .output()
+            .expect("uninstall");
+        assert_eq!(output.status.code(), Some(1), "{key}={value}");
+        assert_eq!(
+            fixture.events(),
+            [
+                "show kidobo-sync.timer",
+                "stop kidobo-sync.timer",
+                "show kidobo-sync.service",
+                "start kidobo-sync.timer"
+            ]
+        );
+        fixture.assert_preserved();
+    }
+}
+
+#[test]
+fn uninstall_rejects_unknown_timer_state_before_stopping_it() {
+    for (key, value) in [
+        ("KIDOBO_TEST_TIMER_QUERY_FAIL", "1"),
+        ("KIDOBO_TEST_TIMER_ACTIVE", "unknown"),
+        ("KIDOBO_TEST_TIMER_JOB", "42"),
+    ] {
+        let fixture = DefaultUninstallFixture::new();
+        let output = fixture
+            .command()
+            .env(key, value)
+            .output()
+            .expect("uninstall");
+        assert_eq!(output.status.code(), Some(1));
+        assert_eq!(fixture.events(), ["show kidobo-sync.timer"]);
+        fixture.assert_preserved();
+    }
+}
+
+#[test]
+fn uninstall_restores_active_timer_after_stop_flush_or_disable_failure() {
+    for (key, middle) in [
+        ("KIDOBO_TEST_STOP_STATUS", vec![]),
+        (
+            "KIDOBO_TEST_FLUSH_STATUS",
+            vec!["show kidobo-sync.service", "flush"],
+        ),
+        (
+            "KIDOBO_TEST_DISABLE_STATUS",
+            vec![
+                "show kidobo-sync.service",
+                "flush",
+                "disable kidobo-sync.timer",
+            ],
+        ),
+    ] {
+        let fixture = DefaultUninstallFixture::new();
+        let output = fixture.command().env(key, "1").output().expect("uninstall");
+        assert_eq!(output.status.code(), Some(1));
+        let mut expected = vec!["show kidobo-sync.timer", "stop kidobo-sync.timer"];
+        expected.extend(middle);
+        expected.push("start kidobo-sync.timer");
+        assert_eq!(fixture.events(), expected);
+        fixture.assert_preserved();
+    }
+}
+
+#[test]
+fn uninstall_reports_timer_restoration_failure() {
+    let fixture = DefaultUninstallFixture::new();
+    let output = fixture
+        .command()
+        .env("KIDOBO_TEST_FLUSH_STATUS", "1")
+        .env("KIDOBO_TEST_START_STATUS", "1")
+        .output()
+        .expect("uninstall");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("failed to restore previously active kidobo-sync.timer")
+    );
+    assert_eq!(
+        fixture.events().last().map(String::as_str),
+        Some("start kidobo-sync.timer")
+    );
+    fixture.assert_preserved();
+}
+
+#[test]
+fn uninstall_does_not_start_a_previously_inactive_timer_after_failure() {
+    let fixture = DefaultUninstallFixture::new();
+    let output = fixture
+        .command()
+        .env("KIDOBO_TEST_TIMER_ACTIVE", "inactive")
+        .env("KIDOBO_TEST_FLUSH_STATUS", "1")
+        .output()
+        .expect("uninstall");
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        fixture.events(),
+        [
+            "show kidobo-sync.timer",
+            "stop kidobo-sync.timer",
+            "show kidobo-sync.service",
+            "flush"
+        ]
+    );
+    fixture.assert_preserved();
+}
+
+#[test]
+fn uninstall_accepts_absent_timer_and_service_without_changing_scheduling() {
+    let fixture = DefaultUninstallFixture::new();
+    let output = fixture
+        .command()
+        .env("KIDOBO_TEST_TIMER_LOAD", "not-found")
+        .env("KIDOBO_TEST_TIMER_ACTIVE", "inactive")
+        .env("KIDOBO_TEST_SERVICE_LOAD", "not-found")
+        .output()
+        .expect("uninstall");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fixture.events(),
+        [
+            "show kidobo-sync.timer",
+            "show kidobo-sync.service",
+            "flush",
+            "remove",
+            "remove",
+            "daemon-reload daemon-reload",
+            "remove",
+            "remove",
+            "remove",
+            "remove"
+        ]
+    );
 }
 
 #[test]
@@ -473,7 +776,7 @@ fn custom_root_init_rejects_explicit_empty_value_before_execution() {
 }
 
 #[test]
-fn uninstall_preserves_artifacts_when_fallback_cleanup_fails() {
+fn uninstall_preserves_artifacts_when_config_aware_flush_fails() {
     let temp = TempDir::new().expect("tempdir");
     let root = temp.path().join("root");
     let install_dir = temp.path().join("bin");
@@ -486,9 +789,7 @@ fn uninstall_preserves_artifacts_when_fallback_cleanup_fails() {
         .arg("-c")
         .arg(
             "source \"$INSTALLER\"; \
-             run_flush_best_effort() { return 1; }; \
-             cleanup_firewall_chain_family() { return 1; }; \
-             cleanup_default_ipsets() { return 0; }; \
+             run_config_aware_flush() { return 1; }; \
              uninstall_artifacts",
         )
         .env("INSTALLER", installer_path())
@@ -508,17 +809,24 @@ fn uninstall_removes_scoped_artifacts_after_successful_flush() {
     let root = temp.path().join("root");
     let install_dir = temp.path().join("bin");
     let binary = install_dir.join("kidobo");
-    write_executable(&binary, "#!/usr/bin/env bash\nexit 0\n");
+    write_executable(
+        &binary,
+        "#!/bin/sh\nprintf 'flush\\n' >> \"$KIDOBO_TEST_CLEANUP_LOG\"\n",
+    );
+    let cleanup_log = temp.path().join("cleanup.log");
+    let fake_bin = write_cleanup_fakes(&temp);
     for directory in ["config", "data", "cache", "systemd/system"] {
         fs::create_dir_all(root.join(directory)).expect("mkdir artifact");
     }
 
     let status = Command::new("bash")
         .arg("-c")
-        .arg("source \"$INSTALLER\"; run_flush_best_effort() { return 0; }; uninstall_artifacts")
+        .arg("source \"$INSTALLER\"; uninstall_artifacts")
         .env("INSTALLER", installer_path())
         .env("KIDOBO_ROOT", &root)
         .env("KIDOBO_INSTALL_DIR", &install_dir)
+        .env("KIDOBO_TEST_CLEANUP_LOG", &cleanup_log)
+        .env("PATH", path_with_prefix(&fake_bin))
         .status()
         .expect("run bash");
 
@@ -527,6 +835,10 @@ fn uninstall_removes_scoped_artifacts_after_successful_flush() {
     assert!(!root.join("config").exists());
     assert!(!root.join("data").exists());
     assert!(!root.join("cache").exists());
+    assert_eq!(
+        read_to_string_with_limit(&cleanup_log, FIXTURE_FILE_READ_LIMIT),
+        "flush\n"
+    );
 }
 
 #[test]
@@ -546,7 +858,7 @@ fn uninstall_canonicalizes_scoped_root_without_touching_siblings() {
 
     let status = Command::new("bash")
         .arg("-c")
-        .arg("source \"$INSTALLER\"; run_flush_best_effort() { return 0; }; uninstall_artifacts")
+        .arg("source \"$INSTALLER\"; run_config_aware_flush() { return 0; }; uninstall_artifacts")
         .env("INSTALLER", installer_path())
         .env("KIDOBO_ROOT", &root_alias)
         .env("KIDOBO_INSTALL_DIR", &install_dir)
@@ -584,7 +896,7 @@ fn uninstall_rejects_root_aliases_before_cleanup() {
             .arg("-c")
             .arg(
                 "source \"$INSTALLER\"; \
-                 run_flush_best_effort() { : > \"$CLEANUP_MARKER\"; return 0; }; \
+                 run_config_aware_flush() { : > \"$CLEANUP_MARKER\"; return 0; }; \
                  remove_path() { : > \"$CLEANUP_MARKER\"; }; \
                  uninstall_artifacts",
             )
@@ -612,7 +924,7 @@ fn uninstall_rejects_explicit_empty_root_before_cleanup() {
         .arg("-c")
         .arg(
             "source \"$INSTALLER\"; \
-             run_flush_best_effort() { : > \"$CLEANUP_MARKER\"; return 0; }; \
+             run_config_aware_flush() { : > \"$CLEANUP_MARKER\"; return 0; }; \
              remove_path() { : > \"$CLEANUP_MARKER\"; }; \
              uninstall_artifacts",
         )
@@ -639,7 +951,7 @@ fn uninstall_rejects_override_when_realpath_is_unavailable() {
         .arg("-c")
         .arg(
             "source \"$INSTALLER\"; \
-             run_flush_best_effort() { : > \"$CLEANUP_MARKER\"; return 0; }; \
+             run_config_aware_flush() { : > \"$CLEANUP_MARKER\"; return 0; }; \
              remove_path() { : > \"$CLEANUP_MARKER\"; }; \
              uninstall_artifacts",
         )
@@ -656,7 +968,7 @@ fn uninstall_rejects_override_when_realpath_is_unavailable() {
 }
 
 #[test]
-fn failed_config_aware_uninstall_attempts_default_cleanup_but_preserves_artifacts() {
+fn failed_config_aware_uninstall_preserves_artifacts_without_direct_cleanup() {
     let temp = TempDir::new().expect("tempdir");
     let root = temp.path().join("root");
     let install_dir = temp.path().join("bin");
@@ -689,28 +1001,10 @@ fn failed_config_aware_uninstall_attempts_default_cleanup_but_preserves_artifact
         .expect("run bash");
 
     assert_eq!(status.code(), Some(1));
-    let transcript = read_to_string_with_limit(&cleanup_log, FIXTURE_FILE_READ_LIMIT);
-    for expected in [
-        "iptables -w 5 -D INPUT -j kidobo-input-stage",
-        "iptables -w 5 -D INPUT -j kidobo-input",
-        "iptables -w 5 -F kidobo-input-stage",
-        "iptables -w 5 -X kidobo-input-stage",
-        "iptables -w 5 -F kidobo-input",
-        "iptables -w 5 -X kidobo-input",
-        "ip6tables -w 5 -D INPUT -j kidobo-input-stage",
-        "ip6tables -w 5 -D INPUT -j kidobo-input",
-        "ip6tables -w 5 -F kidobo-input-stage",
-        "ip6tables -w 5 -X kidobo-input-stage",
-        "ip6tables -w 5 -F kidobo-input",
-        "ip6tables -w 5 -X kidobo-input",
-        "ipset destroy kidobo",
-        "ipset destroy kidobo-v6",
-    ] {
-        assert!(
-            transcript.contains(expected),
-            "missing `{expected}` in: {transcript}"
-        );
-    }
+    assert!(
+        !cleanup_log.exists(),
+        "failed flush must not bypass its lock"
+    );
     assert!(binary.exists());
     assert!(root.join("config").exists());
     assert!(root.join("data").exists());
@@ -728,16 +1022,23 @@ fn failed_config_aware_uninstall_attempts_default_cleanup_but_preserves_artifact
 }
 
 #[test]
-fn uninstall_real_fallback_failure_preserves_all_runtime_artifacts() {
+fn uninstall_respects_a_lock_held_by_another_kidobo_command() {
     let temp = TempDir::new().expect("tempdir");
     let root = temp.path().join("root");
     let install_dir = temp.path().join("bin");
     let binary = install_dir.join("kidobo");
-    write_executable(&binary, "#!/usr/bin/env bash\nexit 1\n");
+    fs::create_dir_all(&install_dir).expect("mkdir install");
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_kidobo"), &binary).expect("link current binary");
     for directory in ["config", "data", "cache", "systemd/system"] {
         fs::create_dir_all(root.join(directory)).expect("mkdir artifact");
     }
-    fs::write(root.join("config/config.toml"), "preserve").expect("write config");
+    fs::write(
+        root.join("config/config.toml"),
+        "[ipset]\nset_name='kidobo'\n",
+    )
+    .expect("write config");
+    let lock = fs::File::create(root.join("cache/sync.lock")).expect("create lock");
+    fs2::FileExt::lock_exclusive(&lock).expect("hold process lock");
     let cleanup_log = temp.path().join("cleanup.log");
     let fake_bin = write_cleanup_fakes(&temp);
 
@@ -748,17 +1049,16 @@ fn uninstall_real_fallback_failure_preserves_all_runtime_artifacts() {
         .env("KIDOBO_ROOT", &root)
         .env("KIDOBO_INSTALL_DIR", &install_dir)
         .env("KIDOBO_TEST_CLEANUP_LOG", &cleanup_log)
-        .env("KIDOBO_TEST_FAIL_CLEANUP", "ip6tables")
         .env("PATH", path_with_prefix(&fake_bin))
-        .status()
+        .output()
         .expect("run bash");
 
-    assert_eq!(status.code(), Some(1));
-    let transcript = read_to_string_with_limit(&cleanup_log, FIXTURE_FILE_READ_LIMIT);
-    assert!(transcript.contains("iptables -w 5 -F kidobo-input"));
-    assert!(transcript.contains("ip6tables -w 5 -F kidobo-input"));
-    assert!(transcript.contains("ipset destroy kidobo"));
-    assert!(transcript.contains("ipset destroy kidobo-v6"));
+    assert_eq!(status.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&status.stderr).contains("lock already held"));
+    assert!(
+        !cleanup_log.exists(),
+        "lock contention must not run firewall commands"
+    );
     assert!(binary.exists());
     assert!(root.join("config/config.toml").exists());
     assert!(root.join("data").exists());

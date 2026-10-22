@@ -1,11 +1,12 @@
 //! Deterministic parsing and mutation planning for the local blocklist.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::HashSet;
 
 use thiserror::Error;
 
 use crate::network::{
-    CanonicalCidr, cidr_overlaps, collapse_ipv4, collapse_ipv6, parse_ip_cidr_strict,
+    CanonicalCidr, IntervalU32, IntervalU128, collapse_ipv4, collapse_ipv6, ipv4_to_interval,
+    ipv6_to_interval, merge_intervals_u32_owned, merge_intervals_u128_owned, parse_ip_cidr_strict,
     split_by_family,
 };
 
@@ -169,44 +170,74 @@ pub fn classify_ban_targets(
     outcomes
 }
 
-#[must_use]
-/// Plans removal of one target without mutating the parsed document.
-pub fn plan_unban(entries: &[Option<CanonicalCidr>], target: CanonicalCidr) -> UnbanIndexPlan {
-    plan_unban_many(entries, &[target])
+/// Reusable exact and family-separated overlap indexes for an unban request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnbanTargetIndex {
+    targets: Vec<CanonicalCidr>,
+    ipv4: Vec<IntervalU32>,
+    ipv6: Vec<IntervalU128>,
 }
 
-#[must_use]
-/// Plans exact removals and partial-overlap warnings for multiple targets.
-///
-/// Returned indexes are sorted and unique; exact matches are excluded from the partial list.
-pub fn plan_unban_many(
-    entries: &[Option<CanonicalCidr>],
-    targets: &[CanonicalCidr],
-) -> UnbanIndexPlan {
-    let mut exact_indexes = BTreeSet::new();
-    let mut partial_indexes = BTreeSet::new();
-
-    for target in targets {
-        for (idx, entry) in entries.iter().enumerate() {
-            let Some(entry) = entry else {
-                continue;
-            };
-
-            if entry == target {
-                exact_indexes.insert(idx);
-            } else if cidr_overlaps(*entry, *target) {
-                partial_indexes.insert(idx);
-            }
+impl UnbanTargetIndex {
+    /// Sorts and deduplicates targets, then merges their family-specific coverage.
+    #[must_use]
+    pub fn new(mut targets: Vec<CanonicalCidr>) -> Self {
+        targets.sort_unstable();
+        targets.dedup();
+        let families = split_by_family(&targets);
+        Self {
+            targets,
+            ipv4: merge_intervals_u32_owned(
+                families.ipv4.into_iter().map(ipv4_to_interval).collect(),
+            ),
+            ipv6: merge_intervals_u128_owned(
+                families.ipv6.into_iter().map(ipv6_to_interval).collect(),
+            ),
         }
     }
 
-    for idx in &exact_indexes {
-        partial_indexes.remove(idx);
+    /// Returns the sorted, unique canonical targets without collapsing their identities.
+    #[must_use]
+    pub fn targets(&self) -> &[CanonicalCidr] {
+        &self.targets
     }
 
-    UnbanIndexPlan {
-        exact_indexes: exact_indexes.into_iter().collect(),
-        partial_indexes: partial_indexes.into_iter().collect(),
+    /// Plans removal in source order, giving exact identities priority over partial overlaps.
+    ///
+    /// Returned indexes are sorted and unique, and include each matching source entry once.
+    #[must_use]
+    pub fn plan(&self, entries: impl IntoIterator<Item = Option<CanonicalCidr>>) -> UnbanIndexPlan {
+        let mut plan = UnbanIndexPlan::default();
+        for (index, entry) in entries.into_iter().enumerate() {
+            let Some(entry) = entry else {
+                continue;
+            };
+            if self.targets.binary_search(&entry).is_ok() {
+                plan.exact_indexes.push(index);
+            } else if self.overlaps(entry) {
+                plan.partial_indexes.push(index);
+            }
+        }
+        plan
+    }
+
+    fn overlaps(&self, entry: CanonicalCidr) -> bool {
+        match entry {
+            CanonicalCidr::V4(cidr) => {
+                let entry = ipv4_to_interval(cidr);
+                let index = self.ipv4.partition_point(|target| target.end < entry.start);
+                self.ipv4
+                    .get(index)
+                    .is_some_and(|target| target.start <= entry.end)
+            }
+            CanonicalCidr::V6(cidr) => {
+                let entry = ipv6_to_interval(cidr);
+                let index = self.ipv6.partition_point(|target| target.end < entry.start);
+                self.ipv6
+                    .get(index)
+                    .is_some_and(|target| target.start <= entry.end)
+            }
+        }
     }
 }
 
@@ -271,8 +302,8 @@ mod tests {
 
     use super::{
         BanClassification, BlocklistDocument, BlocklistTargetParseError, InvalidBlocklistLine,
-        canonicalize_blocklist, classify_ban_targets, exact_match_indexes, parse_blocklist_target,
-        plan_unban, plan_unban_many,
+        UnbanTargetIndex, canonicalize_blocklist, classify_ban_targets, exact_match_indexes,
+        parse_blocklist_target,
     };
 
     #[test]
@@ -342,7 +373,7 @@ mod tests {
         ];
         let target = parse_ip_cidr_non_strict("203.0.113.7").expect("target");
 
-        let plan = plan_unban(&entries, target);
+        let plan = UnbanTargetIndex::new(vec![target]).plan(entries);
         assert_eq!(plan.exact_indexes, vec![1]);
         assert_eq!(plan.partial_indexes, vec![0]);
     }
@@ -359,9 +390,107 @@ mod tests {
             parse_ip_cidr_non_strict("203.0.113.7").expect("overlap exact bucket"),
         ];
 
-        let plan = plan_unban_many(&entries, &targets);
+        let plan = UnbanTargetIndex::new(targets).plan(entries);
         assert_eq!(plan.exact_indexes, vec![0]);
         assert_eq!(plan.partial_indexes, vec![1]);
+    }
+
+    #[test]
+    fn unban_index_preserves_identities_across_adjacent_and_nested_targets() {
+        let targets = ["10.0.0.128/25", "2001:db8::1", "10.0.0.0/25", "10.0.0.0/25"]
+            .map(|value| parse_blocklist_target(value).expect("target"));
+        let index = UnbanTargetIndex::new(targets.to_vec());
+        assert_eq!(index.targets().len(), 3);
+        let entries = [
+            Some(parse_blocklist_target("10.0.0.0/24").expect("merged coverage")),
+            Some(parse_blocklist_target("10.0.0.128/25").expect("exact")),
+            None,
+            Some(parse_blocklist_target("10.0.0.128/25").expect("duplicate source")),
+            Some(parse_blocklist_target("2001:db8::/127").expect("v6 overlap")),
+            Some(parse_blocklist_target("2001:db8::2").expect("v6 outside")),
+        ];
+        let plan = index.plan(entries);
+        assert_eq!(plan.exact_indexes, [1, 3]);
+        assert_eq!(plan.partial_indexes, [0, 4]);
+    }
+
+    #[test]
+    fn unban_index_keeps_endpoint_overlaps_and_gaps_in_both_families() {
+        let targets = [
+            "255.255.255.255",
+            "0.0.0.0",
+            "::",
+            "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+        ]
+        .map(|value| parse_blocklist_target(value).expect("target"));
+        let entries = [
+            "0.0.0.0/0",
+            "0.0.0.1",
+            "255.255.255.254/31",
+            "0.0.0.0",
+            "::/0",
+            "::1",
+            "ffff:ffff:ffff:ffff:ffff:ffff:ffff:fffe/127",
+            "::",
+        ]
+        .map(|value| Some(parse_blocklist_target(value).expect("entry")));
+        let plan = UnbanTargetIndex::new(targets.to_vec()).plan(entries);
+        assert_eq!(plan.exact_indexes, [3, 7]);
+        assert_eq!(plan.partial_indexes, [0, 2, 4, 6]);
+        assert_eq!(
+            UnbanTargetIndex::new(Vec::new()).plan(entries),
+            super::UnbanIndexPlan::default()
+        );
+    }
+
+    #[test]
+    fn unban_index_matches_pairwise_overlap_model_for_mixed_family_targets() {
+        let networks = [
+            "0.0.0.0/0",
+            "10.0.0.0/24",
+            "10.0.0.0/25",
+            "10.0.0.128/25",
+            "10.0.0.127",
+            "10.0.0.128",
+            "10.0.1.0/24",
+            "255.255.255.255",
+            "::/0",
+            "2001:db8::/126",
+            "2001:db8::/127",
+            "2001:db8::2/127",
+            "2001:db8::1",
+            "2001:db8::2",
+            "2001:db8::4",
+            "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+        ]
+        .map(|value| parse_blocklist_target(value).expect("network"));
+        let entries = networks
+            .into_iter()
+            .map(Some)
+            .chain([None])
+            .collect::<Vec<_>>();
+        for first in networks {
+            for second in networks {
+                let targets = [second, first, second];
+                let mut expected = super::UnbanIndexPlan::default();
+                for (index, entry) in entries.iter().enumerate() {
+                    if let Some(entry) = entry {
+                        if targets.contains(entry) {
+                            expected.exact_indexes.push(index);
+                        } else if targets
+                            .iter()
+                            .any(|target| crate::network::cidr_overlaps(*entry, *target))
+                        {
+                            expected.partial_indexes.push(index);
+                        }
+                    }
+                }
+                assert_eq!(
+                    UnbanTargetIndex::new(targets.to_vec()).plan(entries.iter().copied()),
+                    expected
+                );
+            }
+        }
     }
 
     #[test]

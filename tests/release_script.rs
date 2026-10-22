@@ -192,10 +192,13 @@ if [[ -n "${KIDOBO_TEST_READY_MARKER:-}" && "$*" == "release-compat" ]]; then
   : > "${KIDOBO_TEST_READY_MARKER}"
 fi
 if [[ "$*" == "exercise-release" ]]; then
-  mkdir -p target/x86_64-unknown-linux-musl/release
+  binary="${CARGO_TARGET_DIR:-target}/x86_64-unknown-linux-musl/release/kidobo"
+  mkdir -p "$(dirname "$binary")"
   printf '#!/usr/bin/env bash\nprintf '\''kidobo %%s\\n'\'' %q\n' \
-    "${KIDOBO_TEST_BINARY_VERSION}" > target/x86_64-unknown-linux-musl/release/kidobo
-  chmod 0755 target/x86_64-unknown-linux-musl/release/kidobo
+    "${KIDOBO_TEST_BINARY_VERSION}" > "$binary"
+  chmod 0755 "$binary"
+  mkdir -p "${KIDOBO_TEST_GH_RELEASE_DIR}"
+  cp "$binary" "${KIDOBO_TEST_GH_RELEASE_DIR}/validated-candidate"
 fi
 exit 0
 "#,
@@ -381,6 +384,7 @@ fi
             .arg(version)
             .current_dir(&self.repo)
             .env("PATH", path)
+            .env_remove("CARGO_TARGET_DIR")
             .env("KIDOBO_TEST_EVENT_LOG", &self.event_log)
             .env("KIDOBO_TEST_GIT_LOG", &self.git_log)
             .env("KIDOBO_TEST_GH_LOG", &self.gh_log)
@@ -775,6 +779,59 @@ fn publisher_rolls_back_the_tag_when_origin_changes_during_validation() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("origin/main changed"));
     assert_eq!(fixture.head(), original_head);
     assert!(!fixture.tag_exists());
+}
+
+#[test]
+fn publisher_packages_the_validated_candidate_from_each_target_directory() {
+    for target_directory in [
+        None,
+        Some("target/custom"),
+        Some("target/custom with spaces"),
+        Some("absolute"),
+    ] {
+        let fixture = ReleaseFixture::new();
+        let mut command = fixture.publisher_command();
+        if let Some(directory) = target_directory {
+            let path = if directory == "absolute" {
+                fixture._temp.path().join("absolute build with spaces")
+            } else {
+                PathBuf::from(directory)
+            };
+            command.env("CARGO_TARGET_DIR", path);
+        }
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn fixture publisher");
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(b"y\n")
+            .expect("confirm fixture publication");
+        let output = child.wait_with_output().expect("wait publisher");
+        assert_success(&output, &format!("target directory {target_directory:?}"));
+        let archive = fixture
+            .artifact_root(RELEASE_TAG)
+            .join(format!("kidobo-{RELEASE_TAG}-linux-x86_64.tar.gz"));
+        let packaged = Command::new("tar")
+            .arg("-xOzf")
+            .arg(archive)
+            .arg(format!("kidobo-{RELEASE_TAG}-linux-x86_64/kidobo"))
+            .output()
+            .expect("read packaged binary");
+        assert_success(&packaged, "extract candidate");
+        assert_eq!(
+            packaged.stdout,
+            read_to_string_with_limit(
+                &fixture.gh_release_dir.join("validated-candidate"),
+                FIXTURE_LOG_READ_LIMIT,
+            )
+            .into_bytes()
+        );
+    }
 }
 
 #[test]

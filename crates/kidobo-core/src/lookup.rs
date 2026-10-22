@@ -5,8 +5,8 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use crate::network::{
-    CanonicalCidr, IntervalU32, IntervalU128, cidr_overlaps as network_cidr_overlaps,
-    ipv4_to_interval, ipv6_to_interval, parse_ip_cidr_strict,
+    CanonicalCidr, IntervalU32, IntervalU128, ipv4_to_interval, ipv6_to_interval,
+    parse_ip_cidr_strict,
 };
 
 /// One canonical CIDR retained with its operator-visible source context.
@@ -66,14 +66,6 @@ pub fn parse_target_strict(input: &str) -> Result<CanonicalCidr, LookupTargetPar
     }
 
     parse_ip_cidr_strict(normalized).ok_or(LookupTargetParseError::Invalid)
-}
-
-#[must_use]
-/// Returns whether two same-family CIDRs share at least one address.
-///
-/// CIDRs from different address families never overlap.
-pub fn cidr_overlaps(a: CanonicalCidr, b: CanonicalCidr) -> bool {
-    network_cidr_overlaps(a, b)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -278,16 +270,40 @@ where
     S: AsRef<str>,
     F: FnMut(&str, &[&LookupSourceEntry]),
 {
+    let Ok(invalid_targets) = try_run_lookup_by_target(targets, sources, |target, matches| {
+        emit(target, matches);
+        Ok::<(), std::convert::Infallible>(())
+    });
+    invalid_targets
+}
+
+/// Runs indexed lookup with a fallible callback for each valid target's borrowed matches.
+///
+/// Targets and matches are deterministic, including empty batches for unmatched targets.
+/// Returns sorted, unique invalid targets after all valid batches have been emitted.
+///
+/// # Errors
+///
+/// Returns the callback's error immediately without processing further targets.
+pub fn try_run_lookup_by_target<S, F, E>(
+    targets: &[S],
+    sources: &[LookupSourceEntry],
+    mut emit: F,
+) -> Result<Vec<String>, E>
+where
+    S: AsRef<str>,
+    F: FnMut(&str, &[&LookupSourceEntry]) -> Result<(), E>,
+{
     let v4_index = IntervalIndexV4::from_sources(sources);
     let v6_index = IntervalIndexV6::from_sources(sources);
     let (prepared_targets, invalid_targets) = prepare_targets(targets);
 
     for target in prepared_targets {
         let matched_sources = target_matches(target, sources, &v4_index, &v6_index);
-        emit(target.raw, &matched_sources);
+        emit(target.raw, &matched_sources)?;
     }
 
-    invalid_targets
+    Ok(invalid_targets)
 }
 
 /// Runs indexed lookup and emits one callback per target-to-source match.
@@ -331,10 +347,30 @@ pub fn run_lookup<S: AsRef<str>>(targets: &[S], sources: &[LookupSourceEntry]) -
 #[cfg(test)]
 mod tests {
     use super::{
-        LookupSourceEntry, LookupTargetParseError, cidr_overlaps, parse_target_strict, run_lookup,
+        LookupSourceEntry, LookupTargetParseError, parse_target_strict, run_lookup,
         run_lookup_by_target, run_lookup_streaming,
     };
-    use crate::network::{CanonicalCidr, Ipv4Cidr, Ipv6Cidr};
+    use crate::network::{CanonicalCidr, Ipv4Cidr, Ipv6Cidr, cidr_overlaps};
+
+    #[test]
+    fn fallible_batches_stop_at_first_error_in_sorted_target_order() {
+        let mut emitted = Vec::new();
+        let result = super::try_run_lookup_by_target(
+            &["203.0.113.9", "invalid", "198.51.100.8", "192.0.2.1"],
+            &[],
+            |target, matches| {
+                assert_eq!(matches.len(), 0);
+                emitted.push(target.to_string());
+                if target == "198.51.100.8" {
+                    Err(42_u8)
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert_eq!(result, Err(42));
+        assert_eq!(emitted, ["192.0.2.1", "198.51.100.8"]);
+    }
 
     #[test]
     fn strict_target_parsing_accepts_ip_and_cidr() {
