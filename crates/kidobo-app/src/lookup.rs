@@ -247,7 +247,7 @@ mod tests {
             "cache:test"
         );
         assert_eq!(outcome.targets[1].target, "203.0.113.8");
-        assert!(outcome.targets[1].matches.is_empty());
+        assert_eq!(outcome.targets[1].matches.len(), 0);
         assert_eq!(outcome.invalid_targets, ["invalid"]);
         assert_eq!(outcome.notices.len(), 1);
         assert!(

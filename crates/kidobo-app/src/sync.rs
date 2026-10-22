@@ -949,7 +949,7 @@ mod tests {
                 );
             } else {
                 assert!(matches!(result, Err(AppError::Interrupted)));
-                assert!(replacements.is_empty());
+                assert_eq!(replacements.len(), 0);
                 assert!(
                     !ledger
                         .lock()
@@ -1028,12 +1028,9 @@ mod tests {
                 assert_eq!(result.expect("fallback").ipv4_entries, 1);
             } else {
                 assert!(matches!(result, Err(AppError::CacheStaging { .. })));
-                assert!(
-                    enforcement
-                        .replacements
-                        .lock()
-                        .expect("replacements")
-                        .is_empty()
+                assert_eq!(
+                    enforcement.replacements.lock().expect("replacements").len(),
+                    0
                 );
                 assert!(!events(&ledger).iter().any(|event| event == "activate"));
             }
@@ -1471,12 +1468,9 @@ mod tests {
             assert!(!events(&ledger).iter().any(|event| event == "promote"
                 || event.starts_with("replace")
                 || event == "activate"));
-            assert!(
-                enforcement
-                    .replacements
-                    .lock()
-                    .expect("replacements")
-                    .is_empty()
+            assert_eq!(
+                enforcement.replacements.lock().expect("replacements").len(),
+                0
             );
         }
     }
@@ -1576,12 +1570,9 @@ mod tests {
 
         assert!(matches!(error, AppError::IpsetCapacityExceeded { .. }));
         assert!(!events(&ledger).iter().any(|event| event == "promote"));
-        assert!(
-            enforcement
-                .replacements
-                .lock()
-                .expect("replacements")
-                .is_empty()
+        assert_eq!(
+            enforcement.replacements.lock().expect("replacements").len(),
+            0
         );
     }
 
@@ -1619,12 +1610,9 @@ mod tests {
 
         assert!(matches!(error, AppError::CachePromotion { .. }));
         assert!(events(&ledger).iter().any(|event| event == "promote"));
-        assert!(
-            enforcement
-                .replacements
-                .lock()
-                .expect("replacements")
-                .is_empty()
+        assert_eq!(
+            enforcement.replacements.lock().expect("replacements").len(),
+            0
         );
     }
 

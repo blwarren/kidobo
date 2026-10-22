@@ -724,7 +724,7 @@ mod tests {
         )
         .expect("write malformed manifest");
 
-        assert!(generation_candidates(temp.path()).is_empty());
+        assert_eq!(generation_candidates(temp.path()).len(), 0);
     }
 
     #[test]

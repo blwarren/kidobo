@@ -183,6 +183,10 @@ Development commands are defined in `Justfile`. See the
 details, and the [architecture guide](docs/architecture.md) for extension
 boundaries and recipes.
 
+Development uses Rust 1.99.1 through `rust-toolchain.toml`. The minimum supported
+Rust version remains 1.97.1 in the Cargo manifests. Keep code compatible with that
+minimum and verify it with `RUSTUP_TOOLCHAIN=1.97.1 just test`.
+
 ```bash
 cargo install --locked just --version 1.55.1
 just _install-cooldown _install-deny _install-audit

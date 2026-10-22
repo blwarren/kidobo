@@ -699,7 +699,7 @@ fn publisher_cancel_restores_the_original_branch_and_leaves_no_release_state() {
     assert_eq!(fixture.head(), original_head);
     assert!(!fixture.tag_exists());
     assert!(!fixture.artifact_root(RELEASE_TAG).exists());
-    assert!(fixture.git(&["status", "--porcelain"]).stdout.is_empty());
+    assert_eq!(fixture.git(&["status", "--porcelain"]).stdout.len(), 0);
     let log = read_to_string_with_limit(&fixture.git_log, FIXTURE_LOG_READ_LIMIT);
     assert!(log.contains("switch main"));
     assert!(log.contains("switch --quiet feature"));

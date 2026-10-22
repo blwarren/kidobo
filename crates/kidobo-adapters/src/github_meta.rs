@@ -1164,7 +1164,7 @@ mod tests {
         .expect("load");
 
         assert_eq!(result.source, GithubMetaSource::Network);
-        assert!(result.networks.is_empty());
+        assert_eq!(result.networks.len(), 0);
         assert!(
             current_generation_dir(temp.path())
                 .join(super::GENERATION_RAW_FILE)
@@ -1559,7 +1559,7 @@ mod tests {
         .expect("load");
 
         assert_eq!(result.source, GithubMetaSource::Empty);
-        assert!(result.networks.is_empty());
+        assert_eq!(result.networks.len(), 0);
 
         let requests = client.requests();
         assert_eq!(requests.len(), 1);
@@ -1604,7 +1604,7 @@ mod tests {
         .expect("load");
 
         assert_eq!(result.source, GithubMetaSource::Empty);
-        assert!(result.networks.is_empty());
+        assert_eq!(result.networks.len(), 0);
 
         let requests = client.requests();
         assert_eq!(requests.len(), 1);
@@ -1718,7 +1718,7 @@ mod tests {
         .expect("load");
 
         assert_eq!(result.source, GithubMetaSource::Empty);
-        assert!(result.networks.is_empty());
+        assert_eq!(result.networks.len(), 0);
     }
 
     #[test]
@@ -1753,7 +1753,7 @@ mod tests {
         .expect("load");
 
         assert_eq!(result.source, GithubMetaSource::Empty);
-        assert!(result.networks.is_empty());
+        assert_eq!(result.networks.len(), 0);
     }
 
     #[test]
@@ -1917,7 +1917,7 @@ mod tests {
         .expect("load");
 
         assert_eq!(result.source, GithubMetaSource::Empty);
-        assert!(result.networks.is_empty());
+        assert_eq!(result.networks.len(), 0);
     }
 
     #[test]
@@ -2024,6 +2024,6 @@ mod tests {
         .expect("load");
 
         assert_eq!(result.source, GithubMetaSource::Empty);
-        assert!(result.networks.is_empty());
+        assert_eq!(result.networks.len(), 0);
     }
 }

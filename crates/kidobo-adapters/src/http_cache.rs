@@ -1649,7 +1649,7 @@ mod tests {
             fetch_iplist_with_cache(&client, url, temp.path(), &BTreeMap::new()).expect("fetch");
 
         assert_eq!(result.source, CacheSource::Empty);
-        assert!(result.networks.is_empty());
+        assert_eq!(result.networks.len(), 0);
         assert!(!paths.iplist_path.exists());
         assert!(!paths.raw_path.exists());
         assert!(!paths.meta_path.exists());
@@ -1666,7 +1666,7 @@ mod tests {
             fetch_iplist_with_cache(&client, url, temp.path(), &BTreeMap::new()).expect("fetch");
 
         assert_eq!(result.source, CacheSource::Network);
-        assert!(result.networks.is_empty());
+        assert_eq!(result.networks.len(), 0);
         let generation = current_generation_dir(temp.path(), url);
         assert_eq!(
             read_to_string_with_limit(
@@ -1771,7 +1771,7 @@ mod tests {
             fetch_iplist_with_cache(&client, url, cache_dir, &BTreeMap::new()).expect("fetch");
 
         assert_eq!(result.source, CacheSource::Empty);
-        assert!(result.networks.is_empty());
+        assert_eq!(result.networks.len(), 0);
     }
 
     #[test]
@@ -1792,7 +1792,7 @@ mod tests {
 
         let result = fetch_iplist_with_cache(&client, url, cache_dir, &env).expect("fetch");
         assert_eq!(result.source, CacheSource::Empty);
-        assert!(result.networks.is_empty());
+        assert_eq!(result.networks.len(), 0);
     }
 
     #[test]

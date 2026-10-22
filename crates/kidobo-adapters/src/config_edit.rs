@@ -159,7 +159,7 @@ mod tests {
             std::fs::write(&path, format!("# top\n{asn}{unrelated}")).expect("fixture");
             let added = update_asn_bans(&path, &[64513, 64513], &[]).expect("add");
             assert_eq!(added.added, vec![64513]);
-            assert!(added.removed.is_empty());
+            assert_eq!(added.removed.len(), 0);
             let duplicate = update_asn_bans(&path, &[64513], &[64514]).expect("no-op");
             assert_eq!(duplicate, super::AsnBanUpdateResult::default());
             let removed = update_asn_bans(&path, &[], &[64512, 64513]).expect("remove");
@@ -171,7 +171,7 @@ mod tests {
                     vec![64513]
                 }
             );
-            assert!(removed.added.is_empty());
+            assert_eq!(removed.added.len(), 0);
             let rendered = read_to_string_with_limit(&path, 65536).expect("read");
             assert!(rendered.starts_with("# top\n"));
             assert!(rendered.ends_with(unrelated));
@@ -282,7 +282,7 @@ mod tests {
 
         let added = update_asn_bans(&config_path, &[64513, 64514], &[]).expect("add");
         assert_eq!(added.added, vec![64513, 64514]);
-        assert!(added.removed.is_empty());
+        assert_eq!(added.removed.len(), 0);
 
         let removed = update_asn_bans(&config_path, &[], &[64512, 64514]).expect("remove");
         assert_eq!(removed.removed, vec![64512, 64514]);

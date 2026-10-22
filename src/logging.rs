@@ -153,7 +153,7 @@ mod tests {
 
         let err = init(LevelFilter::Off).expect_err("second init must fail");
         match err {
-            KidoboError::LoggerInit { reason } => assert!(!reason.is_empty()),
+            KidoboError::LoggerInit { reason } => assert_ne!(reason, ""),
             _ => panic!("expected logger init error"),
         }
     }

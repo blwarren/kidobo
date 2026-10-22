@@ -16,8 +16,8 @@ redesigns. New commands, configuration surface, or runtime modes require explici
 
 ## 2. Hard Invariants (Non-Negotiable)
 
-* Use the pinned stable toolchain in `rust-toolchain.toml`; keep it synchronized with
-  `package.rust-version`.
+* Use the pinned stable toolchain in `rust-toolchain.toml` for development. Preserve
+  `package.rust-version` as the minimum supported Rust version; the development pin may be newer.
 * The process remains one-shot. The supported systemd timer may invoke the existing `Type=oneshot`
   sync service; do not add a resident daemon, watcher, or internal scheduler.
 * Keep the public command surface and exit meanings stable: `0` for success/help/version, `1` for

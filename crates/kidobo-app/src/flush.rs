@@ -336,7 +336,7 @@ mod tests {
         )
         .expect("flush");
 
-        assert!(outcome.failed.is_empty());
+        assert_eq!(outcome.failed.len(), 0);
         assert_eq!(
             *backend.events.lock().expect("events"),
             [

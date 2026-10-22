@@ -1293,7 +1293,7 @@ mod tests {
 
     #[test]
     fn merge_intervals_returns_empty_for_empty_input() {
-        assert!(merge_intervals_u32(&[]).is_empty());
+        assert_eq!(merge_intervals_u32(&[]).len(), 0);
     }
 
     #[test]

@@ -592,7 +592,7 @@ mod tests {
                 .map(|index| format!("198.51.100.{index}/32"))
                 .collect::<Vec<_>>()
         );
-        assert!(loaded.primary.notices.is_empty());
+        assert_eq!(loaded.primary.notices.len(), 0);
         assert_eq!(loaded.pending_promotions.len(), 8);
         assert_eq!(client.max_in_flight.load(Ordering::SeqCst), workers);
     }
@@ -748,6 +748,6 @@ mod tests {
         )
         .expect("cached production load");
         assert_eq!(cached.primary.networks, loaded.primary.networks);
-        assert!(cached.primary.notices.is_empty());
+        assert_eq!(cached.primary.notices.len(), 0);
     }
 }

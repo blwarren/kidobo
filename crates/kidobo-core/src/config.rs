@@ -581,7 +581,7 @@ mod tests {
         assert_eq!(config.ipset.hashsize.get(), 65_536);
         assert_eq!(config.ipset.maxelem.get(), 500_000);
         assert_eq!(config.ipset.timeout, 0);
-        assert!(config.safe.ips.is_empty());
+        assert_eq!(config.safe.ips.len(), 0);
         assert!(config.safe.include_github_meta);
         assert_eq!(config.safe.github_meta_url, "https://api.github.com/meta");
         assert_eq!(
@@ -590,7 +590,7 @@ mod tests {
         );
         assert_eq!(config.remote.urls, Vec::<String>::new());
         assert_eq!(config.remote.timeout_secs.get(), 30);
-        assert!(config.asn.banned.is_empty());
+        assert_eq!(config.asn.banned.len(), 0);
         assert_eq!(config.asn.cache_stale_after_secs.get(), 86_400);
     }
 

@@ -309,7 +309,7 @@ mod tests {
         ))];
 
         let effective = compute_effective_blocklists(&candidates, &[], false);
-        assert!(effective.ipv6.is_empty());
+        assert_eq!(effective.ipv6.len(), 0);
     }
 
     #[test]
@@ -355,8 +355,8 @@ mod tests {
         ];
 
         let effective = compute_effective_blocklists(&candidates, &safelist, true);
-        assert!(effective.ipv4.is_empty());
-        assert!(effective.ipv6.is_empty());
+        assert_eq!(effective.ipv4.len(), 0);
+        assert_eq!(effective.ipv6.len(), 0);
     }
 
     #[test]
@@ -427,8 +427,8 @@ mod tests {
         ];
 
         let effective = compute_effective_blocklists(&candidates, &safelist, true);
-        assert!(effective.ipv4.is_empty());
-        assert!(effective.ipv6.is_empty());
+        assert_eq!(effective.ipv4.len(), 0);
+        assert_eq!(effective.ipv6.len(), 0);
     }
 
     #[test]
@@ -464,8 +464,8 @@ mod tests {
         ];
 
         let effective = compute_effective_blocklists(&candidates, &safelist, true);
-        assert!(effective.ipv4.is_empty());
-        assert!(effective.ipv6.is_empty());
+        assert_eq!(effective.ipv4.len(), 0);
+        assert_eq!(effective.ipv6.len(), 0);
     }
 
     #[test]
@@ -482,7 +482,7 @@ mod tests {
             assert_disjoint_from_safelist(&effective, &safelist, true);
 
             let effective_ipv4_only = compute_effective_blocklists(&candidates, &safelist, false);
-            assert!(effective_ipv4_only.ipv6.is_empty());
+            assert_eq!(effective_ipv4_only.ipv6.len(), 0);
             assert_disjoint_from_safelist(&effective_ipv4_only, &safelist, false);
         }
     }

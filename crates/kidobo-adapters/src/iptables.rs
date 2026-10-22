@@ -838,10 +838,11 @@ mod tests {
             runner.chain_rules("iptables", KIDOBO_CHAIN_NAME),
             ["-m set --match-set kidobo-set src -j DROP"]
         );
-        assert!(
+        assert_eq!(
             runner
                 .chain_rules("iptables", KIDOBO_STAGING_CHAIN_NAME)
-                .is_empty()
+                .len(),
+            0
         );
         assert!(
             invocations
@@ -1080,17 +1081,14 @@ mod tests {
 
         cleanup_firewall_wiring(&runner, FirewallFamily::Ipv6).expect("cleanup");
 
-        assert!(runner.input_rules("ip6tables").is_empty());
-        assert!(
+        assert_eq!(runner.input_rules("ip6tables").len(), 0);
+        assert_eq!(
             runner
                 .chain_rules("ip6tables", KIDOBO_STAGING_CHAIN_NAME)
-                .is_empty()
+                .len(),
+            0
         );
-        assert!(
-            runner
-                .chain_rules("ip6tables", KIDOBO_CHAIN_NAME)
-                .is_empty()
-        );
+        assert_eq!(runner.chain_rules("ip6tables", KIDOBO_CHAIN_NAME).len(), 0);
     }
 
     #[test]

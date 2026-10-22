@@ -613,7 +613,7 @@ mod tests {
 
         let entries = load_registry_sources(&paths, Some(&config)).expect("load sources");
 
-        assert!(entries.is_empty());
+        assert_eq!(entries.len(), 0);
     }
 
     #[test]
@@ -643,7 +643,7 @@ mod tests {
 
         let entries = load_registry_sources(&paths, Some(&config)).expect("load sources");
 
-        assert!(entries.is_empty());
+        assert_eq!(entries.len(), 0);
     }
 
     #[test]
@@ -652,7 +652,7 @@ mod tests {
         let paths = test_paths(temp.path());
 
         let entries = load_registry_sources(&paths, None).expect("load sources");
-        assert!(entries.is_empty());
+        assert_eq!(entries.len(), 0);
     }
 
     #[test]

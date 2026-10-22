@@ -428,7 +428,7 @@ mod tests {
 
         let report = run_lookup(&["2001:db8::f".to_string()], &sources);
 
-        assert!(report.invalid_targets.is_empty());
+        assert_eq!(report.invalid_targets.len(), 0);
         assert_eq!(report.matches.len(), 1);
         assert_eq!(report.matches[0].source_label, "source:v6-boundary");
         assert_eq!(report.matches[0].matched_source_entry, "2001:db8::/124");
@@ -485,7 +485,7 @@ mod tests {
             ));
         });
 
-        assert!(invalid.is_empty());
+        assert_eq!(invalid.len(), 0);
         assert_eq!(emitted.len(), 1);
         assert_eq!(emitted[0].0, "10.0.0.7");
         assert_eq!(emitted[0].1, "source:a");
@@ -499,7 +499,7 @@ mod tests {
             emitted.push((target.to_string(), matches.len()));
         });
 
-        assert!(invalid.is_empty());
+        assert_eq!(invalid.len(), 0);
         assert_eq!(emitted, vec![("198.51.100.9".to_string(), 0)]);
     }
 
