@@ -96,33 +96,36 @@ impl ProcessStatus {
 }
 
 /// Failure while starting, supervising, or collecting a bounded subprocess.
-#[derive(Debug, Error, Clone, PartialEq, Eq)]
+#[derive(Debug, Error)]
 pub enum CommandRunnerError {
     /// The operating system refused to start the process.
-    #[error("failed to spawn command `{command}`: {reason}")]
+    #[error("failed to spawn command `{command}`: {source}")]
     Spawn {
         /// Rendered command.
         command: String,
         /// Operating-system diagnostic.
-        reason: String,
+        #[source]
+        source: std::io::Error,
     },
 
     /// Process status polling failed.
-    #[error("failed to poll command `{command}`: {reason}")]
+    #[error("failed to poll command `{command}`: {source}")]
     Poll {
         /// Rendered command.
         command: String,
         /// Operating-system diagnostic.
-        reason: String,
+        #[source]
+        source: std::io::Error,
     },
 
     /// Bounded output collection failed.
-    #[error("failed to read output for command `{command}`: {reason}")]
+    #[error("failed to read output for command `{command}`: {source}")]
     Output {
         /// Rendered command.
         command: String,
         /// Pipe, size-bound, or reader diagnostic.
-        reason: String,
+        #[source]
+        source: std::io::Error,
     },
 
     /// The process exceeded its deadline and was terminated.
@@ -168,9 +171,9 @@ impl CommandExecutor for SystemCommandExecutor {
 
         let mut child = child_command
             .spawn()
-            .map_err(|err| CommandRunnerError::Spawn {
+            .map_err(|source| CommandRunnerError::Spawn {
                 command: command.clone(),
-                reason: err.to_string(),
+                source,
             })?;
 
         let result = collect_output(&mut child, request, &command);
@@ -191,19 +194,19 @@ fn collect_output(
         .take()
         .ok_or_else(|| CommandRunnerError::Output {
             command: command.to_string(),
-            reason: "stdout pipe was not available".to_string(),
+            source: std::io::Error::other("stdout pipe was not available"),
         })?;
     let mut stderr = child
         .stderr
         .take()
         .ok_or_else(|| CommandRunnerError::Output {
             command: command.to_string(),
-            reason: "stderr pipe was not available".to_string(),
+            source: std::io::Error::other("stderr pipe was not available"),
         })?;
 
-    let output_error = |error: std::io::Error| CommandRunnerError::Output {
+    let output_error = |source: std::io::Error| CommandRunnerError::Output {
         command: command.to_string(),
-        reason: error.to_string(),
+        source,
     };
     set_nonblocking(&stdout).map_err(output_error)?;
     set_nonblocking(&stderr).map_err(output_error)?;
@@ -222,10 +225,12 @@ fn collect_output(
             });
         }
         if status.is_none() {
-            status = child.try_wait().map_err(|error| CommandRunnerError::Poll {
-                command: command.to_string(),
-                reason: error.to_string(),
-            })?;
+            status = child
+                .try_wait()
+                .map_err(|source| CommandRunnerError::Poll {
+                    command: command.to_string(),
+                    source,
+                })?;
         }
         if !stdout_eof {
             stdout_eof = drain_output(&mut stdout, &mut stdout_bytes).map_err(output_error)?;
@@ -485,13 +490,22 @@ mod tests {
             timeout_ms: 1_000,
         };
 
-        let executor = MockExecutor::new(vec![Err(error.clone())]);
+        let executor = MockExecutor::new(vec![Err(error)]);
         let runner = SudoCommandRunner::new(executor, Duration::from_secs(1));
 
         let returned = runner
             .run("ipset", &["list", "kidobo"])
             .expect_err("must fail");
-        assert_eq!(returned, error);
+        match returned {
+            CommandRunnerError::Timeout {
+                command,
+                timeout_ms,
+            } => {
+                assert_eq!(command, "sudo -n ipset list kidobo");
+                assert_eq!(timeout_ms, 1_000);
+            }
+            other => panic!("expected timeout, got {other:?}"),
+        }
     }
 
     #[test]
@@ -566,8 +580,9 @@ mod tests {
         .expect_err("oversized command output must fail");
 
         match err {
-            CommandRunnerError::Output { reason, .. } => {
-                assert!(reason.contains("command output exceeds"));
+            CommandRunnerError::Output { source, .. } => {
+                assert_eq!(source.kind(), std::io::ErrorKind::InvalidData);
+                assert!(source.to_string().contains("command output exceeds"));
             }
             _ => panic!("expected output error"),
         }

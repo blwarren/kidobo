@@ -52,7 +52,7 @@ where
                 .map_err(map_ipset_error)?;
         }
         ensure_firewall_artifacts_for_families(&self.runner, plan.enable_ipv6)
-            .map_err(|error| map_firewall_error(&error))
+            .map_err(map_firewall_error)
     }
 
     fn replace_set(
@@ -72,7 +72,7 @@ where
             plan.enable_ipv6,
             to_chain_action(plan.chain_action),
         )
-        .map_err(|error| map_firewall_error(&error))
+        .map_err(map_firewall_error)
     }
 
     fn cleanup_disabled_ipv6(&self, plan: &EnforcementPlan) -> Vec<Notice> {
@@ -141,9 +141,9 @@ fn map_ipset_error(error: crate::ipset::IpsetError) -> AppError {
     }
 }
 
-fn map_firewall_error(error: &crate::iptables::FirewallError) -> AppError {
+fn map_firewall_error(error: crate::iptables::FirewallError) -> AppError {
     AppError::Firewall {
-        reason: error.to_string(),
+        source: Box::new(error),
     }
 }
 
@@ -223,7 +223,7 @@ mod tests {
 
     struct CleanupRunner {
         recording: Runner,
-        result: Result<CommandResult, CommandRunnerError>,
+        result: RefCell<Option<Result<CommandResult, CommandRunnerError>>>,
         fail_firewall: bool,
     }
 
@@ -239,7 +239,10 @@ mod tests {
                 .collect::<Vec<_>>();
             let args = args.as_slice();
             self.recording.run(command, args);
-            self.result.clone()
+            self.result
+                .borrow_mut()
+                .take()
+                .expect("one ipset cleanup command")
         }
     }
 
@@ -249,7 +252,7 @@ mod tests {
             if self.fail_firewall {
                 Err(CommandRunnerError::Spawn {
                     command: command.to_string(),
-                    reason: "firewall unavailable".to_string(),
+                    source: std::io::Error::other("firewall unavailable"),
                 })
             } else {
                 Ok(result)
@@ -266,36 +269,37 @@ mod tests {
                 stderr: stderr.to_string(),
             })
         };
-        let cases = [
-            (output(ProcessStatus::Exited(0), ""), None),
-            (
-                output(ProcessStatus::Exited(1), "The set does not exist"),
-                None,
-            ),
-            (
-                output(ProcessStatus::Exited(1), "Set is in use"),
-                Some("Set is in use"),
-            ),
-            (output(ProcessStatus::Exited(2), ""), Some("no stderr")),
-            (
-                output(ProcessStatus::Exited(2), "does not exist"),
-                Some("does not exist"),
-            ),
-            #[cfg(unix)]
-            (output(ProcessStatus::Signaled(9), ""), Some("no stderr")),
-            (
-                Err(CommandRunnerError::Spawn {
-                    command: "ipset".to_string(),
-                    reason: "unavailable".to_string(),
-                }),
-                Some("unavailable"),
-            ),
-        ];
-        for (result, diagnostic) in cases {
-            for fail_firewall in [false, true] {
+        for fail_firewall in [false, true] {
+            let cases = [
+                (output(ProcessStatus::Exited(0), ""), None),
+                (
+                    output(ProcessStatus::Exited(1), "The set does not exist"),
+                    None,
+                ),
+                (
+                    output(ProcessStatus::Exited(1), "Set is in use"),
+                    Some("Set is in use"),
+                ),
+                (output(ProcessStatus::Exited(2), ""), Some("no stderr")),
+                (
+                    output(ProcessStatus::Exited(2), "does not exist"),
+                    Some("does not exist"),
+                ),
+                #[cfg(unix)]
+                (output(ProcessStatus::Signaled(9), ""), Some("no stderr")),
+                (
+                    Err(CommandRunnerError::Spawn {
+                        command: "ipset".to_string(),
+                        source: std::io::Error::other("unavailable"),
+                    }),
+                    Some("unavailable"),
+                ),
+            ];
+            for (result, diagnostic) in cases {
+                let status = result.as_ref().ok().map(|result| result.status);
                 let backend = CommandEnforcementBackend::new(CleanupRunner {
                     recording: Runner(RefCell::new(Vec::new())),
-                    result: result.clone(),
+                    result: RefCell::new(Some(result)),
                     fail_firewall,
                 });
                 let notices = backend.cleanup_disabled_ipv6(&EnforcementPlan {
@@ -321,9 +325,9 @@ mod tests {
                             .contains("disabled IPv6 ipset cleanup failed softly for kidobo-v6")
                     );
                     assert!(notice.message.contains(diagnostic), "{}", notice.message);
-                    if let Ok(result) = &result {
+                    if let Some(status) = status {
                         assert!(
-                            notice.message.contains(&format!("{:?}", result.status)),
+                            notice.message.contains(&format!("{status:?}")),
                             "{}",
                             notice.message
                         );

@@ -16,17 +16,20 @@ pub(crate) const CONFIG_READ_LIMIT: usize = 64 * 1024;
 /// Returns an error when the file is missing, cannot be read within its bound, or fails parsing or
 /// domain validation.
 pub fn load_config_from_file(path: &Path) -> Result<Config, AppError> {
-    if !path.exists() {
-        return Err(AppError::MissingConfigFile {
-            path: path.to_path_buf(),
-        });
-    }
-
-    let contents =
-        read_to_string_with_limit(path, CONFIG_READ_LIMIT).map_err(|err| AppError::ConfigRead {
-            path: path.to_path_buf(),
-            source: err,
-        })?;
+    let contents = match read_to_string_with_limit(path, CONFIG_READ_LIMIT) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(AppError::MissingConfigFile {
+                path: path.to_path_buf(),
+            });
+        }
+        Err(source) => {
+            return Err(AppError::ConfigRead {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
 
     Config::from_toml_str(&contents).map_err(AppError::from)
 }

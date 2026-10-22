@@ -37,12 +37,9 @@ pub fn read_optional_bytes_lossy(
     read_limit: usize,
     description: &str,
 ) -> Option<Vec<u8>> {
-    if !path.exists() {
-        return None;
-    }
-
     match read_bytes_with_limit(path, read_limit) {
         Ok(contents) => Some(contents),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
         Err(err) => {
             warn!("failed to read {description} {}: {err}", path.display());
             None

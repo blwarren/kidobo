@@ -47,10 +47,9 @@ impl BlocklistDocument {
     /// CIDR.
     pub fn parse(contents: &str) -> Result<Self, InvalidBlocklistLine> {
         let mut lines = Vec::new();
-        let mut in_header = true;
 
         for (idx, line) in contents.lines().enumerate() {
-            lines.push(BlocklistLine::parse(line, idx + 1, &mut in_header)?);
+            lines.push(BlocklistLine::parse(line, idx + 1)?);
         }
 
         Ok(Self {
@@ -111,22 +110,8 @@ pub struct BlocklistLine {
 }
 
 impl BlocklistLine {
-    fn parse(
-        line: &str,
-        line_number: usize,
-        in_header: &mut bool,
-    ) -> Result<Self, InvalidBlocklistLine> {
-        let trimmed = line.trim();
-        let canonical = if *in_header {
-            if trimmed.is_empty() || trimmed.starts_with('#') {
-                None
-            } else {
-                *in_header = false;
-                parse_blocklist_entry(line, line_number)?
-            }
-        } else {
-            parse_blocklist_entry(line, line_number)?
-        };
+    fn parse(line: &str, line_number: usize) -> Result<Self, InvalidBlocklistLine> {
+        let canonical = parse_blocklist_entry(line, line_number)?;
 
         Ok(Self {
             original: line.to_string(),

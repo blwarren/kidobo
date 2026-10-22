@@ -40,15 +40,15 @@ impl BlocklistRepository for FileBlocklistRepository {
             return Ok(());
         }
         ensure_blocklist_parent(path)?;
-        let mut contents = if path.exists() {
-            read_to_string_with_limit(path, BLOCKLIST_READ_LIMIT).map_err(|error| {
-                AppError::BlocklistRead {
+        let mut contents = match read_to_string_with_limit(path, BLOCKLIST_READ_LIMIT) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(source) => {
+                return Err(AppError::BlocklistRead {
                     path: path.to_path_buf(),
-                    source: error,
-                }
-            })?
-        } else {
-            String::new()
+                    source,
+                });
+            }
         };
         if has_content && !trailing_newline {
             contents.push('\n');
@@ -183,16 +183,16 @@ pub fn ensure_blocklist_parent(path: &Path) -> Result<(), AppError> {
 /// Returns an error when the file cannot be read or written, or contains an invalid blocklist
 /// entry.
 pub fn normalize_local_blocklist(path: &Path) -> Result<(), AppError> {
-    if !path.exists() {
-        return Ok(());
-    }
-
-    let original = read_to_string_with_limit(path, BLOCKLIST_READ_LIMIT).map_err(|err| {
-        AppError::BlocklistRead {
-            path: path.to_path_buf(),
-            source: err,
+    let original = match read_to_string_with_limit(path, BLOCKLIST_READ_LIMIT) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(AppError::BlocklistRead {
+                path: path.to_path_buf(),
+                source,
+            });
         }
-    })?;
+    };
 
     let normalized =
         canonicalize_blocklist(&original).map_err(|err| map_invalid_blocklist_line(path, err))?;
@@ -219,7 +219,13 @@ pub fn normalize_local_blocklist_with_fast_state(
     blocklist_path: &Path,
     fast_state_path: &Path,
 ) -> Result<BlocklistNormalizeResult, AppError> {
-    if !blocklist_path.exists() {
+    if !blocklist_path
+        .try_exists()
+        .map_err(|source| AppError::BlocklistRead {
+            path: blocklist_path.to_path_buf(),
+            source,
+        })?
+    {
         return Ok(BlocklistNormalizeResult::MissingBlocklist);
     }
 
@@ -268,20 +274,16 @@ fn write_blocklist_fast_state(
 /// Returns an error when the file cannot be read within its bound or contains an invalid
 /// entry.
 pub fn load_blocklist_document(path: &Path) -> Result<CoreBlocklistDocument, AppError> {
-    if !path.exists() {
-        return Ok(CoreBlocklistDocument {
-            lines: Vec::new(),
-            has_content: false,
-            trailing_newline: false,
-        });
-    }
-
-    let contents = read_to_string_with_limit(path, BLOCKLIST_READ_LIMIT).map_err(|err| {
-        AppError::BlocklistRead {
-            path: path.to_path_buf(),
-            source: err,
+    let contents = match read_to_string_with_limit(path, BLOCKLIST_READ_LIMIT) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(source) => {
+            return Err(AppError::BlocklistRead {
+                path: path.to_path_buf(),
+                source,
+            });
         }
-    })?;
+    };
     CoreBlocklistDocument::parse(&contents).map_err(|err| map_invalid_blocklist_line(path, err))
 }
 

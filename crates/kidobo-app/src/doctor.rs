@@ -89,7 +89,11 @@ pub trait DoctorProbe {
     fn find_binary(&self, binary: &str) -> Option<PathBuf>;
 
     /// Returns whether a path exists without mutating it.
-    fn path_exists(&self, path: &Path) -> bool;
+    ///
+    /// # Errors
+    ///
+    /// Returns the filesystem failure when existence cannot be determined.
+    fn path_exists(&self, path: &Path) -> std::io::Result<bool>;
 
     /// Inspects whether a cache directory exists or could plausibly be created.
     ///
@@ -252,7 +256,7 @@ fn push_path_checks(
 ) {
     let Ok(paths) = paths else {
         let reason = match paths {
-            Err(AppError::PathResolution { reason }) => reason.clone(),
+            Err(AppError::PathResolution { source }) => source.to_string(),
             Err(error) => error.to_string(),
             Ok(_) => String::new(),
         };
@@ -299,11 +303,14 @@ fn push_path_checks(
     });
 }
 
-fn file_check(name: &'static str, path: &Path, exists: bool) -> DoctorCheck {
-    if exists {
-        ok_check(name, format!("exists: {}", path.display()))
-    } else {
-        fail_check(name, format!("missing: {}", path.display()))
+fn file_check(name: &'static str, path: &Path, exists: std::io::Result<bool>) -> DoctorCheck {
+    match exists {
+        Ok(true) => ok_check(name, format!("exists: {}", path.display())),
+        Ok(false) => fail_check(name, format!("missing: {}", path.display())),
+        Err(error) => fail_check(
+            name,
+            format!("failed to inspect {}: {error}", path.display()),
+        ),
     }
 }
 
@@ -457,8 +464,8 @@ mod tests {
             Some(PathBuf::from(format!("/usr/bin/{binary}")))
         }
 
-        fn path_exists(&self, _path: &Path) -> bool {
-            true
+        fn path_exists(&self, _path: &Path) -> std::io::Result<bool> {
+            Ok(true)
         }
 
         fn cache_readiness(

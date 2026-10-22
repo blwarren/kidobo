@@ -40,11 +40,14 @@ impl OfflineLookupProvider for LocalBlocklistLookupProvider {
         context: &OfflineLookupContext<'_>,
         entries: &mut Vec<LookupSourceEntry>,
     ) -> Result<(), AppError> {
-        if !context.paths.blocklist_file.exists() {
-            return Ok(());
+        match append_source_file(&context.paths.blocklist_file, "internal:blocklist", entries) {
+            Err(LookupSourceLoadError::Source(SourceLoadError::Source { source, .. }))
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                Ok(())
+            }
+            result => result.map_err(map_lookup_error),
         }
-        append_source_file(&context.paths.blocklist_file, "internal:blocklist", entries)
-            .map_err(map_lookup_error)
     }
 }
 

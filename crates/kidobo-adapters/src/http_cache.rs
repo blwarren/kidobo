@@ -674,14 +674,24 @@ pub(crate) fn collect_offline_remote_generations(
     cache_dir: &Path,
 ) -> Result<Vec<OfflineRemoteGeneration>, std::io::Error> {
     let stores_root = cache_dir.join(V2_REMOTE_CACHE_DIRECTORY);
-    if !stores_root.exists() {
-        return Ok(Vec::new());
-    }
+    let entries = match std::fs::read_dir(&stores_root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
     let mut stores = Vec::new();
-    for entry in std::fs::read_dir(&stores_root)? {
+    for entry in entries {
         let entry = entry?;
         let url_hash = entry.file_name().to_string_lossy().into_owned();
-        if !entry.path().is_dir() || !is_url_hash(&url_hash) {
+        if !is_url_hash(&url_hash) {
+            continue;
+        }
+        let metadata = match std::fs::metadata(entry.path()) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        if !metadata.is_dir() {
             continue;
         }
         stores.push((url_hash, entry.path()));
@@ -799,17 +809,16 @@ fn read_optional_iplist_networks(
     metadata: Option<&RemoteCacheMetadata>,
     feed_limits: RemoteFeedLimits,
 ) -> Result<Option<Vec<CanonicalCidr>>, HttpCacheError> {
-    if !paths.iplist_path.exists() {
-        return Ok(None);
-    }
-
-    let iplist =
-        read_to_string_with_limit(&paths.iplist_path, MAX_IPLIST_READ_BYTES).map_err(|err| {
-            HttpCacheError::ReadIplist {
+    let iplist = match read_to_string_with_limit(&paths.iplist_path, MAX_IPLIST_READ_BYTES) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(HttpCacheError::ReadIplist {
                 path: paths.iplist_path.clone(),
-                source: err,
-            }
-        })?;
+                source,
+            });
+        }
+    };
 
     if let Some(metadata) = metadata {
         let actual_hash = sha256_hex(iplist.as_bytes());

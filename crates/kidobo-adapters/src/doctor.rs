@@ -34,8 +34,8 @@ impl<E: CommandExecutor> DoctorProbe for SystemDoctorProbe<SudoCommandRunner<E>>
         find_executable_in_path(binary, env::var_os("PATH"))
     }
 
-    fn path_exists(&self, path: &Path) -> bool {
-        path.exists()
+    fn path_exists(&self, path: &Path) -> std::io::Result<bool> {
+        path.try_exists()
     }
 
     fn cache_readiness(
@@ -65,33 +65,41 @@ impl<E: CommandExecutor> DoctorProbe for SystemDoctorProbe<SudoCommandRunner<E>>
 }
 
 fn ensure_cache_path_ready(path: &Path) -> Result<CacheReadiness, CacheWritableError> {
-    if path.exists() {
-        ensure_directory_is_writable(path)?;
-        return Ok(CacheReadiness::ExistingDirectory);
+    for candidate in path.ancestors() {
+        let metadata = match fs::metadata(candidate) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(source) => {
+                return Err(CacheWritableError::Metadata {
+                    path: candidate.to_path_buf(),
+                    source,
+                });
+            }
+        };
+        ensure_directory_is_writable(candidate, &metadata)?;
+        return Ok(if candidate == path {
+            CacheReadiness::ExistingDirectory
+        } else {
+            CacheReadiness::CreatableFromParent {
+                parent: candidate.to_path_buf(),
+            }
+        });
     }
-    let parent = path
-        .ancestors()
-        .skip(1)
-        .find(|candidate| candidate.exists())
-        .map(Path::to_path_buf)
-        .ok_or_else(|| CacheWritableError::MissingParent {
-            path: path.to_path_buf(),
-        })?;
-    ensure_directory_is_writable(&parent)?;
-    Ok(CacheReadiness::CreatableFromParent { parent })
+    Err(CacheWritableError::MissingParent {
+        path: path.to_path_buf(),
+    })
 }
 
-fn ensure_directory_is_writable(path: &Path) -> Result<(), CacheWritableError> {
-    let metadata = fs::metadata(path).map_err(|source| CacheWritableError::Metadata {
-        path: path.to_path_buf(),
-        source,
-    })?;
+fn ensure_directory_is_writable(
+    path: &Path,
+    metadata: &fs::Metadata,
+) -> Result<(), CacheWritableError> {
     if !metadata.is_dir() {
         return Err(CacheWritableError::NotDirectory {
             path: path.to_path_buf(),
         });
     }
-    if !directory_has_mutation_permission_bits(&metadata) {
+    if !directory_has_mutation_permission_bits(metadata) {
         return Err(CacheWritableError::InsufficientMode {
             path: path.to_path_buf(),
         });

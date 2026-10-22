@@ -123,16 +123,6 @@ struct CachePaths {
 }
 
 #[derive(Debug, Clone)]
-struct CachedFallback<'a> {
-    raw: Option<&'a [u8]>,
-    networks: Option<Vec<CanonicalCidr>>,
-    meta: Option<GithubMetaCacheMetadata>,
-    sidecar: Option<&'a GithubMetaCategorySidecar>,
-    previous_networks: Option<Vec<CanonicalCidr>>,
-    previous_meta: Option<GithubMetaCacheMetadata>,
-}
-
-#[derive(Debug, Clone)]
 struct GithubMetaCache {
     raw: Option<Vec<u8>>,
     networks: Option<Vec<CanonicalCidr>>,
@@ -197,7 +187,6 @@ pub(crate) fn prepare_github_meta_safelist(
     cleanup_unselected_generations(&paths.generation_store);
     let cache = read_github_meta_cache(&paths, &selection, github_meta_url);
     let (cached_etag, cached_last_modified) = cache.http_validators();
-    let previous = cache.previous_result();
 
     match fetch_with_conditional_cache(
         client,
@@ -209,44 +198,31 @@ pub(crate) fn prepare_github_meta_safelist(
         "github meta",
     ) {
         ConditionalFetchResult::CacheNotModified => {
-            if let Some(networks) = cache.networks.clone() {
+            let mut cache = cache;
+            if let Some(networks) = cache.networks.take() {
+                let metadata = cache.meta.take();
                 Ok(PreparedGithubMetaLoad {
                     staging_failure: None,
                     primary: GithubMetaLoadResult {
                         networks,
                         source: GithubMetaSource::CacheNotModified,
-                        metadata: cache.meta,
+                        metadata,
                     },
-                    fallback: previous,
+                    fallback: cache.into_previous_result(),
                     pending_promotion: None,
                 })
             } else {
-                Ok(PreparedGithubMetaLoad {
-                    staging_failure: None,
-                    primary: cache.fallback(None, &selection, GithubMetaSource::FallbackCache),
-                    fallback: previous,
-                    pending_promotion: None,
-                })
+                Ok(prepared_github_fallback(cache, &selection))
             }
         }
-        ConditionalFetchResult::FallbackCache => Ok(PreparedGithubMetaLoad {
-            staging_failure: None,
-            primary: cache.fallback(
-                cache.networks.clone(),
-                &selection,
-                GithubMetaSource::FallbackCache,
-            ),
-            fallback: previous,
-            pending_promotion: None,
-        }),
+        ConditionalFetchResult::FallbackCache => Ok(prepared_github_fallback(cache, &selection)),
         ConditionalFetchResult::Network(response) => handle_network_response(
             response,
             &paths,
             github_meta_url,
             max_bytes,
-            cache.as_fallback(),
+            cache,
             &selection,
-            cache.generation_id.as_deref(),
         ),
     }
 }
@@ -396,41 +372,12 @@ impl GithubMetaCache {
         })
     }
 
-    fn as_fallback(&self) -> CachedFallback<'_> {
-        CachedFallback {
-            raw: self.raw.as_deref(),
-            networks: self.networks.clone(),
-            meta: self.meta.clone(),
-            sidecar: self.sidecar.as_ref(),
-            previous_networks: self.previous_networks.clone(),
-            previous_meta: self.previous_meta.clone(),
-        }
-    }
-
-    fn previous_result(&self) -> Option<GithubMetaLoadResult> {
-        self.previous_networks
-            .clone()
-            .map(|networks| GithubMetaLoadResult {
-                networks,
-                source: GithubMetaSource::FallbackCache,
-                metadata: self.previous_meta.clone(),
-            })
-    }
-
-    fn fallback(
-        &self,
-        cached_networks: Option<Vec<CanonicalCidr>>,
-        selection: &CategorySelection,
-        source: GithubMetaSource,
-    ) -> GithubMetaLoadResult {
-        cache_fallback(
-            self.raw.as_deref(),
-            cached_networks,
-            self.meta.clone(),
-            self.sidecar.as_ref(),
-            selection,
-            source,
-        )
+    fn into_previous_result(self) -> Option<GithubMetaLoadResult> {
+        self.previous_networks.map(|networks| GithubMetaLoadResult {
+            networks,
+            source: GithubMetaSource::FallbackCache,
+            metadata: self.previous_meta,
+        })
     }
 }
 
@@ -439,9 +386,8 @@ fn handle_network_response(
     paths: &CachePaths,
     github_meta_url: &str,
     max_bytes: usize,
-    cached: CachedFallback<'_>,
+    cached: GithubMetaCache,
     selection: &CategorySelection,
-    previous_generation: Option<&str>,
 ) -> Result<PreparedGithubMetaLoad, GithubMetaLoadError> {
     if !response.status.is_success() {
         warn!(
@@ -477,7 +423,7 @@ fn handle_network_response(
         &response.body,
         &metadata,
         selection,
-        previous_generation,
+        cached.generation_id.as_deref(),
     ) {
         Ok(promotion) => promotion,
         Err(error) => {
@@ -551,23 +497,24 @@ fn stage_cache(
 }
 
 fn prepared_github_fallback(
-    cached: CachedFallback<'_>,
+    cached: GithubMetaCache,
     selection: &CategorySelection,
 ) -> PreparedGithubMetaLoad {
-    let CachedFallback {
+    let GithubMetaCache {
         raw,
         networks,
         meta,
         sidecar,
         previous_networks,
         previous_meta,
+        generation_id: _,
     } = cached;
     PreparedGithubMetaLoad {
         primary: cache_fallback(
-            raw,
+            raw.as_deref(),
             networks,
             meta,
-            sidecar,
+            sidecar.as_ref(),
             selection,
             GithubMetaSource::FallbackCache,
         ),

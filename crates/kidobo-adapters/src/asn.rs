@@ -296,15 +296,11 @@ pub fn load_cached_asn_prefixes(
 /// Returns [`AsnError::CacheWrite`] when an existing cache file cannot be removed.
 pub fn delete_asn_cache_file(asn: u32, cache_dir: &Path) -> Result<bool, AsnError> {
     let path = asn_cache_file(cache_dir, asn);
-    if !path.exists() {
-        return Ok(false);
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(AsnError::CacheWrite { path, source }),
     }
-
-    fs::remove_file(&path).map_err(|err| AsnError::CacheWrite {
-        path: path.clone(),
-        source: err,
-    })?;
-    Ok(true)
 }
 
 #[derive(Debug)]
@@ -324,14 +320,16 @@ fn state_is_stale(modified: SystemTime, stale_after: Duration) -> bool {
 }
 
 fn read_asn_cache_file(path: &Path) -> Result<Option<AsnCacheState>, AsnError> {
-    if !path.exists() {
-        return Ok(None);
-    }
-
-    let metadata = fs::metadata(path).map_err(|err| AsnError::CacheRead {
-        path: path.to_path_buf(),
-        source: err,
-    })?;
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(AsnError::CacheRead {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
     let modified = metadata.modified().map_err(|err| AsnError::CacheRead {
         path: path.to_path_buf(),
         source: err,

@@ -1,1 +1,3 @@
 - Preserve non-UTF-8 temporary directory paths when restoring ipsets during sync.
+- Report filesystem failures instead of treating unreadable configuration, blocklists, or caches as missing, and stop sync before enforcement when the local blocklist cannot be read.
+- Preserve files and cache generations when their metadata or selection manifest cannot be inspected, and distinguish inspection failures from missing paths in doctor reports.

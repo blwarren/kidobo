@@ -55,7 +55,7 @@ impl PathResolver for SystemPathResolver {
             ConfigRequirement::Optional => resolve_paths_without_config(input),
         };
         result.map_err(|error| AppError::PathResolution {
-            reason: error.to_string(),
+            source: Box::new(error),
         })
     }
 }
@@ -102,8 +102,17 @@ impl BasePaths {
 }
 
 /// Failure to select a required or explicitly requested configuration path.
-#[derive(Debug, Error, Clone, PartialEq, Eq)]
+#[derive(Debug, Error)]
 pub enum PathResolutionError {
+    /// The selected configuration path could not be inspected.
+    #[error("failed to inspect config path {path}: {source}")]
+    InspectConfig {
+        /// Selected configuration path.
+        path: PathBuf,
+        /// Underlying filesystem failure.
+        #[source]
+        source: std::io::Error,
+    },
     /// Caller-supplied configuration path does not exist.
     #[error("explicit config path does not exist: {path}")]
     ExplicitConfigMissing {
@@ -124,17 +133,16 @@ pub enum PathResolutionError {
 /// # Errors
 ///
 /// Returns [`PathResolutionError`] when an explicit configuration path is missing or no default
-/// configuration file exists.
+/// configuration file exists, or when the selected path cannot be inspected.
 pub fn resolve_paths(input: &PathResolutionInput) -> Result<ResolvedPaths, PathResolutionError> {
     resolve_paths_with_policy(input, false)
 }
 
-/// Resolves runtime paths while allowing the selected configuration file to be absent.
+/// Resolves runtime paths without inspecting the selected configuration file.
 ///
 /// # Errors
 ///
-/// Returns [`PathResolutionError::ExplicitConfigMissing`] when the caller supplied an explicit
-/// configuration path that does not exist.
+/// Path selection in this mode cannot currently fail; the result type matches required resolution.
 pub fn resolve_paths_without_config(
     input: &PathResolutionInput,
 ) -> Result<ResolvedPaths, PathResolutionError> {
@@ -184,27 +192,29 @@ fn select_config_path(
     base: &BasePaths,
     allow_missing_config: bool,
 ) -> Result<PathBuf, PathResolutionError> {
-    if let Some(explicit) = input.explicit_config_path.as_deref() {
-        if explicit.exists() || allow_missing_config {
-            return Ok(explicit.to_path_buf());
-        }
-
-        return Err(PathResolutionError::ExplicitConfigMissing {
-            path: explicit.to_path_buf(),
-        });
-    }
-
-    if base.config_file.exists() {
-        return Ok(base.config_file.clone());
-    }
-
+    let path = input
+        .explicit_config_path
+        .as_ref()
+        .unwrap_or(&base.config_file);
     if allow_missing_config {
-        Ok(base.config_file.clone())
-    } else {
-        Err(PathResolutionError::MissingConfig {
-            attempted: base.config_file.clone(),
-        })
+        return Ok(path.clone());
     }
+    if path
+        .try_exists()
+        .map_err(|source| PathResolutionError::InspectConfig {
+            path: path.clone(),
+            source,
+        })?
+    {
+        return Ok(path.clone());
+    }
+    Err(if input.explicit_config_path.is_some() {
+        PathResolutionError::ExplicitConfigMissing { path: path.clone() }
+    } else {
+        PathResolutionError::MissingConfig {
+            attempted: path.clone(),
+        }
+    })
 }
 
 fn env_value<'a>(vars: &'a BTreeMap<OsString, OsString>, key: &str) -> Option<&'a OsStr> {
@@ -324,12 +334,12 @@ mod tests {
             .insert(ENV_KIDOBO_ROOT.into(), root.as_os_str().to_owned());
 
         let err = resolve_paths(&input).expect_err("should fail without config");
-        assert_eq!(
-            err,
-            PathResolutionError::MissingConfig {
-                attempted: root.join("config/config.toml"),
+        match err {
+            PathResolutionError::MissingConfig { attempted } => {
+                assert_eq!(attempted, root.join("config/config.toml"));
             }
-        );
+            other => panic!("expected missing config, got {other:?}"),
+        }
     }
 
     #[test]
@@ -354,10 +364,10 @@ mod tests {
         input.explicit_config_path = Some(explicit.clone());
 
         let err = resolve_paths(&input).expect_err("must fail");
-        assert_eq!(
-            err,
-            PathResolutionError::ExplicitConfigMissing { path: explicit }
-        );
+        match err {
+            PathResolutionError::ExplicitConfigMissing { path } => assert_eq!(path, explicit),
+            other => panic!("expected missing explicit config, got {other:?}"),
+        }
     }
 
     #[test]
@@ -372,12 +382,12 @@ mod tests {
             .insert(ENV_KIDOBO_ROOT.into(), root.as_os_str().to_owned());
 
         let err = resolve_paths(&input).expect_err("must fail");
-        assert_eq!(
-            err,
-            PathResolutionError::MissingConfig {
-                attempted: root.join("config/config.toml"),
+        match err {
+            PathResolutionError::MissingConfig { attempted } => {
+                assert_eq!(attempted, root.join("config/config.toml"));
             }
-        );
+            other => panic!("expected missing config, got {other:?}"),
+        }
     }
 
     #[test]

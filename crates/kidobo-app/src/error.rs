@@ -21,10 +21,11 @@ pub enum AppError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
     /// Compatibility-sensitive runtime paths could not be resolved.
-    #[error("path resolution failed: {reason}")]
+    #[error("path resolution failed: {source}")]
     PathResolution {
         /// Path validation diagnostic.
-        reason: String,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
     },
 
     /// A workflow requiring configuration found no file.
@@ -197,10 +198,11 @@ pub enum AppError {
     },
 
     /// Firewall preparation, activation, inspection, or cleanup failed.
-    #[error("firewall operation failed: {reason}")]
+    #[error("firewall operation failed: {source}")]
     Firewall {
         /// Firewall adapter diagnostic.
-        reason: String,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
     },
 
     /// Managed ipset preparation, replacement, or cleanup failed.

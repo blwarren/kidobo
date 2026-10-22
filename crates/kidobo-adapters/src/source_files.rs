@@ -42,7 +42,15 @@ pub fn collect_remote_cache_files(
     for entry in dir_iter {
         let entry = entry.map_err(RemoteCacheFilesError::ReadDirEntry)?;
         let path = entry.path();
-        if path.is_file() && path.extension() == Some(OsStr::new("iplist")) {
+        if path.extension() != Some(OsStr::new("iplist")) {
+            continue;
+        }
+        let metadata = match fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(RemoteCacheFilesError::ReadDirEntry(error)),
+        };
+        if metadata.is_file() {
             files.push(path);
         }
     }

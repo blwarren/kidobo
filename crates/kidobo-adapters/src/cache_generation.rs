@@ -217,15 +217,34 @@ pub(crate) fn cleanup_unselected_generations(store_root: &Path) {
     let manifest_path = store_root.join(MANIFEST_FILE_NAME);
     let candidates = generation_candidates(store_root);
     if candidates.is_empty() {
-        if manifest_path.exists() {
-            return;
+        match fs::symlink_metadata(&manifest_path) {
+            Ok(_) => return,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                warn!(
+                    "cannot inspect cache manifest {}; preserving generations: {error}",
+                    manifest_path.display()
+                );
+                return;
+            }
         }
         let generations_root = store_root.join(GENERATIONS_DIRECTORY);
         let Ok(entries) = fs::read_dir(&generations_root) else {
             return;
         };
         for entry in entries.flatten() {
-            if entry.path().is_dir() {
+            let metadata = match fs::metadata(entry.path()) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    warn!(
+                        "cannot inspect cache generation {}; preserving it: {error}",
+                        entry.path().display()
+                    );
+                    continue;
+                }
+            };
+            if metadata.is_dir() {
                 let _remove_result = fs::remove_dir_all(entry.path());
             }
         }
@@ -366,7 +385,7 @@ where
             })
             .collect::<Vec<_>>();
         let mut repair = None;
-        let remove_on_drop = if generation_directory.exists() {
+        let remove_on_drop = if generation_directory.try_exists()? {
             if generation_contents_match(
                 &GenerationCandidate {
                     id: generation_id.clone(),
@@ -454,7 +473,21 @@ fn prune_generations(store_root: &Path, manifest: &GenerationManifest) {
         let file_name = entry.file_name();
         let name = file_name.to_string_lossy();
         let keep = name == manifest.current || manifest.previous.as_deref() == Some(name.as_ref());
-        if !keep && entry.path().is_dir() {
+        if keep {
+            continue;
+        }
+        let metadata = match fs::metadata(entry.path()) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                warn!(
+                    "cannot inspect cache generation {}; preserving it: {error}",
+                    entry.path().display()
+                );
+                continue;
+            }
+        };
+        if metadata.is_dir() {
             let _remove_result = fs::remove_dir_all(entry.path());
         }
     }
@@ -510,6 +543,32 @@ mod tests {
             previous,
         )
         .expect("commit")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_preserves_generations_when_manifest_cannot_be_inspected() {
+        let temp = TempDir::new().expect("tempdir");
+        let id = commit(temp.path(), b"selected", None);
+        let manifest = temp.path().join(super::MANIFEST_FILE_NAME);
+        std::fs::remove_file(&manifest).expect("remove manifest");
+        std::os::unix::fs::symlink(super::MANIFEST_FILE_NAME, &manifest).expect("manifest loop");
+
+        cleanup_unselected_generations(temp.path());
+
+        let payload = temp
+            .path()
+            .join(GENERATIONS_DIRECTORY)
+            .join(id)
+            .join("payload");
+        assert_eq!(
+            read_bytes_with_limit(&payload, 64).expect("preserved payload"),
+            b"selected"
+        );
+        assert_eq!(
+            std::fs::read_link(&manifest).expect("preserved manifest"),
+            std::path::Path::new(super::MANIFEST_FILE_NAME)
+        );
     }
 
     #[test]

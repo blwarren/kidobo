@@ -83,8 +83,10 @@ fn is_missing_ipset_result(result: &CommandResult) -> bool {
 }
 
 fn clear_remote_cache_dir(remote_cache_dir: &Path) -> Result<(), std::io::Error> {
-    if remote_cache_dir.exists() {
-        fs::remove_dir_all(remote_cache_dir)?;
+    match fs::remove_dir_all(remote_cache_dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
     }
     fs::create_dir_all(remote_cache_dir)
 }

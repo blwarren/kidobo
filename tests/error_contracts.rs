@@ -163,3 +163,284 @@ fn offline_cache_errors_keep_io_causes_through_source_wrappers() {
     assert_eq!(io_cause(&error).kind(), io::ErrorKind::IsADirectory);
     assert!(io_cause(&error).raw_os_error().is_some());
 }
+
+#[cfg(unix)]
+#[test]
+fn blocklist_read_failures_are_not_missing_files() {
+    use kidobo_adapters::blocklist_file::{
+        load_blocklist_document, normalize_local_blocklist,
+        normalize_local_blocklist_with_fast_state,
+    };
+
+    let temp = TempDir::new().expect("tempdir");
+    let blocked = temp.path().join("blocked");
+    fs::write(&blocked, "not a directory").expect("block parent");
+    let path = blocked.join("blocklist.txt");
+    let error = load_blocklist_document(&path).expect_err("failed read is not an empty list");
+    assert_eq!(io_cause(&error).kind(), io::ErrorKind::NotADirectory);
+    let error = normalize_local_blocklist(&path).expect_err("failed read is not absence");
+    assert_eq!(io_cause(&error).kind(), io::ErrorKind::NotADirectory);
+    let error = normalize_local_blocklist_with_fast_state(&path, &temp.path().join("state"))
+        .expect_err("failed inspection is not absence");
+    assert_eq!(io_cause(&error).kind(), io::ErrorKind::NotADirectory);
+}
+
+#[cfg(unix)]
+#[test]
+fn required_config_inspection_retains_its_io_cause() {
+    use kidobo_adapters::path::{ENV_KIDOBO_ROOT, SystemPathResolver};
+    use kidobo_app::paths::{ConfigRequirement, PathResolutionInput};
+    use kidobo_app::ports::PathResolver;
+
+    let temp = TempDir::new().expect("tempdir");
+    let config_dir = temp.path().join("config");
+    fs::write(&config_dir, "not a directory").expect("block config parent");
+    let path = config_dir.join("config.toml");
+    let error = load_config_from_file(&path).expect_err("failed read is not missing config");
+    assert!(matches!(&error, AppError::ConfigRead { path: actual, .. } if actual == &path));
+    assert_eq!(io_cause(&error).kind(), io::ErrorKind::NotADirectory);
+
+    let input = PathResolutionInput {
+        explicit_config_path: None,
+        temp_dir: temp.path().to_path_buf(),
+        env: [(ENV_KIDOBO_ROOT.into(), temp.path().as_os_str().to_owned())].into(),
+    };
+    let error = SystemPathResolver
+        .resolve(&input, ConfigRequirement::Required)
+        .expect_err("required config cannot be inspected");
+    assert_eq!(io_cause(&error).kind(), io::ErrorKind::NotADirectory);
+    let optional = SystemPathResolver
+        .resolve(&input, ConfigRequirement::Optional)
+        .expect("optional resolution does not inspect configuration");
+    assert_eq!(optional.config_file, path);
+}
+
+#[cfg(unix)]
+#[test]
+fn cache_inspection_failures_are_not_missing_sources() {
+    use kidobo_adapters::cached_sources::load_remote_sources;
+
+    let temp = TempDir::new().expect("tempdir");
+    let blocked = temp.path().join("blocked");
+    fs::write(&blocked, "not a directory").expect("block parent");
+    let error = load_cached_asn_prefixes(64512, &blocked.join("asn"))
+        .expect_err("failed ASN inspection is not missing cache");
+    assert_eq!(io_cause(&error).kind(), io::ErrorKind::NotADirectory);
+    let error = load_remote_sources(&blocked.join("remote"))
+        .expect_err("failed directory inspection is not missing cache");
+    assert_eq!(io_cause(&error).kind(), io::ErrorKind::NotADirectory);
+}
+
+#[cfg(unix)]
+#[test]
+fn selected_cache_entry_inspection_failures_are_reported() {
+    use kidobo_adapters::cached_sources::load_remote_sources;
+
+    let temp = TempDir::new().expect("tempdir");
+    let path = temp.path().join("source.iplist");
+    std::os::unix::fs::symlink("source.iplist", &path).expect("symlink loop");
+    let expected = fs::metadata(&path)
+        .expect_err("metadata loop")
+        .raw_os_error();
+    let error = load_remote_sources(temp.path()).expect_err("selected entry cannot be inspected");
+    assert_eq!(io_cause(&error).raw_os_error(), expected);
+    fs::remove_file(&path).expect("remove loop");
+
+    let stores = temp.path().join("v2/remote");
+    fs::create_dir_all(&stores).expect("create stores");
+    let hash = "0123456789abcdef";
+    std::os::unix::fs::symlink(hash, stores.join(hash)).expect("store symlink loop");
+    let error = load_remote_sources(temp.path()).expect_err("selected store cannot be inspected");
+    assert_eq!(io_cause(&error).raw_os_error(), expected);
+}
+
+#[cfg(unix)]
+#[test]
+fn atomic_writes_and_init_preserve_uninspectable_destinations() {
+    use kidobo_adapters::command_runner::{CommandResult, CommandRunnerError};
+    use kidobo_adapters::init::{FileInitProvisioner, InitCommandRunner};
+    use kidobo_adapters::limited_io::write_string_atomic;
+    use kidobo_app::init::InitProvisioner;
+
+    struct NoCommands;
+    impl InitCommandRunner for NoCommands {
+        fn run(&self, _: &str, _: &[&str]) -> Result<CommandResult, CommandRunnerError> {
+            panic!("filesystem provisioning must not execute commands");
+        }
+    }
+    for initialize in [false, true] {
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("destination");
+        std::os::unix::fs::symlink("destination", &path).expect("symlink loop");
+        let expected = fs::metadata(&path)
+            .expect_err("metadata loop")
+            .raw_os_error();
+        if initialize {
+            let error = FileInitProvisioner::new(NoCommands)
+                .ensure_file(&path, "replacement")
+                .expect_err("init must preserve uninspectable file");
+            assert_eq!(io_cause(&error).raw_os_error(), expected);
+        } else {
+            let error = write_string_atomic(&path, "replacement")
+                .expect_err("atomic write must preserve uninspectable file");
+            assert_eq!(error.raw_os_error(), expected);
+        }
+        assert_eq!(
+            fs::read_link(&path).expect("preserved symlink"),
+            std::path::Path::new("destination")
+        );
+        assert_eq!(fs::read_dir(temp.path()).expect("read parent").count(), 1);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_cache_inspection_does_not_skip_errors() {
+    use kidobo_adapters::doctor::SystemDoctorProbe;
+    use kidobo_app::doctor::DoctorProbe;
+
+    let temp = TempDir::new().expect("tempdir");
+    let path = temp.path().join("loop");
+    std::os::unix::fs::symlink("loop", &path).expect("symlink loop");
+    let expected = fs::metadata(&path)
+        .expect_err("metadata loop")
+        .raw_os_error();
+    for cache in [&path, &path.join("nested/cache")] {
+        let error = SystemDoctorProbe::default()
+            .cache_readiness(cache)
+            .expect_err("inspection errors must not imply a creatable cache");
+        assert_eq!(io_cause(error.as_ref()).raw_os_error(), expected);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn local_lookup_and_append_report_unreadable_blocklists() {
+    use kidobo_adapters::blocklist_file::FileBlocklistRepository;
+    use kidobo_adapters::path::{ENV_KIDOBO_ROOT, SystemPathResolver};
+    use kidobo_app::blocklist::BlocklistRepository;
+    use kidobo_app::paths::{ConfigRequirement, PathResolutionInput};
+    use kidobo_app::ports::PathResolver;
+
+    let temp = TempDir::new().expect("tempdir");
+    fs::create_dir(temp.path().join("data")).expect("create data");
+    let blocklist = temp.path().join("data/blocklist.txt");
+    std::os::unix::fs::symlink("blocklist.txt", &blocklist).expect("blocklist loop");
+    let expected = fs::metadata(&blocklist)
+        .expect_err("metadata loop")
+        .raw_os_error();
+    let error = FileBlocklistRepository
+        .append_entries(&blocklist, &["192.0.2.1/32".into()], false, false)
+        .expect_err("append must preserve unreadable blocklist");
+    assert!(matches!(&error, AppError::BlocklistRead { .. }));
+    assert_eq!(io_cause(&error).raw_os_error(), expected);
+
+    let paths = SystemPathResolver
+        .resolve(
+            &PathResolutionInput {
+                explicit_config_path: None,
+                temp_dir: temp.path().to_path_buf(),
+                env: [(ENV_KIDOBO_ROOT.into(), temp.path().as_os_str().to_owned())].into(),
+            },
+            ConfigRequirement::Optional,
+        )
+        .expect("optional paths");
+    let error = build_offline_lookup_registry()
+        .expect("registry")
+        .load(&OfflineLookupContext {
+            paths: &paths,
+            config: None,
+            cancellation: &NoCancellation,
+        })
+        .expect_err("offline lookup must report failed blocklist read");
+    assert!(matches!(&error, AppError::LookupSourceLoad { .. }));
+    assert_eq!(io_cause(&error).raw_os_error(), expected);
+    assert_eq!(
+        fs::read_link(&blocklist).expect("preserved blocklist"),
+        std::path::Path::new("blocklist.txt")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn asn_cache_deletion_handles_symlinks_and_reports_parent_errors() {
+    use kidobo_adapters::asn::delete_asn_cache_file;
+
+    let temp = TempDir::new().expect("tempdir");
+    let path = temp.path().join("as64512.iplist");
+    std::os::unix::fs::symlink("as64512.iplist", &path).expect("cache loop");
+    assert!(delete_asn_cache_file(64512, temp.path()).expect("delete symlink itself"));
+    assert_eq!(
+        fs::symlink_metadata(&path)
+            .expect_err("symlink removed")
+            .kind(),
+        io::ErrorKind::NotFound
+    );
+    assert!(!delete_asn_cache_file(64512, temp.path()).expect("missing cache"));
+    fs::write(&path, "not a directory").expect("block parent");
+    let error = delete_asn_cache_file(64512, &path.join("nested"))
+        .expect_err("failed removal is not missing cache");
+    assert_eq!(io_cause(&error).kind(), io::ErrorKind::NotADirectory);
+}
+
+#[test]
+fn command_and_firewall_errors_keep_nested_io_causes() {
+    use kidobo_adapters::command_runner::{
+        CommandExecutor, CommandRequest, CommandResult, CommandRunnerError, SystemCommandExecutor,
+    };
+    use kidobo_adapters::enforcement::CommandEnforcementBackend;
+    use kidobo_adapters::ipset::IpsetCommandRunner;
+    use kidobo_adapters::iptables::FirewallCommandRunner;
+    use kidobo_app::sync::{EnforcementBackend, EnforcementPlan};
+
+    struct MissingCommand(CommandRequest);
+    impl IpsetCommandRunner for MissingCommand {
+        fn run_os(
+            &self,
+            _: &str,
+            _: &[&std::ffi::OsStr],
+        ) -> Result<CommandResult, CommandRunnerError> {
+            panic!("firewall activation must not execute ipset commands");
+        }
+    }
+    impl FirewallCommandRunner for MissingCommand {
+        fn run(&self, _: &str, _: &[&str]) -> Result<CommandResult, CommandRunnerError> {
+            SystemCommandExecutor.execute(&self.0)
+        }
+    }
+    let temp = TempDir::new().expect("tempdir");
+    let request = CommandRequest {
+        program: temp.path().join("missing-executable").into_os_string(),
+        args: Vec::new(),
+        timeout: std::time::Duration::from_secs(1),
+    };
+    let error = SystemCommandExecutor
+        .execute(&request)
+        .expect_err("missing program");
+    assert_eq!(io_cause(&error).kind(), io::ErrorKind::NotFound);
+    assert!(io_cause(&error).raw_os_error().is_some());
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "failed to spawn command `{}`: {}",
+            request.program.to_string_lossy(),
+            io_cause(&error)
+        )
+    );
+
+    let plan = EnforcementPlan::from_config(
+        &kidobo_core::config::Config::from_toml_str(
+            "[ipset]\nset_name='kidobo'\nenable_ipv6=false\n",
+        )
+        .expect("config"),
+    );
+    let error = CommandEnforcementBackend::new(MissingCommand(request))
+        .activate(&plan)
+        .expect_err("firewall command cannot start");
+    assert!(matches!(&error, AppError::Firewall { .. }));
+    assert_eq!(io_cause(&error).kind(), io::ErrorKind::NotFound);
+    assert!(io_cause(&error).raw_os_error().is_some());
+    assert!(error.to_string().starts_with(
+        "firewall operation failed: firewall command execution failed: failed to spawn command"
+    ));
+}

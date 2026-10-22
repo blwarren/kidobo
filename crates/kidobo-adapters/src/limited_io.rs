@@ -98,7 +98,11 @@ pub fn write_string_atomic(path: &Path, contents: &str) -> io::Result<()> {
 /// preservation, replacement, or parent-directory synchronization fails.
 pub fn write_bytes_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let existing_permissions = fs::metadata(path).ok().map(|meta| meta.permissions());
+    let existing_permissions = match fs::metadata(path) {
+        Ok(metadata) => Some(metadata.permissions()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
 
     for _ in 0..16 {
         let temp_path = temp_write_path(parent, path);

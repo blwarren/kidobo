@@ -68,7 +68,10 @@ impl<R: InitCommandRunner> InitProvisioner for FileInitProvisioner<R> {
     }
 
     fn ensure_dir(&self, path: &Path) -> Result<ProvisionState, AppError> {
-        let existed = path.exists();
+        let existed = path.try_exists().map_err(|source| AppError::InitIo {
+            path: path.to_path_buf(),
+            source,
+        })?;
         fs::create_dir_all(path).map_err(|error| AppError::InitIo {
             path: path.to_path_buf(),
             source: error,
@@ -81,8 +84,18 @@ impl<R: InitCommandRunner> InitProvisioner for FileInitProvisioner<R> {
     }
 
     fn ensure_file(&self, path: &Path, contents: &str) -> Result<ProvisionState, AppError> {
-        if path.exists() {
-            if !path.is_file() {
+        let metadata = match fs::metadata(path) {
+            Ok(metadata) => Some(metadata),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(source) => {
+                return Err(AppError::InitIo {
+                    path: path.to_path_buf(),
+                    source,
+                });
+            }
+        };
+        if let Some(metadata) = metadata {
+            if !metadata.is_file() {
                 return Err(AppError::InitIo {
                     path: path.to_path_buf(),
                     source: std::io::Error::new(

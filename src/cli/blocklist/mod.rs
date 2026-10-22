@@ -12,7 +12,7 @@ use kidobo_adapters::lock::FileLockManager;
 use kidobo_adapters::path::{SystemPathResolver, path_resolution_input_from_process};
 use kidobo_app::AppError;
 use kidobo_app::blocklist::{
-    self, AsnBanRequest, BanChange, BanRequest, BlocklistDependencies, BlocklistInput,
+    self, AsnBanRequest, BanChange, BanOutcome, BanRequest, BlocklistDependencies, BlocklistInput,
     UnbanDecision, UnbanRequest,
 };
 
@@ -59,12 +59,15 @@ pub fn run_ban_command(
     let input = command_input(target, file)?;
     let file_mode = matches!(input, BlocklistInput::File(_));
     let outcome = blocklist::execute_ban(&BanRequest { paths, input }, &dependencies)?;
-    report_invalid_targets(&outcome.invalid_targets, io)?;
-    if outcome.empty_file {
-        output(io, format_args!("no blocklist targets loaded from file"))?;
-        return Ok(());
-    }
-    for change in &outcome.changes {
+    let changes = match outcome {
+        BanOutcome::Applied(changes) => changes,
+        BanOutcome::InvalidTargets(targets) => return report_invalid_targets(&targets, io),
+        BanOutcome::EmptyFile => {
+            output(io, format_args!("no blocklist targets loaded from file"))?;
+            return Ok(());
+        }
+    };
+    for change in &changes {
         match change {
             BanChange::Added(value) => {
                 output(io, format_args!("added blocklist entry {value}"))?;
@@ -74,7 +77,7 @@ pub fn run_ban_command(
             }
         }
     }
-    if !file_mode || !outcome.changes.is_empty() {
+    if !file_mode || !changes.is_empty() {
         sync_notice(io)?;
     }
     Ok(())

@@ -41,33 +41,38 @@ pub struct CachedRemoteSource {
 pub fn load_remote_sources(
     remote_cache_dir: &Path,
 ) -> Result<Vec<CachedRemoteSource>, SourceLoadError> {
-    if !remote_cache_dir.exists() {
-        return Ok(Vec::new());
-    }
+    let mut remote_files = match collect_remote_cache_files(remote_cache_dir) {
+        Ok(files) => files,
+        Err(RemoteCacheFilesError::ReadDir(error))
+            if error.kind() == std::io::ErrorKind::NotFound =>
+        {
+            return Ok(Vec::new());
+        }
+        Err(RemoteCacheFilesError::ReadDir(source)) => {
+            return Err(SourceLoadError::CacheDir {
+                path: remote_cache_dir.to_path_buf(),
+                source,
+            });
+        }
+        Err(RemoteCacheFilesError::ReadDirEntry(source)) => {
+            return Err(SourceLoadError::CacheDirEntry {
+                path: remote_cache_dir.to_path_buf(),
+                source,
+            });
+        }
+    };
 
     let generation_sources =
-        collect_offline_remote_generations(remote_cache_dir).map_err(|err| {
+        collect_offline_remote_generations(remote_cache_dir).map_err(|source| {
             SourceLoadError::CacheDir {
                 path: remote_cache_dir.join("v2/remote"),
-                source: err,
+                source,
             }
         })?;
     let generation_hashes = generation_sources
         .iter()
         .map(|source| source.url_hash.clone())
         .collect::<BTreeSet<_>>();
-
-    let mut remote_files =
-        collect_remote_cache_files(remote_cache_dir).map_err(|err| match err {
-            RemoteCacheFilesError::ReadDir(err) => SourceLoadError::CacheDir {
-                path: remote_cache_dir.to_path_buf(),
-                source: err,
-            },
-            RemoteCacheFilesError::ReadDirEntry(err) => SourceLoadError::CacheDirEntry {
-                path: remote_cache_dir.to_path_buf(),
-                source: err,
-            },
-        })?;
 
     remote_files.sort();
 

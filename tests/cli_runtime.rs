@@ -1619,6 +1619,138 @@ fn sync_oversized_blocklist_fails_with_read_error() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn sync_unreadable_blocklist_stops_before_enforcement() {
+    let root = create_sync_root("[ipset]\nset_name='kidobo'\n[safe]\ninclude_github_meta=false\n");
+    let blocklist = root.path().join("data/blocklist.txt");
+    fs::remove_file(&blocklist).expect("remove blocklist");
+    std::os::unix::fs::symlink("blocklist.txt", &blocklist).expect("blocklist loop");
+    let fake_sudo = write_fake_sudo_script(&root);
+    let log = root.path().join("sudo.log");
+    let mut command = kidobo_with_root_command(root.path(), &["sync"]);
+    command.env(
+        "PATH",
+        path_with_bin_prefix(fake_sudo.parent().expect("sudo parent")),
+    );
+    command.env("KIDOBO_TEST_SUDO_LOG", &log);
+
+    let output = command.output().expect("run isolated sync");
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("failed to read blocklist file"));
+    let commands = read_to_string_with_limit(&log, 64 * 1024).expect("commands");
+    for command in commands.lines() {
+        let args = command.split_whitespace().collect::<Vec<_>>();
+        assert!(
+            !args.contains(&"restore") && !args.contains(&"swap") && !args.contains(&"destroy"),
+            "unexpected replacement: {command}"
+        );
+        assert!(
+            !["-A", "-I", "-D", "-F", "-X", "-R"]
+                .iter()
+                .any(|operation| args.contains(operation)),
+            "unexpected activation: {command}"
+        );
+    }
+    assert_eq!(
+        fs::read_link(&blocklist).expect("preserved blocklist"),
+        Path::new("blocklist.txt")
+    );
+    assert!(!root.path().join("cache/remote/v2").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn optional_config_inspection_failure_keeps_lookup_and_cache_only_flush_usable() {
+    let root = create_lookup_root("203.0.113.7\n");
+    let config = root.path().join("config/config.toml");
+    fs::remove_file(&config).expect("remove config");
+    std::os::unix::fs::symlink("config.toml", &config).expect("config loop");
+    let fake_sudo = write_fake_sudo_script(&root);
+    let touched = root.path().join("sudo-touched");
+    let mut command = kidobo_with_root_command(root.path(), &["lookup", "203.0.113.7"]);
+    command.env(
+        "PATH",
+        path_with_bin_prefix(fake_sudo.parent().expect("sudo parent")),
+    );
+    command.env("KIDOBO_TEST_SUDO_TOUCHED", &touched);
+    let output = command.output().expect("offline lookup");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("MATCH"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("failed to read config file"));
+
+    let mut command = kidobo_with_root_command(root.path(), &["flush", "--cache-only"]);
+    command.env(
+        "PATH",
+        path_with_bin_prefix(fake_sudo.parent().expect("sudo parent")),
+    );
+    command.env("KIDOBO_TEST_SUDO_TOUCHED", &touched);
+    let output = command.output().expect("cache-only flush");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !touched.exists(),
+        "offline operations must not execute sudo"
+    );
+    assert_eq!(
+        fs::read_link(&config).expect("preserved config"),
+        Path::new("config.toml")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_reports_path_inspection_failure_without_mutating_it() {
+    let root = create_lookup_root("203.0.113.7\n");
+    let blocklist = root.path().join("data/blocklist.txt");
+    fs::remove_file(&blocklist).expect("remove blocklist");
+    std::os::unix::fs::symlink("blocklist.txt", &blocklist).expect("blocklist loop");
+    let fake_sudo = write_fake_sudo_script(&root);
+    let mut command = kidobo_with_root_command(root.path(), &["doctor"]);
+    command.env(
+        "PATH",
+        path_with_bin_prefix(fake_sudo.parent().expect("sudo parent")),
+    );
+
+    let output = command.output().expect("isolated doctor");
+
+    assert_eq!(output.status.code(), Some(1));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("doctor JSON");
+    assert_eq!(report["overall"], "FAIL");
+    let check = report["checks"]
+        .as_array()
+        .expect("checks")
+        .iter()
+        .find(|check| check["name"] == "file_blocklist")
+        .expect("blocklist check");
+    assert_eq!(check["status"], "FAIL");
+    assert!(
+        check["detail"]
+            .as_str()
+            .expect("detail")
+            .starts_with("failed to inspect ")
+    );
+    assert_eq!(
+        fs::read_link(&blocklist).expect("preserved blocklist"),
+        Path::new("blocklist.txt")
+    );
+}
+
 #[test]
 fn doctor_forced_human_color_emits_ansi_level_label() {
     let root = create_lookup_root("203.0.113.7\n");

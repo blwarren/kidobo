@@ -43,14 +43,14 @@ pub enum BanChange {
 }
 
 /// Result of parsing and applying a local blocklist ban request.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct BanOutcome {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BanOutcome {
     /// Changes in request order when all targets were valid.
-    pub changes: Vec<BanChange>,
+    Applied(Vec<BanChange>),
     /// Invalid input strings; any invalid target prevents mutation.
-    pub invalid_targets: Vec<String>,
-    /// Whether file input contained no targets.
-    pub empty_file: bool,
+    InvalidTargets(Vec<String>),
+    /// File input contained no targets.
+    EmptyFile,
 }
 
 /// Request to prepare removal of IP or CIDR targets from the local blocklist.
@@ -276,15 +276,13 @@ pub fn execute_ban(
         .resolve(&request.paths, ConfigRequirement::Required)?;
     let _lock = dependencies.locks.acquire(&paths.lock_file)?;
     dependencies.configs.load(&paths.config_file)?;
-    let (targets, invalid_targets, empty_file) =
-        parse_input(&request.input, dependencies.repository)?;
-    if !invalid_targets.is_empty() || empty_file {
-        return Ok(BanOutcome {
-            changes: Vec::new(),
-            invalid_targets,
-            empty_file,
-        });
-    }
+    let targets = match parse_input(&request.input, dependencies.repository)? {
+        ParsedBlocklistInput::Ready(targets) => targets,
+        ParsedBlocklistInput::InvalidTargets(targets) => {
+            return Ok(BanOutcome::InvalidTargets(targets));
+        }
+        ParsedBlocklistInput::EmptyFile => return Ok(BanOutcome::EmptyFile),
+    };
 
     let document = dependencies.repository.load(&paths.blocklist_file)?;
     let existing = document
@@ -316,11 +314,7 @@ pub fn execute_ban(
             BanClassification::AlreadyPresent(cidr) => BanChange::AlreadyPresent(cidr.to_string()),
         })
         .collect();
-    Ok(BanOutcome {
-        changes,
-        invalid_targets: Vec::new(),
-        empty_file: false,
-    })
+    Ok(BanOutcome::Applied(changes))
 }
 
 /// Builds a read-only unban preview from the current blocklist.
@@ -337,14 +331,13 @@ pub fn prepare_unban(
         .paths
         .resolve(&request.paths, ConfigRequirement::Required)?;
     dependencies.configs.load(&paths.config_file)?;
-    let (targets, invalid_targets, empty_file) =
-        parse_input(&request.input, dependencies.repository)?;
-    if !invalid_targets.is_empty() {
-        return Ok(UnbanPreparation::InvalidTargets(invalid_targets));
-    }
-    if empty_file {
-        return Ok(UnbanPreparation::EmptyFile);
-    }
+    let targets = match parse_input(&request.input, dependencies.repository)? {
+        ParsedBlocklistInput::Ready(targets) => targets,
+        ParsedBlocklistInput::InvalidTargets(targets) => {
+            return Ok(UnbanPreparation::InvalidTargets(targets));
+        }
+        ParsedBlocklistInput::EmptyFile => return Ok(UnbanPreparation::EmptyFile),
+    };
     let document = dependencies.repository.load(&paths.blocklist_file)?;
     Ok(UnbanPreparation::Ready(build_preview(
         &request.input,
@@ -512,25 +505,28 @@ pub fn execute_unban_asn(
     })
 }
 
+enum ParsedBlocklistInput {
+    Ready(Vec<CanonicalCidr>),
+    InvalidTargets(Vec<String>),
+    EmptyFile,
+}
+
 fn parse_input(
     input: &BlocklistInput,
     repository: &dyn BlocklistRepository,
-) -> Result<(Vec<CanonicalCidr>, Vec<String>, bool), AppError> {
+) -> Result<ParsedBlocklistInput, AppError> {
     let raw = match input {
         BlocklistInput::Single(value) => {
-            return parse_blocklist_target(value).map_or_else(
-                |_| {
-                    Err(AppError::BlocklistTargetParse {
-                        input: value.clone(),
-                    })
-                },
-                |target| Ok((vec![target], Vec::new(), false)),
-            );
+            return parse_blocklist_target(value)
+                .map(|target| ParsedBlocklistInput::Ready(vec![target]))
+                .map_err(|_| AppError::BlocklistTargetParse {
+                    input: value.clone(),
+                });
         }
         BlocklistInput::File(path) => repository.read_target_lines(path)?,
     };
     if raw.is_empty() {
-        return Ok((Vec::new(), Vec::new(), true));
+        return Ok(ParsedBlocklistInput::EmptyFile);
     }
     let mut targets = Vec::with_capacity(raw.len());
     let mut invalid = Vec::new();
@@ -540,7 +536,11 @@ fn parse_input(
             Err(_) => invalid.push(value),
         }
     }
-    Ok((targets, invalid, false))
+    Ok(if invalid.is_empty() {
+        ParsedBlocklistInput::Ready(targets)
+    } else {
+        ParsedBlocklistInput::InvalidTargets(invalid)
+    })
 }
 
 fn build_preview(
@@ -846,19 +846,23 @@ mod tests {
                 input: BlocklistInput::File(PathBuf::from("targets.txt")),
             },
             &{
-                *repository.target_lines.lock().expect("targets") =
-                    vec!["192.0.2.0/24".to_string(), "2001:db8::/64".to_string()];
+                *repository.target_lines.lock().expect("targets") = vec![
+                    "192.0.2.0/24".to_string(),
+                    "2001:db8::/64".to_string(),
+                    "2001:db8::/64".to_string(),
+                ];
                 dependencies(&repository, &locks)
             },
         )
         .expect("ban");
 
         assert_eq!(
-            outcome.changes,
-            [
+            outcome,
+            super::BanOutcome::Applied(vec![
                 BanChange::AlreadyPresent("192.0.2.0/24".to_string()),
                 BanChange::Added("2001:db8::/64".to_string()),
-            ]
+                BanChange::AlreadyPresent("2001:db8::/64".to_string()),
+            ])
         );
         assert_eq!(
             *repository.contents.lock().expect("contents"),
@@ -870,8 +874,11 @@ mod tests {
     #[test]
     fn file_ban_reports_all_invalid_targets_without_mutating() {
         let repository = Repository::new("192.0.2.0/24\n");
-        *repository.target_lines.lock().expect("targets") =
-            vec!["bad-one".to_string(), "bad-two".to_string()];
+        *repository.target_lines.lock().expect("targets") = vec![
+            "bad-one".to_string(),
+            "198.51.100.7".to_string(),
+            "bad-two".to_string(),
+        ];
         let outcome = execute_ban(
             &BanRequest {
                 paths: request_input(),
@@ -881,7 +888,39 @@ mod tests {
         )
         .expect("typed invalid outcome");
 
-        assert_eq!(outcome.invalid_targets, ["bad-one", "bad-two"]);
+        assert_eq!(
+            outcome,
+            super::BanOutcome::InvalidTargets(vec!["bad-one".into(), "bad-two".into()])
+        );
+        assert_eq!(
+            *repository.contents.lock().expect("contents"),
+            "192.0.2.0/24\n"
+        );
+    }
+
+    #[test]
+    fn empty_file_and_invalid_single_bans_leave_blocklist_unchanged() {
+        let repository = Repository::new("192.0.2.0/24\n");
+        let locks = Locks::default();
+        let dependencies = dependencies(&repository, &locks);
+        let outcome = execute_ban(
+            &BanRequest {
+                paths: request_input(),
+                input: BlocklistInput::File(PathBuf::from("targets.txt")),
+            },
+            &dependencies,
+        )
+        .expect("empty file outcome");
+        assert_eq!(outcome, super::BanOutcome::EmptyFile);
+        let error = execute_ban(
+            &BanRequest {
+                paths: request_input(),
+                input: BlocklistInput::Single("bad-target".into()),
+            },
+            &dependencies,
+        )
+        .expect_err("invalid single target");
+        assert!(matches!(error, AppError::BlocklistTargetParse { input } if input == "bad-target"));
         assert_eq!(
             *repository.contents.lock().expect("contents"),
             "192.0.2.0/24\n"
