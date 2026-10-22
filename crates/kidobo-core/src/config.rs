@@ -367,8 +367,8 @@ fn parse_ipset(raw: RawIpsetConfig) -> Result<IpsetConfig, ConfigError> {
     let enable_ipv6 = raw.enable_ipv6.unwrap_or(true);
     let set_name_v6 = if let Some(value) = raw.set_name_v6 {
         let parsed = non_empty(&value, "ipset.set_name_v6")?;
-        validate_ipset_set_name(&parsed, "ipset.set_name_v6")?;
-        parsed
+        validate_ipset_set_name(parsed, "ipset.set_name_v6")?;
+        parsed.to_owned()
     } else {
         let derived = format!("{set_name}-v6");
         if enable_ipv6 {
@@ -387,8 +387,8 @@ fn parse_ipset(raw: RawIpsetConfig) -> Result<IpsetConfig, ConfigError> {
     let set_type = match raw.set_type {
         Some(value) => {
             let parsed = non_empty(&value, "ipset.set_type")?;
-            validate_ipset_set_type(&parsed)?;
-            parsed
+            validate_ipset_set_type(parsed)?;
+            parsed.to_owned()
         }
         None => DEFAULT_IPSET_TYPE.to_string(),
     };
@@ -434,7 +434,7 @@ fn parse_safe(raw: RawSafeConfig) -> Result<SafeConfig, ConfigError> {
     let mut ips = Vec::new();
     if let Some(values) = raw.ips {
         for value in values {
-            let parsed = parse_cidr_field_strict(&non_empty(&value, "safe.ips")?, "safe.ips")?;
+            let parsed = parse_cidr_field_strict(non_empty(&value, "safe.ips")?, "safe.ips")?;
             ips.push(parsed);
         }
     }
@@ -446,8 +446,8 @@ fn parse_safe(raw: RawSafeConfig) -> Result<SafeConfig, ConfigError> {
     let github_meta_url = match raw.github_meta_url {
         Some(value) => {
             let parsed = non_empty(&value, "safe.github_meta_url")?;
-            validate_http_url(&parsed, "safe.github_meta_url")?;
-            parsed
+            validate_http_url(parsed, "safe.github_meta_url")?;
+            parsed.to_owned()
         }
         None => DEFAULT_GITHUB_META_URL.to_string(),
     };
@@ -457,7 +457,7 @@ fn parse_safe(raw: RawSafeConfig) -> Result<SafeConfig, ConfigError> {
         Some(values) => {
             let mut normalized = Vec::with_capacity(values.len());
             for value in values {
-                normalized.push(non_empty(&value, "safe.github_meta_categories")?);
+                normalized.push(non_empty(&value, "safe.github_meta_categories")?.to_owned());
             }
             Some(normalized)
         }
@@ -476,8 +476,8 @@ fn parse_remote(raw: RawRemoteConfig) -> Result<RemoteConfig, ConfigError> {
     if let Some(values) = raw.urls {
         for value in values {
             let parsed = non_empty(&value, "remote.urls")?;
-            validate_http_url(&parsed, "remote.urls")?;
-            urls.push(parsed);
+            validate_http_url(parsed, "remote.urls")?;
+            urls.push(parsed.to_owned());
         }
     }
 
@@ -592,6 +592,76 @@ mod tests {
         assert_eq!(config.remote.timeout_secs.get(), 30);
         assert_eq!(config.asn.banned.len(), 0);
         assert_eq!(config.asn.cache_stale_after_secs.get(), 86_400);
+    }
+
+    #[test]
+    fn text_fields_trim_surrounding_whitespace() {
+        let config = Config::from_toml_str(
+            "[ipset]\n\
+             set_name = '  kidobo  '\n\
+             set_name_v6 = '  custom-v6  '\n\
+             set_type = '  hash:net  '\n\
+             chain_action = '  rEjEcT  '\n\
+             [safe]\n\
+             ips = ['\t\u{2003}10.0.0.1\u{2003}\t']\n\
+             github_meta_url = '  https://example.com/meta  '\n\
+             github_meta_categories = ['  api  ', '  hooks  ']\n\
+             [remote]\n\
+             urls = ['  https://example.com/list.txt  ']\n",
+        )
+        .expect("parse trimmed text");
+
+        assert_eq!(config.ipset.set_name, "kidobo");
+        assert_eq!(config.ipset.set_name_v6, "custom-v6");
+        assert_eq!(config.ipset.set_type, "hash:net");
+        assert_eq!(config.ipset.chain_action, FirewallAction::Reject);
+        assert_eq!(
+            config.safe.ips,
+            vec![CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a00_0001, 32))]
+        );
+        assert_eq!(config.safe.github_meta_url, "https://example.com/meta");
+        assert_eq!(
+            config.safe.github_meta_categories,
+            Some(vec!["api".to_string(), "hooks".to_string()])
+        );
+        assert_eq!(config.remote.urls, ["https://example.com/list.txt"]);
+    }
+
+    #[test]
+    fn text_fields_reject_empty_or_whitespace_only_values() {
+        for (field, is_list) in [
+            ("ipset.set_name", false),
+            ("ipset.set_name_v6", false),
+            ("ipset.set_type", false),
+            ("ipset.chain_action", false),
+            ("safe.ips", true),
+            ("safe.github_meta_url", false),
+            ("safe.github_meta_categories", true),
+            ("remote.urls", true),
+        ] {
+            for value in ["", " \t\u{2003} "] {
+                let mut contents = String::new();
+                if field != "ipset.set_name" {
+                    contents.push_str("ipset.set_name = 'kidobo'\n");
+                }
+                let assignment = if is_list {
+                    format!("{field} = ['{value}']\n")
+                } else {
+                    format!("{field} = '{value}'\n")
+                };
+                contents.push_str(&assignment);
+
+                let error = Config::from_toml_str(&contents).expect_err("empty text must fail");
+                assert_eq!(
+                    error,
+                    ConfigError::InvalidField {
+                        field,
+                        reason: "value must not be empty".to_string(),
+                    },
+                    "unexpected error for {field}={value:?}"
+                );
+            }
+        }
     }
 
     #[test]

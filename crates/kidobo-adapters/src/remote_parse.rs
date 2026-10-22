@@ -1,6 +1,7 @@
 //! Pure bounded parsing and rendering for remote feed cache payloads.
 
 use std::collections::BTreeSet;
+use std::fmt::Write as _;
 
 use kidobo_core::network::{CanonicalCidr, parse_ip_cidr_non_strict};
 
@@ -90,9 +91,12 @@ pub(crate) fn parse_cached_iplist_bounded(
 }
 
 pub(crate) fn format_normalized_cidrs(cidrs: &[CanonicalCidr]) -> String {
-    cidrs
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join("\n")
+    let mut normalized = String::new();
+    for (index, cidr) in cidrs.iter().enumerate() {
+        if index > 0 {
+            normalized.push('\n');
+        }
+        let _write_result = write!(normalized, "{cidr}");
+    }
+    normalized
 }

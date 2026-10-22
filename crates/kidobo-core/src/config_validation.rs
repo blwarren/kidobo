@@ -7,7 +7,7 @@ pub(super) fn required_non_empty(
     field: &'static str,
 ) -> Result<String, ConfigError> {
     match value {
-        Some(value) => non_empty(&value, field),
+        Some(value) => non_empty(&value, field).map(str::to_owned),
         None => Err(ConfigError::InvalidField {
             field,
             reason: "value is required".to_string(),
@@ -15,8 +15,8 @@ pub(super) fn required_non_empty(
     }
 }
 
-pub(super) fn non_empty(value: &str, field: &'static str) -> Result<String, ConfigError> {
-    let normalized = value.trim().to_string();
+pub(super) fn non_empty<'a>(value: &'a str, field: &'static str) -> Result<&'a str, ConfigError> {
+    let normalized = value.trim();
     if normalized.is_empty() {
         return Err(ConfigError::InvalidField {
             field,
@@ -126,12 +126,14 @@ pub(super) fn parse_chain_action(value: Option<String>) -> Result<FirewallAction
         return Ok(DEFAULT_CHAIN_ACTION);
     };
     let normalized = non_empty(&value, "ipset.chain_action")?;
-    match normalized.to_ascii_uppercase().as_str() {
-        "DROP" => Ok(FirewallAction::Drop),
-        "REJECT" => Ok(FirewallAction::Reject),
-        _ => Err(ConfigError::InvalidField {
+    if normalized.eq_ignore_ascii_case("DROP") {
+        Ok(FirewallAction::Drop)
+    } else if normalized.eq_ignore_ascii_case("REJECT") {
+        Ok(FirewallAction::Reject)
+    } else {
+        Err(ConfigError::InvalidField {
             field: "ipset.chain_action",
             reason: "must be DROP or REJECT".to_string(),
-        }),
+        })
     }
 }

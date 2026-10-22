@@ -388,10 +388,10 @@ pub fn apply_unban(
         dependencies.cancellation.check()?;
         let kept_lines = document
             .lines
-            .iter()
+            .into_iter()
             .enumerate()
             .filter(|(index, _)| !removal_indexes.contains(index))
-            .map(|(_, line)| line.original.clone())
+            .map(|(_, line)| line.original)
             .collect::<Vec<_>>();
         dependencies
             .repository
@@ -602,14 +602,15 @@ fn remove_exact_duplicates(
     let removal_indexes = exact_match_indexes(&line_canonicals, duplicates)
         .into_iter()
         .collect::<HashSet<_>>();
+    let original_line_count = document.lines.len();
     let kept_lines = document
         .lines
-        .iter()
+        .into_iter()
         .enumerate()
         .filter(|(index, _)| !removal_indexes.contains(index))
-        .map(|(_, line)| line.original.clone())
+        .map(|(_, line)| line.original)
         .collect::<Vec<_>>();
-    let removed = document.lines.len().saturating_sub(kept_lines.len());
+    let removed = original_line_count.saturating_sub(kept_lines.len());
     if removed > 0 {
         dependencies.repository.write_lines(path, &kept_lines)?;
     }
@@ -929,7 +930,9 @@ mod tests {
 
     #[test]
     fn unban_applies_exact_and_user_approved_partial_matches() {
-        let repository = Repository::new("10.0.0.0/24\n10.0.0.1/32\n192.0.2.0/24\n");
+        let repository = Repository::new(
+            "# header\n10.0.0.0/24\n\n10.0.0.1/32\n  192.0.2.0/24  \n# retained comment\n",
+        );
         let locks = Locks::default();
         let request = UnbanRequest {
             paths: request_input(),
@@ -957,7 +960,7 @@ mod tests {
         assert_eq!(outcome.removed_partial, 1);
         assert_eq!(
             *repository.contents.lock().expect("contents"),
-            "192.0.2.0/24\n"
+            "# header\n\n  192.0.2.0/24  \n# retained comment\n"
         );
     }
 
