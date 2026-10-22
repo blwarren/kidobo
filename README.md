@@ -179,9 +179,9 @@ for timer and logging details.
 ## Development
 
 Development commands are defined in `Justfile`. See the
-[development-command reference](scripts/README.md) for release and recovery
-details, and the [architecture guide](docs/architecture.md) for extension
-boundaries and recipes.
+[development workflow](docs/development.md) for validation, testing, and release discipline,
+the [command reference](scripts/README.md) for release and recovery details, and the
+[architecture guide](docs/architecture.md) for extension boundaries and recipes.
 
 Development uses Rust 1.99.1 through `rust-toolchain.toml`. The minimum supported
 Rust version remains 1.97.1 in the Cargo manifests. Keep code compatible with that

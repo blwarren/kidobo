@@ -56,5 +56,5 @@ Retain the justification with the dependency change. Once registry timestamps
 confirm that the version has aged seven full days, remove the no-longer-needed
 allowlist entry; preserve the reason in the review record or commit history.
 
-After dependency changes, run `just ci` and `just release-notes-check`. See
-[AGENTS.md](../AGENTS.md) for release-note and validation requirements.
+After dependency changes, follow the [development validation requirements](development.md#toolchain-and-validation)
+and [release-note workflow](development.md#release-notes-and-publication).

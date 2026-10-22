@@ -19,8 +19,10 @@ kidobo-adapters
   └── kidobo-core
 ```
 
-`kidobo-core` performs no filesystem, network, process, clock, or terminal I/O. It uses `url::Url` only
-for deterministic configuration validation; HTTP clients and transport remain in `kidobo-adapters`.
+`kidobo-core` owns canonicalization, family splitting, interval merging, safelist subtraction, minimal
+CIDR regeneration, lookup, and configuration parsing/validation from in-memory text. It performs no
+filesystem, network, process, clock, or terminal I/O. It uses `url::Url` only for deterministic
+configuration validation; HTTP clients and transport remain in `kidobo-adapters`.
 
 `kidobo-app` owns command sequencing and failure policy. Its public-in-workspace interfaces are typed
 requests, typed outcomes, focused capability ports, and internal source registries. It never depends on
@@ -33,7 +35,7 @@ boundary.
 The root package parses arguments, reads confirmations, renders human/TSV/JSON output, maps exit codes,
 and composes production dependencies. `CliIo` supplies injected input, output, error, terminal, and color
 capabilities for command-dispatch tests. Logger and SIGINT handler installation remain in the production
-wrapper.
+wrapper. Domain and workflow decisions belong in the inner crates.
 
 ## Adding a command
 
@@ -67,6 +69,18 @@ To add a built-in source, implement the appropriate provider trait, assign a sta
 in the relevant adapter registry builder, and add role, policy, ordering, fallback, and offline-boundary
 tests. Registries are internal Rust extension points, not plugin ABIs or user configuration.
 
+## Determinism and failure policy
+
+Keep computation and outputs deterministic unless explicitly documented. Reserve `panic!` for internal
+invariants. Commands requiring configuration fail fast on invalid config; preserve the config-free
+paths for `lookup` and `flush --cache-only`. Missing required binaries and lock contention in mutating
+workflows are hard failures.
+
+Follow [Operations](operations.md#when-a-command-fails) for command-facing failures and cleanup.
+Provider fetch failures follow the policies above; cache staging, promotion, and aggregate admission
+have the additional hard-failure boundaries documented below. Ancillary cleanup or cache-maintenance
+failures may remain soft only where the workflow explicitly documents and tests that behavior.
+
 ## Sync safety sequence
 
 The application sync use case explicitly preserves this order:
@@ -81,13 +95,20 @@ The application sync use case explicitly preserves this order:
 7. Atomically replace IPv6, then IPv4.
 8. Activate and normalize fail-closed firewall wiring.
 9. Best-effort clean disabled-family artifacts.
+10. Release the lock before logging the final outcome.
 
-The enforcement adapter retains the 31-character ipset name constraint, temporary restore-and-swap
-replacement, per-set atomicity, and fail-closed chain and INPUT jump ordering. To normalize a family's
-shared `INPUT` chain without numeric-position deletion, it temporarily creates `kidobo-input-stage`, points
-that chain at `kidobo-input`, and activates the staging jump before replacing stable jumps by exact rule
-specification. A successful activation leaves exactly one stable jump at position 1 and removes the staging
-jump and chain. Cleanup handles both names so an interrupted prior activation cannot leave unmanaged
+The enforcement adapter retains the 31-character ipset name constraint, the existing temporary-set
+suffix, restore-and-swap replacement, per-set atomicity, and best-effort temporary-set destruction.
+IPv4 and IPv6 stay separate; their replacements are not one transaction. Establish new enforcement
+before deleting old copies, even if a partial failure leaves duplicates. A successful sync leaves one
+`kidobo-input` chain, one set-match action rule, and exactly one `INPUT` jump at position 1 per managed
+family. Never modify unrelated firewall chains.
+
+To normalize a family's shared `INPUT` chain without numeric-position deletion, the adapter temporarily
+creates `kidobo-input-stage`, points that chain at `kidobo-input`, and activates the staging jump before
+replacing stable jumps by exact rule specification. A successful activation leaves exactly one stable
+jump at position 1 and removes the staging jump and chain. Cleanup handles both names so an interrupted
+prior activation cannot leave unmanaged
 artifacts. Tests use recording ports and scripted command runners; development validation must never invoke
 live firewall or systemd mutations.
 
@@ -139,10 +160,6 @@ the operator's `safe.ips` baseline.
 
 ## Validation and release
 
-Use `just check` at each implementation checkpoint and `just ci` for final integration. The local CI recipe
-checks formatting, lints, dependency policy, audits, and tests. `just publish-release X.Y.Z` prepares the
-candidate in a temporary worktree, runs that gate, repeats the release-note check, then performs the
-release-only coverage, rustdoc, isolated binary-exercise, and static compatibility gates. The exercises use a temporary runtime
-root, loopback feed, fake privileged commands, and Debian 11/Alpine 3.22 containers. The publisher packages the tested static Linux x86_64 binary
-and uses GitHub CLI to upload, verify, and publish the release. Run `just release-notes-check` after every
-repository change.
+Follow [Development workflow](development.md) for validation gates, safety-critical regression coverage,
+mutation-result reviews, and release discipline. The [command reference](../scripts/README.md) covers
+tool prerequisites, publication, and recovery.

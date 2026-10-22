@@ -1,6 +1,9 @@
 # Development Commands
 
-`Justfile` is the canonical entrypoint for local validation and publication.
+`Justfile` is the canonical entrypoint for local validation and publication. Follow the
+[development workflow](../docs/development.md) for validation requirements, test strategy, and
+release-note handling.
+
 Install `just` and the pinned CI tools before running local CI, and authenticate
 GitHub CLI before publishing. The publisher installs the coverage tool when it
 is needed:
