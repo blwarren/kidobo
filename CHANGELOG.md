@@ -2,21 +2,29 @@
 
 ## [Unreleased]
 
+### Added
+
+- Add expiring IP/CIDR and ASN bans stored separately from permanent sources and applied by sync.
+- Allow an explicit version to be installed from a custom release directory with `KIDOBO_RELEASE_BASE_URL`, retaining checksum and binary verification.
+
+### Changed
+
+- Stream lookup matches with bounded retention and escape control characters in targets, source labels, and matched entries in human and TSV output.
+- Deduplicate canonical unban targets and index overlap checks for large batches while preserving confirmation and temporary-first persistence.
+
+### Fixed
+
 - Preserve non-UTF-8 temporary directory paths when restoring ipsets during sync.
 - Report filesystem failures instead of treating unreadable configuration, blocklists, or caches as missing, and stop sync before enforcement when the local blocklist cannot be read.
 - Preserve files and cache generations when their metadata or selection manifest cannot be inspected, and distinguish inspection failures from missing paths in doctor reports.
 - Keep automatically sandboxed initialization's systemd units inside the selected root and skip live timer activation.
 - Reject ASN cache refreshes above 8 MiB before replacing cached data or updating ASN bans.
 - Support bare relative filenames in atomic writes without reporting an error after replacement.
-- Add expiring IP/CIDR and ASN bans stored separately from permanent sources and applied by sync.
 - Abort uninstall when work is active or config-aware cleanup fails, preserve installed files, and restore a previously active timer before artifact removal on failure.
 - Reject normalized remote cache refreshes above 16 MiB before publication, using a validated fallback when available or stopping sync before set replacement.
-- Stream lookup matches with bounded retention and escape control characters in targets, source labels, and matched entries in human and TSV output.
-- Deduplicate canonical unban targets and index overlap checks for large batches while preserving confirmation and temporary-first persistence.
 - Accept every ASCII letter case of the AS prefix in ASN ban and unban arguments.
 - Probe only ipset names in doctor and allow initialization to continue when reset-failed reports the sync service is not loaded.
 - Package the validated release candidate from the configured Cargo target directory.
-- Allow an explicit version to be installed from a custom release directory with `KIDOBO_RELEASE_BASE_URL`, retaining checksum and binary verification.
 - Recognize absent firewall chains on Debian 12 with iptables 1.8.9 (nf_tables), while preserving failures for existing incompatible chains.
 
 ## [0.14.3] - 2026-10-22
