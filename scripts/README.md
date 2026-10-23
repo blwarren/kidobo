@@ -58,11 +58,13 @@ Publication requires a Linux x86_64 host. Release builds require `musl-gcc` and 
 `x86_64-unknown-linux-musl` Rust target. The compatibility gate additionally
 requires `readelf` and Docker access; it runs only offline Kidobo commands in
 the containers and never invokes firewall or systemd operations.
-Publication also requires configured Incus VM access, a host `genisoimage` or `mkisofs` utility
+Publication also requires configured Incus VM access, host `tar`, a `genisoimage` or `mkisofs` utility
 for agent configuration disks, and a passing full distro lifecycle matrix,
 run against the exact packaged archive before pushing refs or uploading assets. E2E command
-logs and frozen guest inputs remain under the original checkout's `target/e2e/<run-id>/`,
-including when the publisher removes its temporary worktree.
+transcript and results remain under the original checkout's `target/e2e/<run-id>/`,
+including when the publisher removes its temporary worktree. Start with `summary.txt` and
+its line references into `transcript.log`; frozen inputs and guest snapshots are retained in
+`evidence.tar.gz`. See [live progress and retained evidence](../docs/e2e.md#diagnose-and-clean-up).
 Packaging reads the validated candidate binary from `CARGO_TARGET_DIR` when
 set, or `target` otherwise. Relative target directories resolve inside the
 candidate worktree; recovery artifacts retain the location below.

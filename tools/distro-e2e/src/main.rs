@@ -5,7 +5,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
 use std::fs::{self, File};
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -15,6 +15,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 const OWNER: &str = "kidobo-e2e-v1";
+
+mod report;
+use report::Report;
 
 #[derive(Parser)]
 struct Cli {
@@ -73,7 +76,97 @@ struct Runner {
     dir: PathBuf,
     incus_program: PathBuf,
     cancelled: Arc<AtomicBool>,
-    sequence: usize,
+    report: Report,
+}
+/// Each command owns only one pair of temporary files, removed even on failure.
+struct Capture {
+    dir: PathBuf,
+    stdout: File,
+    stderr: File,
+}
+impl Capture {
+    fn new(root: &Path) -> Result<Self> {
+        let dir = root.join(format!(
+            ".capture-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+        ));
+        fs::create_dir(&dir)?;
+        let result = (|| -> Result<Self> {
+            Ok(Self {
+                stdout: File::create(dir.join("stdout"))?,
+                stderr: File::create(dir.join("stderr"))?,
+                dir: dir.clone(),
+            })
+        })();
+        if result.is_err() {
+            let _ = fs::remove_dir_all(&dir);
+        }
+        result
+    }
+}
+impl Drop for Capture {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+#[derive(Default)]
+struct Heartbeat {
+    last_activity: Duration,
+    last_notice: Duration,
+}
+impl Heartbeat {
+    fn due(&mut self, elapsed: Duration, activity: bool) -> bool {
+        if activity {
+            self.last_activity = elapsed;
+        }
+        if elapsed.saturating_sub(self.last_activity.max(self.last_notice))
+            >= Duration::from_secs(15)
+        {
+            self.last_notice = elapsed;
+            true
+        } else {
+            false
+        }
+    }
+}
+fn archive_evidence(runner: &mut Runner) -> Result<()> {
+    archive_evidence_using(runner, "tar")
+}
+fn archive_evidence_using(runner: &mut Runner, program: &str) -> Result<()> {
+    runner.stage("finalizing evidence archive")?;
+    fs::create_dir_all(runner.evidence())?;
+    fs::write(
+        runner.evidence().join("README.txt"),
+        "Frozen inputs and SHA256 manifest: inputs/\nGuest diagnostics and snapshots: <distro>/\nCommand output and check references: ../transcript.log and ../results.json\n",
+    )?;
+    let temporary = runner.dir.join(".evidence.tar.gz.tmp");
+    let archive = runner.dir.join("evidence.tar.gz");
+    let temporary_text = temporary
+        .to_str()
+        .ok_or("non-UTF-8 evidence archive path")?;
+    let evidence = runner.evidence();
+    runner.command(
+        program,
+        &strings(&[
+            "-czf",
+            temporary_text,
+            "-C",
+            evidence.to_str().ok_or("non-UTF-8 evidence directory")?,
+            ".",
+        ]),
+        300,
+    )?;
+    runner.command(program, &strings(&["-tzf", temporary_text]), 300)?;
+    let sha256 = hash(&temporary)?;
+    fs::rename(&temporary, &archive)?;
+    runner.report.document["evidence"] = json!({"path": "evidence.tar.gz", "sha256": sha256});
+    runner.report.emit(&format!(
+        "Evidence archive: {} SHA-256={sha256}",
+        archive.display()
+    ))?;
+    fs::remove_dir_all(evidence)?;
+    Ok(())
 }
 fn safe_name(value: &str) -> bool {
     !value.is_empty()
@@ -83,95 +176,209 @@ fn safe_name(value: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
 }
 impl Runner {
+    fn stage(&mut self, name: &str) -> Result<()> {
+        self.report.finish_stage("passed")?;
+        self.report.stage(name)
+    }
+    fn evidence(&self) -> PathBuf {
+        self.dir.join(".evidence")
+    }
     fn command(&mut self, program: &str, args: &[String], seconds: u64) -> Result<String> {
-        const OUTPUT_LIMIT: u64 = 16 * 1024 * 1024;
-
-        self.sequence += 1;
-        let stem = self.dir.join(format!("{:04}", self.sequence));
-        let out = File::create(stem.with_extension("stdout"))?;
-        let err = File::create(stem.with_extension("stderr"))?;
+        let id = self.report.document["commands"]
+            .as_array()
+            .map_or(1, |v| v.len() + 1);
+        let line = self.report.emit(&format!(
+            "[{} | command {id}] START {} {} (timeout {seconds}s)",
+            self.report.context,
+            program,
+            serde_json::to_string(args)?
+        ))?;
         let started = Instant::now();
-        let mut child = match Command::new(program)
+        self.report.document["commands"]
+            .as_array_mut()
+            .ok_or("missing command records")?
+            .push(json!({
+                "id": id, "context": self.report.context, "program": program, "args": args,
+                "code": null, "status": "running", "line": line,
+            }));
+        self.report.save()?;
+        let result = self.capture_command(id, program, args, seconds);
+        let (code, output, mut error) = match result {
+            Ok((code, output, reason)) => (code, output, reason),
+            Err(error) => (None, String::new(), Some(error.to_string())),
+        };
+        let record = &mut self.report.document["commands"][id - 1];
+        record["code"] = json!(code);
+        record["seconds"] = json!(started.elapsed().as_secs_f64());
+        record["error"] = json!(error);
+        record["status"] = json!(if error.is_some() {
+            "error"
+        } else {
+            "completed"
+        });
+        self.report.finish_checks(
+            id,
+            if error.as_deref().is_some_and(|e| e.contains("interrupted")) {
+                "interrupted"
+            } else if error.is_some() {
+                "failed"
+            } else {
+                "incomplete"
+            },
+        )?;
+        if error.is_none()
+            && self.report.document["checks"]
+                .as_array()
+                .is_some_and(|checks| {
+                    checks.iter().any(|check| {
+                        check["command"] == id
+                            && matches!(check["status"].as_str(), Some("failed" | "interrupted"))
+                    })
+                })
+        {
+            error =
+                Some("failed or unfinished guest checks despite successful command exit".into());
+            self.report.document["commands"][id - 1]["error"] = json!(error);
+            self.report.document["commands"][id - 1]["status"] = json!("error");
+        }
+        self.report.emit(&format!(
+            "[{} | command {id}] END exit={} elapsed={:.1}s{}",
+            self.report.context,
+            code.map_or_else(|| "none".into(), |v| v.to_string()),
+            started.elapsed().as_secs_f64(),
+            error
+                .as_ref()
+                .map_or_else(String::new, |e| format!("; {e}"))
+        ))?;
+        self.report.save()?;
+        if let Some(error) = error {
+            let error = if error.starts_with("spawn failed:") {
+                format!("failed to start {program}: {error}")
+            } else {
+                error
+            };
+            return Err(format!(
+                "{error}; transcript: {} (command {id}, line {line})",
+                self.dir.join("transcript.log").display()
+            )
+            .into());
+        }
+        Ok(output)
+    }
+    fn capture_command(
+        &mut self,
+        id: usize,
+        program: &str,
+        args: &[String],
+        seconds: u64,
+    ) -> Result<(Option<i32>, String, Option<String>)> {
+        const OUTPUT_LIMIT: u64 = 16 * 1024 * 1024;
+        let capture = Capture::new(&self.dir)?;
+        let mut out = File::open(capture.dir.join("stdout"))?;
+        let mut err = File::open(capture.dir.join("stderr"))?;
+        let mut child = Command::new(program)
             .args(args)
             .stdin(Stdio::null())
-            .stdout(out)
-            .stderr(err)
+            .stdout(capture.stdout.try_clone()?)
+            .stderr(capture.stderr.try_clone()?)
             .process_group(0)
             .spawn()
-        {
-            Ok(child) => child,
-            Err(error) => {
-                fs::write(
-                    stem.with_extension("json"),
-                    serde_json::to_vec_pretty(&json!({
-                        "program": program,
-                        "args": args,
-                        "code": null,
-                        "seconds": started.elapsed().as_secs_f64(),
-                        "error": format!("spawn failed: {error}"),
-                    }))?,
-                )?;
-                return Err(format!(
-                    "failed to start {program}: {error}; logs: {}",
-                    stem.display()
-                )
-                .into());
+            .map_err(|e| format!("spawn failed: {e}"))?;
+        let started = Instant::now();
+        let mut heartbeat = Heartbeat::default();
+        // Regular-file readers cannot block on inherited pipes. Bound each drain so
+        // continuous output never prevents cancellation or timeout checks.
+        let mut completed = false;
+        let result = (|| -> Result<(Option<i32>, Option<String>)> {
+            loop {
+                let activity =
+                    self.drain(id, "stdout", &mut out)? | self.drain(id, "stderr", &mut err)?;
+                let elapsed = started.elapsed();
+                if heartbeat.due(elapsed, activity) {
+                    self.report.emit(&format!(
+                        "[{} | command {id}] still running; elapsed={:.0}s",
+                        self.report.context,
+                        elapsed.as_secs_f64()
+                    ))?;
+                }
+                if let Some(status) = child.try_wait()? {
+                    completed = true;
+                    // The direct child is done; drain the bytes already captured without
+                    // waiting for EOF from background descendants.
+                    let out_len = out.metadata()?.len();
+                    let err_len = err.metadata()?.len();
+                    while out.stream_position()? < out_len {
+                        self.drain(id, "stdout", &mut out)?;
+                    }
+                    while err.stream_position()? < err_len {
+                        self.drain(id, "stderr", &mut err)?;
+                    }
+                    return Ok((
+                        status.code(),
+                        (!status.success()).then(|| format!("{program} exited {status}")),
+                    ));
+                }
+                if self.cancelled.load(Ordering::Relaxed) {
+                    return Ok((None, Some("interrupted".into())));
+                }
+                if elapsed > Duration::from_secs(seconds) {
+                    return Ok((None, Some("timed out".into())));
+                }
+                if !activity {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
             }
-        };
-        let status = loop {
-            if let Some(status) = child.try_wait()? {
-                break status;
-            }
-            let interrupted = self.cancelled.load(Ordering::Relaxed);
-            let timed_out = started.elapsed() > Duration::from_secs(seconds);
-            if interrupted || timed_out {
-                let pid = i32::try_from(child.id())?;
+        })();
+        if !completed {
+            if let Ok(pid) = i32::try_from(child.id()) {
                 let _ = nix::sys::signal::killpg(
                     nix::unistd::Pid::from_raw(pid),
                     nix::sys::signal::Signal::SIGKILL,
                 );
-                let _ = child.wait();
-                let reason = if interrupted {
-                    "interrupted"
-                } else {
-                    "timed out"
-                };
-                fs::write(
-                    stem.with_extension("json"),
-                    serde_json::to_vec_pretty(&json!({
-                        "program": program,
-                        "args": args,
-                        "code": null,
-                        "seconds": started.elapsed().as_secs_f64(),
-                        "error": reason,
-                    }))?,
-                )?;
-                return Err(format!("{program} {reason}; logs: {}", stem.display()).into());
             }
-            std::thread::sleep(Duration::from_millis(100));
-        };
-        fs::write(
-            stem.with_extension("json"),
-            serde_json::to_vec_pretty(
-                &json!({"program":program,"args":args,"code":status.code(),"seconds":started.elapsed().as_secs_f64()}),
-            )?,
-        )?;
-        if !status.success() {
-            return Err(format!("{program} exited {status}; logs: {}", stem.display()).into());
+            let _ = child.wait();
+            // Best effort on failure; preserve the original reporting/command error.
+            for (stream, source) in [("stdout", &mut out), ("stderr", &mut err)] {
+                let end = source.metadata()?.len();
+                while source.stream_position()? < end {
+                    if self.drain(id, stream, source).is_err() {
+                        break;
+                    }
+                }
+            }
         }
-        let stdout_path = stem.with_extension("stdout");
-        if fs::metadata(&stdout_path)?.len() > OUTPUT_LIMIT {
-            return Err(format!(
-                "{program} stdout exceeds the {OUTPUT_LIMIT}-byte capture limit; logs: {}",
-                stem.display()
-            )
-            .into());
+        self.report.document["commands"][id - 1]["stdout_bytes"] = json!(out.metadata()?.len());
+        self.report.document["commands"][id - 1]["stderr_bytes"] = json!(err.metadata()?.len());
+        let (code, reason) = result?;
+        if let Some(reason) = reason {
+            return Ok((code, String::new(), Some(reason)));
         }
+        if out.metadata()?.len() > OUTPUT_LIMIT {
+            return Ok((
+                code,
+                String::new(),
+                Some(format!(
+                    "{program} stdout exceeds the {OUTPUT_LIMIT}-byte capture limit"
+                )),
+            ));
+        }
+        out.seek(SeekFrom::Start(0))?;
         let mut output = String::new();
-        File::open(stdout_path)?
-            .take(OUTPUT_LIMIT)
-            .read_to_string(&mut output)?;
-        Ok(output)
+        out.take(OUTPUT_LIMIT).read_to_string(&mut output)?;
+        Ok((code, output, None))
+    }
+    fn drain(&mut self, id: usize, stream: &str, source: &mut File) -> Result<bool> {
+        let mut buffer = [0; 8192];
+        let mut activity = false;
+        for _ in 0..32 {
+            let count = source.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            activity = true;
+            self.report.output(id, stream, &buffer[..count])?;
+        }
+        Ok(activity)
     }
     fn incus(&mut self, args: &[String], seconds: u64) -> Result<String> {
         let mut full = vec!["--project".into(), self.project.clone()];
@@ -234,6 +441,10 @@ impl Runner {
             if self.cancelled.load(Ordering::Relaxed) || Instant::now() > deadline {
                 return Err("VM agent did not become ready".into());
             }
+            self.report.emit(&format!(
+                "[{}] VM agent not ready; retrying (expected readiness probe failure)",
+                self.report.context
+            ))?;
             std::thread::sleep(Duration::from_secs(3));
         }
     }
@@ -451,7 +662,7 @@ fn setup(runner: &mut Runner, config: &Config) -> Result<()> {
     Ok(())
 }
 fn prepare_baseline(runner: &mut Runner, vm: &str) -> Result<()> {
-    let baseline = read_text(&runner.dir.join("baseline-tag"))?;
+    let baseline = read_text(&runner.evidence().join("baseline-tag"))?;
     runner.guest(
         vm,
         &strings(&["mkdir", "-p", "/opt/kidobo-e2e/baseline"]),
@@ -459,13 +670,13 @@ fn prepare_baseline(runner: &mut Runner, vm: &str) -> Result<()> {
     )?;
     runner.push(
         vm,
-        &runner.dir.join("baseline-installer.sh"),
+        &runner.evidence().join("baseline-installer.sh"),
         "/opt/kidobo-e2e/baseline/installer.sh",
         false,
     )?;
     runner.push(
         vm,
-        &runner.dir.join("baseline-SHA256SUMS"),
+        &runner.evidence().join("baseline-SHA256SUMS"),
         "/opt/kidobo-e2e/baseline/SHA256SUMS",
         false,
     )?;
@@ -488,6 +699,10 @@ fn prepare_baseline(runner: &mut Runner, vm: &str) -> Result<()> {
     )?;
     Ok(())
 }
+#[expect(
+    clippy::too_many_lines,
+    reason = "Lifecycle stages stay adjacent to their guest commands and timeouts"
+)]
 fn scenario(
     runner: &mut Runner,
     vm: &str,
@@ -498,12 +713,13 @@ fn scenario(
     phase: &mut &str,
 ) -> Result<()> {
     *phase = "provisioning";
+    runner.stage(&format!("{} | provisioning", distro.id))?;
     runner.ready(vm)?;
     runner.guest(vm, &strings(&["sh", "-c", "printf '%s\\n' kidobo-e2e-v1 > /etc/kidobo-e2e-owned; mkdir -p /opt/kidobo-e2e/release"]), 30)?;
     for script in ["provision.sh", "lifecycle.sh", "traffic.py"] {
         runner.push(
             vm,
-            &runner.dir.join("inputs").join(script),
+            &runner.evidence().join("inputs").join(script),
             &format!("/opt/kidobo-e2e/{script}"),
             false,
         )?;
@@ -513,7 +729,7 @@ fn scenario(
     runner.guest(vm, &args, 2400)?;
     runner.push(
         vm,
-        &runner.dir.join("inputs/installer.sh"),
+        &runner.evidence().join("inputs/installer.sh"),
         "/opt/kidobo-e2e/release/installer.sh",
         false,
     )?;
@@ -543,8 +759,10 @@ fn scenario(
         )?;
     }
     if !published {
+        runner.stage(&format!("{} | upgrade baseline preparation", distro.id))?;
         prepare_baseline(runner, vm)?;
     }
+    runner.stage(&format!("{} | OS upgrade", distro.id))?;
     runner.guest(
         vm,
         &strings(&[
@@ -556,6 +774,10 @@ fn scenario(
         ]),
         2400,
     )?;
+    runner.stage(&format!(
+        "{} | OS reboot and kernel verification",
+        distro.id
+    ))?;
     runner.reboot(vm)?;
     runner.guest(
         vm,
@@ -563,6 +785,10 @@ fn scenario(
         60,
     )?;
     *phase = "application";
+    runner.stage(&format!(
+        "{} | installation and application checks",
+        distro.id
+    ))?;
     let mode = if published { "published" } else { "candidate" };
     runner.guest(
         vm,
@@ -570,6 +796,10 @@ fn scenario(
         600,
     )?;
     if !published {
+        runner.stage(&format!(
+            "{} | application reboot and timer recovery",
+            distro.id
+        ))?;
         runner.reboot(vm)?;
         runner.guest(
             vm,
@@ -582,12 +812,14 @@ fn scenario(
             ]),
             600,
         )?;
+        runner.stage(&format!("{} | upgrade and preservation", distro.id))?;
         runner.guest(
             vm,
             &strings(&["bash", "/opt/kidobo-e2e/lifecycle.sh", "upgrade", tag, mode]),
             600,
         )?;
     }
+    runner.stage(&format!("{} | flush and uninstall", distro.id))?;
     runner.guest(
         vm,
         &strings(&["bash", "/opt/kidobo-e2e/lifecycle.sh", "finish", tag, mode]),
@@ -626,42 +858,6 @@ fn validate_owned_manifest(owned: &Owned, project: &str, run_id: &str) -> Result
     }
     Ok(())
 }
-fn render_summary(tag: &str, artifact_hash: Option<&str>, results: &[serde_json::Value]) -> String {
-    let mut summary = format!("Kidobo distro E2E run for {tag}\n");
-    if let Some(hash) = artifact_hash {
-        writeln!(summary, "Archive SHA-256: {hash}").expect("write to String");
-    }
-    summary.push('\n');
-    for result in results {
-        let distro = result["distro"].as_str().unwrap_or("unknown");
-        let phase = result["phase"].as_str().unwrap_or("unknown");
-        let status = if result["error"].is_null() {
-            "PASS"
-        } else {
-            "FAIL"
-        };
-        let seconds = result["seconds"].as_f64().unwrap_or_default();
-        let image = result["image"].as_str().unwrap_or("unknown");
-        let fingerprint = result["image_fingerprint"]
-            .as_str()
-            .unwrap_or("unavailable");
-        let diagnostic_count = result["diagnostic_errors"].as_array().map_or(0, Vec::len);
-        writeln!(
-            summary,
-            "{distro}: {status} ({phase}, {seconds:.1}s) image={image} base_image={fingerprint} diagnostics={diagnostic_count}"
-        )
-        .expect("write to String");
-        if let Some(error) = result["error"].as_str() {
-            writeln!(summary, "  error: {error}").expect("write to String");
-        }
-        if let Some(errors) = result["diagnostic_errors"].as_array() {
-            for error in errors.iter().filter_map(serde_json::Value::as_str) {
-                writeln!(summary, "  diagnostic: {error}").expect("write to String");
-            }
-        }
-    }
-    summary
-}
 #[expect(
     clippy::too_many_lines,
     reason = "Matrix execution keeps diagnostics and cleanup adjacent to lifecycle execution"
@@ -698,15 +894,132 @@ fn run(cli: Cli) -> Result<()> {
         .map_or_else(|| PathBuf::from("target/e2e"), PathBuf::from)
         .join(&run_id);
     fs::create_dir_all(&dir)?;
-    let sequence = fs::read_dir(&dir)?.count();
+    let report = Report::open(&dir)?;
     let mut runner = Runner {
         project: config.project.clone(),
         dir,
         incus_program: PathBuf::from("incus"),
         cancelled,
-        sequence,
+        report,
     };
+    let is_clean = matches!(&cli.action, Action::Clean { .. });
+    if is_clean {
+        runner.stage("cleanup requested after run")?;
+    } else {
+        let (tag, archive, targets) = match &cli.action {
+            Action::Run {
+                tag,
+                archive,
+                distro,
+                ..
+            } => (
+                tag.as_str(),
+                archive.as_ref(),
+                config
+                    .distros
+                    .iter()
+                    .filter(|d| distro.as_ref().is_none_or(|id| *id == d.id))
+                    .map(|d| d.id.clone())
+                    .collect::<Vec<_>>(),
+            ),
+            _ => ("setup", None, Vec::new()),
+        };
+        runner.report.document["run_id"] = json!(run_id);
+        runner.report.document["tag"] = json!(tag);
+        runner.report.document["archive"] = json!(archive);
+        runner.report.document["targets"] = json!(targets);
+        let published = matches!(
+            &cli.action,
+            Action::Run {
+                published: true,
+                ..
+            }
+        );
+        let mut stages = vec![];
+        for target in &targets {
+            for name in [
+                "VM creation",
+                "provisioning",
+                "upgrade baseline preparation",
+                "OS upgrade",
+                "OS reboot and kernel verification",
+                "installation and application checks",
+                "application reboot and timer recovery",
+                "upgrade and preservation",
+                "flush and uninstall",
+                "diagnostics",
+                "cleanup",
+            ] {
+                if published
+                    && matches!(
+                        name,
+                        "upgrade baseline preparation"
+                            | "application reboot and timer recovery"
+                            | "upgrade and preservation"
+                    )
+                {
+                    continue;
+                }
+                stages.push(json!({"name": format!("{target} | {name}"), "status": "not-run"}));
+            }
+        }
+        runner.report.document["stages"] = json!(stages);
+        runner.report.document["status"] = json!("running");
+        runner.report.save()?;
+        runner.report.emit(&format!(
+            "E2E run {run_id}: release={tag} archive={archive:?} targets={targets:?}; results: {}",
+            runner.dir.display()
+        ))?;
+    }
+    let outcome = execute(cli, &config, &run_id, &mut runner);
+    if is_clean {
+        runner
+            .report
+            .finish_stage(if outcome.is_err() { "failed" } else { "passed" })?;
+        return outcome;
+    }
+    let interrupted = runner.cancelled.swap(false, Ordering::Relaxed);
+    runner.report.document["status"] = json!(if interrupted {
+        "interrupted"
+    } else if outcome.is_err() {
+        "failed"
+    } else {
+        "passed"
+    });
+    runner.report.document["error"] = json!(outcome.as_ref().err().map(ToString::to_string));
+    runner.report.finish_stage(if interrupted {
+        "interrupted"
+    } else if outcome.is_err() {
+        "failed"
+    } else {
+        "passed"
+    })?;
+    let archive = archive_evidence(&mut runner);
+    runner
+        .report
+        .finish_stage(if archive.is_err() { "failed" } else { "passed" })?;
+    if let Err(error) = &archive {
+        runner.report.document["evidence_error"] = json!(error.to_string());
+        runner.report.document["status"] = json!("failed");
+        runner.report.emit(&format!(
+            "Evidence incomplete: {error}; working evidence retained at {}",
+            runner.evidence().display()
+        ))?;
+    }
+    runner.report.save()?;
+    outcome?;
+    archive?;
+    Ok(())
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "Matrix execution keeps diagnostics and cleanup adjacent to lifecycle execution"
+)]
+fn execute(cli: Cli, config: &Config, run_id: &str, runner: &mut Runner) -> Result<()> {
     if !matches!(&cli.action, Action::Clean { .. }) {
+        fs::create_dir_all(runner.evidence())?;
+        runner.command("tar", &strings(&["--version"]), 10)?;
         if std::env::consts::OS != "linux" || std::env::consts::ARCH != "x86_64" {
             return Err("distro E2E requires a Linux x86_64 host".into());
         }
@@ -724,8 +1037,8 @@ fn run(cli: Cli) -> Result<()> {
             })?;
     }
     match cli.action {
-        Action::Setup => setup(&mut runner, &config),
-        Action::Clean { .. } => clean(&mut runner, &config),
+        Action::Setup => setup(runner, config),
+        Action::Clean { .. } => clean(runner, config),
         Action::Run {
             archive,
             mut tag,
@@ -733,6 +1046,14 @@ fn run(cli: Cli) -> Result<()> {
             distro,
             keep_failed,
         } => {
+            runner.report.document["coverage"] = json!(if published {
+                "Published smoke lane; candidate post-install reboot, upgrade, and candidate-only checks are not run"
+            } else {
+                "Candidate lifecycle lane including reboot, upgrade, and failure preservation"
+            });
+            runner
+                .report
+                .emit(&format!("Coverage: {}", runner.report.document["coverage"]))?;
             if published && archive.is_some() || !published && archive.is_none() {
                 return Err("choose --published or --archive".into());
             }
@@ -760,12 +1081,12 @@ fn run(cli: Cli) -> Result<()> {
             if !tag_valid(&tag) {
                 return Err("invalid version tag".into());
             }
-            snapshot_inputs(&runner.dir, &cli.config)?;
+            snapshot_inputs(&runner.evidence(), &cli.config)?;
             let archive = archive.map(fs::canonicalize).transpose()?;
             let artifact_hash = archive.as_deref().map(hash).transpose()?;
             let test_archive = archive
                 .as_deref()
-                .map(|source| freeze_archive(source, &runner.dir))
+                .map(|source| freeze_archive(source, &runner.evidence()))
                 .transpose()?;
             if test_archive.as_deref().map(hash).transpose()? != artifact_hash {
                 return Err("candidate changed while taking its input snapshot".into());
@@ -794,7 +1115,7 @@ fn run(cli: Cli) -> Result<()> {
                     .max_by_key(|(n, _)| *n)
                     .ok_or("no earlier published upgrade baseline found")?
                     .1;
-                fs::write(runner.dir.join("baseline-tag"), baseline)?;
+                fs::write(runner.evidence().join("baseline-tag"), baseline)?;
                 for (url, name) in [
                     (
                         format!(
@@ -818,7 +1139,7 @@ fn run(cli: Cli) -> Result<()> {
                             "--max-time",
                             "60",
                             "-o",
-                            &runner.dir.join(name).to_string_lossy(),
+                            &runner.evidence().join(name).to_string_lossy(),
                             &url,
                         ]),
                         200,
@@ -839,26 +1160,32 @@ fn run(cli: Cli) -> Result<()> {
                 project: config.project.clone(),
                 instances: vec![],
             };
+            runner.report.document["tag"] = json!(tag);
+            runner.report.document["archive_sha256"] = json!(artifact_hash);
+            runner.report.save()?;
             let mut results = vec![];
             for target in targets {
                 if runner.cancelled.load(Ordering::Relaxed) {
                     break;
                 }
                 let vm = format!("{}-{}", run_id, target.id);
-                let target_dir = runner.dir.join(&target.id);
+                let target_dir = runner.evidence().join(&target.id);
                 fs::create_dir_all(&target_dir)?;
                 owned.instances.push(vm.clone());
                 fs::write(
                     runner.dir.join("ownership.json"),
                     serde_json::to_vec_pretty(&owned)?,
                 )?;
-                println!("[e2e] {}: fresh VM {vm}", target.id);
+                runner.stage(&format!("{} | VM creation", target.id))?;
+                let transcript_line = runner.report.line;
+                runner.report.document["active_target"] = json!(target.id);
+                runner.report.save()?;
                 let started = Instant::now();
                 let launch = runner.create_vm(&target.image, &vm, &config.profile);
                 let mut phase = "provisioning";
                 let outcome = launch.and_then(|()| {
                     scenario(
-                        &mut runner,
+                        runner,
                         &vm,
                         target,
                         &tag,
@@ -869,6 +1196,14 @@ fn run(cli: Cli) -> Result<()> {
                 });
                 // Diagnostics and cleanup remain possible after SIGINT.
                 let interrupted = runner.cancelled.swap(false, Ordering::Relaxed);
+                runner.report.finish_stage(if interrupted {
+                    "interrupted"
+                } else if outcome.is_err() {
+                    "failed"
+                } else {
+                    "passed"
+                })?;
+                runner.stage(&format!("{} | diagnostics", target.id))?;
                 let mut diagnostic_errors = vec![];
                 let mut image_fingerprint: Option<String> = None;
                 let vm_snapshot = runner
@@ -932,36 +1267,52 @@ printf '%s\n' '=== kidobo service journal ==='; journalctl -u kidobo-sync.servic
                         }
                     }
                 }
-                let mut error = outcome.err().map(|e| e.to_string());
+                let error = outcome.err().map(|e| e.to_string());
+                runner
+                    .report
+                    .finish_stage(if diagnostic_errors.is_empty() {
+                        "passed"
+                    } else {
+                        "incomplete"
+                    })?;
+                runner.stage(&format!("{} | cleanup", target.id))?;
+                let mut cleanup_error = None;
                 if !(keep_failed && error.is_some())
                     && let Err(e) = runner.delete(&vm)
                 {
-                    error = Some(format!("{}; cleanup: {e}", error.unwrap_or_default()));
+                    cleanup_error = Some(e.to_string());
                 }
-                println!(
+                runner.report.emit(&format!(
                     "[e2e] {}: {}",
                     target.id,
-                    error.as_deref().unwrap_or("PASS")
-                );
+                    error
+                        .as_deref()
+                        .or(cleanup_error.as_deref())
+                        .unwrap_or("PASS")
+                ))?;
                 results.push(json!({
                     "distro": target.id,
+                    "transcript_line": transcript_line,
                     "phase": phase,
                     "error": error,
+                    "cleanup_error": cleanup_error,
                     "seconds": started.elapsed().as_secs_f64(),
                     "image": target.image,
                     "image_fingerprint": image_fingerprint,
                     "diagnostic_errors": diagnostic_errors,
                 }));
-                fs::write(
-                    runner.dir.join("results.json"),
-                    serde_json::to_vec_pretty(
-                        &json!({"tag":tag,"archive_sha256":artifact_hash,"results":results}),
-                    )?,
-                )?;
-                fs::write(
-                    runner.dir.join("summary.txt"),
-                    render_summary(&tag, artifact_hash.as_deref(), &results),
-                )?;
+                runner.report.document["tag"] = json!(tag);
+                runner.report.document["archive_sha256"] = json!(artifact_hash);
+                runner.report.document["results"] = json!(results);
+                runner.report.document["active_target"] = json!(null);
+                runner.report.finish_stage(if cleanup_error.is_some() {
+                    "failed"
+                } else if keep_failed && error.is_some() {
+                    "retained"
+                } else {
+                    "passed"
+                })?;
+                runner.report.save()?;
                 if interrupted {
                     runner.cancelled.store(true, Ordering::Relaxed);
                     break;
@@ -971,7 +1322,9 @@ printf '%s\n' '=== kidobo service journal ==='; journalctl -u kidobo-sync.servic
                 return Err("candidate archive changed during testing".into());
             }
             if runner.cancelled.load(Ordering::Relaxed)
-                || results.iter().any(|r| !r["error"].is_null())
+                || results
+                    .iter()
+                    .any(|r| !r["error"].is_null() || !r["cleanup_error"].is_null())
             {
                 return Err(format!("matrix failed; results: {}", runner.dir.display()).into());
             }
@@ -1045,5 +1398,7 @@ fn validate_vm_config(value: &serde_json::Value) -> Result<()> {
     }
     Ok(())
 }
+#[cfg(test)]
+mod guest_reporting_tests;
 #[cfg(test)]
 mod tests;

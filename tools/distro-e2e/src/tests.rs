@@ -15,7 +15,7 @@ impl TestDir {
     fn new() -> Self {
         let guard = TEST_FIXTURE_LOCK
             .lock()
-            .expect("lock test fixture directory");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let id = NEXT_TEST_DIR.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
             "kidobo-distro-e2e-tests-{}-{id}",
@@ -48,13 +48,721 @@ fn executable(path: &Path, body: &str) {
     fs::set_permissions(path, permissions).expect("make test executable");
 }
 
+fn command_metadata_text(dir: &Path, id: usize) -> Result<String> {
+    let document: serde_json::Value = serde_json::from_str(&read_text(&dir.join("results.json"))?)?;
+    Ok(serde_json::to_string(&document["commands"][id - 1])?)
+}
+fn command_output(dir: &Path, id: usize, stream: &str) -> Result<String> {
+    let transcript = read_text(&dir.join("transcript.log"))?;
+    let marker = format!(" | command {id} | {stream}] ");
+    Ok(transcript
+        .lines()
+        .filter_map(|line| {
+            line.split_once(&marker)
+                .map(|(_, text)| format!("{text}\n"))
+        })
+        .collect())
+}
+fn lifecycle_reporting_helpers() -> &'static str {
+    let lifecycle = include_str!("../../../scripts/e2e/lifecycle.sh");
+    let end = lifecycle
+        .find("readonly ROOT=")
+        .expect("end of reporting preamble");
+    &lifecycle[..end]
+}
+
+fn lifecycle_traffic_server_function() -> String {
+    let lifecycle = include_str!("../../../scripts/e2e/lifecycle.sh");
+    let start = lifecycle
+        .find("start_traffic_servers() {")
+        .expect("find traffic server function in guest lifecycle script");
+    let end = lifecycle[start..]
+        .find("\nprobe() {")
+        .map(|offset| start + offset)
+        .expect("find probe function after traffic server function");
+    format!(
+        "{}\n{}",
+        lifecycle_reporting_helpers(),
+        &lifecycle[start..end]
+    )
+}
+
+fn lifecycle_setup_namespace_function() -> String {
+    let lifecycle = include_str!("../../../scripts/e2e/lifecycle.sh");
+    let start = lifecycle
+        .find("setup_namespace() {")
+        .expect("find namespace setup function in guest lifecycle script");
+    let end = lifecycle[start..]
+        .find("\nstart_traffic_servers() {")
+        .map(|offset| start + offset)
+        .expect("find traffic server function after namespace setup");
+    format!(
+        "{}\n{}",
+        lifecycle_reporting_helpers(),
+        &lifecycle[start..end]
+    )
+}
+
+fn lifecycle_baseline_recovery_functions() -> String {
+    let lifecycle = include_str!("../../../scripts/e2e/lifecycle.sh");
+    let start = lifecycle
+        .find("debian12_baseline_recovery_allowed() {")
+        .expect("find baseline recovery helpers in guest lifecycle script");
+    let end = lifecycle[start..]
+        .find("\ntest_uninstall_failure_preserves_runtime() {")
+        .map(|offset| start + offset)
+        .expect("find end of baseline recovery helpers");
+    format!(
+        "{}\n{}",
+        lifecycle_reporting_helpers(),
+        &lifecycle[start..end]
+    )
+}
+
+fn lifecycle_upgrade_test_helpers() -> String {
+    let lifecycle = include_str!("../../../scripts/e2e/lifecycle.sh");
+    let start = lifecycle
+        .find("ensure_unrelated_sentinels() {")
+        .expect("find firewall helpers in guest lifecycle script");
+    let end = lifecycle[start..]
+        .find("\ntest_uninstall_failure_preserves_runtime() {")
+        .map(|offset| start + offset)
+        .expect("find end of upgrade test helpers");
+    format!(
+        "{}\n{}",
+        lifecycle_reporting_helpers(),
+        &lifecycle[start..end]
+    )
+}
+
+fn lifecycle_probe_function() -> String {
+    let lifecycle = include_str!("../../../scripts/e2e/lifecycle.sh");
+    let start = lifecycle
+        .find("probe() {")
+        .expect("find traffic probe helper in guest lifecycle script");
+    let end = lifecycle[start..]
+        .find("\nwrite_config() {")
+        .map(|offset| start + offset)
+        .expect("find end of traffic probe helper");
+    format!(
+        "{}\n{}",
+        lifecycle_reporting_helpers(),
+        &lifecycle[start..end]
+    )
+}
+
+fn fake_baseline_check_script(temp: &TestDir, scenario: &str) -> (PathBuf, PathBuf) {
+    let fake_bin = temp.path().join("baseline-bin");
+    let state = temp.path().join("baseline-state");
+    fs::create_dir(&fake_bin).expect("create baseline fake binary directory");
+    fs::create_dir(&state).expect("create baseline state directory");
+    for binary in ["iptables", "ip6tables"] {
+        executable(
+            &fake_bin.join(binary),
+            r#"#!/bin/bash
+set -eu
+printf '%s\n' "$*" >> "$FAKE_CALLS"
+case "$*" in
+  --version) [[ "$(basename "$0")" == ip6tables ]] && printf 'ip6tables v1.8.9 (nf_tables)\n' || printf 'iptables v1.8.9 (nf_tables)\n' ;;
+  '-S kidobo-input') if [[ "$(basename "$0")" == ip6tables ]]; then printf '%s\n' '-A kidobo-input -m set --match-set kidobo-e2e-v6 src -j DROP'; else printf '%s\n' '-A kidobo-input -m set --match-set kidobo-e2e src -j DROP'; fi ;;
+  '-S INPUT') printf '%s\n' '-A INPUT -j kidobo-input' '-A INPUT -j E2E-UNRELATED-SENTINEL' ;;
+  '-S kidobo-input-stage') exit 1 ;;
+  *) exit 0 ;;
+esac
+"#,
+        );
+    }
+    executable(
+        &fake_bin.join("iptables-save"),
+        "#!/bin/bash\nif [[ \"${FAKE_ACTIVE_JUMP:-0}\" == 1 ]]; then printf '%s\\n' '-A INPUT -j kidobo-input'; else printf '%s\\n' '-A INPUT -j E2E-UNRELATED-SENTINEL'; fi\n",
+    );
+    executable(
+        &fake_bin.join("ip6tables-save"),
+        "#!/bin/bash\nif [[ \"${FAKE_ACTIVE_JUMP:-0}\" == 1 ]]; then printf '%s\\n' '-A INPUT -j kidobo-input'; else printf '%s\\n' '-A INPUT -j E2E-UNRELATED-SENTINEL'; fi\n",
+    );
+    executable(
+        &fake_bin.join("ipset"),
+        "#!/bin/bash\ncase \"$1\" in save) printf '%s\\n' 'create E2E-UNRELATED hash:ip';; list) printf '%s\\n' '192.0.2.239';; *) exit 0;; esac\n",
+    );
+    executable(
+        &fake_bin.join("ip"),
+        "#!/bin/bash\nprintf '%s\\n' \"$*\" >> \"$FAKE_CALLS\"\nexit 1\n",
+    );
+    let error = "firewall operation failed: firewall command failed `iptables -w 5 -S kidobo-input` with status Exited(1): iptables v1.8.9 (nf_tables): chain `kidobo-input' in table `filter' is incompatible, use 'nft' tool.";
+    let error_shell = error.replace('\'', "'\\''");
+    executable(
+        &fake_bin.join("kidobo"),
+        &format!(
+            "#!/bin/bash\nprintf 'kidobo %s\\n' \"$*\" >> \"$FAKE_CALLS\"\ncase \"$FAKE_SYNC_RESULT\" in healthy) exit 0;; expected) printf '%s\\n' '{error_shell}' >&2; exit 1;; unexpected) printf '%s\\n' 'firewall operation failed: permission denied' >&2; exit 1;; esac\n"
+        ),
+    );
+    let config = temp.path().join("config.toml");
+    let blocklist = temp.path().join("blocklist.txt");
+    let temporary = temp.path().join("temporary-bans.toml");
+    let preserved_config = temp.path().join("config.preserved");
+    let preserved_blocklist = temp.path().join("blocklist.preserved");
+    let preserved_temporary = temp.path().join("temporary.preserved");
+    fs::write(&config, "[ipset]\nset_name = 'test'\n").expect("write test config");
+    fs::write(&blocklist, "198.51.100.1\n").expect("write test blocklist");
+    fs::write(&temporary, "[bans]\nitems = []\n").expect("write test temporary bans");
+    fs::copy(&config, &preserved_config).expect("preserve test config");
+    fs::copy(&blocklist, &preserved_blocklist).expect("preserve test blocklist");
+    fs::copy(&temporary, &preserved_temporary).expect("preserve test temporary bans");
+
+    let calls = temp.path().join("baseline-calls.log");
+    let mut script = String::from("#!/bin/bash\nset -euo pipefail\n");
+    writeln!(script, "PATH='{}':$PATH", fake_bin.display()).expect("write fake PATH");
+    writeln!(script, "STATE='{}'", state.display()).expect("write state path");
+    writeln!(script, "CONFIG='{}'", config.display()).expect("write config path");
+    writeln!(script, "BLOCKLIST='{}'", blocklist.display()).expect("write blocklist path");
+    writeln!(script, "TEMPORARY='{}'", temporary.display()).expect("write temporary path");
+    writeln!(script, "CALLS='{}'", calls.display()).expect("write call log path");
+    writeln!(script, "FAKE_CALLS='{}'", calls.display()).expect("write fake call log path");
+    script.push_str("ROOT=/opt/kidobo-e2e\nSET4=kidobo-e2e\nSET6=kidobo-e2e-v6\nTEST_NS=kidobo-e2e\nV4_HOST=198.18.77.1\nV6_HOST=fd42:6b69:646f:626f::1\nTRAFFIC_PORT=39471\n");
+    writeln!(script, "FAKE_SYNC_RESULT='{scenario}'").expect("write fake sync behavior");
+    let allow_recovery = i32::from(scenario != "healthy");
+    writeln!(script, "FAKE_ALLOW_RECOVERY='{allow_recovery}'")
+        .expect("write recovery guard behavior");
+    script.push_str("FAKE_ACTIVE_JUMP=0\nexport FAKE_CALLS FAKE_SYNC_RESULT FAKE_ACTIVE_JUMP FAKE_ALLOW_RECOVERY\n");
+    script.push_str("fail() { printf 'FAIL: %s\\n' \"$*\" >&2; exit 1; }\n");
+    script.push_str(&lifecycle_probe_function());
+    script.push('\n');
+    script.push_str(&lifecycle_upgrade_test_helpers());
+    script.push('\n');
+    script.push_str(
+        "debian12_baseline_recovery_allowed() { [[ \"${FAKE_ALLOW_RECOVERY:-0}\" == 1 ]]; }\n",
+    );
+    writeln!(
+        script,
+        "run_baseline_enforcement_check v0.14.3 '{}' '{}' '{}' '{}'\nprintf candidate-installed > '{}.candidate'\n",
+        preserved_config.display(),
+        preserved_blocklist.display(),
+        preserved_temporary.display(),
+        temporary.display(),
+        state.join("candidate").display()
+    )
+    .expect("write baseline flow invocation");
+    let script_path = temp.path().join("exercise-baseline-check.sh");
+    executable(&script_path, &script);
+    (script_path, calls)
+}
+
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "The extracted-shell regression covers the exact recovery gate and its rejected variants together"
+)]
+fn upgrade_recovery_guard_is_limited_to_recorded_debian12_baselines_and_error() {
+    let temp = TestDir::new();
+    let os_release = temp.path().join("os-release");
+    let stderr = temp.path().join("baseline-sync.stderr");
+    fs::write(&os_release, "ID=debian\nVERSION_ID=12\n").expect("write fake Debian os-release");
+    let diagnostic = "firewall operation failed: firewall command failed `iptables -w 5 -S kidobo-input` with status Exited(1): iptables v1.8.9 (nf_tables): chain `kidobo-input' in table `filter' is incompatible, use 'nft' tool.";
+    fs::write(&stderr, format!("{diagnostic}\n")).expect("write recorded baseline diagnostic");
+
+    let mut script = String::from("#!/bin/bash\nset -euo pipefail\n");
+    script.push_str(&lifecycle_baseline_recovery_functions());
+    script.push('\n');
+    writeln!(
+        script,
+        "debian12_baseline_recovery_allowed v0.14.3 '{}' 'iptables v1.8.9 (nf_tables)' 'ip6tables v1.8.9 (nf_tables)'",
+        os_release.display()
+    )
+    .expect("write positive recovery guard assertion");
+    writeln!(
+        script,
+        "debian12_baseline_recovery_allowed v0.14.2 '{}' 'iptables v1.8.9 (nf_tables)' 'ip6tables v1.8.9 (nf_tables)'",
+        os_release.display()
+    )
+    .expect("write earlier baseline recovery guard assertion");
+    writeln!(
+        script,
+        "! debian12_baseline_recovery_allowed v0.14.4 '{}' 'iptables v1.8.9 (nf_tables)' 'ip6tables v1.8.9 (nf_tables)'",
+        os_release.display()
+    )
+    .expect("write version guard assertion");
+    writeln!(
+        script,
+        "! debian12_baseline_recovery_allowed v0.14.3 '{}' 'iptables v1.8.9 (nf_tables)' 'ip6tables v1.8.9 (legacy)'",
+        os_release.display()
+    )
+    .expect("write backend guard assertion");
+    let non_debian = temp.path().join("ubuntu-release");
+    fs::write(&non_debian, "ID=ubuntu\nVERSION_ID=24.04\n").expect("write fake Ubuntu os-release");
+    writeln!(
+        script,
+        "! debian12_baseline_recovery_allowed v0.14.3 '{}' 'iptables v1.8.9 (nf_tables)' 'ip6tables v1.8.9 (nf_tables)'",
+        non_debian.display()
+    )
+    .expect("write distro guard assertion");
+    let wrong_debian_release = temp.path().join("debian-release");
+    fs::write(&wrong_debian_release, "ID=debian\nVERSION_ID=13\n")
+        .expect("write fake Debian 13 os-release");
+    writeln!(
+        script,
+        "! debian12_baseline_recovery_allowed v0.14.3 '{}' 'iptables v1.8.9 (nf_tables)' 'ip6tables v1.8.9 (nf_tables)'",
+        wrong_debian_release.display()
+    )
+    .expect("write release guard assertion");
+    writeln!(
+        script,
+        "baseline_missing_chain_diagnostic_matches 1 '{}'",
+        stderr.display()
+    )
+    .expect("write positive diagnostic assertion");
+    writeln!(
+        script,
+        "! baseline_missing_chain_diagnostic_matches 2 '{}'",
+        stderr.display()
+    )
+    .expect("write status guard assertion");
+    let wrong_error = temp.path().join("wrong-error.stderr");
+    fs::write(&wrong_error, "iptables: permission denied\n").expect("write unrelated error");
+    writeln!(
+        script,
+        "! baseline_missing_chain_diagnostic_matches 1 '{}'",
+        wrong_error.display()
+    )
+    .expect("write diagnostic guard assertion");
+    writeln!(
+        script,
+        "! debian12_baseline_recovery_allowed v0.14.3 '{}' 'iptables v1.8.9 (legacy)' 'ip6tables v1.8.9 (nf_tables)'",
+        os_release.display()
+    )
+    .expect("write IPv4 backend guard assertion");
+    for (name, wrong) in [
+        (
+            "command",
+            diagnostic.replace("iptables -w 5 -S", "iptables -w 5 -C"),
+        ),
+        ("status", diagnostic.replace("Exited(1)", "Exited(2)")),
+        (
+            "chain",
+            diagnostic.replace("kidobo-input", "kidobo-input-stage"),
+        ),
+        ("table", diagnostic.replace("table `filter'", "table `nat'")),
+    ] {
+        let path = temp.path().join(format!("wrong-{name}.stderr"));
+        fs::write(&path, format!("{wrong}\n")).expect("write altered diagnostic");
+        writeln!(
+            script,
+            "! baseline_missing_chain_diagnostic_matches 1 '{}'",
+            path.display()
+        )
+        .expect("write exact-line diagnostic assertion");
+    }
+
+    let script_path = temp.path().join("exercise-baseline-recovery-guard.sh");
+    executable(&script_path, &script);
+    let mut runner = runner(temp.path());
+    if let Err(error) = runner.command("bash", &[script_path.to_string_lossy().into_owned()], 5) {
+        let stderr = command_output(temp.path(), 1, "stderr").unwrap_or_default();
+        panic!(
+            "only the recorded Debian 12 failure should qualify for recovery: {error}; {stderr}"
+        );
+    }
+}
+
+#[test]
+fn upgrade_recovery_requires_baseline_firewall_to_have_no_kidobo_input_jump() {
+    let temp = TestDir::new();
+    let fake_bin = temp.path().join("bin");
+    fs::create_dir(&fake_bin).expect("create fake firewall command directory");
+    for binary in ["iptables-save", "ip6tables-save"] {
+        executable(
+            &fake_bin.join(binary),
+            "#!/bin/bash\nprintf '%s\\n' \"${FAKE_FIREWALL_RULES:-}\"\n",
+        );
+    }
+
+    let mut script = String::from("#!/bin/bash\nset -euo pipefail\n");
+    writeln!(script, "PATH='{}':$PATH", fake_bin.display()).expect("write fake PATH");
+    script.push_str("fail() { printf 'FAIL: %s\\n' \"$*\" >&2; exit 1; }\n");
+    script.push_str(&lifecycle_baseline_recovery_functions());
+    script.push('\n');
+    script.push_str("FAKE_FIREWALL_RULES='-A INPUT -j E2E-UNRELATED-SENTINEL'\nexport FAKE_FIREWALL_RULES\nassert_no_managed_firewall_jumps\n");
+    let clean_script = temp.path().join("exercise-clean-baseline-firewall.sh");
+    executable(&clean_script, &script);
+
+    let mut runner = runner(temp.path());
+    runner
+        .command("bash", &[clean_script.to_string_lossy().into_owned()], 5)
+        .expect("unrelated rules without a Kidobo jump should be accepted");
+
+    script.push_str("FAKE_FIREWALL_RULES='-A INPUT -j kidobo-input'\nexport FAKE_FIREWALL_RULES\nassert_no_managed_firewall_jumps\n");
+    let active_script = temp.path().join("exercise-active-baseline-firewall.sh");
+    executable(&active_script, &script);
+    let error = runner
+        .command("bash", &[active_script.to_string_lossy().into_owned()], 5)
+        .expect_err("a managed INPUT jump must reject the recovery path");
+    assert!(error.to_string().contains("exited exit status: 1"));
+    let stderr = command_output(temp.path(), 2, "stderr").expect("read rejection output");
+    assert!(stderr.contains("shows active Kidobo enforcement"));
+}
+
+#[test]
+fn upgrade_firewall_evidence_capture_fails_for_each_unavailable_save_command() {
+    for failing in ["ipset", "iptables-save", "ip6tables-save"] {
+        let temp = TestDir::new();
+        let fake_bin = temp.path().join("bin");
+        fs::create_dir(&fake_bin).expect("create fake save-command directory");
+        executable(
+            &fake_bin.join("ipset"),
+            "#!/bin/bash\n[[ \"$1\" != save || \"$FAIL_CAPTURE\" != ipset ]] || exit 7\nprintf 'set evidence\\n'\n",
+        );
+        executable(
+            &fake_bin.join("iptables-save"),
+            "#!/bin/bash\n[[ \"$FAIL_CAPTURE\" != iptables-save ]] || exit 8\nprintf 'v4 evidence\\n'\n",
+        );
+        executable(
+            &fake_bin.join("ip6tables-save"),
+            "#!/bin/bash\n[[ \"$FAIL_CAPTURE\" != ip6tables-save ]] || exit 9\nprintf 'v6 evidence\\n'\n",
+        );
+        let mut script = String::from("#!/bin/bash\nset -euo pipefail\n");
+        writeln!(script, "PATH='{}':$PATH", fake_bin.display()).expect("write fake PATH");
+        writeln!(script, "FAIL_CAPTURE='{failing}'").expect("write failing command");
+        script
+            .push_str("export FAIL_CAPTURE\nfail() { printf 'FAIL: %s\\n' \"$*\" >&2; exit 1; }\n");
+        script.push_str(&lifecycle_upgrade_test_helpers());
+        script.push('\n');
+        writeln!(
+            script,
+            "capture_upgrade_firewall_evidence '{}'",
+            temp.path().join("firewall-evidence.txt").display()
+        )
+        .expect("write evidence capture call");
+        let script_path = temp.path().join("exercise-firewall-capture.sh");
+        executable(&script_path, &script);
+        let mut runner = runner(temp.path());
+
+        let error = runner
+            .command("bash", &[script_path.to_string_lossy().into_owned()], 5)
+            .expect_err("save failure must abort evidence capture");
+        assert!(error.to_string().contains("exited exit status: 1"));
+        let stderr = command_output(temp.path(), 1, "stderr").expect("read capture failure");
+        let expected_error = if failing == "ipset" {
+            "ipset save failed while capturing firewall evidence".to_owned()
+        } else {
+            format!("{failing} failed while capturing firewall evidence")
+        };
+        assert!(
+            stderr.contains(&expected_error),
+            "wrong failure for {failing}: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn baseline_check_keeps_healthy_dual_stack_enforcement_probes() {
+    let temp = TestDir::new();
+    let (script, calls) = fake_baseline_check_script(&temp, "healthy");
+    let mut runner = runner(temp.path());
+
+    if let Err(error) = runner.command("bash", &[script.to_string_lossy().into_owned()], 5) {
+        let stderr = command_output(temp.path(), 1, "stderr").unwrap_or_default();
+        panic!("healthy baseline sync and both enforcement probes should pass: {error}; {stderr}");
+    }
+
+    let calls = read_text(&calls).expect("read fake baseline calls");
+    assert!(calls.contains(
+        "netns exec kidobo-e2e python3 /opt/kidobo-e2e/traffic.py probe 198.18.77.1 39471"
+    ));
+    assert!(calls.contains("netns exec kidobo-e2e python3 /opt/kidobo-e2e/traffic.py probe fd42:6b69:646f:626f::1 39471"));
+    assert_eq!(
+        read_text(&temp.path().join("baseline-state/baseline-sync.status"))
+            .expect("read baseline status"),
+        "0\n"
+    );
+    assert!(
+        !temp
+            .path()
+            .join("baseline-state/upgrade-recovery.txt")
+            .exists()
+    );
+    assert!(
+        temp.path()
+            .join("baseline-state/candidate.candidate")
+            .exists()
+    );
+}
+
+#[test]
+fn baseline_check_accepts_only_exact_recovery_and_preserves_evidence_and_state() {
+    let temp = TestDir::new();
+    let (script, calls) = fake_baseline_check_script(&temp, "expected");
+    let mut runner = runner(temp.path());
+
+    if let Err(error) = runner.command("bash", &[script.to_string_lossy().into_owned()], 5) {
+        let stderr = command_output(temp.path(), 1, "stderr").unwrap_or_default();
+        let sync_error =
+            read_text(&temp.path().join("baseline-state/baseline-sync.stderr")).unwrap_or_default();
+        panic!(
+            "exact known failure should proceed to candidate recovery: {error}; {stderr}; sync: {sync_error}"
+        );
+    }
+
+    let state = temp.path().join("baseline-state");
+    let calls = read_text(&calls).expect("read fake baseline calls");
+    assert!(
+        calls.contains("kidobo sync"),
+        "baseline sync must always run"
+    );
+    assert!(calls.contains("-C INPUT -j E2E-UNRELATED-SENTINEL"));
+    assert_eq!(
+        read_text(&state.join("baseline-sync.status")).unwrap(),
+        "1\n"
+    );
+    assert!(
+        read_text(&state.join("baseline-sync.stderr"))
+            .unwrap()
+            .contains("iptables -w 5 -S kidobo-input")
+    );
+    assert!(state.join("baseline-firewall-before.txt").is_file());
+    assert!(state.join("baseline-firewall-after.txt").is_file());
+    assert!(
+        read_text(&state.join("upgrade-recovery.txt"))
+            .unwrap()
+            .contains("candidate enforcement is required next")
+    );
+    assert!(state.join("candidate.candidate").is_file());
+    for (live, saved) in [
+        ("config.toml", "config.preserved"),
+        ("blocklist.txt", "blocklist.preserved"),
+        ("temporary-bans.toml", "temporary.preserved"),
+    ] {
+        assert_eq!(
+            read_text(&temp.path().join(live)).unwrap(),
+            read_text(&temp.path().join(saved)).unwrap()
+        );
+    }
+}
+
+#[test]
+fn baseline_check_aborts_on_unexpected_error_before_candidate_install() {
+    let temp = TestDir::new();
+    let (script, _) = fake_baseline_check_script(&temp, "unexpected");
+    let mut runner = runner(temp.path());
+
+    let error = runner
+        .command("bash", &[script.to_string_lossy().into_owned()], 5)
+        .expect_err("unexpected baseline sync errors must abort before candidate install");
+
+    assert!(error.to_string().contains("exited exit status: 1"));
+    let state = temp.path().join("baseline-state");
+    let stderr = command_output(temp.path(), 1, "stderr").expect("read phase failure");
+    assert!(
+        stderr.contains("published baseline sync failed unexpectedly"),
+        "unexpected fake baseline error: {stderr}"
+    );
+    assert_eq!(
+        read_text(&state.join("baseline-sync.status")).unwrap(),
+        "1\n"
+    );
+    assert!(!state.join("candidate.candidate").exists());
+    assert!(!state.join("upgrade-recovery.txt").exists());
+}
+
+fn fake_namespace_runner_script(temp: &TestDir, network_manager_state: &str) -> (PathBuf, PathBuf) {
+    let fake_bin = temp.path().join("bin");
+    let call_log = temp.path().join("namespace-calls.log");
+    fs::create_dir(&fake_bin).expect("create fake namespace bin directory");
+    executable(
+        &fake_bin.join("ip"),
+        r#"#!/bin/bash
+set -eu
+printf 'ip %s\n' "$*" >> "$CALL_LOG"
+"#,
+    );
+    executable(
+        &fake_bin.join("nmcli"),
+        r#"#!/bin/bash
+set -eu
+printf 'nmcli %s\n' "$*" >> "$CALL_LOG"
+case "$*" in
+  '-g RUNNING general') printf 'running\n' ;;
+  '-g GENERAL.DEVICE device show ke2eh0') printf 'ke2eh0\n' ;;
+  '-w 10 device set ke2eh0 managed no') ;;
+  '-g GENERAL.STATE device show ke2eh0') printf '%s\n' "$FAKE_NM_STATE" ;;
+  *) printf 'unexpected nmcli call: %s\n' "$*" >&2; exit 91 ;;
+esac
+"#,
+    );
+
+    let mut script = String::from("#!/bin/bash\nset -euo pipefail\n");
+    writeln!(script, "PATH='{}':$PATH", fake_bin.display()).expect("write fake PATH");
+    writeln!(script, "CALL_LOG='{}'", call_log.display()).expect("write call log path");
+    writeln!(script, "FAKE_NM_STATE='{network_manager_state}'")
+        .expect("write fake NetworkManager state");
+    script.push_str("export CALL_LOG FAKE_NM_STATE\n");
+    script.push_str(
+        "TEST_NS=kidobo-e2e\nHOST_IF=ke2eh0\nPEER_IF=ke2ep0\nV4_HOST=198.18.77.1\nV4_PEER=198.18.77.2\nV6_HOST=fd42:6b69:646f:626f::1\nV6_PEER=fd42:6b69:646f:626f::2\n",
+    );
+    script.push_str(
+        r#"
+fail() { printf 'e2e lifecycle: %s\n' "$*" >&2; exit 1; }
+ensure_clean_namespace() { printf 'ensure-clean\n' >> "$CALL_LOG"; }
+"#,
+    );
+    script.push_str(&lifecycle_setup_namespace_function());
+    script.push_str("\nsetup_namespace\n");
+    let script_path = temp.path().join("exercise-namespace-setup.sh");
+    executable(&script_path, &script);
+    (script_path, call_log)
+}
+
+fn fake_traffic_runner_script(temp: &TestDir, failing_address: Option<&str>) -> PathBuf {
+    let state = temp.path().join("state");
+    let fake_bin = temp.path().join("bin");
+    fs::create_dir(&state).expect("create fake fixture state directory");
+    fs::create_dir(&fake_bin).expect("create fake fixture bin directory");
+    let python = fake_bin.join("python3");
+    executable(
+        &python,
+        r#"#!/bin/bash
+set -euo pipefail
+if [[ "$2" != serve || $# -ne 5 ]]; then
+  printf 'unexpected fake python3 arguments: %s\n' "$*" >&2
+  exit 90
+fi
+if [[ "${FAKE_FAIL_ADDRESS:-}" == "$3" ]]; then
+  printf 'deliberate fixture startup failure for %s\n' "$3" >&2
+  exit 23
+fi
+printf 'ready\n' > "$5"
+exec -a "$1 $2 $3 $4" sleep 30
+"#,
+    );
+
+    let mut script = String::from("#!/bin/bash\nset -euo pipefail\n");
+    writeln!(script, "ROOT='{}'", temp.path().display()).expect("write fake root");
+    writeln!(script, "STATE='{}'", state.display()).expect("write fake state path");
+    writeln!(script, "PATH='{}':$PATH", fake_bin.display()).expect("write fake PATH");
+    script.push_str("V4_HOST=198.18.77.1\nV6_HOST=fd42:6b69:646f:626f::1\nTRAFFIC_PORT=39471\n");
+    if let Some(address) = failing_address {
+        writeln!(script, "FAKE_FAIL_ADDRESS='{address}'").expect("write failing address");
+        script.push_str("export FAKE_FAIL_ADDRESS\n");
+    }
+    script.push_str(
+        r#"
+fail() { printf 'e2e lifecycle: %s\n' "$*" >&2; exit 1; }
+stop_fixture() { :; }
+cleanup_fakes() {
+  for pid_file in "$STATE"/server-*.pid; do
+    [[ -f "$pid_file" ]] || continue
+    pid=$(<"$pid_file")
+    kill "$pid" >/dev/null 2>&1 || true
+    wait "$pid" >/dev/null 2>&1 || true
+  done
+}
+trap cleanup_fakes EXIT
+"#,
+    );
+    script.push_str(&lifecycle_traffic_server_function());
+    script.push_str(
+        r#"
+start_traffic_servers
+for address in "$V4_HOST" "$V6_HOST"; do
+  if [[ "$address" == *:* ]]; then label=v6; else label=v4; fi
+  pid=$(<"$STATE/server-$label.pid")
+  [[ -s "$STATE/server-$label.ready" ]] || fail "$label fixture did not publish readiness"
+  [[ -r "/proc/$pid/cmdline" ]] || fail "$label fixture proc cmdline is unreadable"
+  [[ ! -s "/proc/$pid/cmdline" ]] || fail "$label fixture expected proc cmdline st_size to be zero"
+  cmdline=$(tr '\0' ' ' < "/proc/$pid/cmdline")
+  [[ "$cmdline" == *"$ROOT/traffic.py serve $address $TRAFFIC_PORT"* ]] || fail "$label fixture PID does not match expected command"
+done
+"#,
+    );
+    let script_path = temp.path().join("exercise-traffic-servers.sh");
+    executable(&script_path, &script);
+    script_path
+}
+
+#[test]
+fn guest_traffic_server_readiness_uses_proc_content_not_file_size() {
+    let temp = TestDir::new();
+    let script = fake_traffic_runner_script(&temp, None);
+    let mut runner = runner(temp.path());
+
+    runner
+        .command("bash", &[script.to_string_lossy().into_owned()], 5)
+        .expect("both fake traffic servers should become ready");
+}
+
+#[test]
+fn guest_traffic_server_startup_failure_is_reported_and_cleaned_up() {
+    let temp = TestDir::new();
+    let script = fake_traffic_runner_script(&temp, Some("fd42:6b69:646f:626f::1"));
+    let mut runner = runner(temp.path());
+
+    let error = runner
+        .command("bash", &[script.to_string_lossy().into_owned()], 5)
+        .expect_err("a fixture child that exits before readiness must fail the phase");
+
+    let stderr = command_output(temp.path(), 1, "stderr").expect("read startup failure log");
+    assert!(
+        error.to_string().contains("exited exit status: 1"),
+        "unexpected runner error: {error}; stderr: {stderr}"
+    );
+    assert!(stderr.contains("traffic fixture v6 exited before readiness"));
+    assert!(stderr.contains("deliberate fixture startup failure"));
+    assert!(temp.path().join("state/server-v4.ready").exists());
+    assert!(!temp.path().join("state/server-v6.ready").exists());
+}
+
+#[test]
+fn guest_namespace_setup_unmanages_host_veth_before_assigning_addresses() {
+    let temp = TestDir::new();
+    let (script, call_log) = fake_namespace_runner_script(&temp, "10 (unmanaged)");
+    let mut runner = runner(temp.path());
+
+    runner
+        .command("bash", &[script.to_string_lossy().into_owned()], 5)
+        .expect("namespace setup should succeed after NetworkManager releases the veth");
+
+    let calls = read_text(&call_log).expect("read fake network command log");
+    let managed = calls
+        .lines()
+        .position(|line| line == "nmcli -w 10 device set ke2eh0 managed no")
+        .expect("NetworkManager managed=no call");
+    let host_address = calls
+        .lines()
+        .position(|line| line == "ip addr add 198.18.77.1/30 dev ke2eh0")
+        .expect("host IPv4 address assignment");
+    assert!(
+        managed < host_address,
+        "NetworkManager call must precede address assignment:\n{calls}"
+    );
+    assert!(calls.contains("ip -6 addr add fd42:6b69:646f:626f::1/64 dev ke2eh0 nodad"));
+    assert!(calls.contains("ip netns exec kidobo-e2e ip addr add 198.18.77.2/30 dev ke2ep0"));
+}
+
+#[test]
+fn guest_namespace_setup_stops_before_addressing_when_nm_state_is_not_unmanaged() {
+    let temp = TestDir::new();
+    let (script, call_log) = fake_namespace_runner_script(&temp, "100 (connecting)");
+    let mut runner = runner(temp.path());
+
+    let error = runner
+        .command("bash", &[script.to_string_lossy().into_owned()], 5)
+        .expect_err("namespace setup must fail if NetworkManager has not released the veth");
+
+    assert!(error.to_string().contains("exited exit status: 1"));
+    let stderr = command_output(temp.path(), 1, "stderr").expect("read namespace failure log");
+    assert!(stderr.contains("NetworkManager still manages the fixture veth"));
+    let calls = read_text(&call_log).expect("read fake network command log");
+    assert!(
+        !calls.contains("addr add"),
+        "no addresses may be assigned before unmanaged state:\n{calls}"
+    );
+}
+
 fn runner(dir: &Path) -> Runner {
     Runner {
         project: "test-project".into(),
         dir: dir.to_path_buf(),
         incus_program: PathBuf::from("incus"),
         cancelled: Arc::new(AtomicBool::new(false)),
-        sequence: 0,
+        report: Report::open(dir).expect("open test report"),
     }
 }
 
@@ -350,17 +1058,16 @@ fn runner_records_nonzero_exit_and_keeps_both_output_streams() {
         .expect_err("nonzero command must fail");
 
     assert!(error.to_string().contains("exited exit status: 17"));
-    let stem = temp.path().join("0001");
     assert_eq!(
-        read_text(&stem.with_extension("stdout")).expect("read stdout log"),
+        command_output(temp.path(), 1, "stdout").expect("read stdout log"),
         "stdout evidence\n"
     );
     assert_eq!(
-        read_text(&stem.with_extension("stderr")).expect("read stderr log"),
+        command_output(temp.path(), 1, "stderr").expect("read stderr log"),
         "stderr evidence\n"
     );
     let metadata: serde_json::Value = serde_json::from_str(
-        &read_text(&stem.with_extension("json")).expect("read command metadata"),
+        &command_metadata_text(temp.path(), 1).expect("read command metadata"),
     )
     .expect("parse command metadata");
     assert_eq!(metadata["code"], 17);
@@ -381,10 +1088,9 @@ fn runner_records_spawn_failure_metadata() {
         .expect_err("missing program must fail");
 
     assert!(error.to_string().contains("failed to start"));
-    let metadata: serde_json::Value = serde_json::from_str(
-        &read_text(&temp.path().join("0001.json")).expect("read spawn metadata"),
-    )
-    .expect("parse spawn metadata");
+    let metadata: serde_json::Value =
+        serde_json::from_str(&command_metadata_text(temp.path(), 1).expect("read spawn metadata"))
+            .expect("parse spawn metadata");
     assert_eq!(metadata["code"], serde_json::Value::Null);
     assert!(
         metadata["error"]
@@ -418,7 +1124,7 @@ fn runner_timeout_kills_descendants_in_its_process_group() {
 
     assert!(error.to_string().contains("timed out"));
     let metadata: serde_json::Value = serde_json::from_str(
-        &read_text(&temp.path().join("0001.json")).expect("read timeout metadata"),
+        &command_metadata_text(temp.path(), 1).expect("read timeout metadata"),
     )
     .expect("parse timeout metadata");
     assert_eq!(metadata["args"], json!(["--probe"]));
@@ -447,7 +1153,7 @@ fn runner_records_interruption_metadata() {
 
     assert!(error.to_string().contains("interrupted"));
     let metadata: serde_json::Value = serde_json::from_str(
-        &read_text(&temp.path().join("0001.json")).expect("read interruption metadata"),
+        &command_metadata_text(temp.path(), 1).expect("read interruption metadata"),
     )
     .expect("parse interruption metadata");
     assert_eq!(metadata["code"], serde_json::Value::Null);
@@ -475,9 +1181,9 @@ fn runner_reports_stdout_larger_than_capture_limit() {
             .contains("stdout exceeds the 16777216-byte capture limit")
     );
     assert_eq!(
-        fs::metadata(temp.path().join("0001.stdout"))
-            .expect("inspect full stdout log")
-            .len(),
+        runner.report.document["commands"][0]["stdout_bytes"]
+            .as_u64()
+            .expect("stdout byte count"),
         16 * 1024 * 1024 + 1
     );
 }
@@ -541,12 +1247,18 @@ fn rendered_summary_includes_target_state_and_image_fingerprint() {
         "diagnostic_errors": [],
     })];
 
-    let summary = render_summary("v1.2.3", Some("sha256:archive"), &results);
-
-    assert!(summary.contains("Kidobo distro E2E run for v1.2.3"));
-    assert!(summary.contains("Archive SHA-256: sha256:archive"));
-    assert!(summary.contains("debian-13: PASS (application, 12.5s)"));
-    assert!(summary.contains("image=debian/13 base_image=sha256:abc123"));
+    let temp = TestDir::new();
+    let mut report = Report::open(temp.path()).expect("open report");
+    report.document["tag"] = json!("v1.2.3");
+    report.document["archive_sha256"] = json!("sha256:archive");
+    report.document["results"] = json!(results);
+    report.save().expect("save summary");
+    let summary = read_text(&temp.path().join("summary.txt")).expect("read summary");
+    assert!(summary.contains("tag: v1.2.3"));
+    assert!(summary.contains("sha256:archive"));
+    assert!(summary.contains("debian-13: PASS"));
+    assert!(summary.contains("debian/13"));
+    assert!(summary.contains("sha256:abc123"));
 }
 
 #[test]
@@ -682,4 +1394,166 @@ fn create_vm_refuses_agent_disk_and_start_when_ownership_check_fails() {
     assert_eq!(calls.len(), 2, "only init and verification may run");
     assert!(calls[0].contains("<init><images:alma/10><vm-unowned>"));
     assert!(calls[1].contains("<list><vm-unowned><--format=json>"));
+}
+
+#[test]
+fn runner_streams_both_outputs_before_command_completes() {
+    let temp = TestDir::new();
+    let root = temp.path().to_owned();
+    let release = root.join("release");
+    let child_root = root.clone();
+    let handle = std::thread::spawn(move || {
+        let mut runner = runner(&child_root);
+        let result = runner.command("sh", &strings(&["-c",
+            "printf partial; printf diagnostic >&2; while [ ! -f \"$1\" ]; do sleep 0.01; done; printf done", "sh",
+            child_root.join("release").to_str().expect("fixture path")]), 5);
+        (result.map_err(|e| e.to_string()), runner.report.document)
+    });
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let streamed = loop {
+        let text = read_text(&root.join("transcript.log")).unwrap_or_default();
+        if text.contains("stdout] partial") && text.contains("stderr] diagnostic") {
+            break true;
+        }
+        if Instant::now() > deadline {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let incomplete = !handle.is_finished();
+    fs::write(release, "release").expect("release fake command");
+    let (result, document) = handle.join().expect("join fake runner");
+    assert!(
+        streamed && incomplete,
+        "both partial streams must be visible before exit"
+    );
+    assert_eq!(result.expect("successful command"), "partialdone");
+    assert_eq!(document["commands"][0]["code"], 0);
+    assert!(!root.join(".capture").exists());
+    assert!(!root.join("0001.stdout").exists());
+}
+
+#[test]
+fn heartbeat_uses_silence_and_repeat_intervals_without_sleeping() {
+    let mut heartbeat = Heartbeat::default();
+    assert!(!heartbeat.due(Duration::from_secs(14), false));
+    assert!(heartbeat.due(Duration::from_secs(15), false));
+    assert!(!heartbeat.due(Duration::from_secs(29), false));
+    assert!(heartbeat.due(Duration::from_secs(30), false));
+    assert!(!heartbeat.due(Duration::from_secs(44), true));
+    assert!(!heartbeat.due(Duration::from_secs(58), false));
+    assert!(heartbeat.due(Duration::from_secs(59), false));
+}
+
+#[test]
+fn runner_rejects_successful_exit_with_an_aborted_check() {
+    let temp = TestDir::new();
+    let mut runner = runner(temp.path());
+    let error = runner
+        .command(
+            "sh",
+            &strings(&[
+                "-c",
+                "printf 'E2E_CHECK\tunfinished\tSTART\texpect a result\n' >&2",
+            ]),
+            5,
+        )
+        .expect_err("missing assertion outcome cannot pass");
+    assert!(error.to_string().contains("unfinished"));
+    assert_eq!(runner.report.document["checks"][0]["status"], "failed");
+    assert_eq!(runner.report.document["commands"][0]["code"], 0);
+}
+
+#[test]
+fn runner_archives_raw_evidence_and_leaves_five_files() {
+    let temp = TestDir::new();
+    let mut runner = runner(temp.path());
+    fs::create_dir_all(runner.evidence().join("inputs")).expect("create frozen inputs");
+    let snapshot = runner.evidence().join("inputs/SHA256.json");
+    fs::write(&snapshot, "{\"fixture\":\"hash\"}\n").expect("write frozen evidence");
+    fs::write(runner.dir.join("ownership.json"), "{}").expect("ownership fixture");
+    runner.command("true", &[], 5).expect("silent fake command");
+    archive_evidence(&mut runner).expect("archive local fixture only");
+    runner.report.save().expect("save report");
+    let mut files: Vec<_> = fs::read_dir(temp.path())
+        .expect("read results")
+        .map(|entry| entry.expect("entry").file_name())
+        .collect();
+    files.sort();
+    assert_eq!(
+        files,
+        [
+            "evidence.tar.gz",
+            "ownership.json",
+            "results.json",
+            "summary.txt",
+            "transcript.log"
+        ]
+        .map(std::ffi::OsString::from)
+    );
+    let extracted = Command::new("tar")
+        .args(["-xOf"])
+        .arg(temp.path().join("evidence.tar.gz"))
+        .arg("./inputs/SHA256.json")
+        .output()
+        .expect("read archived snapshot");
+    assert!(extracted.status.success());
+    assert_eq!(extracted.stdout, b"{\"fixture\":\"hash\"}\n");
+    assert_eq!(
+        runner.report.document["evidence"]["sha256"],
+        hash(&temp.path().join("evidence.tar.gz")).expect("archive hash")
+    );
+}
+
+#[test]
+fn runner_keeps_evidence_when_archiving_fails() {
+    let temp = TestDir::new();
+    let mut runner = runner(temp.path());
+    fs::create_dir_all(runner.evidence()).expect("create evidence");
+    let snapshot = runner.evidence().join("snapshot");
+    fs::write(&snapshot, "important evidence").expect("write snapshot");
+    assert!(archive_evidence_using(&mut runner, "false").is_err());
+    assert_eq!(
+        read_text(&snapshot).expect("retained snapshot"),
+        "important evidence"
+    );
+    assert!(!runner.dir.join("evidence.tar.gz").exists());
+}
+
+#[test]
+fn runner_cleanup_preserves_legacy_results_and_ignores_stale_captures() {
+    let temp = TestDir::new();
+    let root = temp.path().join("run-123");
+    fs::create_dir(&root).expect("legacy run");
+    fs::create_dir(root.join(".capture")).expect("capture left by a killed old runner");
+    fs::write(root.join("0001.stdout"), "old raw evidence").expect("old log");
+    let original_result =
+        json!({"tag":"v1.2.3", "results":[{"distro":"debian-13","error":"original failure"}]});
+    fs::write(
+        root.join("results.json"),
+        serde_json::to_vec(&original_result).expect("serialize"),
+    )
+    .expect("legacy results");
+    fs::write(
+        root.join("ownership.json"),
+        serde_json::to_vec(&Owned {
+            owner: OWNER.into(),
+            project: "test-project".into(),
+            instances: vec!["run-123-debian-13".into()],
+        })
+        .expect("serialize ownership"),
+    )
+    .expect("legacy ownership");
+    let (program, _) = fake_incus(&temp);
+    let mut runner = runner_with_incus(&root, &program);
+    clean(&mut runner, &setup_config()).expect("already deleted guest cleans successfully");
+    assert_eq!(
+        runner.report.document["results"],
+        original_result["results"]
+    );
+    assert_eq!(
+        read_text(&root.join("0001.stdout")).expect("old evidence"),
+        "old raw evidence"
+    );
+    assert_eq!(runner.report.document["commands"][0]["code"], 0);
 }

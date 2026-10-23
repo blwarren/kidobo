@@ -122,6 +122,19 @@ pub fn chain_exists(
         return Ok(false);
     }
 
+    // Older iptables-nft versions use this diagnostic for both absent and genuinely
+    // incompatible chains. Only a successful full listing can establish absence.
+    if is_ambiguous_chain_result(&result, binary, chain_name) {
+        let listing = run_checked(runner, binary, &["-S"])?;
+        let declared = listing.stdout.lines().any(|line| {
+            let mut fields = line.split_whitespace();
+            matches!(fields.next(), Some("-N" | "-P")) && fields.next() == Some(chain_name)
+        });
+        if !declared {
+            return Ok(false);
+        }
+    }
+
     Err(FirewallError::CommandFailed {
         command: display_command(binary, &args),
         status: result.status,
@@ -418,6 +431,18 @@ fn is_missing_chain_result(result: &CommandResult) -> bool {
             .stderr
             .to_ascii_lowercase()
             .contains("no chain/target/match by that name")
+}
+
+fn is_ambiguous_chain_result(result: &CommandResult, binary: &str, chain_name: &str) -> bool {
+    let prefix = format!("{binary} v");
+    let suffix = format!(
+        "(nf_tables): chain `{chain_name}' in table `filter' is incompatible, use 'nft' tool."
+    );
+    result.status.code() == Some(1)
+        && result
+            .stderr
+            .lines()
+            .any(|line| line.starts_with(&prefix) && line.ends_with(&suffix))
 }
 
 #[cfg(test)]
@@ -742,6 +767,23 @@ mod tests {
         }
     }
 
+    fn nft_incompatible_chain(binary: &str, chain_name: &str) -> CommandResult {
+        CommandResult {
+            status: ProcessStatus::Exited(1),
+            stdout: String::new(),
+            stderr: format!(
+                "{binary} v1.8.9 (nf_tables): chain `{chain_name}' in table `filter' is incompatible, use 'nft' tool.\n"
+            ),
+        }
+    }
+
+    fn listed_rules(stdout: &str) -> CommandResult {
+        CommandResult {
+            stdout: stdout.to_string(),
+            ..ok(0)
+        }
+    }
+
     #[test]
     fn chain_exists_maps_missing_chain_to_false() {
         let runner = MockRunner::new(vec![Ok(CommandResult {
@@ -757,6 +799,155 @@ mod tests {
             runner.invocations()[0].1,
             vec!["-w", "5", "-S", KIDOBO_CHAIN_NAME]
         );
+    }
+
+    #[test]
+    fn chain_exists_disambiguates_nft_absence_by_exact_declaration_for_both_families() {
+        for family in [FirewallFamily::Ipv4, FirewallFamily::Ipv6] {
+            for chain_name in [KIDOBO_CHAIN_NAME, KIDOBO_STAGING_CHAIN_NAME] {
+                let runner = MockRunner::new(vec![
+                    Ok(nft_incompatible_chain(family.binary(), chain_name)),
+                    Ok(listed_rules(&format!(
+                        "-P INPUT ACCEPT\n\n-N {chain_name}-other\n-A INPUT -m comment --comment {chain_name} -j ACCEPT\n"
+                    ))),
+                ]);
+
+                assert!(!chain_exists(&runner, family, chain_name).expect("confirmed absence"));
+                assert_eq!(
+                    runner.invocations(),
+                    vec![
+                        (
+                            family.binary().to_string(),
+                            vec!["-w".into(), "5".into(), "-S".into(), chain_name.into()]
+                        ),
+                        (
+                            family.binary().to_string(),
+                            vec!["-w".into(), "5".into(), "-S".into()]
+                        ),
+                    ]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn chain_exists_preserves_error_for_declared_incompatible_chain() {
+        for family in [FirewallFamily::Ipv4, FirewallFamily::Ipv6] {
+            let original = nft_incompatible_chain(family.binary(), KIDOBO_CHAIN_NAME);
+            let runner = MockRunner::new(vec![
+                Ok(original.clone()),
+                Ok(listed_rules("-P INPUT ACCEPT\n-N kidobo-input\n")),
+            ]);
+
+            let error = chain_exists(&runner, family, KIDOBO_CHAIN_NAME)
+                .expect_err("an existing incompatible chain is not absent");
+            assert!(matches!(
+                error,
+                FirewallError::CommandFailed { stderr, .. } if stderr == original.stderr
+            ));
+            assert_eq!(runner.invocations().len(), 2);
+        }
+    }
+
+    #[test]
+    fn chain_exists_propagates_failed_or_timed_out_full_listing() {
+        for inspection in [
+            Ok(command_failure("filter table is incompatible")),
+            Err(CommandRunnerError::Timeout {
+                command: "iptables -w 5 -S".into(),
+                timeout_ms: 30_000,
+            }),
+        ] {
+            let runner = MockRunner::new(vec![
+                Ok(nft_incompatible_chain("iptables", KIDOBO_CHAIN_NAME)),
+                inspection,
+            ]);
+
+            let error = chain_exists(&runner, FirewallFamily::Ipv4, KIDOBO_CHAIN_NAME)
+                .expect_err("unverified absence must fail");
+            assert!(error.to_string().contains("iptables -w 5 -S"));
+            assert_eq!(runner.invocations().len(), 2);
+        }
+    }
+
+    #[test]
+    fn chain_exists_does_not_reinterpret_other_failures() {
+        let ambiguous = nft_incompatible_chain("iptables", KIDOBO_CHAIN_NAME);
+        let failures = [
+            CommandResult {
+                status: ProcessStatus::Exited(2),
+                ..ambiguous.clone()
+            },
+            CommandResult {
+                stderr: ambiguous.stderr.replace("kidobo-input", "another-chain"),
+                ..ambiguous.clone()
+            },
+            CommandResult {
+                stderr: ambiguous.stderr.replace("`filter'", "`nat'"),
+                ..ambiguous.clone()
+            },
+            CommandResult {
+                stderr: ambiguous.stderr.replace("nf_tables", "legacy"),
+                ..ambiguous.clone()
+            },
+            nft_incompatible_chain("ip6tables", KIDOBO_CHAIN_NAME),
+            CommandResult {
+                status: ProcessStatus::Exited(1),
+                stderr: "Permission denied".into(),
+                ..ok(0)
+            },
+        ];
+        for failure in failures {
+            let runner = MockRunner::new(vec![Ok(failure)]);
+            chain_exists(&runner, FirewallFamily::Ipv4, KIDOBO_CHAIN_NAME)
+                .expect_err("unrelated error must remain fatal");
+            assert_eq!(runner.invocations().len(), 1);
+        }
+    }
+
+    #[test]
+    fn chain_creation_failure_after_confirmed_nft_absence_is_fatal() {
+        let runner = MockRunner::new(vec![
+            Ok(nft_incompatible_chain("ip6tables", KIDOBO_CHAIN_NAME)),
+            Ok(listed_rules("-P INPUT ACCEPT\n")),
+            Ok(command_failure("chain appeared concurrently")),
+        ]);
+
+        let error = ensure_firewall_wiring(
+            &runner,
+            FirewallFamily::Ipv6,
+            "kidobo-set-v6",
+            ChainAction::Drop,
+        )
+        .expect_err("failed creation must stop activation");
+        assert!(error.to_string().contains("chain appeared concurrently"));
+        assert_eq!(runner.invocations().len(), 3);
+        assert_eq!(
+            runner.invocations()[2].1,
+            vec!["-w", "5", "-N", KIDOBO_CHAIN_NAME]
+        );
+    }
+
+    #[test]
+    fn cleanup_does_not_ignore_ambiguous_nft_errors() {
+        for family in [FirewallFamily::Ipv4, FirewallFamily::Ipv6] {
+            let runner = MockRunner::new(vec![
+                Ok(listed_rules("")),
+                Ok(listed_rules("")),
+                Ok(nft_incompatible_chain(
+                    family.binary(),
+                    KIDOBO_STAGING_CHAIN_NAME,
+                )),
+                Ok(missing_chain()),
+                Ok(missing_chain()),
+                Ok(missing_chain()),
+            ]);
+
+            let error = cleanup_firewall_wiring(&runner, family)
+                .expect_err("cleanup cannot assume an incompatible chain is absent");
+            assert!(error.to_string().contains("incompatible, use 'nft' tool"));
+            assert_eq!(runner.invocations().len(), 6);
+        }
     }
 
     #[test]

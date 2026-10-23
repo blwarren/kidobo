@@ -6,6 +6,14 @@ Debian/Alpine static compatibility checks. Publication requires the full candida
 before any release push or upload; published-release smoke testing is separate. `just ci`
 keeps its existing local checks and does not launch VMs.
 
+The mandatory matrix has seven targets: Debian 12 and 13, Ubuntu 24.04 and 26.04, Fedora 44,
+and AlmaLinux 9 and 10. Every configured target must pass before publication.
+
+openSUSE Leap 16.0 is deferred because its configured repositories did not provide the
+required `bgpq4` package. Zypper provisioning remains available for future use. Reintroduce
+Leap only after verifying an appropriate packaged prerequisite repository and completing a
+passing lifecycle run; its earlier failed results remain below.
+
 ## Host preparation
 
 Use an x86-64 Linux host with hardware virtualization enabled, usable `/dev/kvm`, and an
@@ -15,7 +23,8 @@ host distribution and arrange access to its local daemon. The setup command does
 host packages, change user groups, or initialize unrelated Incus resources. Release builds
 also need the repository's pinned Rust target, `musl-gcc`, `readelf`, and `just`.
 
-Install `genisoimage` or `mkisofs` on the host to generate the agent configuration ISO.
+Install `tar` on the host to package retained evidence, and `genisoimage` or `mkisofs`
+to generate the agent configuration ISO.
 Every test VM attaches an
 [Incus `agent:config` disk](https://linuxcontainers.org/incus/docs/main/reference/devices_disk/#types-of-disk-devices),
 which supplies the guest agent when the kernel cannot load it through `9p`. Setup and run
@@ -50,7 +59,8 @@ Incus images and distro repositories require network access.
 Every run launches fresh VMs, updates each selected distro within its pinned release line,
 installs packaged prerequisites, and reboots before application testing. AlmaLinux enables
 EPEL/CRB. Package failures, unavailable images, or missing kernel support fail the run.
-The Leap packaged `bgpq4` prerequisite must pass; the suite does not build replacements.
+The suite requires packaged prerequisites and does not build replacements for unavailable
+packages.
 
 ## Guest network prerequisites
 
@@ -101,6 +111,11 @@ uninstall. Provisioning still updates and reboots each fresh guest before instal
 This smoke lane omits the candidate's post-install reboot and upgrade scenarios. It requires
 GitHub access and runs independently of publication.
 
+Published `v0.14.3` assets are immutable and still reproduce the Debian 12 missing-chain
+failure recorded below. They cannot validate the subsequent candidate fix. After publishing
+a corrected release through the candidate gate, run `just e2e-published <corrected-tag>`
+as a separate post-publication smoke milestone across all seven mandatory targets.
+
 For an existing release archive, including publisher use:
 
 ```bash
@@ -117,15 +132,52 @@ gate. Changing the matrix changes release coverage and should be reviewed accord
 Results live under `target/e2e/<run-id>/` by default. Set `KIDOBO_E2E_RESULTS_DIR` to
 select another results root. Publication selects the original checkout's results root so logs
 survive removal of its temporary worktree. The run ID is the results directory name and
-instance-name prefix printed when each fresh VM starts. Results include `summary.txt`,
-`results.json`, numbered command logs, and per-distro guest diagnostics and state. They record
-image fingerprints, artifact hashes, package and kernel details, guest journals, and firewall
-evidence. The run freezes its installer, guest scripts, and matrix configuration under
-`inputs/`, with their SHA-256 hashes in `inputs/SHA256.json`; guests use these captured
-scripts throughout the run. Candidate archives and their checksum manifest are copied into
-`inputs/release/` before any VM starts, so every distro receives the same private artifact
-snapshot. The runner checks that the original archive remains unchanged during testing.
-Guest state and its scenario logs are copied back before cleanup.
+instance-name prefix printed when each fresh VM starts. The terminal streams the complete
+chronological transcript by default, with named distro/stage boundaries, command arguments,
+stdout/stderr labels, exit statuses, and elapsed time. Silent commands print a heartbeat
+every 15 seconds. Guest checks show their expectations and observations, including traffic
+probe outcomes, preserved-state comparisons, expected failures, and known baseline recovery.
+
+Completed runs contain at most five top-level files:
+
+| File | Read it for |
+| --- | --- |
+| `summary.txt` | Run identity, coverage, outcomes, warnings, and transcript line references |
+| `transcript.log` | Full chronological command, output, and check evidence, matching the terminal |
+| `results.json` | Structured distro, command, and check records |
+| `evidence.tar.gz` | Frozen inputs, hashes, raw guest diagnostics, and snapshots |
+| `ownership.json` | Resource ownership needed to retry cleanup safely |
+
+Start with the summary, then follow its transcript line references to review what happened.
+The summary updates during execution; later checks remain not-run until they begin. Follow
+the same transcript from a second terminal, substituting the printed run ID:
+
+```bash
+run_dir=target/e2e/RUN_ID
+tail -f "$run_dir/transcript.log"
+```
+
+The transcript preserves ordering within each output stream; ordering between stdout and
+stderr reflects when the runner observed the output. Shell tracing includes script, function,
+and line context and uses a separate descriptor so captured command results remain intact.
+
+The archive contains image fingerprints, package/kernel details, guest journals, firewall
+snapshots, and scenario logs. Frozen installer, guest scripts, and matrix configuration are
+under `inputs/`, with hashes in `inputs/SHA256.json`. Candidate artifacts and their checksum
+manifest are under `inputs/release/`; all guests use the same captured inputs. The runner
+also checks that the original archive remains unchanged. Inspect archive contents without
+unpacking everything:
+
+```bash
+tar -tzf "$run_dir/evidence.tar.gz"
+tar -xOf "$run_dir/evidence.tar.gz" ./inputs/SHA256.json
+tar -xOf "$run_dir/evidence.tar.gz" ./debian-13/state/provision.txt
+```
+
+Working evidence lives in `.evidence/` during execution and is removed only after archive
+creation succeeds. Archive failures or abrupt termination can leave that directory behind;
+retain it for diagnosis. Success, failure, and handled interruption all attempt archive
+finalization. Existing historical results keep their original layout and need no migration.
 
 Provisioning failures and application assertion failures both produce a failing exit status. Inspect the earliest failed command and its diagnostics before retrying.
 
@@ -142,37 +194,100 @@ run identity match recorded resources. Do not remove the shared project, bridge,
 
 ## Initial validation: 22 October 2026
 
-The complete latest matrix has not passed. These provisional results establish the observed
-coverage while host ISO tooling and a rerun with the latest assertions remain pending:
+Both eight-target runs completed for version `v0.14.3` after host Incus access, networking,
+and ISO tooling were configured. Both exited with status 1: candidate run
+`run-1792703914-558810` recorded five passes and three failures; published smoke run
+`run-1792703913-557732` recorded six passes and two failures. These historical eight-target
+results did not satisfy publication; the current seven-target matrix and subsequent fixes
+require fresh validation.
+
+| Target | Candidate lifecycle | Published smoke |
+| --- | --- | --- |
+| Debian 12 | Application failure, 45.4 s | Application failure, 41.7 s |
+| Debian 13 | PASS, 247.6 s | PASS, 74.3 s |
+| Ubuntu 24.04 | PASS, 251.7 s | PASS, 76.5 s |
+| Ubuntu 26.04 | PASS, 263.2 s | PASS, 84.3 s |
+| Fedora 44 | PASS, 306.1 s | PASS, 112.7 s |
+| AlmaLinux 9 | Fixture failure, 295.5 s | PASS, 109.0 s |
+| AlmaLinux 10 | PASS, 304.6 s | PASS, 109.1 s |
+| openSUSE Leap 16.0 | Provisioning failure, 32.6 s | Provisioning failure, 28.6 s |
+
+Debian 12 exposed an application compatibility issue: iptables 1.8.9 with the nftables
+backend reports an absent chain using an incompatible-chain diagnostic. The same message
+was reproduced with a fresh unrelated absent chain. The subsequent fix handles that exact
+requested-chain/filter-table diagnostic and exit status 1 by inspecting a bounded, read-only
+chain listing from the same address family. Only absence of the exact chain declaration
+establishes that the chain is missing; a listed chain preserves the original error, and a
+failed listing propagates its error. The application matches the diagnostic rather than
+hard-coding a distro or version.
+
+Upgrade baselines `v0.14.2` and `v0.14.3` require a narrowly guarded harness recovery for
+this historical defect on Debian 12 with both iptables binaries reporting 1.8.9/nf_tables
+and the exact known error. This recovery applies only to the older upgrade baseline; it does
+not mask candidate or published-target failures. Leap's missing packaged `bgpq4` remains a
+recorded provisioning failure, with reintroduction deferred as described above.
+
+AlmaLinux 9's full candidate attempt failed when its traffic fixture lost an interface
+address and could not bind (`EADDRNOTAVAIL`). The fixture now excludes only its test veth
+interface from NetworkManager management before assigning addresses, following the
+[scoped NetworkManager device guidance](https://docs.redhat.com/en/documentation/red_hat_enterprise_linux/9/html/configuring_and_managing_networking/configuring-networkmanager-to-ignore-certain-devices_configuring-and-managing-networking).
+It preserves the guest's main network interface and global NetworkManager configuration.
+The latest focused AlmaLinux 9 candidate run, `run-1792706036-603679`, passed in 300.5 s.
+Its diagnostics retained the test interface address/local route and recorded that the device
+was unmanaged. The VM was cleaned up. This focused pass validates the fixture correction;
+the original full-matrix failure remains recorded in the table.
+
+The full runs used their captured `inputs/` snapshots. Later custom-configuration repeat-init
+and failed-uninstall timer-ordering assertions passed in a focused Debian 13 candidate run,
+`run-1792704567-575487`, in 248.5 s. These focused changes do not retroactively alter the
+full-matrix results. The earlier full candidate attempt `run-1792700407-470030` exposed
+harness assertions that were corrected; it is not a successful matrix result.
+
+Per-target elapsed values include provisioning, application checks, diagnostics, and cleanup.
+Their sums are 1,746.8 s for the candidate run and 636.1 s for published smoke; these exclude
+host builds, setup, and initial release/baseline resolution. The lanes overlapped in time and
+the host image cache was populated, so these observations are not performance benchmarks or
+cold-download estimates. Retained evidence records exact image fingerprints, package updates,
+kernel versions, and iptables backends.
+
+The tested images included both legacy and nftables iptables backends. Fedora and both
+AlmaLinux images reported SELinux Disabled; the suite preserved their image settings.
+Enforcing SELinux was not validated. These observations describe the Incus images used,
+rather than installations from each distribution's standard ISO.
 
 `just ci` and `just coverage` passed locally. Coverage was 92.53% of regions, 93.65% of
 functions, and 93.02% of lines with the existing thresholds. These checks do not establish
 VM matrix acceptance.
 
-| Lane | Target | Observed result | Elapsed |
+## Repair validation: 22 October 2026
+
+Two fresh focused candidate runs passed after the Debian chain-detection fix and final
+fixture corrections:
+
+| Target | Run | Result | Elapsed |
 | --- | --- | --- | --- |
-| Candidate | Debian 13 | Full lifecycle passed in `run-1792701146-490083` | 236.6 s |
-| Published | Debian 13 | Smoke passed | 99.2 s |
-| Published | Ubuntu 24.04 | Smoke passed | 77.1 s |
-| Published | Ubuntu 26.04 | Smoke passed | 100.6 s |
-| Published | Fedora 44 | Smoke passed | 116.5 s |
-| Published | Debian 12 | Application failed while probing an absent firewall chain | — |
-| Published | AlmaLinux 9 and 10 | Guest agent unavailable; agent configuration disk support required | — |
-| Published | openSUSE Leap 16.0 | Provisioning failed: packaged `bgpq4` unavailable | — |
+| Debian 12 | `run-1792709120-639527` | PASS; no diagnostic collection failures | 239.6 s |
+| AlmaLinux 9 | `run-1792709366-657973` | PASS; no diagnostic collection failures | 297.3 s |
 
-Published observations came from the eight-target run `run-1792701111-488918`. Debian 12's
-iptables diagnostic for an absent chain exposed an application compatibility issue; the suite
-does not substitute a successful result. AlmaLinux diagnosis led to attaching an agent
-configuration ISO to every VM, which requires the newly documented host ISO utility. Its
-installation and subsequent matrix validation are still pending. Later assertions also need
-a complete rerun before publication can pass.
+Debian 12 reproduced the known `v0.14.2` baseline synchronization failure with exit status 1
+and its exact incompatible-chain diagnostic before the guarded historical recovery. The
+corrected candidate then passed its lifecycle. AlmaLinux 9's final network diagnostics
+recorded the test veth as unmanaged and retained both assigned address families. Both VMs
+were deleted after diagnostic collection.
 
-The earlier complete candidate attempt `run-1792700407-470030` exposed harness assertion
-issues that were subsequently corrected; it is not a successful matrix result. The focused
-Debian 13 candidate result above likewise does not establish eight-target acceptance.
+The Debian candidate archive SHA-256 was
+`8f78dbe8fc7eeffcaf44354a6f2f19b498e36654864af1131bf7533f68b7fbfc`;
+the AlmaLinux candidate archive SHA-256 was
+`8f84346d9c117fcd03da559879d18462e21afe3b6a8a358c378ec031948eddae`.
+The differing archives belong to separate captured runs; neither focused result establishes
+a complete mandatory-matrix pass.
 
-Elapsed values come from the runner's per-target measurements and include provisioning,
-application checks, diagnostics, and cleanup. The host image cache was already populated;
-these are not cold image download benchmarks. Retained run evidence records image
-fingerprints, package updates, and kernel/backend versions for comparisons. No VM success
-claim follows from compilation or fixture tests alone.
+Local `just ci`, `just coverage`, `just exercise-release`, `just release-compat`, and
+`just rustdoc` passed. Coverage was 92.61% of regions, 93.69% of functions, and 93.10% of
+lines with the existing thresholds. Release-note generation added the compatibility entry
+to `CHANGELOG.md`; the normal check initially reported the intentional unstaged note and
+changelog differences. Verification against an isolated temporary index passed without
+changing the real staging area, and the final check rewrote no files.
+
+The fresh seven-target candidate run `run-1792709674-661101` is still in progress. Its
+completion and corrected-release published smoke remain separate acceptance milestones.

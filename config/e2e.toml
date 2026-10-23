@@ -47,9 +47,3 @@ id = "almalinux-10"
 image = "almalinux/10"
 family = "dnf-epel"
 packages = ["bash", "ca-certificates", "curl", "tar", "coreutils", "grep", "kmod", "sudo", "iproute", "python3", "ipset", "iptables", "bgpq4", "epel-release", "dnf-plugins-core", "kernel-modules-extra"]
-
-[[distros]]
-id = "opensuse-leap-16"
-image = "opensuse/16.0"
-family = "zypper"
-packages = ["bash", "ca-certificates", "curl", "tar", "coreutils", "grep", "kmod", "sudo", "iproute2", "python3", "ipset", "iptables", "bgpq4"]

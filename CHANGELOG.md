@@ -17,6 +17,7 @@
 - Probe only ipset names in doctor and allow initialization to continue when reset-failed reports the sync service is not loaded.
 - Package the validated release candidate from the configured Cargo target directory.
 - Allow an explicit version to be installed from a custom release directory with `KIDOBO_RELEASE_BASE_URL`, retaining checksum and binary verification.
+- Recognize absent firewall chains on Debian 12 with iptables 1.8.9 (nf_tables), while preserving failures for existing incompatible chains.
 
 ## [0.14.3] - 2026-10-22
 

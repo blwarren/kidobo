@@ -5,6 +5,7 @@
 /mutants.out/
 /mutants.out.old/
 /tmp/
+__pycache__/
 *.db
 *.key
 *.log
