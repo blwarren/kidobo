@@ -2,12 +2,15 @@
 
 The Incus suite installs and operates Kidobo in disposable QEMU/KVM virtual machines,
 including real guest firewall and systemd operations. It supplements `just ci` and the
-Debian/Alpine static compatibility checks. Publication requires the full candidate matrix
-before any release push or upload; published-release smoke testing is separate. `just ci`
-keeps its existing local checks and does not launch VMs.
+Debian/Alpine static compatibility checks. Publication runs the full candidate matrix before any
+release push or upload by default; published-release smoke testing is separate.
+`just publish-release X.Y.Z --skip-e2e` omits the matrix and its Incus/agent-ISO prerequisites;
+all other release checks remain enabled. See the [command reference](../scripts/README.md).
+`just ci` keeps its existing local checks and does not launch VMs.
 
-The mandatory matrix has seven targets: Debian 12 and 13, Ubuntu 24.04 and 26.04, Fedora 44,
-and AlmaLinux 9 and 10. Every configured target must pass before publication.
+The default publication matrix has seven targets: Debian 12 and 13, Ubuntu 24.04 and 26.04,
+Fedora 44, and AlmaLinux 9 and 10. Every configured target must pass before publication unless
+the explicit `--skip-e2e` publisher override is selected.
 
 openSUSE Leap 16.0 is deferred because its configured repositories did not provide the
 required `bgpq4` package. Zypper provisioning remains available for future use. Reintroduce
@@ -141,6 +144,8 @@ just e2e-artifact "${release_archive}" "${release_tag}"
 
 This command runs all configured targets. A filtered diagnosis is not a passing publication
 gate. Changing the matrix changes release coverage and should be reviewed accordingly.
+The publisher's `--skip-e2e` option is a deliberate release-workflow override; it does not change
+these candidate or artifact commands or make a prior matrix run count for the skipped release.
 
 ## Diagnose and clean up
 

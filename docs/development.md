@@ -30,7 +30,8 @@ advisories, and tests; it satisfies the Rust gate without requiring a separate `
 Regardless of the editing checks above, `just ci` must pass locally before a push or merge.
 Coverage, strict rustdoc, the isolated release-binary exercise, static compatibility checks,
 and the [Incus distro lifecycle matrix](e2e.md)
-are publication gates; they are not part of `just ci`.
+are publication gates; they are not part of `just ci`. The matrix can be omitted
+with the explicit publisher option `--skip-e2e`.
 
 CI/CD remains local. Dependabot version updates are the sole GitHub-hosted automation exception;
 do not add GitHub Actions workflows without explicit approval. Dependency changes must also follow
@@ -130,8 +131,11 @@ Do not bump versions or create tags unless explicitly requested. When requested,
 The publisher prepares a candidate in a temporary worktree, runs local CI and the release-note check,
 then runs the publication-only gates listed above. The binary exercises use a temporary runtime root,
 loopback feed, fake privileged commands, and Debian/Alpine containers. The publisher packages the
-tested static Linux x86_64 binary, runs the complete Incus VM matrix against that archive,
-and uses GitHub CLI to upload, verify, and publish it. The VM suite operates real guest
+tested static Linux x86_64 binary and, by default, runs the complete seven-target Incus VM matrix
+against that archive before using GitHub CLI to upload, verify, and publish it.
+`just publish-release X.Y.Z --skip-e2e` skips only the matrix and its Incus/agent-ISO
+prerequisites, keeping all other gates. See the [command reference](../scripts/README.md)
+for skip reporting. The VM suite operates real guest
 firewalls and systemd only inside disposable VMs. Read [setup and diagnosis](e2e.md) for VM
 requirements and retained run evidence, and [commands and recovery](../scripts/README.md)
 for publication prerequisites and recovery steps.

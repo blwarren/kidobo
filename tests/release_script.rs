@@ -88,6 +88,22 @@ fn assert_success(output: &Output, context: &str) {
     );
 }
 
+fn run_with_confirmation(command: &mut Command, confirmation: &str) -> Output {
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn publisher");
+    child
+        .stdin
+        .take()
+        .expect("publisher stdin")
+        .write_all(confirmation.as_bytes())
+        .expect("write confirmation");
+    child.wait_with_output().expect("wait for publisher")
+}
+
 struct ReleaseFixture {
     temp: TempDir,
     repo: PathBuf,
@@ -198,6 +214,7 @@ exec "${KIDOBO_TEST_REAL_GIT}" "$@"
             r#"#!/usr/bin/env bash
 set -euo pipefail
 printf 'just %s\n' "$*" >> "${KIDOBO_TEST_EVENT_LOG}"
+if [[ "$1" == "${KIDOBO_TEST_FAIL_GATE:-}" ]]; then exit 44; fi
 if [[ -n "${KIDOBO_TEST_READY_MARKER:-}" && "$*" == "release-compat" ]]; then
   : > "${KIDOBO_TEST_READY_MARKER}"
 fi
@@ -420,20 +437,7 @@ fi
     }
 
     fn run_publisher_for(&self, version: &str, confirmation: &str) -> Output {
-        let mut child = self
-            .publisher_command_for(version)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn publisher");
-        child
-            .stdin
-            .take()
-            .expect("publisher stdin")
-            .write_all(confirmation.as_bytes())
-            .expect("write confirmation");
-        child.wait_with_output().expect("wait for publisher")
+        run_with_confirmation(&mut self.publisher_command_for(version), confirmation)
     }
 
     fn run_after_validation<F>(&self, action: F) -> Output
@@ -606,11 +610,18 @@ fn publisher_fixture_clears_repository_local_git_environment() {
 
 #[test]
 fn publisher_requires_exactly_one_version() {
-    let output = Command::new(publisher_path())
-        .output()
-        .expect("run publisher without version");
-    assert_eq!(output.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("Usage:"));
+    for args in [
+        vec![],
+        vec![RELEASE_VERSION, RELEASE_VERSION],
+        vec![RELEASE_VERSION, "--skip-e2e", "extra"],
+    ] {
+        let output = Command::new(publisher_path())
+            .args(&args)
+            .output()
+            .expect("reject missing or extra arguments");
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("Usage:"));
+    }
 }
 
 #[test]
@@ -1058,4 +1069,127 @@ fn distro_gate_failure_or_artifact_changes_prevent_publication() {
         assert!(!events.contains("git push --atomic "));
         assert!(!events.contains("gh release create "));
     }
+}
+
+#[test]
+fn publisher_can_skip_e2e_without_vm_tools_and_keeps_other_gates() {
+    let fixture = ReleaseFixture::new();
+    let no_vm_tools = fixture.temp.path().join("no-vm-tools.sh");
+    fs::write(
+        &no_vm_tools,
+        r#"
+command() {
+  if [[ "$1" == -v ]]; then
+    case "$2" in incus|genisoimage|mkisofs) return 1 ;; esac
+  fi
+  builtin command "$@"
+}
+"#,
+    )
+    .expect("hide VM tools independently of the host PATH");
+    let default = fixture
+        .publisher_command()
+        .env("BASH_ENV", &no_vm_tools)
+        .output()
+        .expect("check default VM prerequisites");
+    assert_eq!(default.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&default.stderr).contains("missing required command: incus"));
+
+    let output = run_with_confirmation(
+        fixture
+            .publisher_command()
+            .arg("--skip-e2e")
+            .env("BASH_ENV", &no_vm_tools)
+            .env("KIDOBO_TEST_FAIL_E2E", "1"),
+        "y\n",
+    );
+    assert_success(
+        &output,
+        "publish without VM prerequisites or matrix execution",
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let notice = "Distro lifecycle matrix: SKIPPED (--skip-e2e)";
+    let first_notice = stdout.find(notice).expect("initial skipped-gate notice");
+    assert!(first_notice < stdout.find("running local CI").expect("local CI"));
+    let last_notice = stdout
+        .rfind(notice)
+        .expect("confirmation skipped-gate notice");
+    assert!(
+        last_notice
+            > stdout
+                .find("is ready to publish")
+                .expect("publication review")
+    );
+    let events = read_to_string_with_limit(&fixture.event_log, FIXTURE_LOG_READ_LIMIT);
+    assert!(!events.contains("just e2e-artifact "));
+    for gate in [
+        "ci",
+        "release-notes-check",
+        "coverage",
+        "rustdoc",
+        "exercise-release",
+        "release-compat",
+    ] {
+        assert!(events.contains(&format!("just {gate}\n")), "missing {gate}");
+    }
+    assert!(events.contains("gh release download "));
+    assert!(fixture.gh_release_dir.join("published").exists());
+}
+
+#[test]
+fn publisher_rejects_unknown_options_before_running_tools() {
+    let fixture = ReleaseFixture::new();
+    let output = fixture
+        .publisher_command()
+        .arg("--skip-e2")
+        .output()
+        .expect("reject misspelled option");
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unknown option: --skip-e2"));
+    assert!(!fixture.event_log.exists());
+}
+
+#[test]
+fn skipping_e2e_still_blocks_publication_on_other_gate_failures() {
+    for gate in ["ci", "release-compat"] {
+        let fixture = ReleaseFixture::new();
+        let output = fixture
+            .publisher_command()
+            .arg("--skip-e2e")
+            .env("KIDOBO_TEST_FAIL_GATE", gate)
+            .output()
+            .expect("exercise retained gate failure");
+        assert_eq!(output.status.code(), Some(44), "{gate}");
+        assert!(!fixture.tag_exists());
+        assert!(!fixture.remote_tag_exists(RELEASE_TAG));
+        let events = read_to_string_with_limit(&fixture.event_log, FIXTURE_LOG_READ_LIMIT);
+        assert!(!events.contains("git push --atomic "));
+        assert!(!events.contains("gh release create "));
+    }
+}
+
+#[test]
+fn publication_recipe_forwards_the_skip_option_as_an_argument() {
+    let fixture = ReleaseFixture::new();
+    let justfile = fixture.repo.join("Justfile");
+    fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("Justfile"),
+        &justfile,
+    )
+    .expect("copy recipes into isolated repository");
+    write_executable(
+        &fixture.repo.join("scripts/publish-release.sh"),
+        "#!/bin/bash\nprintf '%s\\n' \"$@\"\n",
+    );
+    let output = Command::new("just")
+        .arg("--justfile")
+        .arg(&justfile)
+        .args(["publish-release", RELEASE_VERSION, "--skip-e2e"])
+        .output()
+        .expect("exercise recipe with an inert publisher");
+    assert_success(&output, "forward publisher arguments");
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("forwarded arguments"),
+        format!("{RELEASE_VERSION}\n--skip-e2e\n")
+    );
 }

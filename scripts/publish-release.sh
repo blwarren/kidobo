@@ -3,20 +3,31 @@ set -euo pipefail
 
 usage() {
     cat <<'EOF'
-Usage: just publish-release [v]X.Y.Z
+Usage: just publish-release [v]X.Y.Z [--skip-e2e]
 
 Prepares and validates a release in a temporary worktree, asks for confirmation,
 then atomically pushes the release commit and tag, uploads locally built assets
 with GitHub CLI, verifies the uploaded archive, and publishes the GitHub release.
+
+  --skip-e2e  Skip the Incus VM matrix; all other release checks still run.
 EOF
 }
 
-if [[ $# -ne 1 ]]; then
+if [[ $# -lt 1 || $# -gt 2 ]]; then
     usage >&2
     exit 2
 fi
 
 requested_version="$1"
+skip_e2e=false
+if [[ $# -eq 2 ]]; then
+    if [[ "$2" != --skip-e2e ]]; then
+        echo "unknown option: $2" >&2
+        usage >&2
+        exit 2
+    fi
+    skip_e2e=true
+fi
 if [[ ! "${requested_version}" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z][0-9A-Za-z.-]*)?$ ]]; then
     echo "invalid release version: ${requested_version} (expected X.Y.Z or vX.Y.Z)" >&2
     exit 2
@@ -24,14 +35,23 @@ fi
 
 release_tag="v${requested_version#v}"
 release_version="${release_tag#v}"
-required_commands=(gh cargo cat cmp date docker git grep head incus install just mkdir mktemp musl-gcc readelf rm rustup sed sha256sum sort tar uname)
+matrix_result="not run"
+if [[ "${skip_e2e}" == true ]]; then
+    matrix_result="SKIPPED (--skip-e2e)"
+    echo "[release] Distro lifecycle matrix: ${matrix_result}"
+fi
+required_commands=(gh cargo cat cmp date docker git grep head install just mkdir mktemp musl-gcc readelf rm rustup sed sha256sum sort tar uname)
+if [[ "${skip_e2e}" == false ]]; then
+    required_commands+=(incus)
+fi
 for required_command in "${required_commands[@]}"; do
     if ! command -v "${required_command}" >/dev/null 2>&1; then
         echo "missing required command: ${required_command}" >&2
         exit 1
     fi
 done
-if ! command -v genisoimage >/dev/null 2>&1 && ! command -v mkisofs >/dev/null 2>&1; then
+if [[ "${skip_e2e}" == false ]] \
+    && ! command -v genisoimage >/dev/null 2>&1 && ! command -v mkisofs >/dev/null 2>&1; then
     echo "Incus agent CD-ROM requires host genisoimage or mkisofs" >&2
     exit 1
 fi
@@ -269,11 +289,14 @@ artifacts_created=true
 ./scripts/package-release.sh "${candidate_binary}" "${release_tag}" "${artifact_root}"
 install -m 0644 "${release_notes_path}" "${release_notes_copy}"
 
-# Keep the exact tested archive and checksum manifest through publication.
+# Keep the packaged archive and checksum manifest unchanged through validation.
 archive_digest="$(sha256sum "${archive_path}")"
 checksums_digest="$(sha256sum "${checksums_path}")"
-echo "[release] running complete distro lifecycle matrix"
-KIDOBO_E2E_RESULTS_DIR="${repo_root}/target/e2e" just e2e-artifact "${archive_path}" "${release_tag}"
+if [[ "${skip_e2e}" == false ]]; then
+    echo "[release] running complete distro lifecycle matrix"
+    KIDOBO_E2E_RESULTS_DIR="${repo_root}/target/e2e" just e2e-artifact "${archive_path}" "${release_tag}"
+    matrix_result="PASSED (complete matrix)"
+fi
 if [[ "$(sha256sum "${archive_path}")" != "${archive_digest}" \
     || "$(sha256sum "${checksums_path}")" != "${checksums_digest}" ]]; then
     echo "release artifacts changed during distro validation" >&2
@@ -282,6 +305,7 @@ fi
 
 echo
 echo "Release ${release_tag} is ready to publish:"
+echo "Distro lifecycle matrix: ${matrix_result}"
 git --no-pager diff --cached --stat
 echo
 git --no-pager diff --cached

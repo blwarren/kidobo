@@ -199,7 +199,8 @@ just release-notes-check
 push; GitHub does not run project CI for pushes or tags. The complete local gate
 checks formatting, lints, dependency policy, audits, and tests. Publication additionally
 requires coverage, strict rustdoc, the isolated release-binary exercise, static Debian/Alpine
-compatibility, and the complete [Incus distro lifecycle matrix](docs/e2e.md). The isolated exercises use a temporary
+compatibility, and by default the complete [Incus distro lifecycle
+matrix](docs/e2e.md). The isolated exercises use a temporary
 `KIDOBO_ROOT`, a loopback HTTP feed, and fake privileged commands; they never
 touch the development host's firewall or systemd. The Incus matrix runs real privileged
 operations only inside disposable VMs. Dependabot update
@@ -211,7 +212,8 @@ Authenticate with `gh auth login` before publishing, then run
 packages the release locally, pushes the release commit and tag atomically,
 verifies the draft's downloaded assets, and only then publishes it. See the
 [development-command reference](scripts/README.md) for the complete workflow
-and failure recovery.
+and failure recovery. Use `just publish-release X.Y.Z --skip-e2e` to omit the VM
+matrix while retaining all other release checks and uploaded-asset verification.
 
 Use `just --list` to see all available local and CI recipes.
 

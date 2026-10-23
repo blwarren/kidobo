@@ -99,8 +99,9 @@ mutants *args:
     @env CARGO_MUTANTS_JOBS="${CARGO_MUTANTS_JOBS:-4}" cargo mutants -vV {{ args }}
 
 # Prepare, validate, package, and publish a release locally.
-publish-release version:
-    @./scripts/publish-release.sh "{{ version }}"
+[positional-arguments]
+publish-release version *args:
+    @./scripts/publish-release.sh "$@"
 
 # Normalize release notes, regenerate the changelog, and verify the diff.
 release-notes-check: _release-notes-format _release-notes-generate

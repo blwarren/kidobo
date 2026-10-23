@@ -43,7 +43,8 @@ gh auth login
 - `just update` (install the pinned cooldown tool, update dependencies at least seven days old, and test)
 - `just udeps` (manual nightly-toolchain dependency-usage audit)
 - `just release-notes-check` (required after repository changes and during release validation)
-- `just publish-release X.Y.Z` (complete local release preparation, validation, upload, verification, and publication)
+- `just publish-release X.Y.Z` (complete local preparation, validation, seven-target Incus matrix, upload, verification, and publication)
+- `just publish-release X.Y.Z --skip-e2e` (skip only the matrix and its Incus/agent-ISO prerequisites; other validation and upload verification remain enabled)
 - `just mutants`
 - `just mutants --shard 1/4`
 
@@ -59,9 +60,14 @@ Publication requires a Linux x86_64 host. Release builds require `musl-gcc` and 
 `x86_64-unknown-linux-musl` Rust target. The compatibility gate additionally
 requires `readelf` and Docker access; it runs only offline Kidobo commands in
 the containers and never invokes firewall or systemd operations.
-Publication also requires configured Incus VM access, host `tar`, a `genisoimage` or `mkisofs` utility
-for agent configuration disks, and a passing full distro lifecycle matrix,
-run against the exact packaged archive before pushing refs or uploading assets. E2E command
+Publication requires host `tar`. By default, it also requires configured Incus VM access, a
+`genisoimage` or `mkisofs` utility for agent configuration disks, and a passing full seven-target
+distro lifecycle matrix run against the exact packaged archive before pushing refs or uploading
+assets. An explicit `--skip-e2e` argument skips only that matrix and its Incus/agent-ISO
+prerequisites; CI, release-note validation, coverage, strict rustdoc, the release-binary exercise,
+static compatibility, packaging, and upload verification still run. The publisher labels the
+skip before validation and repeats it before the final confirmation. This override does not reuse
+or imply evidence from an earlier matrix run. E2E command
 transcript and results remain under the original checkout's `target/e2e/<run-id>/`,
 including when the publisher removes its temporary worktree. Start with `summary.txt` and
 its line references into `transcript.log`; frozen inputs and guest snapshots are retained in
