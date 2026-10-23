@@ -51,8 +51,15 @@ release-compat: build-release
 e2e-setup:
     @cargo run --locked -p kidobo-e2e -- setup
 
-# Package the current static candidate and exercise every configured distro.
-e2e *args: build-release
+# Start candidate testing in a persistent, detached tmux session.
+[positional-arguments]
+e2e *args:
+    @bash ./scripts/e2e-tmux.sh "$@"
+
+# Package and test the candidate inside the persistent session.
+[private]
+[positional-arguments]
+_e2e *args: build-release
     #!/usr/bin/env bash
     set -euo pipefail
     binary="${CARGO_TARGET_DIR:-target}/x86_64-unknown-linux-musl/release/kidobo"
@@ -61,7 +68,7 @@ e2e *args: build-release
     mkdir -p "target/e2e-candidate/${tag}"
     output="$(mktemp -d "target/e2e-candidate/${tag}/run-XXXXXXXX")"
     ./scripts/package-release.sh "${binary}" "${tag}" "${output}"
-    cargo run --locked -p kidobo-e2e -- run --archive "${output}/kidobo-${tag}-linux-x86_64.tar.gz" --tag "${tag}" {{ args }}
+    cargo run --locked -p kidobo-e2e -- run --archive "${output}/kidobo-${tag}-linux-x86_64.tar.gz" --tag "${tag}" "$@"
 
 # Test the exact archive selected for publication; always run the full matrix.
 e2e-artifact archive tag:

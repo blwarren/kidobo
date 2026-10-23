@@ -83,6 +83,21 @@ incus --project default network list-leases kidoboe2e0
 
 ## Run the matrix
 
+`just e2e` requires `tmux` and starts a detached `kidobo-e2e` session before building
+the candidate, so the build and matrix survive an SSH disconnect. The command returns
+after starting the session; its success does not mean the matrix passed. Watch it with:
+
+```bash
+tmux attach -t kidobo-e2e
+```
+
+Detach with **Ctrl+b**, then **d**. Reattach with the same command after reconnecting.
+The pane remains after completion and prints the matrix command's exit status.
+An existing session prevents another candidate run. After reviewing the completed result,
+remove the session with `tmux kill-session -t kidobo-e2e` before starting a new run.
+Killing a session while the matrix is active interrupts it. Artifact and published-release
+recipes continue to run in the foreground.
+
 ```bash
 just e2e
 just e2e --distro debian-12 --keep-failed

@@ -34,7 +34,8 @@ gh auth login
 - `just exercise-release` (release-only build and isolated binary exercise)
 - `just release-compat` (release-only static ELF, Debian 11, and Alpine 3.22 gate)
 - `just e2e-setup` (configure suite-owned Incus infrastructure; see [distro testing](../docs/e2e.md))
-- `just e2e` (build, package, and test the candidate across the complete distro matrix)
+- `just e2e` (start the candidate build and complete distro matrix in detached tmux session
+  `kidobo-e2e`; attach with `tmux attach -t kidobo-e2e` to watch progress and the final exit status)
 - `just e2e-artifact ARCHIVE TAG` (run the full candidate matrix against an existing archive)
 - `just e2e-published [tag]` (test a published release; default latest)
 - `just e2e-clean RUN_ID` (clean recorded VMs for one run)

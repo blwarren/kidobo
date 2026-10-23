@@ -17,6 +17,10 @@ deterministic computation, operator compatibility, and reliable installation and
   disposable environment.
 - Agents must not run mutation tests; execution belongs to the user. Agents may inspect
   user-produced reports.
+- Agents are prohibited from running the E2E matrix unless the user explicitly and expressly
+  asks them to run it. Requests to change, document, or review the E2E workflow do not authorize
+  execution. This applies to all candidate, artifact, published-release, and publication paths
+  that launch the matrix, including filtered runs.
 - New commands, configuration surface, or runtime modes require explicit scope. Changes to cache
   format, fallback, or staleness semantics require explicit approval.
 - `CHANGELOG.md` is generated; never hand-edit it. After any repository change, run
