@@ -1399,6 +1399,10 @@ fn validate_vm_config(value: &serde_json::Value) -> Result<()> {
     Ok(())
 }
 #[cfg(test)]
+mod guest_http_tests;
+#[cfg(test)]
 mod guest_reporting_tests;
+#[cfg(test)]
+mod guest_upgrade_tests;
 #[cfg(test)]
 mod tests;

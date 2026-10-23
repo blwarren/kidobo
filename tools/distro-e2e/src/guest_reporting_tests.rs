@@ -110,3 +110,62 @@ fn guest_plans_later_checks_without_claiming_they_ran() {
         );
     }
 }
+
+#[test]
+fn guest_timer_deferral_replaces_existing_triggers_before_restart() {
+    use super::tests::{TestDir, executable};
+
+    let temp = TestDir::new();
+    let dropin = temp.path().join("kidobo-sync.timer.d/e2e.conf");
+    let reloaded = temp.path().join("reloaded.conf");
+    let script = include_str!("../../../scripts/e2e/lifecycle.sh");
+    let start = script
+        .find("defer_timer_until_configuration_is_ready() {")
+        .expect("timer deferral helper");
+    let end = script[start..]
+        .find("\nrestore_boot_timer() {")
+        .map(|offset| start + offset)
+        .expect("end of timer deferral");
+    let helper = script[start..end].replace(
+        "/run/systemd/system/kidobo-sync.timer.d/e2e.conf",
+        dropin.to_str().expect("temporary drop-in path"),
+    );
+    let bin = temp.path().join("bin");
+    std::fs::create_dir(&bin).expect("fake systemd command directory");
+    executable(
+        &bin.join("systemctl"),
+        r#"#!/bin/bash
+set -eu
+case "$1" in
+  daemon-reload) cp "$DROPIN" "$RELOADED" ;;
+  is-active) exit 0 ;;
+  restart) cmp -s "$DROPIN" "$RELOADED"; printf restarted ;;
+  *) exit 90 ;;
+esac
+"#,
+    );
+    let output = Command::new("bash")
+        .args([
+            "-c",
+            &format!("set -eu\n{helper}\ndefer_timer_until_configuration_is_ready"),
+        ])
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+        .env("DROPIN", &dropin)
+        .env("RELOADED", &reloaded)
+        .output()
+        .expect("exercise deferral with fake systemctl");
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"restarted");
+
+    // systemd.timer(5): empty assignments clear all accumulated timer expressions.
+    let mut triggers = vec!["OnBootSec=2min", "OnUnitActiveSec=1h"];
+    let config = super::read_text(&reloaded).expect("configuration loaded before restart");
+    for line in config.lines().filter(|line| line.starts_with("On")) {
+        if line.ends_with('=') {
+            triggers.clear();
+        } else {
+            triggers.push(line);
+        }
+    }
+    assert_eq!(triggers, ["OnActiveSec=1h"]);
+}

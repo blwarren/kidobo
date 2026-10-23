@@ -176,6 +176,22 @@ The transcript preserves ordering within each output stream; ordering between st
 stderr reflects when the runner observed the output. Shell tracing includes script, function,
 and line context and uses a separate descriptor so captured command results remain intact.
 
+Background fixtures close the tracing descriptor as well as redirecting stdout/stderr.
+Otherwise the fixture can keep an Incus exec stream open after the lifecycle shell exits,
+consuming the entire 600-second phase timeout even when every assertion passed.
+Local fixture HTTP probes bypass proxies and have one-second request limits within a
+five-second startup deadline. The source fixture uses content ETags so feed rewrites do
+not need timestamp-resolution sleeps; unchanged content still exercises HTTP 304 responses.
+OS upgrades reuse the package metadata refreshed during prerequisite provisioning.
+Temporary timer deferral resets inherited triggers before setting a delay relative to timer
+activation, preventing the normal boot trigger from racing configuration changes.
+The candidate's post-install reboot still tests the generated two-minute boot timer;
+that wait and fresh-VM package upgrades remain part of lifecycle coverage.
+
+Local harness regression tests require Bash, curl, Python 3, and coreutils on the development
+host. They use fake privileged commands, temporary files, and loopback sockets without
+launching VMs or touching the host firewall or systemd.
+
 The archive contains image fingerprints, package/kernel details, guest journals, firewall
 snapshots, and scenario logs. Frozen installer, guest scripts, and matrix configuration are
 under `inputs/`, with hashes in `inputs/SHA256.json`. Candidate artifacts and their checksum

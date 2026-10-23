@@ -6,13 +6,13 @@ use std::sync::{Mutex, MutexGuard};
 static TEST_FIXTURE_LOCK: Mutex<()> = Mutex::new(());
 static NEXT_TEST_DIR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-struct TestDir {
+pub(super) struct TestDir {
     path: PathBuf,
     _guard: MutexGuard<'static, ()>,
 }
 
 impl TestDir {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let guard = TEST_FIXTURE_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -28,7 +28,7 @@ impl TestDir {
         }
     }
 
-    fn path(&self) -> &Path {
+    pub(super) fn path(&self) -> &Path {
         &self.path
     }
 }
@@ -39,7 +39,7 @@ impl Drop for TestDir {
     }
 }
 
-fn executable(path: &Path, body: &str) {
+pub(super) fn executable(path: &Path, body: &str) {
     fs::write(path, body).expect("write test executable");
     let mut permissions = fs::metadata(path)
         .expect("read executable metadata")
@@ -707,6 +707,102 @@ fn guest_traffic_server_startup_failure_is_reported_and_cleaned_up() {
     assert!(stderr.contains("deliberate fixture startup failure"));
     assert!(temp.path().join("state/server-v4.ready").exists());
     assert!(!temp.path().join("state/server-v6.ready").exists());
+}
+
+#[test]
+fn guest_background_fixtures_release_exec_streams_while_still_running() {
+    let lifecycle = include_str!("../../../scripts/e2e/lifecycle.sh");
+    let start = lifecycle.find("fixture_curl() {").expect("HTTP helpers");
+    let end = lifecycle
+        .find("defer_timer_until_configuration_is_ready() {")
+        .expect("end of HTTP helpers");
+    let traffic_start = lifecycle
+        .find("start_traffic_servers() {")
+        .expect("traffic startup helper");
+    let traffic_end = lifecycle
+        .find("\nprobe() {")
+        .expect("end of traffic startup");
+    for invocation in [
+        "serve_dir \"$ROOT/release\" 39472 release",
+        "start_source_fixture",
+        "start_traffic_servers",
+    ] {
+        let temp = TestDir::new();
+        let bin = temp.path().join("bin");
+        let state = temp.path().join("state");
+        fs::create_dir(&bin).expect("fake command directory");
+        fs::create_dir(&state).expect("fixture state directory");
+        executable(
+            &bin.join("python3"),
+            r#"#!/bin/bash
+set -eu
+if [[ "$1" == -m ]]; then
+  printf ready > "$STATE/http-${!#}.ready"
+elif [[ "$2" == source ]]; then
+  printf ready > "$STATE/http-$4.ready"
+else
+  printf ready > "$5"
+fi
+exec -a "$*" sleep 30
+"#,
+        );
+        executable(
+            &bin.join("curl"),
+            r#"#!/bin/bash
+set -eu
+url=${!#}
+port=${url#http://127.0.0.1:}
+port=${port%%/*}
+[[ -f "$STATE/http-$port.ready" ]]
+"#,
+        );
+        let script = temp.path().join("fixtures.sh");
+        executable(
+            &script,
+            &format!(
+                "{}\nROOT='{}'\nSTATE='{}'\nexport STATE\nPATH='{}':$PATH\n\
+                 SOURCE_PORT=39474 TRAFFIC_PORT=39471\n\
+                 V4_HOST=198.18.77.1 V6_HOST=fd42:6b69:646f:626f::1\n\
+                 fail() {{ printf '%s\\n' \"$*\" >&2; exit 1; }}\n\
+                 {}\n{}\n{invocation}\n",
+                lifecycle_reporting_helpers(),
+                temp.path().display(),
+                state.display(),
+                bin.display(),
+                &lifecycle[start..end],
+                &lifecycle[traffic_start..traffic_end],
+            ),
+        );
+        let mut runner = runner(temp.path());
+        // The reader must see EOF before the fake servers are stopped. A host
+        // runner using regular capture files alone cannot detect guest FD leaks.
+        let outcome = runner.command(
+            "bash",
+            &strings(&[
+                "-c",
+                r#"
+set -o pipefail
+bash "$1" 2>&1 | cat
+status=$?
+for pid_file in "$2"/*.pid; do
+  pid=$(<"$pid_file")
+  kill -0 "$pid" || status=91
+  kill "$pid" || status=92
+done
+exit "$status"
+"#,
+                "fixture-stream-test",
+                script.to_str().expect("script path"),
+                state.to_str().expect("state path"),
+            ]),
+            3,
+        );
+        let output = command_output(temp.path(), 1, "stdout").expect("fixture trace");
+        outcome.unwrap_or_else(|error| {
+            panic!("{invocation} kept exec streams open after shell exit: {error}; {output}")
+        });
+        assert!(output.contains("TRACE"), "parent tracing must stay enabled");
+    }
 }
 
 #[test]

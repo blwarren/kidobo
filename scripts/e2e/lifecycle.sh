@@ -83,29 +83,33 @@ install_target() {
   fi
 }
 
+fixture_curl() {
+  curl --noproxy '*' --connect-timeout 1 --max-time 1 "$@"
+}
 serve_dir() {
-  local directory=$1 port=$2 label=$3
-  if [[ -s "$directory/SHA256SUMS" ]] && cmp -s "$directory/SHA256SUMS" <(curl -fsS "http://127.0.0.1:$port/SHA256SUMS" 2>/dev/null); then return 0; fi
-  python3 -m http.server --bind 127.0.0.1 --directory "$directory" "$port" >"$STATE/http-$label.log" 2>&1 &
+  local directory=$1 port=$2 label=$3 deadline=$((SECONDS + 5))
+  if [[ -s "$directory/SHA256SUMS" ]] && cmp -s "$directory/SHA256SUMS" <(fixture_curl -fsS "http://127.0.0.1:$port/SHA256SUMS" 2>/dev/null); then return 0; fi
+  python3 -m http.server --bind 127.0.0.1 --directory "$directory" "$port" >"$STATE/http-$label.log" 2>&1 9>&- &
   printf '%s\n' "$!" > "$STATE/http-$label.pid"
-  for _ in {1..50}; do
-    if curl -fsS "http://127.0.0.1:$port/" >/dev/null 2>&1; then return 0; fi
+  while (( SECONDS < deadline )); do
+    if fixture_curl -fsS "http://127.0.0.1:$port/" >/dev/null 2>&1; then return 0; fi
     sleep 0.1
   done
   fail "HTTP fixture failed to start: $label"
 }
 start_source_fixture() {
+  local deadline=$((SECONDS + 5))
   mkdir -p "$ROOT/fixtures"
   cat > "$ROOT/fixtures/feed.txt" <<EOF
 198.51.100.44
 2001:db8::44
 EOF
-  if cmp -s "$ROOT/fixtures/feed.txt" <(curl -fsS "http://127.0.0.1:$SOURCE_PORT/feed.txt" 2>/dev/null); then return 0; fi
-  stop_fixture "$STATE/http-source.pid" "$ROOT/fixtures $SOURCE_PORT"
-  python3 -m http.server --bind 127.0.0.1 --directory "$ROOT/fixtures" "$SOURCE_PORT" >"$STATE/http-source.log" 2>&1 &
+  if cmp -s "$ROOT/fixtures/feed.txt" <(fixture_curl -fsS "http://127.0.0.1:$SOURCE_PORT/feed.txt" 2>/dev/null); then return 0; fi
+  stop_fixture "$STATE/http-source.pid" "$ROOT/traffic.py source $ROOT/fixtures/feed.txt $SOURCE_PORT"
+  python3 "$ROOT/traffic.py" source "$ROOT/fixtures/feed.txt" "$SOURCE_PORT" >"$STATE/http-source.log" 2>&1 9>&- &
   printf '%s\n' "$!" > "$STATE/http-source.pid"
-  for _ in {1..50}; do
-    if curl -fsS "http://127.0.0.1:$SOURCE_PORT/feed.txt" >/dev/null 2>&1; then return 0; fi
+  while (( SECONDS < deadline )); do
+    if fixture_curl -fsS "http://127.0.0.1:$SOURCE_PORT/feed.txt" >/dev/null 2>&1; then return 0; fi
     sleep 0.1
   done
   fail 'HTTP source fixture failed to start'
@@ -126,7 +130,8 @@ defer_timer_until_configuration_is_ready() {
   local dropin=/run/systemd/system/kidobo-sync.timer.d/e2e.conf
   [[ ! -e "$dropin" ]] || fail "refusing to replace existing timer drop-in $dropin"
   mkdir -p "${dropin%/*}"
-  printf '[Timer]\nOnBootSec=1h\n' > "$dropin"
+  # Timer expressions accumulate across drop-ins unless the list is reset first.
+  printf '[Timer]\nOnBootSec=\nOnActiveSec=1h\n' > "$dropin"
   systemctl daemon-reload
   if systemctl is-active --quiet kidobo-sync.timer; then
     systemctl restart kidobo-sync.timer
@@ -231,7 +236,7 @@ start_traffic_servers() {
     log_file="$STATE/server-$label.log"
     stop_fixture "$pid_file" "$ROOT/traffic.py serve $address $TRAFFIC_PORT"
     rm -f "$ready_file"
-    python3 "$ROOT/traffic.py" serve "$address" "$TRAFFIC_PORT" "$ready_file" >"$log_file" 2>&1 &
+    python3 "$ROOT/traffic.py" serve "$address" "$TRAFFIC_PORT" "$ready_file" >"$log_file" 2>&1 9>&- &
     pid=$!
     printf '%s\n' "$pid" > "$pid_file"
     for _ in {1..200}; do
@@ -427,7 +432,7 @@ test_bad_checksum() {
 }
 
 os_upgrade_phase() {
-  e2e_check_start 'operating system upgrade' 'package manager completes successfully or requests reboot with status 102/103'
+  e2e_check_start 'operating system upgrade' 'upgrade uses the fresh provisioning metadata; transaction completes or requests reboot with status 102/103'
   [[ -s "$STATE/provision.txt" ]] || fail 'OS upgrade requires provisioning metadata'
   local family
   family=$(sed -n 's/^family=//p' "$STATE/provision.txt")
@@ -444,9 +449,12 @@ os_upgrade_phase() {
     esac
   }
   case "$family" in
-    apt) export DEBIAN_FRONTEND=noninteractive; apt-get -o APT::Update::Error-Mode=any update; run_upgrade apt-get -y full-upgrade ;;
-    dnf|dnf-epel) run_upgrade dnf -y --refresh upgrade ;;
-    zypper) zypper --non-interactive refresh; run_upgrade zypper --non-interactive update ;;
+    # provision.sh refreshed package metadata immediately before installing prerequisites.
+    # Reuse that per-VM metadata here; forcing another refresh adds network work without
+    # improving the OS upgrade coverage.
+    apt) export DEBIAN_FRONTEND=noninteractive; run_upgrade apt-get -y full-upgrade ;;
+    dnf|dnf-epel) run_upgrade dnf -y upgrade ;;
+    zypper) run_upgrade zypper --no-refresh --non-interactive update ;;
     *) fail "unknown recorded package family: $family" ;;
   esac
   case "$family" in
@@ -564,7 +572,7 @@ start_phase() {
 
   # Read-only doctor and lookup must leave source files, sets, and firewall rules unchanged.
   e2e_check_start 'offline doctor and lookup preserve runtime' 'readonly-before and readonly-after snapshots match with HTTP source stopped'
-  stop_fixture "$STATE/http-source.pid" "$ROOT/fixtures $SOURCE_PORT"
+  stop_fixture "$STATE/http-source.pid" "$ROOT/traffic.py source $ROOT/fixtures/feed.txt $SOURCE_PORT"
   readonly_state_snapshot "$STATE/readonly-before"
   kidobo doctor > "$STATE/doctor.json"
   kidobo lookup "$V4_PEER" --format tsv > "$STATE/lookup.tsv"
@@ -580,7 +588,6 @@ start_phase() {
 2001:db8::44
 2001:db8::46
 EOF
-  sleep 2
   write_config '' '' 2
   local before after
   before=$(sets_snapshot)
@@ -593,7 +600,6 @@ EOF
 198.51.100.44
 2001:db8::44
 EOF
-  sleep 2
   write_config
   sync_and_assert
   restore_boot_timer
@@ -649,7 +655,7 @@ after_reboot_phase() {
 upgrade_phase() {
   e2e_check_start 'baseline to target upgrade preserves data' 'published baseline validated or narrowly recovered; target installed; config/blocklist/temporary bans unchanged; enforcement restored'
   start_source_fixture
-  if [[ "$mode" == candidate ]] && ! curl -fsS "http://127.0.0.1:$HTTP_PORT/" >/dev/null 2>&1; then
+  if [[ "$mode" == candidate ]] && ! fixture_curl -fsS "http://127.0.0.1:$HTTP_PORT/" >/dev/null 2>&1; then
     serve_dir "$RELEASE" "$HTTP_PORT" release-upgrade
   fi
   [[ -s "$ROOT/baseline-tag" ]] || fail 'runner must write /opt/kidobo-e2e/baseline-tag'
@@ -868,7 +874,7 @@ finish_phase() {
   assert_no_managed_runtime
   assert_unrelated_sentinels
   e2e_check_pass 'binary/data/cache/units/sets/chains absent; timer inactive; IPv4/IPv6 allowed; unrelated sentinels retained'
-  stop_fixture "$STATE/http-source.pid" "$ROOT/fixtures $SOURCE_PORT"
+  stop_fixture "$STATE/http-source.pid" "$ROOT/traffic.py source $ROOT/fixtures/feed.txt $SOURCE_PORT"
   printf 'finished tag=%s\n' "$tag" > "$STATE/finished"
   printf 'finish phase passed; failed uninstall preserved runtime and cleanup retained unrelated sentinels\n'
 }
