@@ -195,8 +195,11 @@ just ci
 just release-notes-check
 ```
 
-`just check` is the fast development loop. Run `just ci` explicitly before every
-push; GitHub does not run project CI for pushes or tags. The complete local gate
+`just test-fast` runs the core, application, and CLI unit tests. The pre-commit hook
+uses `just commit-check` for whitespace checks and, when staged files affect Rust,
+formatting verification and these fast tests. It does not modify source files.
+`just check` remains the complete development format/test/lint loop. Run `just ci`
+before every push; GitHub does not run project CI for pushes or tags. The complete local gate
 checks formatting, lints, dependency policy, audits, and tests. Publication additionally
 requires coverage, strict rustdoc, the isolated release-binary exercise, static Debian/Alpine
 compatibility, and by default required Debian/Ubuntu coverage in the [Incus distro lifecycle

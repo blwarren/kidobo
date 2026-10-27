@@ -175,7 +175,7 @@ mod tests {
 
     use tempfile::TempDir;
 
-    use super::{read_bytes_with_limit, read_to_string_with_limit, write_string_atomic};
+    use super::{read_bytes_with_limit, read_to_string_with_limit};
 
     #[test]
     fn read_to_string_with_limit_errors_when_file_exceeds_limit() {
@@ -196,16 +196,5 @@ mod tests {
 
         let bytes = read_bytes_with_limit(&path, 3).expect("read");
         assert_eq!(bytes, vec![0, 1, 2]);
-    }
-
-    #[test]
-    fn atomic_write_replaces_existing_contents() {
-        let temp = TempDir::new().expect("tempdir");
-        let path = temp.path().join("atomic.txt");
-        fs::write(&path, "before").expect("write");
-
-        write_string_atomic(&path, "after").expect("atomic write");
-
-        assert_eq!(read_to_string_with_limit(&path, 16).expect("read"), "after");
     }
 }

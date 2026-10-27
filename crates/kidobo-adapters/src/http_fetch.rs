@@ -112,14 +112,24 @@ mod tests {
         }
     }
 
+    fn expected_request(conditional: bool) -> HttpRequest {
+        HttpRequest {
+            url: "https://example.com/feed.txt".into(),
+            max_body_bytes: 1024,
+            if_none_match: conditional.then(|| "etag-1".into()),
+            if_modified_since: conditional.then(|| "Mon, 01 Jan 2024 00:00:00 GMT".into()),
+        }
+    }
+
     #[test]
     fn returns_network_response_for_non_304_status() {
-        let client = MockHttpClient::new(vec![Ok(HttpResponse {
+        let expected = HttpResponse {
             status: StatusCode::OK,
             body: b"10.0.0.1".to_vec(),
-            etag: None,
-            last_modified: None,
-        })]);
+            etag: Some("new-etag".into()),
+            last_modified: Some("Tue, 02 Jan 2024 00:00:00 GMT".into()),
+        };
+        let client = MockHttpClient::new(vec![Ok(expected.clone())]);
 
         let response = unwrap_network_result(fetch_with_conditional_cache(
             &client,
@@ -131,8 +141,8 @@ mod tests {
             "remote source",
         ));
 
-        assert_eq!(response.status, StatusCode::OK);
-        assert_eq!(client.requests().len(), 1);
+        assert_eq!(response, expected);
+        assert_eq!(client.requests(), [expected_request(false)]);
     }
 
     #[test]
@@ -155,7 +165,7 @@ mod tests {
         );
 
         assert_eq!(result, ConditionalFetchResult::CacheNotModified);
-        assert_eq!(client.requests().len(), 1);
+        assert_eq!(client.requests(), [expected_request(true)]);
     }
 
     #[test]
@@ -185,12 +195,19 @@ mod tests {
             "remote source",
         ));
 
-        assert_eq!(response.status, StatusCode::OK);
-
-        let requests = client.requests();
-        assert_eq!(requests.len(), 2);
-        assert_eq!(requests[1].if_none_match, None);
-        assert_eq!(requests[1].if_modified_since, None);
+        assert_eq!(
+            response,
+            HttpResponse {
+                status: StatusCode::OK,
+                body: b"198.51.100.7".to_vec(),
+                etag: None,
+                last_modified: None,
+            }
+        );
+        assert_eq!(
+            client.requests(),
+            [expected_request(true), expected_request(false)]
+        );
     }
 
     #[test]
@@ -218,5 +235,9 @@ mod tests {
         );
 
         assert_eq!(result, ConditionalFetchResult::FallbackCache);
+        assert_eq!(
+            client.requests(),
+            [expected_request(false), expected_request(false)]
+        );
     }
 }

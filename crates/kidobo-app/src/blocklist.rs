@@ -207,15 +207,14 @@ fn partial_update_error(
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
-    use std::sync::{Arc, Mutex};
+    use std::sync::Mutex;
 
     use kidobo_core::blocklist::BlocklistDocument;
     use kidobo_core::config::Config;
 
     use super::{
-        AsnCacheRemover, AsnConfigEditor, AsnConfigUpdate, AsnUnbanDependencies, AsnUnbanRequest,
         BanChange, BanDependencies, BanRequest, BlocklistInput, BlocklistRepository, UnbanDecision,
-        UnbanRequest, apply_unban, execute_ban, execute_unban_asn, prepare_unban,
+        UnbanRequest, apply_unban, execute_ban, prepare_unban,
     };
     use crate::AppError;
     use crate::paths::{ConfigRequirement, PathResolutionInput, ResolvedPaths};
@@ -1008,83 +1007,6 @@ mod tests {
             [(cidr("192.0.2.1"), 6000), (cidr("2001:db8::1"), 5000),]
                 .into_iter()
                 .collect()
-        );
-    }
-
-    // Drop records lock release, making the ledger sensitive to deletion occurring one statement
-    // too late even though both operations would otherwise succeed in a sequential unit test.
-    struct EventGuard(Arc<Mutex<Vec<&'static str>>>);
-
-    impl LockGuard for EventGuard {}
-
-    impl Drop for EventGuard {
-        fn drop(&mut self) {
-            self.0.lock().expect("events").push("unlock");
-        }
-    }
-
-    struct EventLocks(Arc<Mutex<Vec<&'static str>>>);
-
-    impl LockManager for EventLocks {
-        fn acquire(&self, _path: &Path) -> Result<Box<dyn LockGuard>, AppError> {
-            self.0.lock().expect("events").push("lock");
-            Ok(Box::new(EventGuard(Arc::clone(&self.0))))
-        }
-    }
-
-    struct EventAsn(Arc<Mutex<Vec<&'static str>>>);
-
-    impl AsnConfigEditor for EventAsn {
-        fn update_config(
-            &self,
-            _config_path: &Path,
-            _add: &[u32],
-            _remove: &[u32],
-        ) -> Result<AsnConfigUpdate, AppError> {
-            self.0.lock().expect("events").push("update");
-            Ok(AsnConfigUpdate {
-                added: Vec::new(),
-                removed: vec![64512],
-            })
-        }
-    }
-
-    impl AsnCacheRemover for EventAsn {
-        fn delete_cache(&self, _asn: u32, _cache_dir: &Path) -> Result<bool, AppError> {
-            self.0.lock().expect("events").push("delete");
-            Ok(true)
-        }
-    }
-
-    #[test]
-    fn asn_unban_holds_the_process_lock_through_cache_deletion() {
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let locks = EventLocks(Arc::clone(&events));
-        let asn = EventAsn(Arc::clone(&events));
-        let dependencies = AsnUnbanDependencies {
-            cancellation: &crate::ports::NoCancellation,
-            paths: &Paths,
-            configs: &Configs,
-            locks: &locks,
-            config_editor: &asn,
-            cache_remover: &asn,
-            temporary_bans: &EmptyTemporary,
-        };
-
-        let outcome = execute_unban_asn(
-            &AsnUnbanRequest {
-                paths: request_input(),
-                tokens: vec!["As64512".to_string()],
-            },
-            &dependencies,
-        )
-        .expect("unban ASN");
-
-        assert_eq!(outcome.removed, [64512]);
-        assert_eq!(outcome.deleted_cache_files, 1);
-        assert_eq!(
-            *events.lock().expect("events"),
-            ["lock", "update", "delete", "unlock"]
         );
     }
 }

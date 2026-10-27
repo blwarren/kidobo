@@ -495,7 +495,7 @@ mod tests {
         }
 
         fn save(&self, _path: &Path, _state: &TemporaryBans) -> Result<(), AppError> {
-            Ok(())
+            panic!("doctor must not write temporary state")
         }
     }
 
@@ -503,6 +503,10 @@ mod tests {
     struct Probes(Mutex<Vec<String>>);
     impl DoctorProbe for Probes {
         fn find_binary(&self, binary: &str) -> Option<PathBuf> {
+            self.0
+                .lock()
+                .expect("probes")
+                .push(format!("find:{binary}"));
             Some(PathBuf::from(format!("/usr/bin/{binary}")))
         }
 
@@ -563,6 +567,16 @@ mod tests {
                 .iter()
                 .all(|check| check.detail == "ipv6 disabled in config")
         );
-        assert_eq!(*probes.0.lock().expect("probes"), ["ipset", "iptables"]);
+        assert_eq!(
+            *probes.0.lock().expect("probes"),
+            [
+                "find:sudo",
+                "find:bgpq4",
+                "find:ipset",
+                "find:iptables",
+                "ipset",
+                "iptables",
+            ]
+        );
     }
 }

@@ -30,22 +30,25 @@ impl TemporaryBanRepository for FileTemporaryBanRepository {
     }
 
     fn save(&self, path: &Path, state: &TemporaryBans) -> Result<(), AppError> {
-        let contents = serialize_temporary_bans(state).map_err(|error| state_error(path, error))?;
-        if contents.len() > TEMPORARY_BANS_READ_LIMIT {
-            return Err(state_error(
-                path,
-                format!("file exceeds {TEMPORARY_BANS_READ_LIMIT} byte limit"),
-            ));
-        }
-        if let Some(parent) = path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-        {
-            fs::create_dir_all(parent).map_err(|error| state_error(path, error))?;
-        }
-        write_string_atomic_with_limit(path, &contents, TEMPORARY_BANS_READ_LIMIT)
-            .map_err(|error| state_error(path, error))
+        save_with_limit(path, state, TEMPORARY_BANS_READ_LIMIT)
     }
+}
+
+fn save_with_limit(path: &Path, state: &TemporaryBans, limit: usize) -> Result<(), AppError> {
+    let contents = serialize_temporary_bans(state).map_err(|error| state_error(path, error))?;
+    if contents.len() > limit {
+        return Err(state_error(
+            path,
+            format!("file exceeds {limit} byte limit"),
+        ));
+    }
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent).map_err(|error| state_error(path, error))?;
+    }
+    write_string_atomic_with_limit(path, &contents, limit).map_err(|error| state_error(path, error))
 }
 
 fn state_error(path: &Path, error: impl std::fmt::Display) -> AppError {
@@ -150,12 +153,11 @@ mod tests {
             read_to_string_with_limit(&path, TEMPORARY_BANS_READ_LIMIT).expect("preserved"),
             original
         );
-        state.asns = (1..=400_000)
+        state.asns = (1..=10)
             .map(|asn| (asn, 9_223_372_036_854_775_807))
             .collect();
         assert!(
-            repository
-                .save(&path, &state)
+            save_with_limit(&path, &state, 128)
                 .expect_err("oversized")
                 .to_string()
                 .contains("byte limit")
@@ -165,6 +167,40 @@ mod tests {
             original
         );
         assert_eq!(fs::read_dir(root.path()).expect("read dir").count(), 1);
+    }
+
+    #[test]
+    fn serialized_save_limit_accepts_exact_bytes_and_preserves_rejected_state() {
+        let root = tempfile::tempdir().expect("root");
+        let path = root.path().join("temporary-bans.toml");
+        let mut state = TemporaryBans::default();
+        state.asns.insert(64496, 1234);
+        let serialized = serialize_temporary_bans(&state).expect("serialize");
+        for limit in [serialized.len() + 1, serialized.len(), serialized.len() - 1] {
+            fs::write(&path, "preserve").expect("original");
+            let result = save_with_limit(&path, &state, limit);
+            if limit < serialized.len() {
+                assert!(
+                    matches!(result, Err(AppError::TemporaryBans { path: failed, reason })
+                    if failed == path && reason == format!("file exceeds {limit} byte limit"))
+                );
+                assert_eq!(
+                    read_to_string_with_limit(&path, 128).expect("preserved"),
+                    "preserve"
+                );
+            } else {
+                result.expect("within limit");
+                assert_eq!(
+                    FileTemporaryBanRepository.load(&path).expect("roundtrip"),
+                    state
+                );
+                assert_eq!(
+                    read_to_string_with_limit(&path, limit).expect("bytes"),
+                    serialized
+                );
+            }
+            assert_eq!(fs::read_dir(root.path()).expect("read dir").count(), 1);
+        }
     }
 
     #[test]

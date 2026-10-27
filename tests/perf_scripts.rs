@@ -68,6 +68,82 @@ fn benchmark_runner_compares_then_saves_in_separate_invocations() {
 }
 
 #[test]
+fn regression_checker_requires_fresh_complete_comparisons() {
+    for scenario in [
+        "complete",
+        "missing",
+        "stale",
+        "malformed",
+        "invalid-mean",
+        "wrong-field",
+        "slow",
+    ] {
+        let temp = TempDir::new().expect("tempdir");
+        let target = temp.path().join("custom-target");
+        for case in ["first", "second"] {
+            let directory = target.join("criterion").join(case).join("main");
+            fs::create_dir_all(&directory).expect("baseline directory");
+            fs::write(
+                directory.join("estimates.json"),
+                r#"{"mean":{"point_estimate":100}}"#,
+            )
+            .expect("baseline");
+            if scenario == "stale" {
+                let old = directory.parent().expect("case").join("new");
+                fs::create_dir_all(&old).expect("stale directory");
+                fs::write(
+                    old.join("estimates.json"),
+                    r#"{"mean":{"point_estimate":100}}"#,
+                )
+                .expect("stale estimates");
+            }
+        }
+        let fake_bin = temp.path().join("bin");
+        write_executable(
+            &fake_bin.join("cargo"),
+            r#"#!/bin/bash
+set -euo pipefail
+[[ "$*" == 'bench --bench core_perf -- --baseline main' ]]
+mkdir -p "$CARGO_TARGET_DIR/criterion/first/new"
+mean=105
+[[ "$KIDOBO_TEST_SCENARIO" != slow ]] || mean=125
+if [[ "$KIDOBO_TEST_SCENARIO" == malformed ]]; then
+  printf 'garbage "point_estimate":105' > "$CARGO_TARGET_DIR/criterion/first/new/estimates.json"
+elif [[ "$KIDOBO_TEST_SCENARIO" == invalid-mean ]]; then
+  printf '{"mean":{"point_estimate":0}}' > "$CARGO_TARGET_DIR/criterion/first/new/estimates.json"
+elif [[ "$KIDOBO_TEST_SCENARIO" == wrong-field ]]; then
+  printf '{"median":{"point_estimate":105}}' > "$CARGO_TARGET_DIR/criterion/first/new/estimates.json"
+else
+  printf '{"mean":{"point_estimate":%s}}' "$mean" > "$CARGO_TARGET_DIR/criterion/first/new/estimates.json"
+fi
+if [[ "$KIDOBO_TEST_SCENARIO" != missing && "$KIDOBO_TEST_SCENARIO" != stale ]]; then
+  mkdir -p "$CARGO_TARGET_DIR/criterion/second/new"
+  printf '{"mean":{"point_estimate":105}}' > "$CARGO_TARGET_DIR/criterion/second/new/estimates.json"
+fi
+"#,
+        );
+        let output = Command::new(script_path("scripts/perf/check-regressions.sh"))
+            .args(["--skip-rss-probe"])
+            .current_dir(temp.path())
+            .env("CARGO_TARGET_DIR", &target)
+            .env("KIDOBO_TEST_SCENARIO", scenario)
+            .env("PATH", path_with_prefix(&fake_bin))
+            .output()
+            .expect("check isolated estimates");
+        assert_eq!(
+            output.status.success(),
+            scenario == "complete",
+            "{scenario}: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if matches!(scenario, "missing" | "stale") {
+            assert!(String::from_utf8_lossy(&output.stderr).contains("missing current results"));
+        }
+    }
+}
+
+#[test]
 fn lookup_probe_builds_fixture_without_running_init_and_measures_both_formats() {
     let temp = TempDir::new().expect("tempdir");
     let fake_binary = temp.path().join("kidobo");

@@ -27,6 +27,7 @@ fn runner_at(dir: &Path) -> Runner {
         incus_program: "/unused-incus".into(),
         cancelled: Arc::new(AtomicBool::new(false)),
         report: Report::open(dir).expect("report"),
+        command_poll_interval: std::time::Duration::from_millis(1),
     }
 }
 

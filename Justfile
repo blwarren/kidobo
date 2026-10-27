@@ -22,6 +22,18 @@ test:
 format:
     @cargo fmt --all
 
+# Check formatting without modifying sources.
+format-check:
+    @cargo fmt --all --check
+
+# Run the fast domain, application, and CLI unit tests.
+test-fast:
+    @cargo test --locked --quiet -p kidobo-core -p kidobo-app -p kidobo --lib
+
+# Check staged whitespace and run fast Rust checks when staged files affect Rust.
+commit-check:
+    @./scripts/check-commit.sh
+
 # Run cargo-deny policy checks.
 deny:
     @cargo deny check advisories bans licenses sources
@@ -57,8 +69,8 @@ e2e *args:
     @bash ./scripts/e2e-tmux.sh "$@"
 
 # Package and test the candidate inside the persistent session.
-[private]
 [positional-arguments]
+[private]
 _e2e *args: build-release
     #!/usr/bin/env bash
     set -euo pipefail
@@ -111,7 +123,7 @@ rustdoc:
 
 # Run the complete local CI validation sequence.
 ci: && lint deny audit test
-    @cargo fmt --all --check
+    @just format-check
 
 # Run the stable llvm-cov region, function, and line coverage gates.
 coverage:

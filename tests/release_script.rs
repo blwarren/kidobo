@@ -104,6 +104,45 @@ fn run_with_confirmation(command: &mut Command, confirmation: &str) -> Output {
     child.wait_with_output().expect("wait for publisher")
 }
 
+struct CommandFixture {
+    _temp: TempDir,
+    repo: PathBuf,
+    fake_bin: PathBuf,
+    event_log: PathBuf,
+}
+
+impl CommandFixture {
+    fn new() -> Self {
+        let temp = TempDir::new().expect("tempdir");
+        let repo = temp.path().join("repo");
+        let fake_bin = temp.path().join("fake-bin");
+        let event_log = temp.path().join("events.log");
+        fs::create_dir_all(repo.join("scripts")).expect("create recipe directory");
+        for tool in ["git", "cargo", "gh"] {
+            write_executable(
+                &fake_bin.join(tool),
+                "#!/bin/bash\nprintf 'unexpected tool: %s\\n' \"$0\" >> \"$KIDOBO_TEST_EVENT_LOG\"\nexit 99\n",
+            );
+        }
+        Self {
+            _temp: temp,
+            repo,
+            fake_bin,
+            event_log,
+        }
+    }
+
+    fn publisher_command(&self) -> Command {
+        let mut command = Command::new(publisher_path());
+        command
+            .arg(RELEASE_VERSION)
+            .current_dir(&self.repo)
+            .env("PATH", path_with_prefix(&self.fake_bin))
+            .env("KIDOBO_TEST_EVENT_LOG", &self.event_log);
+        command
+    }
+}
+
 struct ReleaseFixture {
     temp: TempDir,
     repo: PathBuf,
@@ -202,6 +241,9 @@ impl ReleaseFixture {
 set -euo pipefail
 printf '%s\n' "$*" >> "${KIDOBO_TEST_GIT_LOG}"
 printf 'git %s\n' "$*" >> "${KIDOBO_TEST_EVENT_LOG}"
+if [[ -n "${KIDOBO_TEST_READY_MARKER:-}" && "$*" == '--no-pager diff --cached' ]]; then
+  : > "${KIDOBO_TEST_READY_MARKER}"
+fi
 exec "${KIDOBO_TEST_REAL_GIT}" "$@"
 "#,
         );
@@ -215,9 +257,6 @@ exec "${KIDOBO_TEST_REAL_GIT}" "$@"
 set -euo pipefail
 printf 'just %s\n' "$*" >> "${KIDOBO_TEST_EVENT_LOG}"
 if [[ "$1" == "${KIDOBO_TEST_FAIL_GATE:-}" ]]; then exit 44; fi
-if [[ -n "${KIDOBO_TEST_READY_MARKER:-}" && "$*" == "release-compat" ]]; then
-  : > "${KIDOBO_TEST_READY_MARKER}"
-fi
 if [[ "$1" == "e2e-artifact" ]]; then
   [[ "${KIDOBO_E2E_RESULTS_DIR}" == "${KIDOBO_TEST_REPO_ROOT}/target/e2e" ]] || exit 46
   if [[ "${KIDOBO_TEST_FAIL_E2E:-0}" == "1" ]]; then exit 45; fi
@@ -889,7 +928,7 @@ fn publisher_atomically_pushes_then_verifies_and_publishes_local_artifacts() {
     assert!(fixture.remote_tag_exists(RELEASE_TAG));
     let log = read_to_string_with_limit(&fixture.git_log, FIXTURE_LOG_READ_LIMIT);
     let expected_push = format!(
-        "push --atomic origin {release_head}:refs/heads/main refs/tags/{RELEASE_TAG}:refs/tags/{RELEASE_TAG}"
+        "-c core.hooksPath=/dev/null push --atomic origin {release_head}:refs/heads/main refs/tags/{RELEASE_TAG}:refs/tags/{RELEASE_TAG}"
     );
     assert!(
         log.lines().any(|line| line == expected_push),
@@ -960,7 +999,7 @@ fn publisher_atomically_pushes_then_verifies_and_publishes_local_artifacts() {
         .find("just release-compat\n")
         .expect("release compatibility event");
     let push_position = events
-        .find("git push --atomic ")
+        .find("git -c core.hooksPath=/dev/null push --atomic ")
         .expect("atomic push event");
     let create_position = events
         .find("gh release create ")
@@ -1076,7 +1115,7 @@ fn distro_gate_failure_or_artifact_changes_prevent_publication() {
         assert!(!fixture.tag_exists());
         let events = read_to_string_with_limit(&fixture.event_log, FIXTURE_LOG_READ_LIMIT);
         assert!(events.contains("just e2e-artifact "));
-        assert!(!events.contains("git push --atomic "));
+        assert!(!events.contains("git -c core.hooksPath=/dev/null push --atomic "));
         assert!(!events.contains("gh release create "));
     }
 }
@@ -1191,7 +1230,7 @@ fn publisher_resume_rejects_changed_source_and_retained_artifacts() {
         assert!(!fixture.tag_exists());
         let events = read_to_string_with_limit(&fixture.event_log, FIXTURE_LOG_READ_LIMIT);
         assert_eq!(events.matches("just e2e-artifact ").count(), 1);
-        assert!(!events.contains("git push --atomic "));
+        assert!(!events.contains("git -c core.hooksPath=/dev/null push --atomic "));
     }
 }
 
@@ -1247,7 +1286,7 @@ fn publisher_rejects_conflicting_or_malformed_resume_options_before_tools() {
         vec!["--resume-e2e", "run-123-456", "--resume-e2e", "run-123-789"],
         vec!["--skip-e2e", "--skip-e2e"],
     ] {
-        let fixture = ReleaseFixture::new();
+        let fixture = CommandFixture::new();
         let output = fixture
             .publisher_command()
             .args(&options)
@@ -1325,7 +1364,7 @@ command() {
 
 #[test]
 fn publisher_rejects_unknown_options_before_running_tools() {
-    let fixture = ReleaseFixture::new();
+    let fixture = CommandFixture::new();
     let output = fixture
         .publisher_command()
         .arg("--skip-e2")
@@ -1334,6 +1373,85 @@ fn publisher_rejects_unknown_options_before_running_tools() {
     assert_eq!(output.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&output.stderr).contains("unknown option: --skip-e2"));
     assert!(!fixture.event_log.exists());
+}
+
+#[test]
+fn publisher_runs_explicit_gates_without_repeating_git_hooks() {
+    let fixture = ReleaseFixture::new();
+    let hooks = fixture.temp.path().join("hooks");
+    for hook in ["pre-commit", "pre-push"] {
+        write_executable(&hooks.join(hook), "#!/bin/bash\nexit 91\n");
+    }
+    assert_success(
+        &run_git_at(
+            &fixture.repo,
+            &[
+                "config",
+                "core.hooksPath",
+                hooks.to_str().expect("hook path"),
+            ],
+        ),
+        "configure hooks that reject unvalidated ordinary Git operations",
+    );
+    assert_success(
+        &fixture.run_publisher("y\n"),
+        "publish already validated candidate",
+    );
+    let events = read_to_string_with_limit(&fixture.event_log, FIXTURE_LOG_READ_LIMIT);
+    for gate in [
+        "ci",
+        "release-notes-check",
+        "coverage",
+        "rustdoc",
+        "exercise-release",
+        "release-compat",
+    ] {
+        assert_eq!(
+            events.matches(&format!("just {gate}\n")).count(),
+            1,
+            "{gate}"
+        );
+    }
+    assert_eq!(
+        run_git_at(
+            &fixture.repo,
+            &["commit", "--allow-empty", "-m", "ordinary commit"]
+        )
+        .status
+        .code(),
+        Some(1)
+    );
+}
+
+#[test]
+fn publisher_rejects_candidate_changes_after_validation() {
+    let fixture = ReleaseFixture::new();
+    let output = fixture.run_after_validation(|| {
+        let worktrees = run_git_at(&fixture.repo, &["worktree", "list", "--porcelain"]);
+        assert_success(&worktrees, "list candidate worktree");
+        let listing = String::from_utf8(worktrees.stdout).expect("worktree paths");
+        let candidate = listing
+            .lines()
+            .filter_map(|line| line.strip_prefix("worktree "))
+            .map(PathBuf::from)
+            .find(|path| path != &fixture.repo)
+            .expect("candidate worktree");
+        fs::write(candidate.join("LICENSE"), "changed after validation\n")
+            .expect("change candidate");
+        assert_success(
+            &run_git_at(&candidate, &["add", "LICENSE"]),
+            "restage changed candidate",
+        );
+    });
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("validation produced uncommitted changes")
+            || stderr.contains("validated candidate changed"),
+        "{stderr}"
+    );
+    assert!(!fixture.tag_exists());
+    assert!(!fixture.remote_tag_exists(RELEASE_TAG));
 }
 
 #[test]
@@ -1350,14 +1468,14 @@ fn skipping_e2e_still_blocks_publication_on_other_gate_failures() {
         assert!(!fixture.tag_exists());
         assert!(!fixture.remote_tag_exists(RELEASE_TAG));
         let events = read_to_string_with_limit(&fixture.event_log, FIXTURE_LOG_READ_LIMIT);
-        assert!(!events.contains("git push --atomic "));
+        assert!(!events.contains("git -c core.hooksPath=/dev/null push --atomic "));
         assert!(!events.contains("gh release create "));
     }
 }
 
 #[test]
 fn publication_recipe_forwards_the_skip_option_as_an_argument() {
-    let fixture = ReleaseFixture::new();
+    let fixture = CommandFixture::new();
     let justfile = fixture.repo.join("Justfile");
     fs::copy(
         Path::new(env!("CARGO_MANIFEST_DIR")).join("Justfile"),
@@ -1383,8 +1501,7 @@ fn publication_recipe_forwards_the_skip_option_as_an_argument() {
 
 #[test]
 fn artifact_recipe_only_allows_resume_and_preserves_argument_boundaries() {
-    let fixture = ReleaseFixture::new();
-    fs::remove_file(fixture.fake_bin.join("just")).expect("use the real recipe runner");
+    let fixture = CommandFixture::new();
     let justfile = fixture.repo.join("Justfile");
     fs::copy(
         Path::new(env!("CARGO_MANIFEST_DIR")).join("Justfile"),
@@ -1437,8 +1554,7 @@ fn artifact_recipe_only_allows_resume_and_preserves_argument_boundaries() {
 
 #[test]
 fn resume_recipe_defaults_to_all_targets_and_only_accepts_required_only_selection() {
-    let fixture = ReleaseFixture::new();
-    fs::remove_file(fixture.fake_bin.join("just")).expect("use the real recipe runner");
+    let fixture = CommandFixture::new();
     let justfile = fixture.repo.join("Justfile");
     fs::copy(
         Path::new(env!("CARGO_MANIFEST_DIR")).join("Justfile"),

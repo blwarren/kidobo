@@ -138,7 +138,6 @@ mod tests {
     use super::update_asn_bans;
     use crate::limited_io::read_to_string_with_limit;
     use kidobo_app::AppError;
-    use kidobo_core::config::DEFAULT_ASN_CACHE_STALE_AFTER_SECS;
 
     #[test]
     fn asn_table_representations_preserve_unrelated_settings() {
@@ -217,9 +216,11 @@ mod tests {
             let temp = TempDir::new().expect("tempdir");
             let path = temp.path().join("config.toml");
             std::fs::write(&path, asn).expect("fixture");
-            assert!(matches!(
-                update_asn_bans(&path, &[64512], &[]),
-                Err(AppError::ConfigParse { .. })
+            let error =
+                update_asn_bans(&path, &[64512], &[]).expect_err("invalid ASN representation");
+            assert!(matches!(error,
+                AppError::ConfigParse { source: kidobo_core::config::ConfigError::InvalidField { field, .. } }
+                if field == if asn == "asn = 42" { "asn" } else { "asn.banned" }
             ));
             assert_eq!(read_to_string_with_limit(&path, 65536).expect("read"), asn);
         }
@@ -297,75 +298,13 @@ mod tests {
 
         let removed = update_asn_bans(&config_path, &[], &[64512, 64514]).expect("remove");
         assert_eq!(removed.removed, vec![64512, 64514]);
-    }
-
-    #[test]
-    fn update_asn_bans_creates_asn_table_when_missing() {
-        let temp = TempDir::new().expect("tempdir");
-        let config_path = temp.path().join("config.toml");
-        std::fs::write(&config_path, "[ipset]\nset_name='kidobo'\n").expect("write");
-
-        let result = update_asn_bans(&config_path, &[64513], &[]).expect("update");
-        assert_eq!(result.added, vec![64513]);
-
-        let rendered = read_to_string_with_limit(&config_path, 64 * 1024).expect("read");
-        assert!(rendered.contains("[asn]"));
-        assert!(rendered.contains("banned = [64513]"));
-    }
-
-    #[test]
-    fn update_asn_bans_adds_default_cache_stale_after_when_missing() {
-        let temp = TempDir::new().expect("tempdir");
-        let config_path = temp.path().join("config.toml");
-        std::fs::write(
-            &config_path,
-            "[ipset]\nset_name='kidobo'\n[asn]\nbanned=[64512]\n",
-        )
-        .expect("write");
-
-        let _ = update_asn_bans(&config_path, &[64513], &[]).expect("update");
-        let rendered = read_to_string_with_limit(&config_path, 64 * 1024).expect("read");
-        assert!(rendered.contains(&format!(
-            "cache_stale_after_secs = {DEFAULT_ASN_CACHE_STALE_AFTER_SECS}"
-        )));
-    }
-
-    #[test]
-    fn update_asn_bans_rejects_non_array_banned_values() {
-        let temp = TempDir::new().expect("tempdir");
-        let config_path = temp.path().join("config.toml");
-        std::fs::write(
-            &config_path,
-            "[ipset]\nset_name='kidobo'\n[asn]\nbanned='not-an-array'\n",
-        )
-        .expect("write");
-
-        let err = update_asn_bans(&config_path, &[64513], &[]).expect_err("must fail");
-        assert!(matches!(
-            err,
-            AppError::ConfigParse {
-                source: kidobo_core::config::ConfigError::InvalidField { field, .. }
-            } if field == "asn.banned"
-        ));
-    }
-
-    #[test]
-    fn update_asn_bans_rejects_non_positive_asn_values() {
-        let temp = TempDir::new().expect("tempdir");
-        let config_path = temp.path().join("config.toml");
-        std::fs::write(
-            &config_path,
-            "[ipset]\nset_name='kidobo'\n[asn]\nbanned=[0]\n",
-        )
-        .expect("write");
-
-        let err = update_asn_bans(&config_path, &[64513], &[]).expect_err("must fail");
-        assert!(matches!(
-            err,
-            AppError::ConfigParse {
-                source: kidobo_core::config::ConfigError::InvalidField { field, .. }
-            } if field == "asn.banned"
-        ));
+        assert_eq!(
+            crate::config::load_config_from_file(&config_path)
+                .expect("persisted config")
+                .asn
+                .banned,
+            vec![64513]
+        );
     }
 
     #[test]

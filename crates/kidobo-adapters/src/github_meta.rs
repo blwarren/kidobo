@@ -1086,6 +1086,12 @@ mod tests {
         )
         .expect("load invalid");
         assert_eq!(invalid.source, GithubMetaSource::Empty);
+        assert_eq!(invalid.networks, []);
+        assert!(
+            !CachePaths::from_cache_dir(invalid_temp.path())
+                .generation_store
+                .exists()
+        );
         assert!(
             !invalid_temp
                 .path()
@@ -1459,7 +1465,7 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         fs::write(
             temp.path().join(GITHUB_META_RAW_CACHE_FILE),
-            br#"{"api":["192.30.252.0/22"]}"#,
+            br#"{"api":["192.30.252.0/22"],"git":[],"hooks":[],"packages":[]}"#,
         )
         .expect("write raw cache");
         fs::write(
@@ -1728,6 +1734,14 @@ mod tests {
         )
         .expect("load");
         assert_eq!(result.source, GithubMetaSource::CacheNotModified);
+        assert_eq!(
+            result
+                .networks
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["192.30.252.0/22"]
+        );
 
         let requests = client.requests();
         assert_eq!(requests.len(), 1);
@@ -1978,7 +1992,7 @@ mod tests {
     #[test]
     fn poisoned_legacy_cache_is_ignored_under_the_fixed_envelope() {
         let temp = TempDir::new().expect("tempdir");
-        let raw = br#"{"api":["0.0.0.0/0"]}"#;
+        let raw = br#"{"api":["0.0.0.0/0"],"git":[],"hooks":[],"packages":[]}"#;
         fs::write(temp.path().join(GITHUB_META_RAW_CACHE_FILE), raw).expect("write raw cache");
         fs::write(
             temp.path().join(GITHUB_META_META_CACHE_FILE),

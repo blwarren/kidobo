@@ -28,6 +28,14 @@ Select checks according to the change:
 `just check` formats, tests, and lints. `just ci` checks formatting, lints, dependency policy,
 advisories, and tests; it satisfies the Rust gate without requiring a separate `just check` run.
 Regardless of the editing checks above, `just ci` must pass locally before a push or merge.
+The pre-commit hook runs `just commit-check`: staged and working-tree whitespace checks,
+then `just format-check` and `just test-fast` when staged Rust sources, Cargo manifests/lockfile,
+toolchain/Cargo configuration, or the Justfile change. Documentation-only commits avoid Cargo.
+The fast tests cover core, application, and CLI library units; adapter, process, installer,
+release-script, and local E2E-tool tests remain in the full suite at pre-push. Hook checks use
+the working tree, so review partial staging before committing. Formatting checks never rewrite files.
+The publisher suppresses Git hooks only for its own final commit and push after explicit candidate
+validation or verified resume; ordinary pushes still run `just ci`.
 Coverage, strict rustdoc, the isolated release-binary exercise, static compatibility checks,
 and required coverage in the [Incus distro lifecycle matrix](e2e.md)
 are publication gates; they are not part of `just ci`. Fedora and AlmaLinux coverage is advisory

@@ -653,7 +653,7 @@ after_reboot_phase() {
 }
 
 upgrade_phase() {
-  e2e_check_start 'baseline to target upgrade preserves data' 'published baseline validated or narrowly recovered; target installed; config/blocklist/temporary bans unchanged; enforcement restored'
+  e2e_check_start 'baseline to target upgrade preserves data' 'published baseline validated or narrowly recovered; target installed; config/blocklist/active temporary ban unchanged; preserved ban found offline and enforced'
   start_source_fixture
   if [[ "$mode" == candidate ]] && ! fixture_curl -fsS "http://127.0.0.1:$HTTP_PORT/" >/dev/null 2>&1; then
     serve_dir "$RELEASE" "$HTTP_PORT" release-upgrade
@@ -665,6 +665,8 @@ upgrade_phase() {
   [[ "$baseline_tag" != "$tag" ]] || fail 'baseline-tag must differ from target tag'
   [[ -x "$baseline_installer" ]] || fail "missing baseline installer $baseline_installer"
   [[ -s "$BASELINE/SHA256SUMS" ]] || fail 'baseline release checksums missing'
+  local upgrade_temporary_target=203.0.113.79
+  kidobo ban "$upgrade_temporary_target" --for 1d
   local preserved_config="$STATE/upgrade-config.toml" preserved_blocklist="$STATE/upgrade-blocklist.txt"
   local preserved_temporary="$STATE/upgrade-temporary-bans.toml"
   cp -p "$CONFIG" "$preserved_config"
@@ -701,14 +703,17 @@ upgrade_phase() {
   cmp -s "$preserved_config" "$CONFIG" || fail 'binary upgrade changed configuration'
   cmp -s "$preserved_blocklist" "$BLOCKLIST" || fail 'binary upgrade changed blocklist data'
   cmp -s "$preserved_temporary" /var/lib/kidobo/temporary-bans.toml || fail 'binary upgrade changed temporary-ban data'
+  kidobo lookup "$upgrade_temporary_target" --format tsv > "$STATE/upgrade-temporary-lookup.tsv"
+  grep -Fxq "$(printf '%s\ttemporary:blocklist\t%s/32' "$upgrade_temporary_target" "$upgrade_temporary_target")" "$STATE/upgrade-temporary-lookup.tsv" || fail 'binary upgrade lost the active temporary ban from offline lookup'
   printf 'PRESERVATION: cmp upgrade-config.toml with %s, upgrade-blocklist.txt with %s, upgrade-temporary-bans.toml with temporary-bans.toml: all match\n' "$CONFIG" "$BLOCKLIST" >&9
   restore_boot_timer
   kidobo doctor > "$STATE/doctor-after-upgrade.json"
   sync_and_assert
+  ipset test "$SET4" "$upgrade_temporary_target" || fail 'upgraded sync did not enforce the preserved temporary ban'
   probe IPv4 "$V4_HOST" blocked
   probe IPv6 "$V6_HOST" blocked
   printf 'upgrade phase passed: baseline %s -> target %s with config/data retained\n' "$baseline_tag" "$tag"
-  e2e_check_pass "baseline=$baseline_tag target=$tag; three preserved files match; IPv4/IPv6 blocked after target sync"
+  e2e_check_pass "baseline=$baseline_tag target=$tag; three preserved files match; active temporary ban found offline and enforced; IPv4/IPv6 blocked after target sync"
 }
 
 assert_enforcement_absent() {
@@ -808,12 +813,13 @@ run_baseline_enforcement_check() {
   e2e_check_pass "KNOWN BASELINE RECOVERY: $baseline_tag sync status=$baseline_sync_status matched exact Debian 12 diagnostic; three preserved files match; unrelated sentinels intact; no managed jumps; candidate enforcement required next"
 }
 test_uninstall_failure_preserves_runtime() {
-  e2e_check_start 'failed uninstall preserves runtime' 'invalid-config uninstall fails; timer, binary hash, runtime files and both ipsets retained'
-  local before_hash
+  e2e_check_start 'failed uninstall preserves runtime' 'invalid-config uninstall fails; timer, binary hash, runtime files and exact dual-stack enforcement retained before repair'
+  local before_hash before_firewall
   cp -p "$CONFIG" "$STATE/finish-config.good.toml"
   before_hash=$(sha256sum /usr/local/bin/kidobo | awk '{print $1}')
   defer_timer_until_configuration_is_ready
   wait_for_sync_service_idle
+  before_firewall=$(sets_snapshot)
   printf '\nunknown_key = true\n' >> "$CONFIG"
   printf 'EXPECTED FAILURE: uninstall with invalid runtime configuration\n' >&9
   if "$installer" --uninstall; then fail 'uninstall unexpectedly succeeded with invalid runtime configuration'; else printf 'EXPECTED FAILURE observed: invalid-config uninstall exit status=%s\n' "$?" >&9; fi
@@ -821,12 +827,13 @@ test_uninstall_failure_preserves_runtime() {
   [[ -x /usr/local/bin/kidobo && -s "$CONFIG" && -s "$BLOCKLIST" ]] || fail 'failed uninstall removed runtime files or binary'
   [[ "$(sha256sum /usr/local/bin/kidobo | awk '{print $1}')" == "$before_hash" ]] || fail 'failed uninstall changed binary bytes'
   ipset list "$SET4" >/dev/null && ipset list "$SET6" >/dev/null || fail 'failed uninstall removed managed ipsets'
+  [[ "$(sets_snapshot)" == "$before_firewall" ]] || fail 'failed uninstall changed live firewall enforcement'
+  probe IPv4 "$V4_HOST" blocked
+  probe IPv6 "$V6_HOST" blocked
   cp -p "$STATE/finish-config.good.toml" "$CONFIG"
   sync_and_assert
   restore_boot_timer
-  probe IPv4 "$V4_HOST" blocked
-  probe IPv6 "$V6_HOST" blocked
-  e2e_check_pass "uninstall rejected; timer active, binary sha256=$before_hash retained; config restored; both traffic probes blocked"
+  e2e_check_pass "uninstall rejected; timer active, binary sha256=$before_hash retained; firewall snapshot unchanged and both probes blocked before repair; config restored"
 }
 finish_phase() {
   stop_fixture "$STATE/http-release.pid" "$RELEASE $HTTP_PORT"

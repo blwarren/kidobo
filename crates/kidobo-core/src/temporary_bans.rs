@@ -309,9 +309,18 @@ mod tests {
              [[asns]]\nasn = 64497\nexpires_at = 102\n",
         )
         .expect("state");
-        assert_eq!(state.ips.len(), 3);
-        assert_eq!(state.active_ips(99).len(), 3);
-        assert_eq!(state.active_ips(100).len(), 2);
+        let subnet = parse_ip_cidr_strict("203.0.113.0/24").expect("subnet");
+        let host = parse_ip_cidr_strict("203.0.113.7").expect("host");
+        let v6 = parse_ip_cidr_strict("2001:db8::/48").expect("IPv6 subnet");
+        assert_eq!(
+            state,
+            TemporaryBans {
+                ips: [(subnet, 100), (host, 101), (v6, 102)].into(),
+                asns: [(64496, 100), (64497, 102)].into(),
+            }
+        );
+        assert_eq!(state.active_ips(99), [subnet, host, v6]);
+        assert_eq!(state.active_ips(100), [host, v6]);
         assert_eq!(state.active_ips(102), []);
         assert_eq!(state.active_asns(99), [64496, 64497]);
         assert_eq!(state.active_asns(100), [64497]);
@@ -321,9 +330,15 @@ mod tests {
         assert_eq!(parse_temporary_bans(&rendered).expect("roundtrip"), state);
         let mut pruned = state.clone();
         assert!(!pruned.prune_expired(99));
+        assert_eq!(pruned, state);
         assert!(pruned.prune_expired(100));
-        assert_eq!(pruned.ips.len(), 2);
-        assert_eq!(pruned.asns.len(), 1);
+        assert_eq!(
+            pruned,
+            TemporaryBans {
+                ips: [(host, 101), (v6, 102)].into(),
+                asns: [(64497, 102)].into(),
+            }
+        );
         assert!(!pruned.prune_expired(100));
         assert!(pruned.prune_expired(102));
         assert_eq!(pruned, TemporaryBans::default());

@@ -587,84 +587,10 @@ mod tests {
         subtract_safelist_ipv6,
     };
 
-    fn all_intervals_u32(base: u32, width: u32) -> Vec<IntervalU32> {
-        let mut intervals = Vec::new();
-        for start in 0..width {
-            for end in start..width {
-                intervals.push(IntervalU32 {
-                    start: base + start,
-                    end: base + end,
-                });
-            }
-        }
-        intervals
-    }
-
     #[test]
     fn checked_constructors_reject_invalid_prefixes() {
         assert!(Ipv4Cidr::new(Ipv4Addr::UNSPECIFIED, 33).is_none());
         assert!(Ipv6Cidr::new(Ipv6Addr::UNSPECIFIED, 129).is_none());
-    }
-
-    #[test]
-    fn checked_constructors_canonicalize_boundary_prefixes() {
-        let v4 = Ipv4Cidr::new(Ipv4Addr::new(203, 0, 113, 7), 0).expect("valid prefix");
-        let v6 = Ipv6Cidr::new(Ipv6Addr::LOCALHOST, 0).expect("valid prefix");
-
-        assert_eq!(v4.network(), Ipv4Addr::UNSPECIFIED);
-        assert_eq!(v6.network(), Ipv6Addr::UNSPECIFIED);
-        assert!(Ipv4Cidr::new(Ipv4Addr::BROADCAST, 32).is_some());
-        assert!(Ipv6Cidr::new(Ipv6Addr::from(u128::MAX), 128).is_some());
-    }
-
-    fn all_intervals_u128(base: u128, width: u32) -> Vec<IntervalU128> {
-        let mut intervals = Vec::new();
-        for start in 0..width {
-            for end in start..width {
-                intervals.push(IntervalU128 {
-                    start: base + u128::from(start),
-                    end: base + u128::from(end),
-                });
-            }
-        }
-        intervals
-    }
-
-    fn interval_bits_u32(interval: IntervalU32, base: u32, width: u32) -> u16 {
-        let mut bits = 0_u16;
-        let upper = base + width;
-        let start = interval.start.max(base);
-        let end = interval.end.min(upper - 1);
-        if start > end {
-            return bits;
-        }
-
-        for ip in start..=end {
-            bits |= 1_u16 << (ip - base);
-        }
-        bits
-    }
-
-    fn interval_bits_u128(interval: IntervalU128, base: u128, width: u32) -> u16 {
-        let mut bits = 0_u16;
-        let upper = base + u128::from(width);
-        let start = interval.start.max(base);
-        let end = interval.end.min(upper - 1);
-        if start > end {
-            return bits;
-        }
-
-        let mut ip = start;
-        loop {
-            let offset = u32::try_from(ip - base).expect("offset must fit u32");
-            bits |= 1_u16 << offset;
-            if ip == end {
-                break;
-            }
-            ip += 1;
-        }
-
-        bits
     }
 
     fn cidrs_to_bits_u32(cidrs: &[Ipv4Cidr], base: u32, width: u32) -> u16 {
@@ -711,69 +637,27 @@ mod tests {
     }
 
     fn build_ipv4_forms(base: u32, width: u32) -> Vec<(Vec<Ipv4Cidr>, u16)> {
-        let intervals = all_intervals_u32(base, width);
-        let mut choices = Vec::with_capacity(intervals.len() + 1);
-        choices.push(None);
-        choices.extend(intervals.iter().copied().map(Some));
-
-        let mut forms = Vec::new();
-        for first in &choices {
-            for second in &choices {
-                let mut cidrs = Vec::new();
-                let mut bits = 0_u16;
-
-                if let Some(interval) = first {
-                    cidrs.extend(intervals_to_ipv4_cidrs(&[*interval]));
-                    bits |= interval_bits_u32(*interval, base, width);
-                }
-                if let Some(interval) = second {
-                    cidrs.extend(intervals_to_ipv4_cidrs(&[*interval]));
-                    bits |= interval_bits_u32(*interval, base, width);
-                }
-
-                if let Some(first_cidr) = cidrs.first().copied() {
-                    cidrs.push(first_cidr);
-                }
-                cidrs.reverse();
-
-                forms.push((cidrs, bits));
-            }
-        }
-
-        forms
+        (0..1_u16 << width)
+            .map(|bits| {
+                let cidrs = (0..width)
+                    .filter(|offset| bits & (1_u16 << offset) != 0)
+                    .map(|offset| Ipv4Cidr::from_parts(base + offset, 32))
+                    .collect();
+                (cidrs, bits)
+            })
+            .collect()
     }
 
     fn build_ipv6_forms(base: u128, width: u32) -> Vec<(Vec<Ipv6Cidr>, u16)> {
-        let intervals = all_intervals_u128(base, width);
-        let mut choices = Vec::with_capacity(intervals.len() + 1);
-        choices.push(None);
-        choices.extend(intervals.iter().copied().map(Some));
-
-        let mut forms = Vec::new();
-        for first in &choices {
-            for second in &choices {
-                let mut cidrs = Vec::new();
-                let mut bits = 0_u16;
-
-                if let Some(interval) = first {
-                    cidrs.extend(intervals_to_ipv6_cidrs(&[*interval]));
-                    bits |= interval_bits_u128(*interval, base, width);
-                }
-                if let Some(interval) = second {
-                    cidrs.extend(intervals_to_ipv6_cidrs(&[*interval]));
-                    bits |= interval_bits_u128(*interval, base, width);
-                }
-
-                if let Some(first_cidr) = cidrs.first().copied() {
-                    cidrs.push(first_cidr);
-                }
-                cidrs.reverse();
-
-                forms.push((cidrs, bits));
-            }
-        }
-
-        forms
+        (0..1_u16 << width)
+            .map(|bits| {
+                let cidrs = (0..width)
+                    .filter(|offset| bits & (1_u16 << offset) != 0)
+                    .map(|offset| Ipv6Cidr::from_parts(base + u128::from(offset), 128))
+                    .collect();
+                (cidrs, bits)
+            })
+            .collect()
     }
 
     fn merge_intervals_u32_with_standard_sort(mut intervals: Vec<IntervalU32>) -> Vec<IntervalU32> {
@@ -1486,6 +1370,66 @@ mod tests {
                     "IPv6 carved set mismatch candidates={candidates:?} safelist={safelist:?}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn subtraction_preserves_coverage_across_network_representations() {
+        type Shape = &'static [(u32, u8)];
+        let cases: &[(Shape, Shape, u16)] = &[
+            (&[], &[(0, 2)], 0),
+            (
+                &[(4, 1), (0, 2), (0, 2), (2, 1)],
+                &[(4, 0), (1, 0), (1, 0)],
+                0b0010_1101,
+            ),
+            (
+                &[(6, 1), (0, 1), (4, 1), (2, 1)],
+                &[(6, 0), (0, 0), (4, 0), (2, 0)],
+                0b1010_1010,
+            ),
+            (
+                &[(0, 2), (1, 0), (0, 1)],
+                &[(2, 1), (3, 0), (2, 1)],
+                0b0000_0011,
+            ),
+            (&[(0, 3)], &[(4, 1), (2, 1)], 0b1100_0011),
+            (&[(4, 0), (0, 0)], &[(0, 3)], 0),
+            (&[(4, 1), (0, 1)], &[(2, 1)], 0b0011_0011),
+            (&[(0, 3)], &[(7, 0), (0, 0)], 0b0111_1110),
+            (&[(0, 1)], &[(2, 1)], 0b0000_0011),
+        ];
+        let v4_base = 0xcb00_7100;
+        let v6_base = 0x2001_0db8_0000_0000_0000_0000_0000_0000;
+        for &(candidates, safelist, expected) in cases {
+            let v4 = |shape: Shape| {
+                shape
+                    .iter()
+                    .map(|&(offset, host_bits)| {
+                        Ipv4Cidr::from_parts(v4_base + offset, 32 - host_bits)
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let v6 = |shape: Shape| {
+                shape
+                    .iter()
+                    .map(|&(offset, host_bits)| {
+                        Ipv6Cidr::from_parts(v6_base + u128::from(offset), 128 - host_bits)
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let actual_v4 = subtract_safelist_ipv4(&v4(candidates), &v4(safelist));
+            let actual_v6 = subtract_safelist_ipv6(&v6(candidates), &v6(safelist));
+            assert_eq!(
+                cidrs_to_bits_u32(&actual_v4, v4_base, 8),
+                expected,
+                "IPv4 candidates={candidates:?} safelist={safelist:?}"
+            );
+            assert_eq!(
+                cidrs_to_bits_u128(&actual_v6, v6_base, 8),
+                expected,
+                "IPv6 candidates={candidates:?} safelist={safelist:?}"
+            );
         }
     }
 

@@ -164,14 +164,20 @@ mod tests {
     }
 
     #[test]
-    fn label_falls_back_when_metadata_missing() {
-        let temp = TempDir::new().expect("tempdir");
-        let remote_cache_dir = temp.path().join("remote");
-        fs::create_dir_all(&remote_cache_dir).expect("mkdir remote");
-        fs::write(remote_cache_dir.join("a.iplist"), "2001:db8::/64\n").expect("write a");
-
-        let sources = load_remote_sources(&remote_cache_dir).expect("load");
-        assert_eq!(sources[0].label, "remote:a.iplist");
+    fn label_falls_back_when_metadata_is_missing_or_invalid() {
+        for metadata in [None, Some("{")] {
+            let temp = TempDir::new().expect("tempdir");
+            let remote = temp.path().join("remote");
+            fs::create_dir_all(&remote).expect("mkdir remote");
+            fs::write(remote.join("a.iplist"), "2001:db8::/64\n").expect("write");
+            if let Some(metadata) = metadata {
+                fs::write(remote.join("a.meta.json"), metadata).expect("metadata");
+            }
+            let sources = load_remote_sources(&remote).expect("load");
+            assert_eq!(sources.len(), 1);
+            assert_eq!(sources[0].label, "remote:a.iplist");
+            assert_eq!(sources[0].entries[0].source_line, "2001:db8::/64");
+        }
     }
 
     #[test]
@@ -192,7 +198,9 @@ mod tests {
 
         let err = load_remote_sources(&remote_cache_dir).expect_err("must fail");
         match err {
-            SourceLoadError::Source { source, .. } => {
+            SourceLoadError::Source { path, source } => {
+                assert_eq!(path, remote_cache_dir.join("a.iplist"));
+                assert_eq!(source.kind(), std::io::ErrorKind::InvalidData);
                 assert!(source.to_string().contains("hash mismatch"));
             }
             _ => panic!("unexpected error variant"),

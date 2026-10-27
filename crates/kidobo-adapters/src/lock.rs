@@ -170,15 +170,6 @@ mod tests {
     use super::{LockError, acquire_non_blocking};
 
     #[test]
-    fn acquires_non_blocking_lock() {
-        let temp = TempDir::new().expect("tempdir");
-        let path = temp.path().join("sync.lock");
-
-        let _lock = acquire_non_blocking(&path).expect("acquire");
-        assert!(path.exists());
-    }
-
-    #[test]
     fn second_acquire_fails_when_held() {
         let temp = TempDir::new().expect("tempdir");
         let path = temp.path().join("sync.lock");

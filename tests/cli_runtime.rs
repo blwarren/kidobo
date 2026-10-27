@@ -1,6 +1,6 @@
 use std::env;
 use std::fs::{self, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -239,7 +239,11 @@ if [[ "${KIDOBO_TEST_SLEEP_ONCE:-0}" == "1" ]]; then
   marker="${KIDOBO_TEST_SLEEP_MARKER:-/tmp/kidobo-sudo-sleep.marker}"
   if [[ ! -f "${marker}" ]]; then
     : > "${marker}"
-    sleep 2
+    for ((attempt=0; attempt<500; attempt++)); do
+      [[ -e "${KIDOBO_TEST_SUDO_RELEASE}" ]] && break
+      sleep 0.01
+    done
+    [[ -e "${KIDOBO_TEST_SUDO_RELEASE}" ]] || exit 97
   fi
 fi
 
@@ -576,20 +580,6 @@ fn usage_error_exits_with_two() {
     assert_eq!(output.status.code(), Some(2));
 }
 
-#[test]
-fn lookup_uses_local_sources_and_exits_zero() {
-    let root = create_lookup_root("203.0.113.7\n");
-    let output = run_kidobo_with_root(root.path(), &["lookup", "203.0.113.7", "--format", "tsv"]);
-
-    assert_eq!(output.status.code(), Some(0));
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("203.0.113.7\tinternal:blocklist\t203.0.113.7"),
-        "unexpected lookup output: {stdout}"
-    );
-}
-
 #[cfg(unix)]
 #[test]
 fn lookup_ignores_unrelated_non_unicode_environment_values() {
@@ -777,10 +767,30 @@ fn lookup_streams_two_million_matches_within_192_mib() {
         .env("KIDOBO_ROOT", root.path())
         .env_remove("KIDOBO_TEST_SANDBOX")
         .env_remove("KIDOBO_DISABLE_TEST_SANDBOX")
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn capped lookup");
+    let stdout = child.stdout.take().expect("lookup stdout");
+    let (completed, received) = mpsc::channel();
+    let rows = thread::spawn(move || {
+        let mut reader = io::BufReader::new(stdout);
+        let mut line = String::new();
+        let mut matches = 0;
+        let mut summary = None;
+        while reader.read_line(&mut line).expect("read streamed row") != 0 {
+            if line.starts_with("summary:") {
+                assert!(summary.replace(line.trim_end().to_owned()).is_none());
+            } else {
+                assert_eq!(line.bytes().filter(|byte| *byte == b'\t').count(), 2);
+                matches += 1;
+            }
+            line.clear();
+        }
+        completed
+            .send((matches, summary))
+            .expect("report streamed rows");
+    });
     let deadline = Instant::now() + Duration::from_secs(60);
     while child.try_wait().expect("poll capped lookup").is_none() {
         if Instant::now() >= deadline {
@@ -790,6 +800,15 @@ fn lookup_streams_two_million_matches_within_192_mib() {
         }
         thread::sleep(Duration::from_millis(50));
     }
+    let (matches, summary) = received
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .expect("stdout must finish before the test deadline");
+    rows.join().expect("stream reader");
+    assert_eq!(matches, 2_000_000);
+    assert_eq!(
+        summary.as_deref(),
+        Some("summary: total_ips=2000 matched_ips=2000 matched_pct=100%")
+    );
     let output = child.wait_with_output().expect("wait capped lookup");
     assert!(
         output.status.success(),
@@ -968,41 +987,6 @@ fn lookup_human_output_shows_matches_no_matches_and_summary() {
             "─".repeat(32)
         ),
     ];
-    let actual_borders = stdout
-        .lines()
-        .filter(|line| matches!(line.chars().next(), Some('┌' | '├' | '└')))
-        .collect::<Vec<_>>();
-    assert_eq!(
-        actual_borders,
-        expected_borders
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>(),
-        "lookup table borders changed: {stdout}"
-    );
-    assert!(
-        stdout.contains("│ Target"),
-        "missing table header: {stdout}"
-    );
-    assert!(
-        stdout.contains("203.0.113.7")
-            && stdout.contains("MATCH")
-            && stdout.contains("internal:blocklist"),
-        "missing match row: {stdout}"
-    );
-    assert!(
-        stdout.contains("198.51.100.9") && stdout.contains("NO MATCH"),
-        "missing no-match row: {stdout}"
-    );
-    assert!(stdout.contains("Summary"), "missing summary: {stdout}");
-    assert!(stdout.contains("Targets:    2"), "wrong total: {stdout}");
-    assert!(stdout.contains("Matched:    1"), "wrong matches: {stdout}");
-    assert!(stdout.contains("Unmatched:  1"), "wrong misses: {stdout}");
-    assert!(stdout.contains("Match rate: 50%"), "wrong rate: {stdout}");
-    assert!(
-        !stdout.contains("\x1b["),
-        "redirected human output must not contain ANSI escapes: {stdout:?}"
-    );
     assert_eq!(
         stdout,
         format!(
@@ -1522,6 +1506,7 @@ fn sync_sigint_exits_with_130() {
     let fake_sudo = write_fake_sudo_script(&root);
     let touched = root.path().join("sudo-touched");
     let sleep_marker = root.path().join("sudo-sleep-once.marker");
+    let release = root.path().join("sudo-release");
     let command_log = root.path().join("sudo.log");
 
     let mut command = kidobo_with_root_command(root.path(), &["sync"]);
@@ -1531,6 +1516,7 @@ fn sync_sigint_exits_with_130() {
     );
     command.env("KIDOBO_TEST_SUDO_TOUCHED", &touched);
     command.env("KIDOBO_TEST_SLEEP_ONCE", "1");
+    command.env("KIDOBO_TEST_SUDO_RELEASE", &release);
     command.env("KIDOBO_TEST_SLEEP_MARKER", &sleep_marker);
     command.env("KIDOBO_TEST_SUDO_LOG", &command_log);
     command.stdout(Stdio::piped());
@@ -1552,6 +1538,7 @@ fn sync_sigint_exits_with_130() {
         .expect("send SIGINT");
     assert!(signal_status.success(), "failed to deliver SIGINT");
 
+    fs::write(&release, b"release").expect("release fake command after SIGINT");
     let output = child.wait_with_output().expect("wait for sync");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(

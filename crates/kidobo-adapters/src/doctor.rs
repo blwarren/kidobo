@@ -155,7 +155,11 @@ mod tests {
             let cache = temp.path().join("cache");
             fs::create_dir(&cache).expect("mkdir");
             fs::set_permissions(&cache, fs::Permissions::from_mode(mode)).expect("chmod");
-            assert!(ensure_cache_path_ready(&cache).is_err(), "mode {mode:o}");
+            assert!(
+                matches!(ensure_cache_path_ready(&cache),
+                Err(super::CacheWritableError::InsufficientMode { path }) if path == cache),
+                "mode {mode:o}"
+            );
         }
     }
 

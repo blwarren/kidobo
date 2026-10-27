@@ -624,7 +624,7 @@ fn benchmark_real_world_fixed(c: &mut Criterion, dataset: &RealWorldDataset) {
 }
 
 fn benchmark_real_world_scaled(c: &mut Criterion, dataset: &RealWorldDataset) {
-    let scales = [1_usize, 2_usize, 5_usize, 10_usize];
+    let scales = [2_usize, 5_usize, 10_usize];
 
     let mut collapse_scaled_group = c.benchmark_group("real_world_collapse_ipv4_scaled");
     for scale in scales {

@@ -2,7 +2,8 @@ use super::*;
 use std::os::unix::fs::PermissionsExt;
 use std::sync::{Mutex, MutexGuard};
 
-// Parallel fixture writes and process creation intermittently cause ETXTBSY on Linux.
+// Keep executable fixture writes isolated from concurrent process creation:
+// previous parallel runs intermittently failed with ETXTBSY on Linux.
 static TEST_FIXTURE_LOCK: Mutex<()> = Mutex::new(());
 static NEXT_TEST_DIR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
@@ -859,6 +860,7 @@ fn runner(dir: &Path) -> Runner {
         incus_program: PathBuf::from("incus"),
         cancelled: Arc::new(AtomicBool::new(false)),
         report: Report::open(dir).expect("open test report"),
+        command_poll_interval: Duration::from_millis(1),
     }
 }
 
@@ -1201,13 +1203,11 @@ fn runner_records_spawn_failure_metadata() {
 fn runner_timeout_kills_descendants_in_its_process_group() {
     let temp = TestDir::new();
     let program = temp.path().join("spawn-descendant");
-    let marker = temp.path().join("descendant-finished");
     let spawned = temp.path().join("descendant-started");
     executable(
         &program,
         &format!(
-            "#!/bin/sh\n(sleep 2; printf alive > '{}') &\nprintf started > '{}'\nwait\n",
-            marker.display(),
+            "#!/bin/sh\nsleep 30 &\nprintf '%s\\n' \"$!\" > '{}'\nwait\n",
             spawned.display()
         ),
     );
@@ -1227,12 +1227,40 @@ fn runner_timeout_kills_descendants_in_its_process_group() {
     assert_eq!(metadata["code"], serde_json::Value::Null);
     assert_eq!(metadata["error"], "timed out");
     assert!(metadata["seconds"].as_f64().is_some());
-    assert!(spawned.exists(), "the test descendant should have started");
-    std::thread::sleep(Duration::from_millis(2200));
-    assert!(
-        !marker.exists(),
-        "timed-out descendant must not keep running"
-    );
+    let pid: i32 = read_text(&spawned)
+        .expect("the test descendant should have started")
+        .trim()
+        .parse()
+        .expect("descendant PID");
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        match read_text(&PathBuf::from(format!("/proc/{pid}/stat"))) {
+            Ok(stat)
+                if stat.rsplit_once(") ").is_some_and(|(_, fields)| {
+                    matches!(fields.split_whitespace().next(), Some("Z" | "X"))
+                }) =>
+            {
+                break;
+            }
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                break;
+            }
+            Ok(_) => (),
+            Err(error) => panic!("inspect timed-out descendant: {error}"),
+        }
+        if Instant::now() >= deadline {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+            panic!("timed-out descendant must not keep running");
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
 }
 
 #[test]

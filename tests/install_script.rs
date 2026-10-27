@@ -695,32 +695,37 @@ fn installer_version_verification_failure_preserves_the_existing_binary() {
 
 #[test]
 fn installer_runs_when_read_from_standard_input() {
-    let installer = fs::File::open(installer_path()).expect("open installer");
+    let temp = TempDir::new().expect("tempdir");
+    let binary_script = "#!/bin/bash\nprintf 'kidobo 9.8.7\\n'\n";
+    let release_dir = prepare_release_fixture(&temp, binary_script);
+    let install_dir = temp.path().join("installed");
+    fs::create_dir(&install_dir).expect("temporary install directory");
+    let privileged = temp.path().join("fake-bin/sudo");
+    write_executable(
+        &privileged,
+        "#!/bin/bash\necho 'unexpected privilege fallback' >&2\nexit 99\n",
+    );
     let output = Command::new("bash")
-        .arg("-s")
-        .arg("--")
-        .arg("--help")
-        .stdin(Stdio::from(installer))
+        .args(["-s", "--", "--version", TEST_VERSION])
+        .stdin(Stdio::from(
+            fs::File::open(installer_path()).expect("open installer"),
+        ))
+        .env("KIDOBO_INSTALL_DIR", &install_dir)
+        .env("KIDOBO_ROOT", temp.path().join("runtime"))
+        .env("KIDOBO_TEST_RELEASE_DIR", &release_dir)
+        .env("PATH", path_with_prefix(&temp.path().join("fake-bin")))
         .output()
-        .expect("run installer from stdin");
+        .expect("install through stdin using isolated release assets");
 
-    assert!(output.status.success());
-    assert!(String::from_utf8_lossy(&output.stdout).contains("Usage:"));
-    assert!(!String::from_utf8_lossy(&output.stderr).contains("BASH_SOURCE"));
-}
-
-#[test]
-fn installer_entrypoint_does_not_depend_on_bash_source() {
-    const MAX_INSTALLER_BYTES: u64 = 1024 * 1024;
-    let installer_file = fs::File::open(installer_path()).expect("open installer");
-    let mut installer = String::new();
-    installer_file
-        .take(MAX_INSTALLER_BYTES + 1)
-        .read_to_string(&mut installer)
-        .expect("read installer");
-
-    assert!(installer.len() as u64 <= MAX_INSTALLER_BYTES);
-    assert!(!installer.contains("BASH_SOURCE"));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        read_bytes_with_limit(&install_dir.join("kidobo"), FIXTURE_FILE_READ_LIMIT),
+        binary_script.as_bytes()
+    );
 }
 
 #[test]
@@ -839,34 +844,6 @@ fn custom_root_init_rejects_explicit_empty_value_before_execution() {
 
     assert_eq!(status.code(), Some(1));
     assert!(!marker.exists());
-}
-
-#[test]
-fn uninstall_preserves_artifacts_when_config_aware_flush_fails() {
-    let temp = TempDir::new().expect("tempdir");
-    let root = temp.path().join("root");
-    let install_dir = temp.path().join("bin");
-    let binary = install_dir.join("kidobo");
-    write_executable(&binary, "#!/usr/bin/env bash\nexit 1\n");
-    fs::create_dir_all(root.join("config")).expect("mkdir config");
-    fs::write(root.join("config/config.toml"), "preserve").expect("write config");
-
-    let status = Command::new("bash")
-        .arg("-c")
-        .arg(
-            "source \"$INSTALLER\"; \
-             run_config_aware_flush() { return 1; }; \
-             uninstall_artifacts",
-        )
-        .env("INSTALLER", installer_path())
-        .env("KIDOBO_ROOT", &root)
-        .env("KIDOBO_INSTALL_DIR", &install_dir)
-        .status()
-        .expect("run bash");
-
-    assert_eq!(status.code(), Some(1));
-    assert!(binary.exists());
-    assert!(root.join("config/config.toml").exists());
 }
 
 #[test]

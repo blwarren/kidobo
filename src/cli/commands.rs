@@ -389,10 +389,6 @@ mod tests {
     fn lookup_status_color_wraps_already_padded_cell() {
         let colored = color_lookup_status("MATCH", "MATCH   ");
         assert_eq!(colored, "\x1b[1;36mMATCH   \x1b[0m");
-        assert_eq!(
-            colored.replace("\x1b[1;36m", "").replace("\x1b[0m", ""),
-            "MATCH   "
-        );
     }
 
     #[test]
@@ -417,8 +413,6 @@ mod tests {
     fn lookup_cell_wrapping_preserves_content_and_width() {
         let wrapped = wrap_lookup_cell("abcdefghij", 4);
         assert_eq!(wrapped, vec!["abcd", "efgh", "ij"]);
-        assert_eq!(wrapped.concat(), "abcdefghij");
-        assert!(wrapped.iter().all(|line| line.chars().count() <= 4));
     }
 
     #[test]

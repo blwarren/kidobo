@@ -185,7 +185,9 @@ mod tests {
 
     use kidobo_core::config::Config;
 
-    use super::{FirewallFamily, FlushBackend, FlushDependencies, FlushRequest, execute};
+    use super::{
+        FirewallFamily, FlushBackend, FlushDependencies, FlushOutcome, FlushRequest, execute,
+    };
     use crate::AppError;
     use crate::paths::{ConfigRequirement, PathResolutionInput, ResolvedPaths};
     use crate::ports::{ConfigRepository, LockGuard, LockManager, PathResolver};
@@ -208,13 +210,14 @@ mod tests {
         }
     }
 
-    struct Paths;
+    struct Paths(ConfigRequirement);
     impl PathResolver for Paths {
         fn resolve(
             &self,
             _input: &PathResolutionInput,
-            _requirement: ConfigRequirement,
+            requirement: ConfigRequirement,
         ) -> Result<ResolvedPaths, AppError> {
+            assert_eq!(requirement, self.0);
             Ok(paths())
         }
     }
@@ -223,6 +226,13 @@ mod tests {
     impl ConfigRepository for Configs {
         fn load(&self, _path: &Path) -> Result<Config, AppError> {
             Ok(config())
+        }
+    }
+
+    struct UnusedConfigs;
+    impl ConfigRepository for UnusedConfigs {
+        fn load(&self, _: &Path) -> Result<Config, AppError> {
+            panic!("cache-only flush must not load configuration")
         }
     }
 
@@ -284,6 +294,36 @@ mod tests {
         }
     }
 
+    const CLEANUP_EVENTS: [&str; 5] = [
+        "firewall:Ipv4",
+        "firewall:Ipv6",
+        "ipset:kidobo",
+        "ipset:kidobo-v6",
+        "cache",
+    ];
+
+    fn assert_failed_cleanup(outcome: &FlushOutcome, backend: &Backend) {
+        assert_eq!(*backend.events.lock().expect("events"), CLEANUP_EVENTS);
+        assert_eq!(outcome.completed, [] as [String; 0]);
+        assert_eq!(
+            outcome
+                .failed
+                .iter()
+                .map(|failure| (failure.operation.as_str(), failure.reason.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("IPv4 firewall", "firewall:Ipv4 failed"),
+                ("IPv6 firewall", "firewall:Ipv6 failed"),
+                ("ipset `kidobo`", "ipset:kidobo failed"),
+                ("ipset `kidobo-v6`", "ipset:kidobo-v6 failed"),
+                (
+                    "remote cache",
+                    "failed to clear remote cache at /root/cache/remote: cache failed"
+                ),
+            ]
+        );
+    }
+
     #[test]
     fn cancellation_during_flush_does_not_skip_remaining_cleanup() {
         let backend = Backend {
@@ -294,21 +334,20 @@ mod tests {
             &request(false),
             &FlushDependencies {
                 cancellation: &backend,
-                paths: &Paths,
+                paths: &Paths(ConfigRequirement::Required),
                 configs: &Configs,
                 locks: &Locks,
                 backend: &backend,
             },
         )
         .expect("complete cleanup ledger");
-        assert_eq!(outcome.failed.len(), 5);
-        assert_eq!(backend.events.lock().expect("events").len(), 5);
+        assert_failed_cleanup(&outcome, &backend);
         assert!(matches!(
             execute(
                 &request(false),
                 &FlushDependencies {
                     cancellation: &backend,
-                    paths: &Paths,
+                    paths: &Paths(ConfigRequirement::Required),
                     configs: &Configs,
                     locks: &Locks,
                     backend: &backend
@@ -316,7 +355,7 @@ mod tests {
             ),
             Err(AppError::Interrupted)
         ));
-        assert_eq!(backend.events.lock().expect("events").len(), 5);
+        assert_eq!(*backend.events.lock().expect("events"), CLEANUP_EVENTS);
     }
 
     #[test]
@@ -329,7 +368,7 @@ mod tests {
             &request(false),
             &FlushDependencies {
                 cancellation: &crate::ports::NoCancellation,
-                paths: &Paths,
+                paths: &Paths(ConfigRequirement::Required),
                 configs: &Configs,
                 locks: &Locks,
                 backend: &backend,
@@ -338,14 +377,15 @@ mod tests {
         .expect("flush");
 
         assert_eq!(outcome.failed.len(), 0);
+        assert_eq!(*backend.events.lock().expect("events"), CLEANUP_EVENTS);
         assert_eq!(
-            *backend.events.lock().expect("events"),
+            outcome.completed,
             [
-                "firewall:Ipv4",
-                "firewall:Ipv6",
-                "ipset:kidobo",
-                "ipset:kidobo-v6",
-                "cache",
+                "IPv4 firewall",
+                "IPv6 firewall",
+                "ipset `kidobo`",
+                "ipset `kidobo-v6`",
+                "remote cache"
             ]
         );
     }
@@ -360,7 +400,7 @@ mod tests {
             &request(false),
             &FlushDependencies {
                 cancellation: &crate::ports::NoCancellation,
-                paths: &Paths,
+                paths: &Paths(ConfigRequirement::Required),
                 configs: &Configs,
                 locks: &Locks,
                 backend: &backend,
@@ -368,8 +408,7 @@ mod tests {
         )
         .expect("typed outcome");
 
-        assert_eq!(outcome.failed.len(), 5);
-        assert_eq!(backend.events.lock().expect("events").len(), 5);
+        assert_failed_cleanup(&outcome, &backend);
     }
 
     #[test]
@@ -382,8 +421,8 @@ mod tests {
             &request(true),
             &FlushDependencies {
                 cancellation: &crate::ports::NoCancellation,
-                paths: &Paths,
-                configs: &Configs,
+                paths: &Paths(ConfigRequirement::Optional),
+                configs: &UnusedConfigs,
                 locks: &Locks,
                 backend: &backend,
             },

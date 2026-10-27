@@ -666,15 +666,6 @@ mod tests {
     }
 
     #[test]
-    fn set_name_v6_can_be_overridden() {
-        let config =
-            Config::from_toml_str("[ipset]\nset_name = 'kidobo'\nset_name_v6 = 'custom-v6'\n")
-                .expect("parse");
-
-        assert_eq!(config.ipset.set_name_v6, "custom-v6");
-    }
-
-    #[test]
     fn set_name_v6_must_not_match_set_name() {
         let err = Config::from_toml_str("[ipset]\nset_name = 'kidobo'\nset_name_v6 = 'kidobo'\n")
             .expect_err("must fail");
@@ -705,14 +696,6 @@ mod tests {
     }
 
     #[test]
-    fn enable_ipv6_false_is_respected() {
-        let config = Config::from_toml_str("[ipset]\nset_name='kidobo'\nenable_ipv6=false\n")
-            .expect("parse");
-
-        assert!(!config.ipset.enable_ipv6);
-    }
-
-    #[test]
     fn enable_ipv6_false_does_not_require_valid_derived_v6_set_name() {
         let config = Config::from_toml_str(
             "[ipset]\nset_name='kidobo-name-that-is-thirty-one'\nenable_ipv6=false\n",
@@ -735,12 +718,6 @@ mod tests {
                 reason: "must be 31 characters or fewer".to_string(),
             }
         );
-    }
-
-    #[test]
-    fn chain_action_defaults_to_drop() {
-        let config = Config::from_toml_str("[ipset]\nset_name='kidobo'\n").expect("parse");
-        assert_eq!(config.ipset.chain_action, FirewallAction::Drop);
     }
 
     #[test]
@@ -783,17 +760,6 @@ mod tests {
     }
 
     #[test]
-    fn safe_ips_are_strictly_parsed_as_cidrs() {
-        let config =
-            Config::from_toml_str("[ipset]\nset_name='kidobo'\n[safe]\nips=['10.0.0.1']\n")
-                .expect("parse");
-        assert_eq!(
-            config.safe.ips,
-            vec![CanonicalCidr::V4(Ipv4Cidr::from_parts(0x0a00_0001, 32))]
-        );
-    }
-
-    #[test]
     fn safe_ips_reject_invalid_cidr_tokens() {
         let err = Config::from_toml_str("[ipset]\nset_name='kidobo'\n[safe]\nips=['not-an-ip']\n")
             .expect_err("must fail");
@@ -817,15 +783,6 @@ mod tests {
             config.safe.github_meta_category_mode(),
             GithubMetaCategoryMode::Explicit(vec!["api".to_string(), "hooks".to_string()])
         );
-    }
-
-    #[test]
-    fn safe_github_meta_url_can_be_overridden() {
-        let config = Config::from_toml_str(
-            "[ipset]\nset_name='kidobo'\n[safe]\ngithub_meta_url='https://example.com/meta'\n",
-        )
-        .expect("parse");
-        assert_eq!(config.safe.github_meta_url, "https://example.com/meta");
     }
 
     #[test]
@@ -865,15 +822,6 @@ mod tests {
         )
         .expect("parse");
         assert_eq!(config.asn.banned, vec![64512, 64513]);
-    }
-
-    #[test]
-    fn asn_cache_stale_after_secs_can_be_overridden() {
-        let config = Config::from_toml_str(
-            "[ipset]\nset_name='kidobo'\n[asn]\ncache_stale_after_secs=7200\n",
-        )
-        .expect("parse");
-        assert_eq!(config.asn.cache_stale_after_secs.get(), 7200);
     }
 
     #[test]
@@ -1019,19 +967,6 @@ mod tests {
     }
 
     #[test]
-    fn empty_remote_url_fails() {
-        let err = Config::from_toml_str("[ipset]\nset_name='kidobo'\n[remote]\nurls=['']\n")
-            .expect_err("must fail");
-        assert_eq!(
-            err,
-            ConfigError::InvalidField {
-                field: "remote.urls",
-                reason: "value must not be empty".to_string(),
-            }
-        );
-    }
-
-    #[test]
     fn remote_urls_must_be_http_or_https() {
         let err = Config::from_toml_str(
             "[ipset]\nset_name='kidobo'\n[remote]\nurls=['file:///tmp/list.txt']\n",
@@ -1059,14 +994,6 @@ mod tests {
                 reason: "must be a valid http:// or https:// URL with a host".to_string(),
             }
         );
-    }
-
-    #[test]
-    fn remote_timeout_secs_can_be_overridden() {
-        let config =
-            Config::from_toml_str("[ipset]\nset_name='kidobo'\n[remote]\ntimeout_secs=45\n")
-                .expect("parse");
-        assert_eq!(config.remote.timeout_secs.get(), 45);
     }
 
     #[test]

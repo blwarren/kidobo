@@ -66,9 +66,17 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+criterion_root="${CARGO_TARGET_DIR:-target}/criterion"
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+bench_log="$(mktemp)"
+trap 'rm -f "${bench_log}"' EXIT
+# Only results produced by this invocation may satisfy a baseline comparison.
+if [[ -d "${criterion_root}" ]]; then
+  find "${criterion_root}" -type d -name new -prune -exec rm -rf -- {} +
+fi
 echo "[perf-check] running cargo bench --bench ${bench_name} -- --baseline ${baseline}"
-cargo bench --bench "${bench_name}" -- --baseline "${baseline}" >/tmp/kidobo-perf-bench.log 2>&1 || {
-  cat /tmp/kidobo-perf-bench.log
+cargo bench --bench "${bench_name}" -- --baseline "${baseline}" >"${bench_log}" 2>&1 || {
+  cat "${bench_log}"
   exit 1
 }
 
@@ -80,17 +88,18 @@ checked=0
 while IFS= read -r baseline_estimates; do
   new_estimates="${baseline_estimates%/${baseline}/estimates.json}/new/estimates.json"
   if [[ ! -f "${new_estimates}" ]]; then
+    regressions=$((regressions + 1))
+    echo "[perf-check] FAIL missing current results for ${baseline_estimates}" >&2
     continue
   fi
 
-  label="${baseline_estimates#target/criterion/}"
+  label="${baseline_estimates#"${criterion_root}"/}"
   label="${label%/${baseline}/estimates.json}"
 
-  baseline_mean="$(grep -o '"point_estimate":[0-9.]*' "${baseline_estimates}" | head -n1 | cut -d: -f2)"
-  new_mean="$(grep -o '"point_estimate":[0-9.]*' "${new_estimates}" | head -n1 | cut -d: -f2)"
-
-  if [[ -z "${baseline_mean}" || -z "${new_mean}" ]]; then
-    echo "[perf-check] WARN could not parse estimates for ${label}" >&2
+  if ! baseline_mean="$(python3 "${script_dir}/read-mean.py" "${baseline_estimates}")" \
+      || ! new_mean="$(python3 "${script_dir}/read-mean.py" "${new_estimates}")"; then
+    regressions=$((regressions + 1))
+    echo "[perf-check] FAIL could not parse estimates for ${label}" >&2
     continue
   fi
 
@@ -103,10 +112,10 @@ while IFS= read -r baseline_estimates; do
   else
     echo "[perf-check] OK   ${label}: ${slowdown_pct}%"
   fi
-done < <(find target/criterion -type f -path "*/${baseline}/estimates.json" | sort)
+done < <(find "${criterion_root}" -type f -path "*/${baseline}/estimates.json" | sort)
 
 if [[ ${checked} -eq 0 ]]; then
-  echo "[perf-check] error: no baseline estimates found for '${baseline}' under target/criterion" >&2
+  echo "[perf-check] error: no baseline estimates found for '${baseline}' under ${criterion_root}" >&2
   echo "[perf-check] hint: run scripts/perf/run-benchmarks.sh ${baseline} first" >&2
   exit 1
 fi
@@ -143,4 +152,4 @@ if [[ ${regressions} -gt 0 ]]; then
   exit 1
 fi
 
-echo "[perf-check] no significant regressions detected"
+echo "[perf-check] no regressions above the configured thresholds detected"

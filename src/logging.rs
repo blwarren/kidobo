@@ -149,7 +149,7 @@ mod tests {
 
     #[test]
     fn repeated_init_reports_logger_init_error() {
-        let _ = init(LevelFilter::Off);
+        init(LevelFilter::Off).expect("first logger initialization");
 
         let err = init(LevelFilter::Off).expect_err("second init must fail");
         match err {

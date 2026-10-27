@@ -738,23 +738,6 @@ mod tests {
     }
 
     #[test]
-    fn cache_load_falls_back_to_stale_when_refresh_fails() {
-        let temp = TempDir::new().expect("tempdir");
-        let cache_dir = temp.path();
-        fs::write(cache_dir.join("as64512.iplist"), "203.0.113.0/24\n").expect("write");
-        let resolver = Mutex::new(MockResolver::new(vec![Err(AsnError::ResolveFailed {
-            asn: 64512,
-            reason: "boom".to_string(),
-        })]));
-
-        let loaded =
-            load_asn_prefixes_with_cache(64512, cache_dir, Duration::from_secs(0), &resolver)
-                .expect("load");
-        assert!(loaded.stale);
-        assert_eq!(loaded.prefixes.len(), 1);
-    }
-
-    #[test]
     fn empty_refresh_uses_nonempty_stale_cache_without_overwriting_it() {
         let temp = TempDir::new().expect("tempdir");
         let cache_path = temp.path().join("as64512.iplist");

@@ -311,10 +311,12 @@ printf '%s %s\n' "${release_tag}" "${release_date}" >> release-notes/dates.tsv
 echo "[release] regenerating release notes and changelog"
 just _release-notes-format _release-notes-generate
 git add Cargo.toml Cargo.lock README.md CHANGELOG.md release-notes
+validated_tree="$(git write-tree)"
 
 write_candidate_manifest() {
+    local candidate_tree="${1:-$(git write-tree)}"
     printf 'format=1\nbase_commit=%s\ncandidate_tree=%s\nrelease_date=%s\n' \
-        "${base_commit}" "$(git write-tree)" "${release_date}"
+        "${base_commit}" "${candidate_tree}" "${release_date}"
     printf 'archive=%s\nchecksums=%s\nrelease_notes=%s\n' \
         "$(sha256sum "${archive_path}")" "$(sha256sum "${checksums_path}")" \
         "$(sha256sum "${release_notes_copy}")"
@@ -341,7 +343,7 @@ else
     just release-compat
 fi
 git diff --check --cached
-if ! git diff --quiet || [[ -n "$(git ls-files --others --exclude-standard)" ]]; then
+if [[ "$(git write-tree)" != "${validated_tree}" ]] || ! git diff --quiet || [[ -n "$(git ls-files --others --exclude-standard)" ]]; then
     echo "validation produced uncommitted changes outside the staged release update" >&2
     git status --short >&2
     exit 1
@@ -353,7 +355,7 @@ if [[ -z "${resume_e2e}" ]]; then
     artifacts_created=true
     ./scripts/package-release.sh "${candidate_binary}" "${release_tag}" "${artifact_root}"
     install -m 0644 "${release_notes_path}" "${release_notes_copy}"
-    write_candidate_manifest > "${candidate_manifest}"
+    write_candidate_manifest "${validated_tree}" > "${candidate_manifest}"
 fi
 
 # Keep the packaged archive and checksum manifest unchanged through validation.
@@ -400,7 +402,15 @@ if [[ ! "${confirmation}" =~ ^[Yy]$ ]]; then
     exit 0
 fi
 
-git commit -m "Prepare ${release_tag} release"
+write_candidate_manifest > "${temporary_root}/confirmed-candidate.txt"
+if ! cmp -s "${candidate_manifest}" "${temporary_root}/confirmed-candidate.txt" \
+    || ! git diff --quiet || [[ -n "$(git ls-files --others --exclude-standard)" ]]; then
+    echo "validated candidate changed before publication; start a fresh candidate" >&2
+    exit 1
+fi
+
+# The exact candidate already passed the explicit gates above (or verified resume).
+git -c core.hooksPath=/dev/null commit -m "Prepare ${release_tag} release"
 release_commit="$(git rev-parse HEAD)"
 git tag -a "${release_tag}" -m "Release ${release_tag}"
 tag_created=true
@@ -420,7 +430,7 @@ if [[ "$(git rev-parse refs/remotes/origin/main)" != "${remote_main}" ]]; then
 fi
 
 echo "[release] atomically pushing main and ${release_tag}"
-git push --atomic origin \
+git -c core.hooksPath=/dev/null push --atomic origin \
     "${release_commit}:refs/heads/main" \
     "refs/tags/${release_tag}:refs/tags/${release_tag}"
 refs_pushed=true

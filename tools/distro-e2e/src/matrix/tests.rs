@@ -144,6 +144,7 @@ esac
             incus_program: program,
             cancelled: Arc::new(AtomicBool::new(false)),
             report,
+            command_poll_interval: Duration::from_millis(1),
         };
         let config = Config {
             project: "test-project".into(),

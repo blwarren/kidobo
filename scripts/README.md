@@ -28,7 +28,18 @@ gh auth login
 
 ## Common Commands
 
-- `just check`
+Performance comparisons require Python 3 (standard library only) and current results for
+every saved baseline case. They respect `CARGO_TARGET_DIR`, remove previous `new` estimates
+before running Criterion, and fail on missing comparisons or unparsable estimates.
+Thresholds compare mean point estimates;
+they do not establish statistical significance. Keep datasets and machine load comparable.
+The duplicate scaled real-world cases at scale 1 were removed; fixed real-world cases retain
+their names. Regenerate baselines in a fresh target directory when migrating old estimates
+that include those retired scaled cases.
+
+- `just commit-check` (nonmutating pre-commit whitespace and staged-change-selected fast Rust checks)
+- `just test-fast` (core, application, and CLI unit tests)
+- `just check` (format, complete workspace tests, and lint)
 - `just ci` (local formatting, lint, dependency-policy, audit, and test gate)
 - `just coverage` (release-only 90% minimum for stable region, function, and line metrics)
 - `just exercise-release` (release-only build and isolated binary exercise)

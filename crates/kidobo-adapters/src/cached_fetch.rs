@@ -88,21 +88,34 @@ mod tests {
     }
 
     #[test]
-    fn invalid_hash_blocks_cached_bytes() {
+    fn validated_cache_accepts_matching_or_absent_hash_and_rejects_mismatch() {
         let temp = TempDir::new().expect("tempdir");
         let path = temp.path().join("raw.json");
         fs::write(&path, b"raw-body").expect("write raw");
 
-        let result = read_validated_bytes_lossy(
-            &path,
-            1024,
-            "raw cache file",
-            Some("not-the-right-hash"),
-            "raw cache",
-            "body",
-        );
+        for expected_hash in [
+            None,
+            Some(crate::hash::sha256_hex(b"raw-body")),
+            Some("not-the-right-hash".into()),
+        ] {
+            let result = read_validated_bytes_lossy(
+                &path,
+                1024,
+                "raw cache file",
+                expected_hash.as_deref(),
+                "raw cache",
+                "body",
+            );
 
-        assert!(result.is_none());
+            assert_eq!(
+                result,
+                if expected_hash.as_deref() == Some("not-the-right-hash") {
+                    None
+                } else {
+                    Some(b"raw-body".to_vec())
+                }
+            );
+        }
     }
 
     #[test]
@@ -127,6 +140,19 @@ mod tests {
             SampleJson {
                 value: "ok".to_string()
             }
+        );
+        assert_eq!(
+            read_optional_bytes_lossy(&raw_path, 6, "oversized cache"),
+            None
+        );
+        assert_eq!(
+            read_optional_bytes_lossy(&temp.path().join("missing"), 1024, "missing cache"),
+            None
+        );
+        fs::write(&json_path, b"invalid JSON").expect("malformed metadata");
+        assert_eq!(
+            read_optional_json_lossy::<SampleJson>(&json_path, 1024, "json cache file"),
+            None
         );
     }
 }

@@ -101,6 +101,7 @@ struct Runner {
     incus_program: PathBuf,
     cancelled: Arc<AtomicBool>,
     report: Report,
+    command_poll_interval: Duration,
 }
 /// Each command owns only one pair of temporary files, removed even on failure.
 struct Capture {
@@ -349,7 +350,7 @@ impl Runner {
                     return Ok((None, Some("timed out".into())));
                 }
                 if !activity {
-                    std::thread::sleep(Duration::from_millis(100));
+                    std::thread::sleep(self.command_poll_interval);
                 }
             }
         })();
@@ -933,6 +934,7 @@ fn run(cli: Cli) -> Result<()> {
         incus_program: PathBuf::from("incus"),
         cancelled,
         report,
+        command_poll_interval: Duration::from_millis(100),
     };
     let is_clean = matches!(&cli.action, Action::Clean { .. });
     if is_clean {
@@ -1303,6 +1305,8 @@ fn validate_vm_config(value: &serde_json::Value) -> Result<()> {
 }
 #[cfg(test)]
 mod guest_http_tests;
+#[cfg(test)]
+mod guest_preservation_tests;
 #[cfg(test)]
 mod guest_reporting_tests;
 #[cfg(test)]

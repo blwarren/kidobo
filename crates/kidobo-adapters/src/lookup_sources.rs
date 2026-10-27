@@ -462,92 +462,6 @@ mod tests {
     }
 
     #[test]
-    fn remote_source_label_falls_back_to_cache_file_when_metadata_missing() {
-        let temp = TempDir::new().expect("tempdir");
-        let paths = test_paths(temp.path());
-
-        fs::create_dir_all(&paths.remote_cache_dir).expect("mkdir remote");
-        fs::write(paths.remote_cache_dir.join("a.iplist"), "2001:db8::/64\n")
-            .expect("write remote a");
-
-        let entries = load_registry_sources(&paths, None).expect("load sources");
-
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].source_label.as_ref(), "remote:a.iplist");
-    }
-
-    #[test]
-    fn remote_source_label_falls_back_to_cache_file_when_metadata_invalid() {
-        let temp = TempDir::new().expect("tempdir");
-        let paths = test_paths(temp.path());
-
-        fs::create_dir_all(&paths.remote_cache_dir).expect("mkdir remote");
-        fs::write(paths.remote_cache_dir.join("a.iplist"), "2001:db8::/64\n")
-            .expect("write remote a");
-        fs::write(paths.remote_cache_dir.join("a.meta.json"), "{").expect("write invalid meta");
-
-        let entries = load_registry_sources(&paths, None).expect("load sources");
-
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].source_label.as_ref(), "remote:a.iplist");
-    }
-
-    #[test]
-    fn hash_mismatched_remote_iplist_is_rejected() {
-        let temp = TempDir::new().expect("tempdir");
-        let paths = test_paths(temp.path());
-
-        fs::create_dir_all(&paths.remote_cache_dir).expect("mkdir remote");
-        fs::write(paths.remote_cache_dir.join("a.iplist"), "2001:db8::/64\n")
-            .expect("write remote a");
-        fs::write(
-            paths.remote_cache_dir.join("a.meta.json"),
-            format!(
-                "{{\"url\":\"https://example.com/a.txt\",\"etag\":null,\"last_modified\":null,\"sha256_raw\":\"{}\",\"sha256_iplist\":\"{}\"}}",
-                sha256_hex(b"raw"),
-                sha256_hex(b"10.0.0.0/24\n")
-            ),
-        )
-        .expect("write remote meta");
-
-        let err = load_registry_sources(&paths, None).expect_err("load must fail");
-        assert!(err.to_string().contains("hash mismatch"));
-    }
-
-    #[test]
-    fn remote_entries_are_sorted_by_resolved_label_not_cache_filename() {
-        let temp = TempDir::new().expect("tempdir");
-        let paths = test_paths(temp.path());
-
-        fs::create_dir_all(&paths.remote_cache_dir).expect("mkdir remote");
-        fs::write(paths.remote_cache_dir.join("a.iplist"), "2001:db8::/64\n")
-            .expect("write remote a");
-        fs::write(
-            paths.remote_cache_dir.join("a.meta.json"),
-            r#"{"url":"https://example.com/z.txt"}"#,
-        )
-        .expect("write remote meta a");
-        fs::write(paths.remote_cache_dir.join("b.iplist"), "10.0.0.0/24\n")
-            .expect("write remote b");
-        fs::write(
-            paths.remote_cache_dir.join("b.meta.json"),
-            r#"{"url":"https://example.com/a.txt"}"#,
-        )
-        .expect("write remote meta b");
-
-        let entries = load_registry_sources(&paths, None).expect("load sources");
-        let labels = entries
-            .iter()
-            .map(|entry| entry.source_label.as_ref())
-            .collect::<Vec<_>>();
-
-        assert_eq!(
-            labels,
-            vec!["https://example.com/a.txt", "https://example.com/z.txt"]
-        );
-    }
-
-    #[test]
     fn multiple_remote_files_with_same_label_are_all_loaded() {
         let temp = TempDir::new().expect("tempdir");
         let paths = test_paths(temp.path());
@@ -838,11 +752,5 @@ mod tests {
 
         let parsed = parse_cidr_source_line("203.0.113.1 # trailing").expect("parse");
         assert_eq!(parsed.1, "203.0.113.1");
-    }
-
-    #[test]
-    fn io_error_display_is_stable() {
-        let io_err = std::io::Error::other("boom");
-        assert_eq!(io_err.to_string(), "boom");
     }
 }

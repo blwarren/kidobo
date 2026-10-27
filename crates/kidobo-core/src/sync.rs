@@ -494,14 +494,29 @@ mod tests {
         for _ in 0..400 {
             let candidate_count = 1 + rng.next_usize(12);
             let safelist_count = rng.next_usize(12);
-            let mut candidates = Vec::with_capacity(candidate_count);
-            let mut safelist = Vec::with_capacity(safelist_count);
+            let base = 0xcb00_7100;
+            let mut candidates = vec![
+                Ipv4Cidr::from_parts(base, 29),
+                Ipv4Cidr::from_parts(base + 512, 32),
+            ];
+            let mut safelist = vec![
+                Ipv4Cidr::from_parts(base + 1, 32),
+                Ipv4Cidr::from_parts(base + 256, 32),
+            ];
 
             for _ in 0..candidate_count {
-                candidates.push(random_ipv4_cidr(&mut rng, 29));
+                let cidr = random_ipv4_cidr(&mut rng, 29);
+                candidates.push(Ipv4Cidr::from_parts(
+                    base + (u32::from(cidr.network()) & 255),
+                    cidr.prefix(),
+                ));
             }
             for _ in 0..safelist_count {
-                safelist.push(random_ipv4_cidr(&mut rng, 29));
+                let cidr = random_ipv4_cidr(&mut rng, 29);
+                safelist.push(Ipv4Cidr::from_parts(
+                    base + (u32::from(cidr.network()) & 255),
+                    cidr.prefix(),
+                ));
             }
 
             let candidate_canonical = candidates
@@ -520,9 +535,12 @@ mod tests {
             assert_disjoint_from_safelist(&effective, &safelist_canonical, true);
 
             let mut expected = expand_ipv4(&candidates);
+            let candidate_addresses = expected.len();
             for safe_ip in expand_ipv4(&safelist) {
                 expected.remove(&safe_ip);
             }
+            assert!(expected.len() < candidate_addresses);
+            assert!(expected.contains(&(base + 512)));
             let actual = expand_ipv4(&effective.ipv4);
 
             assert_eq!(
@@ -539,14 +557,29 @@ mod tests {
         for _ in 0..250 {
             let candidate_count = 1 + rng.next_usize(8);
             let safelist_count = rng.next_usize(8);
-            let mut candidates = Vec::with_capacity(candidate_count);
-            let mut safelist = Vec::with_capacity(safelist_count);
+            let base = 0x2001_0db8_0000_0000_0000_0000_0000_0000;
+            let mut candidates = vec![
+                Ipv6Cidr::from_parts(base, 126),
+                Ipv6Cidr::from_parts(base + 512, 128),
+            ];
+            let mut safelist = vec![
+                Ipv6Cidr::from_parts(base + 1, 128),
+                Ipv6Cidr::from_parts(base + 256, 128),
+            ];
 
             for _ in 0..candidate_count {
-                candidates.push(random_ipv6_cidr(&mut rng, 126));
+                let cidr = random_ipv6_cidr(&mut rng, 126);
+                candidates.push(Ipv6Cidr::from_parts(
+                    base + (u128::from(cidr.network()) & 255),
+                    cidr.prefix(),
+                ));
             }
             for _ in 0..safelist_count {
-                safelist.push(random_ipv6_cidr(&mut rng, 126));
+                let cidr = random_ipv6_cidr(&mut rng, 126);
+                safelist.push(Ipv6Cidr::from_parts(
+                    base + (u128::from(cidr.network()) & 255),
+                    cidr.prefix(),
+                ));
             }
 
             let candidate_canonical = candidates
@@ -565,9 +598,12 @@ mod tests {
             assert_disjoint_from_safelist(&effective, &safelist_canonical, true);
 
             let mut expected = expand_ipv6(&candidates);
+            let candidate_addresses = expected.len();
             for safe_ip in expand_ipv6(&safelist) {
                 expected.remove(&safe_ip);
             }
+            assert!(expected.len() < candidate_addresses);
+            assert!(expected.contains(&(base + 512)));
             let actual = expand_ipv6(&effective.ipv6);
 
             assert_eq!(

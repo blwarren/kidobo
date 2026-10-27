@@ -325,25 +325,19 @@ mod tests {
     #[test]
     fn test_sandbox_is_disabled_when_disable_var_is_set() {
         let temp = TempDir::new().expect("tempdir");
-        let root = temp.path().join("override-root");
-        fs::create_dir_all(&root).expect("mkdir root");
-
         let mut input = test_input(&temp);
         input.env.insert(ENV_KIDOBO_TEST_SANDBOX.into(), "1".into());
         input
             .env
-            .insert(ENV_KIDOBO_DISABLE_TEST_SANDBOX.into(), "1".into());
-        input
-            .env
-            .insert(ENV_KIDOBO_ROOT.into(), root.as_os_str().to_owned());
+            .insert(ENV_KIDOBO_DISABLE_TEST_SANDBOX.into(), "".into());
 
-        let err = resolve_paths(&input).expect_err("should fail without config");
-        match err {
-            PathResolutionError::MissingConfig { attempted } => {
-                assert_eq!(attempted, root.join("config/config.toml"));
-            }
-            other => panic!("expected missing config, got {other:?}"),
-        }
+        let resolved =
+            resolve_paths_without_config(&input).expect("system paths without config inspection");
+        assert_eq!(
+            resolved.config_file,
+            std::path::Path::new("/etc/kidobo/config.toml")
+        );
+        assert_eq!(resolved.root_override, None);
     }
 
     #[test]
@@ -353,10 +347,21 @@ mod tests {
         fs::write(&explicit, "[ipset]\nset_name='kidobo'\n").expect("write config");
 
         let mut input = test_input(&temp);
+        let root = temp.path().join("root");
+        fs::create_dir_all(root.join("config")).expect("config directory");
+        fs::write(
+            root.join("config/config.toml"),
+            "[ipset]\nset_name='default'\n",
+        )
+        .expect("default config");
+        input
+            .env
+            .insert(ENV_KIDOBO_ROOT.into(), root.as_os_str().to_owned());
         input.explicit_config_path = Some(explicit.clone());
 
         let resolved = resolve_paths(&input).expect("resolve");
         assert_eq!(resolved.config_file, explicit);
+        assert_eq!(resolved.data_dir, root.join("data"));
     }
 
     #[test]

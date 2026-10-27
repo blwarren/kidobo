@@ -36,33 +36,13 @@ impl BlocklistRepository for FileBlocklistRepository {
         has_content: bool,
         trailing_newline: bool,
     ) -> Result<(), AppError> {
-        if entries.is_empty() {
-            return Ok(());
-        }
-        ensure_blocklist_parent(path)?;
-        let mut contents = match read_to_string_with_limit(path, BLOCKLIST_READ_LIMIT) {
-            Ok(contents) => contents,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-            Err(source) => {
-                return Err(AppError::BlocklistRead {
-                    path: path.to_path_buf(),
-                    source,
-                });
-            }
-        };
-        if has_content && !trailing_newline {
-            contents.push('\n');
-        }
-        for entry in entries {
-            contents.push_str(entry);
-            contents.push('\n');
-        }
-        write_string_atomic_with_limit(path, &contents, BLOCKLIST_READ_LIMIT).map_err(|error| {
-            AppError::BlocklistWrite {
-                path: path.to_path_buf(),
-                source: error,
-            }
-        })
+        append_entries_with_limit(
+            path,
+            entries,
+            has_content,
+            trailing_newline,
+            BLOCKLIST_READ_LIMIT,
+        )
     }
 
     fn write_lines(&self, path: &Path, lines: &[String]) -> Result<(), AppError> {
@@ -79,6 +59,42 @@ impl BlocklistRepository for FileBlocklistRepository {
             })?;
         Ok(contents.lines().map(ToString::to_string).collect())
     }
+}
+
+fn append_entries_with_limit(
+    path: &Path,
+    entries: &[String],
+    has_content: bool,
+    trailing_newline: bool,
+    limit: usize,
+) -> Result<(), AppError> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    ensure_blocklist_parent(path)?;
+    let mut contents = match read_to_string_with_limit(path, limit) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(source) => {
+            return Err(AppError::BlocklistRead {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    if has_content && !trailing_newline {
+        contents.push('\n');
+    }
+    for entry in entries {
+        contents.push_str(entry);
+        contents.push('\n');
+    }
+    write_string_atomic_with_limit(path, &contents, limit).map_err(|error| {
+        AppError::BlocklistWrite {
+            path: path.to_path_buf(),
+            source: error,
+        }
+    })
 }
 
 /// Result of checking or normalizing the local blocklist during sync.
@@ -143,6 +159,14 @@ impl BlocklistFastState {
 ///
 /// Returns [`AppError::BlocklistWrite`] when the destination cannot be replaced atomically.
 pub fn write_blocklist_lines<S: AsRef<str>>(path: &Path, lines: &[S]) -> Result<(), AppError> {
+    write_blocklist_lines_with_limit(path, lines, BLOCKLIST_READ_LIMIT)
+}
+
+fn write_blocklist_lines_with_limit<S: AsRef<str>>(
+    path: &Path,
+    lines: &[S],
+    limit: usize,
+) -> Result<(), AppError> {
     let mut contents = lines
         .iter()
         .map(AsRef::as_ref)
@@ -152,11 +176,9 @@ pub fn write_blocklist_lines<S: AsRef<str>>(path: &Path, lines: &[S]) -> Result<
         contents.push('\n');
     }
 
-    write_string_atomic_with_limit(path, &contents, BLOCKLIST_READ_LIMIT).map_err(|err| {
-        AppError::BlocklistWrite {
-            path: path.to_path_buf(),
-            source: err,
-        }
+    write_string_atomic_with_limit(path, &contents, limit).map_err(|err| AppError::BlocklistWrite {
+        path: path.to_path_buf(),
+        source: err,
     })
 }
 
@@ -183,7 +205,11 @@ pub fn ensure_blocklist_parent(path: &Path) -> Result<(), AppError> {
 /// Returns an error when the file cannot be read or written, or contains an invalid blocklist
 /// entry.
 pub fn normalize_local_blocklist(path: &Path) -> Result<(), AppError> {
-    let original = match read_to_string_with_limit(path, BLOCKLIST_READ_LIMIT) {
+    normalize_local_blocklist_with_limit(path, BLOCKLIST_READ_LIMIT)
+}
+
+fn normalize_local_blocklist_with_limit(path: &Path, limit: usize) -> Result<(), AppError> {
+    let original = match read_to_string_with_limit(path, limit) {
         Ok(contents) => contents,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(source) => {
@@ -198,7 +224,7 @@ pub fn normalize_local_blocklist(path: &Path) -> Result<(), AppError> {
         canonicalize_blocklist(&original).map_err(|err| map_invalid_blocklist_line(path, err))?;
 
     if normalized != original {
-        write_string_atomic_with_limit(path, &normalized, BLOCKLIST_READ_LIMIT).map_err(|err| {
+        write_string_atomic_with_limit(path, &normalized, limit).map_err(|err| {
             AppError::BlocklistWrite {
                 path: path.to_path_buf(),
                 source: err,
@@ -313,7 +339,7 @@ mod tests {
     }
 
     fn assert_contents(actual: &str, expected: &str) {
-        // Avoid dumping a 16 MiB fixture when a boundary assertion fails.
+        // Report mismatches without dumping production-sized fixtures.
         assert_eq!(actual.len(), expected.len());
         assert_eq!(
             actual
@@ -324,14 +350,32 @@ mod tests {
         );
     }
 
+    const TEST_WRITE_LIMIT: usize = 128;
+
+    #[test]
+    fn production_limit_allows_readable_replacement_and_rejects_append() {
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("blocklist");
+        let line = format!("#{}", "x".repeat(super::BLOCKLIST_READ_LIMIT - 2));
+        FileBlocklistRepository
+            .write_lines(&path, std::slice::from_ref(&line))
+            .expect("exact production limit");
+        assert_eq!(
+            fs::metadata(&path).expect("metadata").len(),
+            16 * 1024 * 1024
+        );
+        load_blocklist_document(&path).expect("production-size document is readable");
+        assert!(matches!(
+            FileBlocklistRepository.append_entries(&path, &["192.0.2.1/32".into()], true, true),
+            Err(kidobo_app::AppError::BlocklistWrite { .. })
+        ));
+        assert_contents(&read(&path), &format!("{line}\n"));
+    }
+
     #[test]
     fn append_enforces_serialized_byte_limit_and_preserves_rejected_file() {
         for trailing_newline in [false, true] {
-            for size in [
-                super::BLOCKLIST_READ_LIMIT - 1,
-                super::BLOCKLIST_READ_LIMIT,
-                super::BLOCKLIST_READ_LIMIT + 1,
-            ] {
+            for size in [TEST_WRITE_LIMIT - 1, TEST_WRITE_LIMIT, TEST_WRITE_LIMIT + 1] {
                 let temp = TempDir::new().expect("tempdir");
                 let path = temp.path().join("blocklist");
                 let entry = "192.0.2.1/32";
@@ -344,13 +388,14 @@ mod tests {
                     original.push('\n');
                 }
                 fs::write(&path, &original).expect("fixture");
-                let result = FileBlocklistRepository.append_entries(
+                let result = super::append_entries_with_limit(
                     &path,
                     &[entry.to_string()],
                     true,
                     trailing_newline,
+                    TEST_WRITE_LIMIT,
                 );
-                if size > super::BLOCKLIST_READ_LIMIT {
+                if size > TEST_WRITE_LIMIT {
                     assert!(matches!(
                         result,
                         Err(kidobo_app::AppError::BlocklistWrite { .. })
@@ -374,17 +419,17 @@ mod tests {
 
     #[test]
     fn replacement_enforces_serialized_byte_limit() {
-        for size in [
-            super::BLOCKLIST_READ_LIMIT - 1,
-            super::BLOCKLIST_READ_LIMIT,
-            super::BLOCKLIST_READ_LIMIT + 1,
-        ] {
+        for size in [TEST_WRITE_LIMIT - 1, TEST_WRITE_LIMIT, TEST_WRITE_LIMIT + 1] {
             let temp = TempDir::new().expect("tempdir");
             let path = temp.path().join("blocklist");
             fs::write(&path, "192.0.2.0/24\n").expect("fixture");
             let line = format!("#é{}", "x".repeat(size - 4));
-            let result = FileBlocklistRepository.write_lines(&path, std::slice::from_ref(&line));
-            if size > super::BLOCKLIST_READ_LIMIT {
+            let result = super::write_blocklist_lines_with_limit(
+                &path,
+                std::slice::from_ref(&line),
+                TEST_WRITE_LIMIT,
+            );
+            if size > TEST_WRITE_LIMIT {
                 assert!(matches!(
                     result,
                     Err(kidobo_app::AppError::BlocklistWrite { .. })
@@ -400,18 +445,14 @@ mod tests {
 
     #[test]
     fn normalization_growth_enforces_serialized_byte_limit() {
-        for size in [
-            super::BLOCKLIST_READ_LIMIT - 1,
-            super::BLOCKLIST_READ_LIMIT,
-            super::BLOCKLIST_READ_LIMIT + 1,
-        ] {
+        for size in [TEST_WRITE_LIMIT - 1, TEST_WRITE_LIMIT, TEST_WRITE_LIMIT + 1] {
             let temp = TempDir::new().expect("tempdir");
             let path = temp.path().join("blocklist");
             let header = format!("#é{}\n", "x".repeat(size - 5 - "192.0.2.1/32\n".len()));
             let original = format!("{header}192.0.2.1");
             fs::write(&path, &original).expect("fixture");
-            let result = super::normalize_local_blocklist(&path);
-            if size > super::BLOCKLIST_READ_LIMIT {
+            let result = super::normalize_local_blocklist_with_limit(&path, TEST_WRITE_LIMIT);
+            if size > TEST_WRITE_LIMIT {
                 assert!(matches!(
                     result,
                     Err(kidobo_app::AppError::BlocklistWrite { .. })
