@@ -321,6 +321,10 @@ fn display(value: &Value) -> String {
         .map_or_else(|| value.to_string(), str::to_owned)
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "Summary rendering keeps ordered evidence sections together"
+)]
 fn summary(document: &Value) -> String {
     let mut text = String::from(
         "Kidobo e2e results\nFull evidence: transcript.log (references below are line numbers)\n\n",
@@ -332,6 +336,9 @@ fn summary(document: &Value) -> String {
         "archive_sha256",
         "archive",
         "targets",
+        "required_targets",
+        "advisory_targets",
+        "resume_from",
         "coverage",
         "current_stage",
         "evidence",
@@ -360,7 +367,14 @@ fn summary(document: &Value) -> String {
                 display(&result["phase"]),
                 display(&result["seconds"])
             );
-            for key in ["image", "image_fingerprint", "transcript_line"] {
+            for key in [
+                "required",
+                "reused_from",
+                "source_transcript_line",
+                "image",
+                "image_fingerprint",
+                "transcript_line",
+            ] {
                 if !result[key].is_null() {
                     let _ = writeln!(text, "  {key}: {}", display(&result[key]));
                 }

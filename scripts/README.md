@@ -36,15 +36,20 @@ gh auth login
 - `just e2e-setup` (configure suite-owned Incus infrastructure; see [distro testing](../docs/e2e.md))
 - `just e2e` (start the candidate build and complete distro matrix in detached tmux session
   `kidobo-e2e`; attach with `tmux attach -t kidobo-e2e` to watch progress and the final exit status)
-- `just e2e-artifact ARCHIVE TAG` (run the full candidate matrix against an existing archive)
+- `just e2e --required-only` (build and test only required targets in the detached session)
+- `just e2e-artifact ARCHIVE TAG` (select every required target against an existing archive)
+- `just e2e-artifact ARCHIVE TAG --resume RUN_ID` (reuse compatible successful required targets for the exact archive)
+- `just e2e-resume RUN_ID` (resume a candidate in the foreground using its frozen archive and tag)
+- `just e2e-resume RUN_ID --required-only` (resume only required coverage for the captured candidate)
 - `just e2e-published [tag]` (test a published release; default latest)
 - `just e2e-clean RUN_ID` (clean recorded VMs for one run)
 - `just rustdoc` (workspace documentation with warnings denied)
 - `just update` (install the pinned cooldown tool, update dependencies at least seven days old, and test)
 - `just udeps` (manual nightly-toolchain dependency-usage audit)
 - `just release-notes-check` (required after repository changes and during release validation)
-- `just publish-release X.Y.Z` (complete local preparation, validation, seven-target Incus matrix, upload, verification, and publication)
+- `just publish-release X.Y.Z` (complete local preparation, validation, required Incus coverage, upload, verification, and publication)
 - `just publish-release X.Y.Z --skip-e2e` (skip only the matrix and its Incus/agent-ISO prerequisites; other validation and upload verification remain enabled)
+- `just publish-release X.Y.Z --resume-e2e RUN_ID` (resume the retained exact candidate after checking its source, validation identity, and artifacts)
 - `just mutants`
 - `just mutants --shard 1/4`
 
@@ -61,9 +66,15 @@ Publication requires a Linux x86_64 host. Release builds require `musl-gcc` and 
 requires `readelf` and Docker access; it runs only offline Kidobo commands in
 the containers and never invokes firewall or systemd operations.
 Publication requires host `tar`. By default, it also requires configured Incus VM access, a
-`genisoimage` or `mkisofs` utility for agent configuration disks, and a passing full seven-target
-distro lifecycle matrix run against the exact packaged archive before pushing refs or uploading
-assets. An explicit `--skip-e2e` argument skips only that matrix and its Incus/agent-ISO
+`genisoimage` or `mkisofs` utility for agent configuration disks, and passing required distro
+lifecycle coverage against the exact packaged archive before pushing refs or uploading assets.
+The default required targets are Debian 12 and 13 and Ubuntu 24.04 and 26.04. Publication and
+`just e2e-artifact` select only those required targets. Use a separate `just e2e` run for all seven
+configured targets, including advisory Fedora 44 and AlmaLinux 9 and 10. Advisory prerequisite
+and application failures do not fail that broader run; cleanup, shared infrastructure, and
+evidence archive failures still do. Guest prerequisites are checked across
+pending targets before application lifecycles. An explicit `--skip-e2e` argument skips only that
+matrix and its Incus/agent-ISO
 prerequisites; CI, release-note validation, coverage, strict rustdoc, the release-binary exercise,
 static compatibility, packaging, and upload verification still run. The publisher labels the
 skip before validation and repeats it before the final confirmation. This override does not reuse
@@ -76,6 +87,16 @@ Packaging reads the validated candidate binary from `CARGO_TARGET_DIR` when
 set, or `target` otherwise. Relative target directories resolve inside the
 candidate worktree; recovery artifacts retain the location below.
 
+After a matrix failure, `just publish-release X.Y.Z --resume-e2e RUN_ID` verifies the retained
+source commit, reconstructed candidate tree and saved release date, and artifact hashes. It reuses
+the completed local validation gates and exact archive without rebuilding or repackaging, then
+resumes compatible distro successes and reruns pending targets. Source or artifact changes reject
+publisher resume. `--resume-e2e` cannot be combined with `--skip-e2e`.
+See [candidate resume](../docs/e2e.md#resume-a-candidate) for result compatibility and historical-run
+limits; old attempts without retained publisher metadata cannot resume publication. That guide
+also shows how to move a retained candidate aside before starting fresh after source changes;
+fresh publication refuses to overwrite an existing candidate directory.
+
 ## GitHub Automation
 
 Kidobo does not use checked-in GitHub Actions workflows. Run `just ci` before
@@ -84,10 +105,11 @@ PRs remain enabled as the sole GitHub-hosted automation exception.
 
 ## Release Recovery
 
-The publisher retains the archive, checksum, and release notes under
-`target/release-artifacts/<tag>/` whenever Git refs have been pushed but the
-GitHub release was not confirmed published. It prints commands specialized for
-that release. The equivalent manual recovery flow is:
+The publisher retains the archive, checksum, release notes, and candidate validation metadata
+under `target/release-artifacts/<tag>/` after a matrix failure so the exact candidate can be resumed.
+It also retains release artifacts whenever Git refs have been pushed but the GitHub release was
+not confirmed published. In that case it prints commands specialized for that release. The
+equivalent manual recovery flow after refs have been pushed is:
 
 ```bash
 release_tag="${RELEASE_TAG:?set RELEASE_TAG to vX.Y.Z}"

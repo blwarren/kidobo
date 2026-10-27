@@ -2,15 +2,21 @@
 
 The Incus suite installs and operates Kidobo in disposable QEMU/KVM virtual machines,
 including real guest firewall and systemd operations. It supplements `just ci` and the
-Debian/Alpine static compatibility checks. Publication runs the full candidate matrix before any
-release push or upload by default; published-release smoke testing is separate.
+Debian/Alpine static compatibility checks. Publication requires successful candidate coverage for
+every required target before any release push or upload; published-release smoke testing is separate.
 `just publish-release X.Y.Z --skip-e2e` omits the matrix and its Incus/agent-ISO prerequisites;
 all other release checks remain enabled. See the [command reference](../scripts/README.md).
 `just ci` keeps its existing local checks and does not launch VMs.
 
-The default publication matrix has seven targets: Debian 12 and 13, Ubuntu 24.04 and 26.04,
-Fedora 44, and AlmaLinux 9 and 10. Every configured target must pass before publication unless
-the explicit `--skip-e2e` publisher override is selected.
+The default release gate has four required targets: Debian 12 and 13, and Ubuntu 24.04 and 26.04.
+Publication and `just e2e-artifact` select only required targets, avoiding the runtime cost of
+additional compatibility coverage. Run `just e2e` separately to cover all seven configured targets,
+including advisory Fedora 44 and AlmaLinux 9 and 10. In that broader run, advisory prerequisite
+and application failures are reported without failing the run when every required target passes.
+Cleanup failures and shared infrastructure or evidence archive failures still block the run.
+In [the matrix configuration](../config/e2e.toml), `required` defaults to `true`; advisory targets
+explicitly set `required = false`. Changing this policy changes release coverage and should be
+reviewed accordingly. The explicit publisher option `--skip-e2e` omits the entire release matrix.
 
 openSUSE Leap 16.0 is deferred because its configured repositories did not provide the
 required `bgpq4` package. Zypper provisioning remains available for future use. Reintroduce
@@ -55,15 +61,22 @@ directory-backed storage pool `kidobo-e2e`. Existing resources must belong to th
 conflicts fail setup. Rerunning setup restores missing owned profile devices and applies
 changed device/resource settings; an unchanged owned profile is left untouched. Review
 [the matrix configuration](../config/e2e.toml) for image selectors
-and resource settings. Defaults are sequential execution with 2 vCPUs, 4 GiB memory, and a
-30 GiB virtual disk per VM. Reserve additional storage for images and failure artifacts.
+and resource settings. Commands execute sequentially, with 2 vCPUs, 4 GiB memory, and a
+30 GiB virtual disk per VM by default. Successfully prepared VMs are stopped until their
+application checks, keeping at most one VM running. Allow disk space for all pending targets
+as well as images and failure artifacts.
 Incus images and distro repositories require network access.
 
-Every run launches fresh VMs, updates each selected distro within its pinned release line,
-installs packaged prerequisites, and reboots before application testing. AlmaLinux enables
-EPEL/CRB. Package failures, unavailable images, or missing kernel support fail the run.
-The suite requires packaged prerequisites and does not build replacements for unavailable
-packages.
+The runner prepares fresh VMs for all pending targets before starting application lifecycles.
+Preparation installs packaged prerequisites, updates each distro within its pinned release line,
+reboots, and checks the running kernel's required firewall modules and backends. It then stops
+each prepared VM; application testing starts it again and repeats kernel checks before installation.
+AlmaLinux enables EPEL/CRB. A required target's package, image, or kernel prerequisite failure
+stops the application batch before the longer lifecycle checks, while diagnostics and cleanup
+still run. An advisory prerequisite failure leaves successful targets eligible to continue.
+The suite requires packaged prerequisites and does not build
+replacements for unavailable packages. Resume can reuse compatible successful targets without
+creating VMs for them.
 
 ## Guest network prerequisites
 
@@ -103,6 +116,7 @@ recipes continue to run in the foreground.
 
 ```bash
 just e2e
+just e2e --required-only
 just e2e --distro debian-12 --keep-failed
 just e2e-published
 just e2e-published "${RELEASE_TAG:?set RELEASE_TAG to a published tag}" --distro debian-12
@@ -132,7 +146,7 @@ GitHub access and runs independently of publication.
 Published `v0.14.3` assets are immutable and still reproduce the Debian 12 missing-chain
 failure recorded below. They cannot validate the subsequent candidate fix. After publishing
 a corrected release through the candidate gate, run `just e2e-published <corrected-tag>`
-as a separate post-publication smoke milestone across all seven mandatory targets.
+as a separate post-publication smoke milestone across the configured targets.
 
 For an existing release archive, including publisher use:
 
@@ -142,10 +156,72 @@ release_archive="${RELEASE_ARCHIVE:?set RELEASE_ARCHIVE to the existing tar.gz p
 just e2e-artifact "${release_archive}" "${release_tag}"
 ```
 
-This command runs all configured targets. A filtered diagnosis is not a passing publication
-gate. Changing the matrix changes release coverage and should be reviewed accordingly.
+This command selects every configured required target and excludes advisory targets. It accepts
+only an optional `--resume RUN_ID`; selecting an individual distro cannot bypass the release gate.
+A filtered diagnosis alone does not satisfy publication; every required target needs a compatible
+successful lifecycle result. The underlying runner's `--required-only` option selects required
+targets, and the report records that selection.
 The publisher's `--skip-e2e` option is a deliberate release-workflow override; it does not change
 these candidate or artifact commands or make a prior matrix run count for the skipped release.
+
+## Resume a candidate
+
+After correcting a failed target's environment, resume against the same captured candidate.
+Select only required coverage for the release gate, or include advisory compatibility targets:
+
+```bash
+just e2e-resume RUN_ID --required-only
+just e2e-resume RUN_ID
+```
+
+This foreground command reads the candidate archive and tag from the prior run's retained
+evidence. It creates a new run and leaves the earlier report and archive intact. Without
+`--required-only`, it selects all seven configured targets. Compatible successful selected targets
+are reused; failed, incomplete, new, or incompatible selected targets get fresh VMs. The new report
+identifies reused results and their source run. If you already have the exact candidate archive
+and tag, the artifact command resumes required coverage:
+
+```bash
+just e2e-artifact "${release_archive}" "${release_tag}" --resume RUN_ID
+```
+
+Reuse requires the exact candidate archive hash and tag, matching installer and guest-script
+hashes, matching target and VM resource definitions, and the same upgrade baseline tag, installer,
+and checksum manifest. A reused target must have completed the full candidate lifecycle with
+successful stages, diagnostics, and cleanup. Changes to a target's definition or VM resources
+invalidate that target's earlier success. A changed candidate, installer, guest script, or checksum
+manifest rejects resume and requires a fresh run for all targets.
+Published smoke results cannot substitute for candidate lifecycle coverage.
+
+Historical candidate runs can be considered when their retained reports and evidence establish
+these checks. Resume verifies the source evidence archive's recorded SHA-256 before using it.
+Keep source runs and evidence when preserving a chain of resumed results.
+
+For a failed publication attempt created with resume support, use:
+
+```bash
+just publish-release X.Y.Z --resume-e2e RUN_ID
+```
+
+The publisher retains the exact candidate archive and validation identity under
+`target/release-artifacts/<tag>/` when the matrix fails. It checks the source commit,
+reconstructed candidate tree and saved release date, and artifact hashes before reusing completed
+local validation and resuming E2E against that archive. It does not rebuild or repackage the
+candidate on resume. Source or candidate changes require a fresh publication attempt. First move
+the retained candidate directory aside, preserving it for inspection, because a fresh attempt
+refuses to overwrite an existing candidate:
+
+```bash
+release_tag="${RELEASE_TAG:?set RELEASE_TAG to vX.Y.Z}"
+candidate_dir="target/release-artifacts/${release_tag}"
+saved_dir="$(mktemp -d "target/release-artifacts/${release_tag}-saved-XXXXXXXX")"
+mv "${candidate_dir}" "${saved_dir}/candidate"
+just publish-release "${release_tag}"
+```
+
+`--resume-e2e` and `--skip-e2e` are mutually exclusive. Older publisher attempts without retained
+validation metadata cannot use publisher resume, even if their evidence remains eligible for
+`just e2e-resume`.
 
 ## Diagnose and clean up
 
@@ -215,7 +291,10 @@ creation succeeds. Archive failures or abrupt termination can leave that directo
 retain it for diagnosis. Success, failure, and handled interruption all attempt archive
 finalization. Existing historical results keep their original layout and need no migration.
 
-Provisioning failures and application assertion failures both produce a failing exit status. Inspect the earliest failed command and its diagnostics before retrying.
+Required target provisioning failures and application assertion failures produce a failing exit status.
+Advisory target prerequisite and application failures remain visible in the summary and structured
+results. Cleanup, shared infrastructure, and evidence archive failures still fail the run. Inspect the
+earliest failed command and its diagnostics before retrying.
 
 VMs are deleted after diagnostics by default. `--keep-failed` retains failed guests for
 inspection. Interrupted runs retain ownership records so cleanup can be retried safely:

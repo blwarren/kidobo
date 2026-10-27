@@ -70,9 +70,32 @@ _e2e *args: build-release
     ./scripts/package-release.sh "${binary}" "${tag}" "${output}"
     cargo run --locked -p kidobo-e2e -- run --archive "${output}/kidobo-${tag}-linux-x86_64.tar.gz" --tag "${tag}" "$@"
 
-# Test the exact archive selected for publication; always run the full matrix.
-e2e-artifact archive tag:
-    @cargo run --locked -p kidobo-e2e -- run --archive "{{ archive }}" --tag "{{ tag }}"
+# Test required targets against the publication archive; optionally resume results.
+[positional-arguments]
+e2e-artifact archive tag *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    archive="$1"
+    tag="$2"
+    shift 2
+    if [[ $# -ne 0 && ( $# -ne 2 || "$1" != --resume || ! "$2" =~ ^run-[0-9]+-[0-9]+$ ) ]]; then
+        echo 'Usage: just e2e-artifact ARCHIVE TAG [--resume RUN_ID]' >&2
+        exit 2
+    fi
+    cargo run --locked -p kidobo-e2e -- run --required-only --archive "${archive}" --tag "${tag}" "$@"
+
+# Resume an unchanged candidate using its frozen archive and retained results.
+[positional-arguments]
+e2e-resume run_id *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    run_id="$1"
+    shift
+    if [[ $# -ne 0 && ( $# -ne 1 || "$1" != --required-only ) ]]; then
+        echo 'Usage: just e2e-resume RUN_ID [--required-only]' >&2
+        exit 2
+    fi
+    cargo run --locked -p kidobo-e2e -- run --resume "${run_id}" "$@"
 
 # Exercise genuine GitHub installation of a published release.
 e2e-published tag="latest" *args:

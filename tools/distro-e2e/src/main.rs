@@ -16,7 +16,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 const OWNER: &str = "kidobo-e2e-v1";
 
+mod matrix;
 mod report;
+mod resume;
 use report::Report;
 
 #[derive(Parser)]
@@ -38,8 +40,14 @@ enum Action {
         published: bool,
         #[arg(long)]
         distro: Option<String>,
+        /// Run the configured release requirements, omitting advisory compatibility targets.
+        #[arg(long, conflicts_with = "distro")]
+        required_only: bool,
         #[arg(long)]
         keep_failed: bool,
+        /// Reuse completed target results for the same candidate and test inputs.
+        #[arg(long, conflicts_with_all = ["published", "distro"])]
+        resume: Option<String>,
     },
     Clean {
         run_id: String,
@@ -64,6 +72,22 @@ struct Distro {
     image: String,
     family: String,
     packages: Vec<String>,
+    #[serde(default = "required_by_default")]
+    required: bool,
+}
+fn required_by_default() -> bool {
+    true
+}
+fn selected_targets<'a>(
+    config: &'a Config,
+    distro: Option<&str>,
+    required_only: bool,
+) -> Vec<&'a Distro> {
+    config
+        .distros
+        .iter()
+        .filter(|d| distro.is_none_or(|id| id == d.id) && (!required_only || d.required))
+        .collect()
 }
 #[derive(Serialize, Deserialize)]
 struct Owned {
@@ -699,20 +723,14 @@ fn prepare_baseline(runner: &mut Runner, vm: &str) -> Result<()> {
     )?;
     Ok(())
 }
-#[expect(
-    clippy::too_many_lines,
-    reason = "Lifecycle stages stay adjacent to their guest commands and timeouts"
-)]
-fn scenario(
+fn prerequisites(
     runner: &mut Runner,
     vm: &str,
     distro: &Distro,
     tag: &str,
     published: bool,
     archive: Option<&Path>,
-    phase: &mut &str,
 ) -> Result<()> {
-    *phase = "provisioning";
     runner.stage(&format!("{} | provisioning", distro.id))?;
     runner.ready(vm)?;
     runner.guest(vm, &strings(&["sh", "-c", "printf '%s\\n' kidobo-e2e-v1 > /etc/kidobo-e2e-owned; mkdir -p /opt/kidobo-e2e/release"]), 30)?;
@@ -784,7 +802,15 @@ fn scenario(
         &strings(&["bash", "/opt/kidobo-e2e/provision.sh", "--check-kernel"]),
         60,
     )?;
-    *phase = "application";
+    Ok(())
+}
+fn application(
+    runner: &mut Runner,
+    vm: &str,
+    distro: &Distro,
+    tag: &str,
+    published: bool,
+) -> Result<()> {
     runner.stage(&format!(
         "{} | installation and application checks",
         distro.id
@@ -876,6 +902,12 @@ fn run(cli: Cli) -> Result<()> {
     {
         return Err("unsafe resource identifier".into());
     }
+    let mut ids = std::collections::BTreeSet::new();
+    if config.distros.iter().any(|d| !ids.insert(&d.id))
+        || !config.distros.iter().any(|d| d.required)
+    {
+        return Err("matrix needs unique targets and at least one required target".into());
+    }
     let cancelled = Arc::new(AtomicBool::new(false));
     let signal = cancelled.clone();
     ctrlc::set_handler(move || signal.store(true, Ordering::Relaxed))?;
@@ -911,14 +943,13 @@ fn run(cli: Cli) -> Result<()> {
                 tag,
                 archive,
                 distro,
+                required_only,
                 ..
             } => (
                 tag.as_str(),
                 archive.as_ref(),
-                config
-                    .distros
-                    .iter()
-                    .filter(|d| distro.as_ref().is_none_or(|id| *id == d.id))
+                selected_targets(&config, distro.as_deref(), *required_only)
+                    .into_iter()
                     .map(|d| d.id.clone())
                     .collect::<Vec<_>>(),
             ),
@@ -972,6 +1003,10 @@ fn run(cli: Cli) -> Result<()> {
         ))?;
     }
     let outcome = execute(cli, &config, &run_id, &mut runner);
+    let restored = runner.dir.join(".resume-candidate");
+    if restored.exists() {
+        fs::remove_dir_all(restored)?;
+    }
     if is_clean {
         runner
             .report
@@ -1044,8 +1079,28 @@ fn execute(cli: Cli, config: &Config, run_id: &str, runner: &mut Runner) -> Resu
             mut tag,
             published,
             distro,
+            required_only,
             keep_failed,
+            resume,
         } => {
+            let previous = resume
+                .as_deref()
+                .map(|id| resume::Resume::load(runner, id))
+                .transpose()?;
+            let archive = if let Some(previous) = &previous {
+                if tag == "latest" {
+                    tag = previous.document["tag"]
+                        .as_str()
+                        .ok_or("missing resume tag")?
+                        .into();
+                }
+                Some(match archive {
+                    Some(archive) => archive,
+                    None => previous.restore_candidate(runner)?,
+                })
+            } else {
+                archive
+            };
             runner.report.document["coverage"] = json!(if published {
                 "Published smoke lane; candidate post-install reboot, upgrade, and candidate-only checks are not run"
             } else {
@@ -1091,7 +1146,14 @@ fn execute(cli: Cli, config: &Config, run_id: &str, runner: &mut Runner) -> Resu
             if test_archive.as_deref().map(hash).transpose()? != artifact_hash {
                 return Err("candidate changed while taking its input snapshot".into());
             }
-            if !published {
+            if let Some(previous) = &previous {
+                previous.verify_inputs(
+                    runner,
+                    &tag,
+                    archive.as_deref().ok_or("resume needs candidate")?,
+                )?;
+                previous.restore_baseline(runner)?;
+            } else if !published {
                 let release_list = runner.command(
                     "curl",
                     &strings(&[
@@ -1147,186 +1209,27 @@ fn execute(cli: Cli, config: &Config, run_id: &str, runner: &mut Runner) -> Resu
                 }
             }
 
-            let targets: Vec<_> = config
-                .distros
-                .iter()
-                .filter(|d| distro.as_ref().is_none_or(|id| *id == d.id))
-                .collect();
+            let targets = selected_targets(config, distro.as_deref(), required_only);
             if targets.is_empty() {
                 return Err("no matching distros".into());
             }
-            let mut owned = Owned {
-                owner: OWNER.into(),
-                project: config.project.clone(),
-                instances: vec![],
-            };
             runner.report.document["tag"] = json!(tag);
             runner.report.document["archive_sha256"] = json!(artifact_hash);
+            runner.report.document["published"] = json!(published);
             runner.report.save()?;
-            let mut results = vec![];
-            for target in targets {
-                if runner.cancelled.load(Ordering::Relaxed) {
-                    break;
-                }
-                let vm = format!("{}-{}", run_id, target.id);
-                let target_dir = runner.evidence().join(&target.id);
-                fs::create_dir_all(&target_dir)?;
-                owned.instances.push(vm.clone());
-                fs::write(
-                    runner.dir.join("ownership.json"),
-                    serde_json::to_vec_pretty(&owned)?,
-                )?;
-                runner.stage(&format!("{} | VM creation", target.id))?;
-                let transcript_line = runner.report.line;
-                runner.report.document["active_target"] = json!(target.id);
-                runner.report.save()?;
-                let started = Instant::now();
-                let launch = runner.create_vm(&target.image, &vm, &config.profile);
-                let mut phase = "provisioning";
-                let outcome = launch.and_then(|()| {
-                    scenario(
-                        runner,
-                        &vm,
-                        target,
-                        &tag,
-                        published,
-                        test_archive.as_deref(),
-                        &mut phase,
-                    )
-                });
-                // Diagnostics and cleanup remain possible after SIGINT.
-                let interrupted = runner.cancelled.swap(false, Ordering::Relaxed);
-                runner.report.finish_stage(if interrupted {
-                    "interrupted"
-                } else if outcome.is_err() {
-                    "failed"
-                } else {
-                    "passed"
-                })?;
-                runner.stage(&format!("{} | diagnostics", target.id))?;
-                let mut diagnostic_errors = vec![];
-                let mut image_fingerprint: Option<String> = None;
-                let vm_snapshot = runner
-                    .incus(&strings(&["list", &vm, "--format=json"]), 30)
-                    .and_then(|output| -> Result<()> {
-                        let instances: Vec<serde_json::Value> = serde_json::from_str(&output)?;
-                        let instance = instances
-                            .iter()
-                            .find(|instance| instance["name"] == vm)
-                            .ok_or("VM missing from Incus diagnostics")?;
-                        validate_vm_config(instance)?;
-                        image_fingerprint = instance["config"]["volatile.base_image"]
-                            .as_str()
-                            .map(str::to_owned);
-                        fs::write(
-                            target_dir.join("vm.json"),
-                            serde_json::to_vec_pretty(instance)?,
-                        )?;
-                        Ok(())
-                    });
-                if let Err(error) = vm_snapshot {
-                    diagnostic_errors.push(format!("VM metadata: {error}"));
-                } else {
-                    let diagnostic_script = r"
-printf '%s\n' '=== uname ==='; uname -a || true
-printf '%s\n' '=== os-release ==='; cat /etc/os-release || true
-printf '%s\n' '=== packages ==='
-if command -v dpkg-query >/dev/null 2>&1; then dpkg-query -W -f='${binary:Package}\t${Version}\n' || true; elif command -v rpm >/dev/null 2>&1; then rpm -qa || true; fi
-printf '%s\n' '=== netfilter ==='; iptables --version || true; ip6tables --version || true; ipset save || true; iptables-save || true; ip6tables-save || true
-printf '%s\n' '=== missing-chain comparison ==='; iptables -S E2E-ABSENT-CHAIN 2>&1 || true; ip6tables -S E2E-ABSENT-CHAIN 2>&1 || true
-printf '%s\n' '=== native nft rules ==='; if command -v nft >/dev/null 2>&1; then nft list ruleset || true; fi
-printf '%s\n' '=== kidobo service journal ==='; journalctl -u kidobo-sync.service --no-pager || true
-";
-                    match runner.guest(&vm, &strings(&["bash", "-c", diagnostic_script]), 120) {
-                        Ok(output) => {
-                            if let Err(error) =
-                                fs::write(target_dir.join("guest-diagnostics.txt"), output)
-                            {
-                                diagnostic_errors.push(format!("write guest diagnostics: {error}"));
-                            }
-                        }
-                        Err(error) => diagnostic_errors.push(format!("guest diagnostics: {error}")),
-                    }
-                    match runner.guest(&vm, &strings(&["test", "-d", "/opt/kidobo-e2e/state"]), 30)
-                    {
-                        Ok(_) => {
-                            let pull = runner.verify(&vm).and_then(|()| {
-                                let source = format!("{vm}/opt/kidobo-e2e/state");
-                                let destination =
-                                    target_dir.join("state").to_string_lossy().into_owned();
-                                let mut args = strings(&["file", "pull", "-r"]);
-                                args.extend([source, destination]);
-                                runner.incus(&args, 120).map(|_| ())
-                            });
-                            if let Err(error) = pull {
-                                diagnostic_errors.push(format!("pull guest state: {error}"));
-                            }
-                        }
-                        Err(error) => {
-                            diagnostic_errors.push(format!("guest state unavailable: {error}"));
-                        }
-                    }
-                }
-                let error = outcome.err().map(|e| e.to_string());
-                runner
-                    .report
-                    .finish_stage(if diagnostic_errors.is_empty() {
-                        "passed"
-                    } else {
-                        "incomplete"
-                    })?;
-                runner.stage(&format!("{} | cleanup", target.id))?;
-                let mut cleanup_error = None;
-                if !(keep_failed && error.is_some())
-                    && let Err(e) = runner.delete(&vm)
-                {
-                    cleanup_error = Some(e.to_string());
-                }
-                runner.report.emit(&format!(
-                    "[e2e] {}: {}",
-                    target.id,
-                    error
-                        .as_deref()
-                        .or(cleanup_error.as_deref())
-                        .unwrap_or("PASS")
-                ))?;
-                results.push(json!({
-                    "distro": target.id,
-                    "transcript_line": transcript_line,
-                    "phase": phase,
-                    "error": error,
-                    "cleanup_error": cleanup_error,
-                    "seconds": started.elapsed().as_secs_f64(),
-                    "image": target.image,
-                    "image_fingerprint": image_fingerprint,
-                    "diagnostic_errors": diagnostic_errors,
-                }));
-                runner.report.document["tag"] = json!(tag);
-                runner.report.document["archive_sha256"] = json!(artifact_hash);
-                runner.report.document["results"] = json!(results);
-                runner.report.document["active_target"] = json!(null);
-                runner.report.finish_stage(if cleanup_error.is_some() {
-                    "failed"
-                } else if keep_failed && error.is_some() {
-                    "retained"
-                } else {
-                    "passed"
-                })?;
-                runner.report.save()?;
-                if interrupted {
-                    runner.cancelled.store(true, Ordering::Relaxed);
-                    break;
-                }
-            }
+            matrix::execute(
+                runner,
+                config,
+                run_id,
+                &targets,
+                &tag,
+                published,
+                test_archive.as_deref(),
+                keep_failed,
+                previous.as_ref(),
+            )?;
             if archive.as_deref().map(hash).transpose()? != artifact_hash {
                 return Err("candidate archive changed during testing".into());
-            }
-            if runner.cancelled.load(Ordering::Relaxed)
-                || results
-                    .iter()
-                    .any(|r| !r["error"].is_null() || !r["cleanup_error"].is_null())
-            {
-                return Err(format!("matrix failed; results: {}", runner.dir.display()).into());
             }
             Ok(())
         }

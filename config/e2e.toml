@@ -31,18 +31,21 @@ family = "apt"
 packages = ["bash", "ca-certificates", "curl", "tar", "coreutils", "grep", "kmod", "sudo", "iproute2", "python3", "ipset", "iptables", "bgpq4"]
 
 [[distros]]
+required = false
 id = "fedora-44"
 image = "fedora/44"
 family = "dnf"
 packages = ["bash", "ca-certificates", "curl", "tar", "coreutils", "grep", "kmod", "sudo", "iproute", "python3", "ipset", "iptables", "bgpq4", "kernel-modules-extra"]
 
 [[distros]]
+required = false
 id = "almalinux-9"
 image = "almalinux/9"
 family = "dnf-epel"
 packages = ["bash", "ca-certificates", "curl", "tar", "coreutils", "grep", "kmod", "sudo", "iproute", "python3", "ipset", "iptables", "bgpq4", "epel-release", "dnf-plugins-core", "kernel-modules-extra"]
 
 [[distros]]
+required = false
 id = "almalinux-10"
 image = "almalinux/10"
 family = "dnf-epel"
