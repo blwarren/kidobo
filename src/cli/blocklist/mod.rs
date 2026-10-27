@@ -4,6 +4,7 @@ use std::path::Path;
 use log::warn;
 
 use crate::cli::CliIo;
+use crate::cli::presentation::{format_utc, remaining_duration};
 use crate::error::KidoboError;
 use kidobo_adapters::blocklist_file::FileBlocklistRepository;
 use kidobo_adapters::blocklist_operations::SystemAsnOperations;
@@ -18,6 +19,7 @@ use kidobo_app::blocklist::{
     BanDependencies, BanOutcome, BanRequest, BlocklistInput, UnbanApplyDependencies, UnbanDecision,
     UnbanPreparationDependencies, UnbanRequest,
 };
+use kidobo_app::temporary_bans::Clock;
 
 pub fn run_ban_command(
     target: Option<&str>,
@@ -25,7 +27,7 @@ pub fn run_ban_command(
     asn: Option<&[String]>,
     duration: Option<BanDuration>,
     io: &mut CliIo<'_>,
-) -> Result<(), KidoboError> {
+) -> Result<bool, KidoboError> {
     let paths = path_resolution_input_from_process(None);
     if let Some(tokens) = asn {
         let outcome = blocklist::execute_ban_asn(
@@ -41,8 +43,7 @@ pub fn run_ban_command(
         }
         if let Some(duration) = duration {
             render_ban_changes(&outcome.temporary_changes, Some(duration), io)?;
-            sync_notice(io)?;
-            return Ok(());
+            return Ok(changes_saved(&outcome.temporary_changes));
         }
         output(
             io,
@@ -61,12 +62,10 @@ pub fn run_ban_command(
                 ),
             )?;
         }
-        sync_notice(io)?;
-        return Ok(());
+        return Ok(!outcome.added.is_empty());
     }
 
     let input = command_input(target, file)?;
-    let file_mode = matches!(input, BlocklistInput::File(_));
     let outcome = blocklist::execute_ban(
         &BanRequest {
             paths,
@@ -78,20 +77,20 @@ pub fn run_ban_command(
     let (changes, notices) = match outcome {
         BanOutcome::Applied(changes) => (changes, Vec::new()),
         BanOutcome::TemporaryApplied { changes, notices } => (changes, notices),
-        BanOutcome::InvalidTargets(targets) => return report_invalid_targets(&targets, io),
+        BanOutcome::InvalidTargets(targets) => {
+            return report_invalid_targets(&targets, io).map(|()| false);
+        }
         BanOutcome::EmptyFile => {
             output(io, format_args!("no blocklist targets loaded from file"))?;
-            return Ok(());
+            return Ok(false);
         }
     };
     for notice in notices {
         warn!("{}", notice.message);
     }
     render_ban_changes(&changes, duration, io)?;
-    if !file_mode || !changes.is_empty() {
-        sync_notice(io)?;
-    }
-    Ok(())
+
+    Ok(changes_saved(&changes))
 }
 
 pub fn run_unban_command(
@@ -100,7 +99,7 @@ pub fn run_unban_command(
     asn: Option<&[String]>,
     yes: bool,
     io: &mut CliIo<'_>,
-) -> Result<(), KidoboError> {
+) -> Result<bool, KidoboError> {
     let paths = path_resolution_input_from_process(None);
     if let Some(tokens) = asn {
         let outcome = blocklist::execute_unban_asn(
@@ -125,8 +124,7 @@ pub fn run_unban_command(
             io,
             format_args!("deleted {} ASN cache file(s)", outcome.deleted_cache_files),
         )?;
-        sync_notice(io)?;
-        return Ok(());
+        return Ok(!outcome.removed.is_empty());
     }
 
     let input = command_input(target, file)?;
@@ -137,11 +135,11 @@ pub fn run_unban_command(
         blocklist::UnbanPreparation::Ready(preview) => preview,
         blocklist::UnbanPreparation::InvalidTargets(targets) => {
             report_invalid_targets(&targets, io)?;
-            return Ok(());
+            return Ok(false);
         }
         blocklist::UnbanPreparation::EmptyFile => {
             output(io, format_args!("no blocklist targets loaded from file"))?;
-            return Ok(());
+            return Ok(false);
         }
     };
     let remove_partial = confirm_partial_matches(&preview, file_mode, yes, io)?;
@@ -174,7 +172,7 @@ pub fn run_unban_command(
                 format_args!("no blocklist entries match {}", outcome.target_label),
             )?;
         }
-        return Ok(());
+        return Ok(false);
     }
     if file_mode {
         output(
@@ -195,8 +193,7 @@ pub fn run_unban_command(
             ),
         )?;
     }
-    sync_notice(io)?;
-    Ok(())
+    Ok(true)
 }
 
 fn ban_dependencies() -> BanDependencies<'static> {
@@ -281,13 +278,17 @@ fn render_ban_changes(
             BanChange::TemporaryAdded { target, expires_at } => output(
                 io,
                 format_args!(
-                    "added temporary ban {target}{duration_text} (expires at Unix {expires_at})"
+                    "added temporary ban {target}{duration_text} (expires {}; {}; Unix {expires_at})",
+                    format_utc(*expires_at),
+                    remaining_duration(*expires_at, SystemClock.now_unix_secs()?)
                 ),
             )?,
             BanChange::TemporaryRescheduled { target, expires_at } => output(
                 io,
                 format_args!(
-                    "rescheduled temporary ban {target}{duration_text} (expires at Unix {expires_at})"
+                    "rescheduled temporary ban {target}{duration_text} (expires {}; {}; Unix {expires_at})",
+                    format_utc(*expires_at),
+                    remaining_duration(*expires_at, SystemClock.now_unix_secs()?)
                 ),
             )?,
             BanChange::AlreadyPermanent(target) => {
@@ -303,12 +304,19 @@ fn render_ban_changes(
             BanChange::Added(target) => output(io, format_args!("added blocklist entry {target}"))?,
         }
     }
+    if duration.is_some() && changes_saved(changes) {
+        io.presentation().paragraph(io.stdout, "The duration started when saved. Delayed or failed sync/timer runs can delay activation or removal; another source may continue blocking the address.")?;
+    }
     Ok(())
 }
 
 fn report_invalid_targets(targets: &[String], io: &mut CliIo<'_>) -> Result<(), KidoboError> {
     for target in targets {
-        writeln!(io.stderr, "invalid target: {target}")?;
+        writeln!(
+            io.stderr,
+            "invalid target: {}",
+            crate::cli::presentation::escape(target)
+        )?;
     }
     if targets.is_empty() {
         Ok(())
@@ -365,15 +373,20 @@ fn confirm_partial_matches(
 }
 
 fn output(io: &mut CliIo<'_>, arguments: fmt::Arguments<'_>) -> Result<(), KidoboError> {
-    writeln!(io.stdout, "{arguments}")?;
+    io.presentation()
+        .paragraph(io.stdout, &arguments.to_string())?;
     Ok(())
 }
 
-fn sync_notice(io: &mut CliIo<'_>) -> Result<(), KidoboError> {
-    output(
-        io,
-        format_args!("changes take effect after running `sudo kidobo sync`"),
-    )
+fn changes_saved(changes: &[BanChange]) -> bool {
+    changes.iter().any(|change| {
+        matches!(
+            change,
+            BanChange::Added(_)
+                | BanChange::TemporaryAdded { .. }
+                | BanChange::TemporaryRescheduled { .. }
+        )
+    })
 }
 
 fn format_asn_list(asns: &[u32]) -> String {
@@ -421,6 +434,11 @@ mod tests {
                 stdout: &mut FailingWriter,
                 stderr: &mut Vec::new(),
                 stdout_is_terminal: false,
+                stdin_is_terminal: false,
+                stderr_is_terminal: false,
+                terminal_width: 80,
+                term_dumb: false,
+                under_systemd: false,
                 no_color: true,
             },
             format_args!("added blocklist entry 203.0.113.7/32"),

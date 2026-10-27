@@ -1,6 +1,8 @@
 use log::info;
 
 use crate::cli::CliIo;
+use crate::cli::args::ReportFormat;
+use crate::cli::presentation::{Presentation, Status};
 use crate::error::KidoboError;
 use kidobo_adapters::config::FileConfigRepository;
 use kidobo_adapters::doctor::SystemDoctorProbe;
@@ -10,7 +12,10 @@ use kidobo_app::doctor::{
     self, DoctorCheckStatus, DoctorDependencies, DoctorOverall, DoctorReport,
 };
 
-pub fn run_doctor_command(io: &mut CliIo<'_>) -> Result<(), KidoboError> {
+pub fn run_doctor_command(
+    format: Option<ReportFormat>,
+    io: &mut CliIo<'_>,
+) -> Result<(), KidoboError> {
     let paths = SystemPathResolver;
     let configs = FileConfigRepository;
     let probes = SystemDoctorProbe::default();
@@ -25,8 +30,15 @@ pub fn run_doctor_command(io: &mut CliIo<'_>) -> Result<(), KidoboError> {
             probes: &probes,
         },
     )?;
-    let json = render_report(&report)?;
-    writeln!(io.stdout, "{json}")?;
+    let format = format.unwrap_or(if io.stdout_is_terminal && !io.under_systemd {
+        ReportFormat::Human
+    } else {
+        ReportFormat::Json
+    });
+    match format {
+        ReportFormat::Json => writeln!(io.stdout, "{}", render_report(&report)?)?,
+        ReportFormat::Human => render_human(&report, io)?,
+    }
 
     let failed_count = report
         .checks
@@ -54,6 +66,93 @@ pub fn run_doctor_command(io: &mut CliIo<'_>) -> Result<(), KidoboError> {
     } else {
         Err(KidoboError::DoctorFailed)
     }
+}
+
+fn render_human(report: &DoctorReport, io: &mut CliIo<'_>) -> Result<(), KidoboError> {
+    let view = io.presentation();
+    view.heading(io.stdout, "Kidobo doctor")?;
+    for (heading, prefix) in [
+        ("Configuration", "config_"),
+        ("Required tools", "binary_"),
+        ("Local files and cache", "file_"),
+        ("Cache access", "cache_"),
+        ("Firewall permissions", "sudo_"),
+    ] {
+        let checks = report
+            .checks
+            .iter()
+            .filter(|check| check.name.starts_with(prefix))
+            .collect::<Vec<_>>();
+        if checks.is_empty() {
+            continue;
+        }
+        view.heading(io.stdout, heading)?;
+        for check in checks {
+            render_check(&view, check, io.stdout)?;
+        }
+    }
+    for check in &report.checks {
+        if !["config_", "binary_", "file_", "cache_", "sudo_"]
+            .iter()
+            .any(|prefix| check.name.starts_with(prefix))
+        {
+            render_check(&view, check, io.stdout)?;
+        }
+    }
+    let failed = report
+        .checks
+        .iter()
+        .filter(|check| check.status == DoctorCheckStatus::Fail)
+        .count();
+    let skipped = report
+        .checks
+        .iter()
+        .filter(|check| check.status == DoctorCheckStatus::Skip)
+        .count();
+    view.heading(io.stdout, "Summary")?;
+    view.paragraph(
+        io.stdout,
+        &format!(
+            "{} checks: {} passed, {failed} failed, {skipped} skipped.",
+            report.checks.len(),
+            report.checks.len() - failed - skipped
+        ),
+    )?;
+    view.next(
+        io.stdout,
+        if failed == 0 {
+            "sudo kidobo sync"
+        } else {
+            "correct the reported issues, then rerun kidobo doctor"
+        },
+    )?;
+    Ok(())
+}
+
+fn render_check(
+    view: &Presentation,
+    check: &kidobo_app::doctor::DoctorCheck,
+    out: &mut dyn std::io::Write,
+) -> Result<(), KidoboError> {
+    let status = match check.status {
+        DoctorCheckStatus::Ok => Status::Pass,
+        DoctorCheckStatus::Fail => Status::Fail,
+        DoctorCheckStatus::Skip => Status::Skip,
+    };
+    view.status(out, status, &check.name.replace('_', " "), &check.detail)?;
+    if check.status == DoctorCheckStatus::Fail {
+        let remedy = if check.name.starts_with("config_") {
+            "Correct the reported configuration path or error; sudo kidobo init creates missing configuration."
+        } else if check.name.starts_with("binary_") {
+            "Install the named tool using your distribution's package manager, then rerun doctor."
+        } else if check.name.starts_with("sudo_") {
+            "Retry sudo kidobo doctor; check privilege configuration if the probe still fails."
+        } else {
+            "Inspect the reported path and permissions; sudo kidobo init creates missing files without replacing existing files."
+        };
+        view.paragraph(out, remedy)?;
+    }
+    Ok(())
 }
 
 fn render_report(report: &DoctorReport) -> Result<String, KidoboError> {

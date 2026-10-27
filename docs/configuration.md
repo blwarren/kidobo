@@ -81,6 +81,34 @@ fields, unsupported versions, invalid records, and duplicate canonical
 identities are errors. A missing file is an empty source. `unban` updates both
 permanent and temporary sources for the requested target type.
 
+## Managing configured sources and exemptions
+
+Use `kidobo sources` or `kidobo sources list` to inspect configured remote
+blocklist URLs and `kidobo sources add URL` / `kidobo sources remove URL` to
+edit them. Listing also reports validated cache availability; refresh time is
+unknown when there is no trustworthy refresh receipt. These commands update
+`remote.urls`; they do not fetch feeds, refresh caches, or change firewall
+state. Run `sudo kidobo sync` to apply a saved change.
+
+Use `kidobo allow` or `kidobo allow list` to inspect operator-managed
+exemptions in `safe.ips`.
+`kidobo allow add IP_OR_CIDR` and `kidobo allow remove IP_OR_CIDR` edit that
+list. Adding an exact canonical duplicate is a no-op. A distinct address or
+range already covered by a broader exemption can be saved without expanding
+coverage or prompting; this can keep the narrower entry if the broader one is
+removed later. An addition that expands coverage asks for confirmation in an
+interactive terminal; use `--yes` to approve that change when running
+noninteractively. Removal matches the exact canonical address or network and
+does not split a wider CIDR into smaller ranges. These edits are saved source
+changes; run `sudo kidobo sync` before expecting the live managed set to
+reflect them.
+
+`kidobo config show` displays effective configuration values, their origins,
+and defaults, redacting URL credentials and query/fragment values. It does not
+print secrets. `kidobo config path` prints the active configuration path,
+including a path relocated by `KIDOBO_ROOT`. Both commands are read-only and
+work without creating a missing configuration file.
+
 ## Paths and validation
 
 | Item | Default path |

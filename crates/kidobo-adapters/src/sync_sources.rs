@@ -10,8 +10,9 @@ use std::time::Duration;
 
 use kidobo_app::AppError;
 use kidobo_app::source::{
-    FailurePolicy, Notice, PendingCachePromotion, SourceRole, SyncSourceBatch, SyncSourceContext,
-    SyncSourceDescriptor, SyncSourceLoad, SyncSourceProvider, SyncSourceRegistry,
+    FailurePolicy, Notice, PendingCachePromotion, SourceObservation, SourceProvenance, SourceRole,
+    SyncSourceBatch, SyncSourceContext, SyncSourceDescriptor, SyncSourceLoad, SyncSourceProvider,
+    SyncSourceRegistry,
 };
 
 use crate::asn::{AsnPrefixResolver, Bgpq4AsnPrefixResolver, load_asn_prefixes_with_cache};
@@ -19,8 +20,8 @@ use crate::blocklist_file::{
     BlocklistNormalizeResult, load_blocklist_document, normalize_local_blocklist_with_fast_state,
 };
 use crate::cache_generation::StagedGeneration;
-use crate::github_meta::prepare_github_meta_safelist;
-use crate::http_cache::prepare_iplist_with_cache;
+use crate::github_meta::{GithubMetaSource, prepare_github_meta_safelist};
+use crate::http_cache::{CacheSource, prepare_iplist_with_cache};
 use crate::http_client::{HttpClient, ReqwestHttpClient};
 
 struct CancellableHttpClient<'a, C: ?Sized> {
@@ -210,7 +211,13 @@ impl SyncSourceProvider for GithubMetadataSyncProvider {
 
     fn load(&self, context: &SyncSourceContext<'_>) -> Result<SyncSourceLoad, AppError> {
         if !context.config.safe.include_github_meta {
-            return Ok(SyncSourceLoad::default());
+            return Ok(SyncSourceLoad {
+                observations: vec![SourceObservation {
+                    label: "github-metadata".to_string(),
+                    provenance: SourceProvenance::Disabled,
+                }],
+                ..SyncSourceLoad::default()
+            });
         }
         let timeout = Duration::from_secs(u64::from(context.config.remote.timeout_secs.get()));
         let client = ReqwestHttpClient::with_user_agent_and_timeout(&self.user_agent, timeout);
@@ -240,6 +247,10 @@ impl SyncSourceProvider for GithubMetadataSyncProvider {
             .into_iter()
             .collect();
         Ok(SyncSourceLoad {
+            observations: vec![SourceObservation {
+                label: "github-metadata".to_string(),
+                provenance: github_provenance(loaded.primary.source),
+            }],
             fallback_failure: loaded.staging_failure.map(|error| AppError::CacheStaging {
                 provider: "github-metadata",
                 source: Box::new(error),
@@ -290,6 +301,13 @@ fn load_asn_bans(
         .collect::<BTreeSet<_>>();
     let mut networks = Vec::new();
     let mut notices = Vec::new();
+    let mut observations = Vec::new();
+    if asns.is_empty() {
+        observations.push(SourceObservation {
+            label: "asn-bans".to_string(),
+            provenance: SourceProvenance::Disabled,
+        });
+    }
     for asn in asns {
         context.cancellation.check()?;
         let loaded = load_asn_prefixes_with_cache(asn, &cache_dir, stale_after, resolver).map_err(
@@ -302,11 +320,36 @@ fn load_asn_bans(
                 "ASN cache refresh failed; using stale prefixes for AS{asn}"
             )));
         }
+        observations.push(SourceObservation {
+            label: format!("AS{asn}"),
+            provenance: loaded.source,
+        });
         networks.extend(loaded.prefixes);
     }
     networks.sort_unstable();
     networks.dedup();
-    Ok(SyncSourceLoad::ready(SyncSourceBatch { networks, notices }))
+    Ok(SyncSourceLoad {
+        observations,
+        ..SyncSourceLoad::ready(SyncSourceBatch { networks, notices })
+    })
+}
+
+fn github_provenance(source: GithubMetaSource) -> SourceProvenance {
+    match source {
+        GithubMetaSource::Network => SourceProvenance::Network,
+        GithubMetaSource::CacheNotModified => SourceProvenance::Cache,
+        GithubMetaSource::FallbackCache => SourceProvenance::FallbackCache,
+        GithubMetaSource::Empty => SourceProvenance::Unavailable,
+    }
+}
+
+fn remote_provenance(source: CacheSource) -> SourceProvenance {
+    match source {
+        CacheSource::Network => SourceProvenance::Network,
+        CacheSource::CacheNotModified => SourceProvenance::Cache,
+        CacheSource::FallbackCache => SourceProvenance::FallbackCache,
+        CacheSource::Empty => SourceProvenance::Unavailable,
+    }
 }
 
 /// Builds the complete registry of synchronization source providers.
@@ -326,6 +369,10 @@ pub fn build_sync_source_registry(product_version: &str) -> Result<SyncSourceReg
     Ok(registry)
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "keep bounded worker collection, ordered provenance, and aggregate admission together"
+)]
 fn prepare_remote_networks_in_chunks<S, C>(
     urls: &[S],
     http_client: &C,
@@ -352,6 +399,13 @@ where
     let mut aggregate = BTreeSet::new();
     let mut notices = Vec::new();
     let mut pending_promotions: Vec<Box<dyn PendingCachePromotion>> = Vec::new();
+    let mut observations = Vec::new();
+    if unique_urls.is_empty() {
+        observations.push(SourceObservation {
+            label: "remote-feeds".to_string(),
+            provenance: SourceProvenance::Disabled,
+        });
+    }
 
     for chunk in unique_urls.chunks(MAX_REMOTE_FETCH_WORKERS) {
         cancellation.check()?;
@@ -393,7 +447,7 @@ where
                         results
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .push((index, result));
+                            .push((index, url.to_string(), result));
                     }
                 });
             }
@@ -404,11 +458,15 @@ where
         let mut chunk_results = results
             .into_inner()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        chunk_results.sort_unstable_by_key(|(index, _)| *index);
-        for (_, result) in chunk_results {
+        chunk_results.sort_unstable_by_key(|(index, _, _)| *index);
+        for (_, label, result) in chunk_results {
             let prepared = match result {
                 Ok(prepared) => prepared,
                 Err(error @ AppError::Source { .. }) => {
+                    observations.push(SourceObservation {
+                        label,
+                        provenance: SourceProvenance::Unavailable,
+                    });
                     notices.push(Notice::warning(format!(
                         "remote source fetch failed softly: {error}"
                     )));
@@ -416,6 +474,10 @@ where
                 }
                 Err(error) => return Err(error),
             };
+            observations.push(SourceObservation {
+                label,
+                provenance: remote_provenance(prepared.loaded.source),
+            });
             for network in prepared.loaded.networks {
                 aggregate.insert(network);
                 if aggregate.len() > aggregate_limit {
@@ -439,10 +501,11 @@ where
         fallback: None,
         pending_promotions,
         fallback_failure: None,
+        observations,
     })
 }
 
-fn remote_aggregate_limit(maxelem: u32) -> usize {
+pub(crate) fn remote_aggregate_limit(maxelem: u32) -> usize {
     let maxelem = usize::try_from(maxelem).unwrap_or(usize::MAX);
     8_192.max(maxelem.saturating_mul(4).min(2_000_000))
 }
@@ -465,7 +528,7 @@ mod tests {
     use std::fmt::Write as _;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use kidobo_app::source::{FailurePolicy, SourceRole};
+    use kidobo_app::source::{FailurePolicy, SourceObservation, SourceProvenance, SourceRole};
     use reqwest::StatusCode;
     use tempfile::TempDir;
 
@@ -710,6 +773,13 @@ mod tests {
             .expect("old timestamp");
         let loaded = super::load_asn_bans(&context, &resolver).expect("stale fallback");
         assert_eq!(
+            loaded.observations,
+            [SourceObservation {
+                label: "AS64512".to_string(),
+                provenance: SourceProvenance::FallbackCache,
+            }]
+        );
+        assert_eq!(
             loaded
                 .primary
                 .networks
@@ -835,6 +905,17 @@ mod tests {
         );
         assert_eq!(loaded.primary.notices.len(), 0);
         assert_eq!(loaded.pending_promotions.len(), 8);
+        assert_eq!(
+            loaded
+                .observations
+                .iter()
+                .map(|observation| observation.label.clone())
+                .collect::<Vec<_>>(),
+            urls
+        );
+        assert!(loaded.observations.iter().all(|observation| {
+            observation.provenance == kidobo_app::source::SourceProvenance::Network
+        }));
         assert_eq!(client.max_in_flight.load(Ordering::SeqCst), workers);
     }
 
@@ -991,6 +1072,7 @@ mod tests {
 
         assert_eq!(client.calls.load(Ordering::SeqCst), 1);
         assert_eq!(loaded.pending_promotions.len(), 1);
+        assert_eq!(loaded.observations.len(), 1);
         for promotion in loaded.pending_promotions {
             promotion.promote().expect("promote staged cache");
         }
@@ -1006,5 +1088,12 @@ mod tests {
         .expect("cached production load");
         assert_eq!(cached.primary.networks, loaded.primary.networks);
         assert_eq!(cached.primary.notices.len(), 0);
+        assert_eq!(
+            cached.observations,
+            [kidobo_app::source::SourceObservation {
+                label: url.to_string(),
+                provenance: kidobo_app::source::SourceProvenance::FallbackCache,
+            }]
+        );
     }
 }

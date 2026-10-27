@@ -31,6 +31,31 @@ pub enum FailurePolicy {
     BestEffort,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SourceFailureDisposition {
+    Fatal,
+    Degraded,
+}
+
+pub(crate) fn classify_source_failure(
+    policy: FailurePolicy,
+    error: &AppError,
+) -> SourceFailureDisposition {
+    if policy == FailurePolicy::Required
+        || matches!(
+            error,
+            AppError::Interrupted
+                | AppError::SourceAggregateBudgetExceeded { .. }
+                | AppError::CacheStaging { .. }
+                | AppError::PreviewSourceBudget { .. }
+        )
+    {
+        SourceFailureDisposition::Fatal
+    } else {
+        SourceFailureDisposition::Degraded
+    }
+}
+
 /// Stable metadata controlling a synchronization provider's workflow policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SyncSourceDescriptor {
@@ -87,6 +112,46 @@ pub struct SyncSourceBatch {
     pub notices: Vec<Notice>,
 }
 
+/// Evidence describing where one source's usable networks came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceProvenance {
+    /// Operator-managed files or configuration read during this sync.
+    Local,
+    /// Newly validated network or ASN resolver response.
+    Network,
+    /// Validated cache, including a successful conditional HTTP response.
+    Cache,
+    /// Validated cache retained after an unsuccessful refresh or rejected primary batch.
+    FallbackCache,
+    /// No usable source data was available.
+    Unavailable,
+    /// The source is explicitly disabled in configuration.
+    Disabled,
+}
+
+impl SourceProvenance {
+    #[must_use]
+    /// Returns whether a source was unavailable or needed fallback data.
+    pub fn is_degraded(self) -> bool {
+        matches!(self, Self::FallbackCache | Self::Unavailable)
+    }
+
+    #[must_use]
+    /// Returns whether a source supplied usable data, including an intentionally empty batch.
+    pub fn is_loaded(self) -> bool {
+        !matches!(self, Self::Unavailable | Self::Disabled)
+    }
+}
+
+/// One provider, configured feed, or ASN's observed source provenance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceObservation {
+    /// Source identity; renderers must escape and redact it before presentation.
+    pub label: String,
+    /// Typed load evidence, independent of notice wording.
+    pub provenance: SourceProvenance,
+}
+
 /// Deferred selection of a fully written cache generation.
 pub trait PendingCachePromotion: Send {
     /// Atomically selects the staged generation.
@@ -108,6 +173,8 @@ pub struct SyncSourceLoad {
     pub pending_promotions: Vec<Box<dyn PendingCachePromotion>>,
     /// Persistence failure that must abort sync if neither cached batch passes admission.
     pub fallback_failure: Option<AppError>,
+    /// Load evidence for individual sources, in deterministic evaluation order.
+    pub observations: Vec<SourceObservation>,
 }
 
 impl SyncSourceLoad {
@@ -119,6 +186,7 @@ impl SyncSourceLoad {
             fallback: None,
             pending_promotions: Vec::new(),
             fallback_failure: None,
+            observations: Vec::new(),
         }
     }
 }

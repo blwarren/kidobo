@@ -28,12 +28,44 @@ pub fn run_init_command(io: &mut CliIo<'_>) -> Result<(), KidoboError> {
             provisioner: &provisioner,
         },
     )?;
-    io.stdout
-        .write_all(render_init_outcome(&outcome).as_bytes())?;
+    write_init_outcome(&outcome, io)
+}
+
+pub(super) fn write_init_outcome(
+    outcome: &InitOutcome,
+    io: &mut CliIo<'_>,
+) -> Result<(), KidoboError> {
+    if !io.stdout_is_terminal {
+        io.stdout
+            .write_all(render_init_outcome(outcome).as_bytes())?;
+        return Ok(());
+    }
+    let view = io.presentation();
+    view.heading(io.stdout, "Kidobo initialization")?;
+    for artifact in &outcome.artifacts {
+        let (status, label) = match artifact.state {
+            ProvisionState::Created => (crate::cli::presentation::Status::Pass, "Created"),
+            ProvisionState::Preserved => (crate::cli::presentation::Status::Skip, "Preserved"),
+        };
+        view.status(
+            io.stdout,
+            status,
+            label,
+            &artifact.path.display().to_string(),
+        )?;
+    }
+    view.paragraph(
+        io.stdout,
+        if outcome.systemd_enabled {
+            "The managed sync timer was enabled."
+        } else {
+            "No host timer activation was requested by provisioning."
+        },
+    )?;
     Ok(())
 }
 
-fn render_init_outcome(outcome: &InitOutcome) -> String {
+pub(super) fn render_init_outcome(outcome: &InitOutcome) -> String {
     let created = outcome
         .artifacts
         .iter()
@@ -52,10 +84,18 @@ fn render_init_outcome(outcome: &InitOutcome) -> String {
         preserved.len()
     );
     for artifact in created {
-        let _created = writeln!(&mut output, "created: {}", artifact.path.display());
+        let _created = writeln!(
+            &mut output,
+            "created: {}",
+            crate::cli::presentation::escape(&artifact.path.display().to_string())
+        );
     }
     for artifact in preserved {
-        let _preserved = writeln!(&mut output, "unchanged: {}", artifact.path.display());
+        let _preserved = writeln!(
+            &mut output,
+            "unchanged: {}",
+            crate::cli::presentation::escape(&artifact.path.display().to_string())
+        );
     }
     output
 }

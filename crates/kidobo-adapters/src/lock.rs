@@ -63,7 +63,7 @@ pub enum LockError {
     },
 }
 
-/// Open-file guard that owns an acquired exclusive process lock.
+/// Open-file guard that owns an acquired shared or exclusive process lock.
 #[derive(Debug)]
 pub struct FileLock {
     file: File,
@@ -74,6 +74,58 @@ impl LockGuard for FileLock {}
 /// Production nonblocking lock manager.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct FileLockManager;
+
+/// Opens only an existing regular lock file, without creating or hardening filesystem state.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ReadOnlyFileLockManager;
+
+impl kidobo_app::preview::SharedLockManager for ReadOnlyFileLockManager {
+    fn acquire_existing(&self, path: &Path) -> Result<Box<dyn LockGuard>, AppError> {
+        acquire_existing_shared(path)
+            .map(|guard| -> Box<dyn LockGuard> { Box::new(guard) })
+            .map_err(|source| AppError::Lock {
+                source: Box::new(source),
+            })
+    }
+}
+
+fn acquire_existing_shared(path: &Path) -> Result<FileLock, LockError> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC | nix::libc::O_NONBLOCK);
+    }
+    let file = options.open(path).map_err(|source| LockError::OpenFile {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let metadata = file.metadata().map_err(|source| LockError::OpenFile {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if !metadata.is_file() {
+        return Err(LockError::OpenFile {
+            path: path.to_path_buf(),
+            source: io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "existing process lock must be a regular file",
+            ),
+        });
+    }
+    match FileExt::try_lock_shared(&file) {
+        Ok(()) => Ok(FileLock { file }),
+        Err(source) if source.kind() == io::ErrorKind::WouldBlock => Err(LockError::AlreadyHeld {
+            path: path.to_path_buf(),
+            source,
+        }),
+        Err(source) => Err(LockError::Acquire {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
 
 impl LockManager for FileLockManager {
     fn acquire(&self, path: &Path) -> Result<Box<dyn LockGuard>, AppError> {
@@ -244,5 +296,113 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o644);
+    }
+
+    #[test]
+    fn shared_preview_lock_never_creates_missing_state() {
+        let root = TempDir::new().expect("root");
+        let path = root.path().join("absent/sync.lock");
+        match super::acquire_existing_shared(&path).expect_err("existing file required") {
+            LockError::OpenFile { source, .. } => {
+                assert_eq!(source.kind(), io::ErrorKind::NotFound);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        assert!(!path.parent().expect("parent").exists());
+        assert!(matches!(
+            super::acquire_existing_shared(root.path()).expect_err("regular file required"),
+            LockError::OpenFile { .. }
+        ));
+    }
+
+    #[test]
+    fn shared_preview_guards_cooperate_and_exclude_source_mutations() {
+        let root = TempDir::new().expect("root");
+        let path = root.path().join("sync.lock");
+        let initial = acquire_non_blocking(&path).expect("initialize lock fixture");
+        drop(initial);
+        let first = super::acquire_existing_shared(&path).expect("first reader");
+        let second = super::acquire_existing_shared(&path).expect("second reader");
+        assert!(matches!(
+            acquire_non_blocking(&path).expect_err("writer excluded"),
+            LockError::AlreadyHeld { .. }
+        ));
+        drop((first, second));
+        let writer = acquire_non_blocking(&path).expect("read guards released");
+        assert!(matches!(
+            super::acquire_existing_shared(&path).expect_err("writer excludes reader"),
+            LockError::AlreadyHeld { .. }
+        ));
+        drop(writer);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_preview_lock_preserves_bytes_mode_and_mtime_and_rejects_symlinks() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let root = TempDir::new().expect("root");
+        let path = root.path().join("sync.lock");
+        fs::write(&path, "preserve").expect("fixture");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).expect("mode");
+        let before = fs::metadata(&path).expect("metadata");
+        let guard = super::acquire_existing_shared(&path).expect("read only lock");
+        drop(guard);
+        let after = fs::metadata(&path).expect("metadata after");
+        assert_eq!(
+            before.modified().expect("mtime"),
+            after.modified().expect("mtime")
+        );
+        assert_eq!(after.permissions().mode() & 0o777, 0o640);
+        assert_eq!(
+            read_bytes_with_limit(&path, 16).expect("bytes"),
+            b"preserve"
+        );
+        let link = root.path().join("symlink.lock");
+        symlink(&path, &link).expect("symlink");
+        assert!(matches!(
+            super::acquire_existing_shared(&link).expect_err("symlink rejected"),
+            LockError::OpenFile { .. }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_preview_lock_rejects_fifo_without_waiting_for_a_writer() {
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let root = TempDir::new().expect("root");
+        let path = root.path().join("fifo.lock");
+        nix::unistd::mkfifo(
+            &path,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .expect("FIFO fixture");
+        let (send, receive) = mpsc::channel();
+        let fifo = path.clone();
+        let worker = std::thread::spawn(move || {
+            send.send(super::acquire_existing_shared(&fifo))
+                .expect("result receiver");
+        });
+        let result = receive.recv_timeout(Duration::from_secs(2));
+        // Unblock a regressed implementation before failing, so the test itself stays bounded.
+        let _wakeup = result.is_err().then(|| {
+            fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(nix::libc::O_NONBLOCK)
+                .open(&path)
+                .expect("release blocked FIFO reader")
+        });
+        worker.join().expect("reader joined");
+        match result
+            .expect("lock file type must be rejected without waiting")
+            .expect_err("FIFO is not a regular lock")
+        {
+            LockError::OpenFile { source, .. } => {
+                assert_eq!(source.kind(), io::ErrorKind::InvalidInput);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 }

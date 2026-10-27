@@ -10,6 +10,7 @@ use crate::command_runner::{
     CommandExecutor, CommandRequest, ProcessStatus, SystemCommandExecutor,
 };
 use crate::limited_io::{read_to_string_with_limit, write_string_atomic_with_limit};
+use kidobo_app::source::SourceProvenance;
 use kidobo_core::AddressFamily;
 use kidobo_core::network::{CanonicalCidr, parse_ip_cidr_token};
 
@@ -159,8 +160,10 @@ impl<E: CommandExecutor> AsnPrefixResolver for Bgpq4AsnPrefixResolver<E> {
 pub struct CachedAsnPrefixes {
     /// Non-empty sorted, unique canonical prefixes.
     pub prefixes: Vec<CanonicalCidr>,
-    /// Whether stale cache was used after refresh failure.
+    /// Whether retained cache exceeds its refresh interval; offline previews do not attempt refresh.
     pub stale: bool,
+    /// Exact origin of this load, independent of cache-age warnings.
+    pub source: SourceProvenance,
 }
 
 /// Loads fresh ASN prefixes or falls back to a stale bounded cache.
@@ -175,8 +178,44 @@ pub fn load_asn_prefixes_with_cache(
     stale_after: Duration,
     resolver: &dyn AsnPrefixResolver,
 ) -> Result<CachedAsnPrefixes, AsnError> {
+    let loaded = prepare_asn_prefixes(asn, cache_dir, stale_after, Some(resolver))?;
+    if loaded.source == SourceProvenance::Network {
+        write_asn_cache_file(&asn_cache_file(cache_dir, asn), &loaded.prefixes)?;
+    }
+    Ok(loaded)
+}
+
+/// Reads cached ASN state, optionally resolving stale or missing prefixes only in memory.
+pub(crate) fn read_asn_for_preview(
+    asn: u32,
+    cache_dir: &Path,
+    stale_after: Duration,
+    resolver: Option<&dyn AsnPrefixResolver>,
+) -> Result<CachedAsnPrefixes, AsnError> {
+    prepare_asn_prefixes(asn, cache_dir, stale_after, resolver)
+}
+
+fn prepare_asn_prefixes(
+    asn: u32,
+    cache_dir: &Path,
+    stale_after: Duration,
+    resolver: Option<&dyn AsnPrefixResolver>,
+) -> Result<CachedAsnPrefixes, AsnError> {
     let cache_file = asn_cache_file(cache_dir, asn);
     let cache_state = read_asn_cache_file(&cache_file)?.filter(|state| !state.prefixes.is_empty());
+    let Some(resolver) = resolver else {
+        return cache_state.map_or_else(
+            || Err(AsnError::ResolveFailed {
+                asn,
+                reason: "offline preview has no usable cached prefixes; use --allow-network to resolve this ASN".to_string(),
+            }),
+            |state| Ok(CachedAsnPrefixes {
+                stale: state_is_stale(state.modified, stale_after),
+                prefixes: state.prefixes,
+                source: SourceProvenance::Cache,
+            }),
+        );
+    };
 
     if cache_state
         .as_ref()
@@ -185,6 +224,7 @@ pub fn load_asn_prefixes_with_cache(
         return Ok(CachedAsnPrefixes {
             prefixes: cache_state.map_or_else(Vec::new, |state| state.prefixes),
             stale: false,
+            source: SourceProvenance::Cache,
         });
     }
 
@@ -198,18 +238,17 @@ pub fn load_asn_prefixes_with_cache(
             Ok(prefixes)
         }
     }) {
-        Ok(prefixes) => {
-            write_asn_cache_file(&cache_file, &prefixes)?;
-            Ok(CachedAsnPrefixes {
-                prefixes,
-                stale: false,
-            })
-        }
+        Ok(prefixes) => Ok(CachedAsnPrefixes {
+            prefixes,
+            stale: false,
+            source: SourceProvenance::Network,
+        }),
         Err(err) => {
             if let Some(stale) = cache_state {
                 Ok(CachedAsnPrefixes {
                     prefixes: stale.prefixes,
                     stale: true,
+                    source: SourceProvenance::FallbackCache,
                 })
             } else {
                 Err(err)
@@ -369,11 +408,14 @@ mod tests {
     use super::{
         ASN_CACHE_FILE_READ_LIMIT, AsnError, AsnPrefixResolver, Bgpq4AsnPrefixResolver,
         CachedAsnPrefixes, delete_asn_cache_file, load_asn_prefixes_with_cache,
+        read_asn_for_preview,
     };
     use crate::command_runner::{
         CommandExecutor, CommandRequest, CommandResult, CommandRunnerError, ProcessStatus,
     };
+    use crate::http_cache::test_support::snapshot;
     use crate::limited_io::read_to_string_with_limit;
+    use kidobo_app::source::SourceProvenance;
     use kidobo_core::network::{CanonicalCidr, Ipv4Cidr, Ipv6Cidr, parse_ip_cidr_token};
 
     struct MockResolver {
@@ -629,7 +671,8 @@ mod tests {
                     Ipv4Cidr::new(std::net::Ipv4Addr::from(0xcb00_7100_u32), 24)
                         .expect("valid test CIDR")
                 )],
-                stale: false
+                stale: false,
+                source: kidobo_app::source::SourceProvenance::Cache,
             }
         );
     }
@@ -684,7 +727,8 @@ mod tests {
                     Ipv4Cidr::new(std::net::Ipv4Addr::from(0xc633_6400_u32), 24)
                         .expect("valid test CIDR")
                 )],
-                stale: false
+                stale: false,
+                source: kidobo_app::source::SourceProvenance::Network,
             }
         );
     }
@@ -932,5 +976,153 @@ mod tests {
         assert!(!delete_asn_cache_file(64512, temp.path()).expect("delete"));
         fs::write(temp.path().join("as64512.iplist"), "203.0.113.0/24\n").expect("write");
         assert!(delete_asn_cache_file(64512, temp.path()).expect("delete"));
+    }
+
+    #[test]
+    fn preview_offline_cache_staleness_is_truthful_and_never_refreshes_or_writes() {
+        let temp = TempDir::new().expect("root");
+        let path = temp.path().join("as64512.iplist");
+        fs::write(&path, "# kidobo-asn-cache-v1\n203.0.113.0/24\n").expect("cached ASN");
+        fs::File::open(&path)
+            .expect("cache file")
+            .set_times(fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH))
+            .expect("stale cache mtime");
+        let before = snapshot(temp.path());
+        let loaded = read_asn_for_preview(64512, temp.path(), Duration::from_hours(24), None)
+            .expect("offline cached ASN");
+        assert_eq!(loaded.source, SourceProvenance::Cache);
+        assert!(loaded.stale);
+        assert_eq!(
+            loaded
+                .prefixes
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["203.0.113.0/24"]
+        );
+        assert_eq!(snapshot(temp.path()), before);
+        let recent = std::time::SystemTime::now()
+            .checked_sub(Duration::from_secs(3600))
+            .expect("recent time");
+        fs::File::open(&path)
+            .expect("cache file")
+            .set_times(fs::FileTimes::new().set_modified(recent))
+            .expect("fresh cache mtime");
+        let before = snapshot(temp.path());
+        let unused = Mutex::new(MockResolver::new(Vec::new()));
+        let fresh =
+            read_asn_for_preview(64512, temp.path(), Duration::from_hours(24), Some(&unused))
+                .expect("fresh cache");
+        assert_eq!(fresh.source, SourceProvenance::Cache);
+        assert!(!fresh.stale);
+        assert_eq!(snapshot(temp.path()), before);
+    }
+
+    #[test]
+    fn preview_missing_or_malformed_required_asn_cache_fails_without_creating_state() {
+        let temp = TempDir::new().expect("root");
+        let cache = temp.path().join("missing-cache");
+        let before = snapshot(temp.path());
+        let error = read_asn_for_preview(64512, &cache, Duration::from_hours(24), None)
+            .expect_err("required missing cache");
+        assert!(
+            matches!(error, AsnError::ResolveFailed { asn: 64512, reason } if reason.contains("--allow-network"))
+        );
+        assert_eq!(snapshot(temp.path()), before);
+        fs::write(temp.path().join("as64512.iplist"), "malformed prefix\n")
+            .expect("malformed ASN cache");
+        let before = snapshot(temp.path());
+        assert!(matches!(
+            read_asn_for_preview(64512, temp.path(), Duration::from_hours(24), None),
+            Err(AsnError::ResolveFailed { asn: 64512, .. })
+        ));
+        assert_eq!(snapshot(temp.path()), before);
+    }
+
+    #[test]
+    fn preview_asn_network_results_and_stale_fallback_never_update_the_cache() {
+        let temp = TempDir::new().expect("root");
+        let path = temp.path().join("as64512.iplist");
+        fs::write(&path, "203.0.113.0/24\n").expect("stale ASN cache");
+        fs::File::open(&path)
+            .expect("cache file")
+            .set_times(fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH))
+            .expect("stale mtime");
+        let before = snapshot(temp.path());
+        for (response, provenance, expected, stale) in [
+            (
+                Ok(vec![
+                    parse_ip_cidr_token("198.51.100.0/24").expect("network"),
+                ]),
+                SourceProvenance::Network,
+                "198.51.100.0/24",
+                false,
+            ),
+            (
+                Err(AsnError::ResolveFailed {
+                    asn: 64512,
+                    reason: "offline".to_string(),
+                }),
+                SourceProvenance::FallbackCache,
+                "203.0.113.0/24",
+                true,
+            ),
+            (
+                Ok(Vec::new()),
+                SourceProvenance::FallbackCache,
+                "203.0.113.0/24",
+                true,
+            ),
+        ] {
+            let resolver = Mutex::new(MockResolver::new(vec![response]));
+            let loaded = read_asn_for_preview(
+                64512,
+                temp.path(),
+                Duration::from_hours(24),
+                Some(&resolver),
+            )
+            .expect("ASN preview");
+            assert_eq!(loaded.source, provenance);
+            assert_eq!(loaded.stale, stale);
+            assert_eq!(
+                loaded
+                    .prefixes
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>(),
+                [expected]
+            );
+            assert_eq!(snapshot(temp.path()), before);
+        }
+    }
+
+    #[test]
+    fn preview_asn_fresh_resolution_does_not_create_a_cache_and_unreadable_cache_stops_reads() {
+        let temp = TempDir::new().expect("root");
+        let cache = temp.path().join("missing-cache");
+        let before = snapshot(temp.path());
+        let resolver = Mutex::new(MockResolver::new(vec![Ok(vec![
+            parse_ip_cidr_token("198.51.100.0/24").expect("network"),
+        ])]));
+        let loaded = read_asn_for_preview(64512, &cache, Duration::from_hours(24), Some(&resolver))
+            .expect("fresh prefixes");
+        assert_eq!(loaded.source, SourceProvenance::Network);
+        assert_eq!(
+            loaded
+                .prefixes
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["198.51.100.0/24"]
+        );
+        assert_eq!(snapshot(temp.path()), before);
+        fs::create_dir(temp.path().join("as64512.iplist")).expect("nonfile cache");
+        let before = snapshot(temp.path());
+        let unused = Mutex::new(MockResolver::new(Vec::new()));
+        assert!(matches!(
+            read_asn_for_preview(64512, temp.path(), Duration::from_hours(24), Some(&unused)),
+            Err(AsnError::CacheRead { .. })
+        ));
+        assert_eq!(snapshot(temp.path()), before);
     }
 }

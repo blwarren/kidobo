@@ -43,6 +43,59 @@ pub enum KidoboError {
     #[error("doctor checks failed")]
     DoctorFailed,
 
+    /// Live inspection completed without enough evidence for a verified verdict.
+    #[error(
+        "unable to verify Kidobo enforcement; inspect the evidence above and retry with explicit privileges if needed"
+    )]
+    CheckUnknown,
+
+    /// A new structured report could not be written as JSON.
+    #[error("failed to write JSON report: {source}")]
+    JsonReport {
+        /// Serialization or underlying writer failure.
+        #[from]
+        source: serde_json::Error,
+    },
+
+    /// Source persistence succeeded, but a separately requested synchronization failed.
+    #[error("{source_state}; live firewall update failed: {source}; retry: sudo kidobo sync")]
+    SourceApplyFailed {
+        /// Whether a source change was saved or the existing source state was retained.
+        source_state: &'static str,
+        /// Original synchronization failure, preserving interruption and cause information.
+        #[source]
+        source: Box<KidoboError>,
+    },
+
+    /// A source change was saved before confirmation input or output failed.
+    #[error(
+        "Source change saved; live firewall update was not started because confirmation failed: {source}; retry: sudo kidobo sync"
+    )]
+    SavedConfirmationFailed {
+        /// Original prompt or interruption failure.
+        #[source]
+        source: Box<KidoboError>,
+    },
+
+    /// A valid command requires an explicit mode or terminal capability that was not supplied.
+    #[error("{message}")]
+    Usage {
+        /// Actionable usage guidance.
+        message: String,
+    },
+
+    /// Setup stopped after its reviewed configuration had already been saved.
+    #[error(
+        "Configuration saved; setup stopped during {stage}: {source}; inspect kidobo status before retrying"
+    )]
+    SetupAfterSave {
+        /// Stage that did not complete normally.
+        stage: &'static str,
+        /// Original cause; saved files are retained and no rollback is implied.
+        #[source]
+        source: Box<KidoboError>,
+    },
+
     /// Interactive blocklist confirmation could not be read or rendered.
     #[error("blocklist prompt failed: {source}")]
     BlocklistPrompt {
@@ -69,6 +122,10 @@ impl KidoboError {
             | Self::Application {
                 source: AppError::Interrupted,
             } => 130,
+            Self::SourceApplyFailed { source, .. }
+            | Self::SavedConfirmationFailed { source }
+            | Self::SetupAfterSave { source, .. } => source.exit_code(),
+            Self::Usage { .. } => 2,
             _ => 1,
         }
     }

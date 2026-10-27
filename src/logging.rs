@@ -30,13 +30,28 @@ pub fn init(level: LevelFilter) -> Result<(), KidoboError> {
         LogFormat::Journal => WriteStyle::Never,
     });
     let color_enabled = format == LogFormat::Human
-        && should_use_human_color(color_mode, stderr_is_terminal, no_color_set);
+        && should_use_human_color(color_mode, stderr_is_terminal, no_color_set)
+        && (color_mode == LogColorMode::Always
+            || env::var_os("TERM").is_none_or(|term| term != "dumb"));
     builder.format(move |buf, record| match format {
         LogFormat::Human => {
             let level = format_human_level(record.level(), color_enabled);
-            writeln!(buf, "{level}: {}", record.args())
+            writeln!(
+                buf,
+                "{level}: {}",
+                crate::cli::presentation::escape(&crate::cli::presentation::redact_urls(
+                    &record.args().to_string()
+                ))
+            )
         }
-        LogFormat::Journal => writeln!(buf, "level={} msg={}", record.level(), record.args()),
+        LogFormat::Journal => writeln!(
+            buf,
+            "level={} msg={}",
+            record.level(),
+            crate::cli::presentation::escape(&crate::cli::presentation::redact_urls(
+                &record.args().to_string()
+            ))
+        ),
     });
     builder.try_init().map_err(|err| KidoboError::LoggerInit {
         reason: err.to_string(),

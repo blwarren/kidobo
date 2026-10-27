@@ -31,14 +31,18 @@
 
 //! Application use cases and ports for Kidobo.
 
+pub mod bans;
 pub mod blocklist;
+pub mod configuration;
 pub mod doctor;
 pub mod error;
 pub mod flush;
 pub mod init;
+pub mod inspection;
 pub mod lookup;
 pub mod paths;
 pub mod ports;
+pub mod preview;
 pub mod source;
 pub mod sync;
 pub mod temporary_bans;

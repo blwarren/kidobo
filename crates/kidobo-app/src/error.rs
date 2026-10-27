@@ -38,6 +38,14 @@ pub enum AppError {
     /// The caller cancelled work at a safe workflow boundary.
     #[error("operation interrupted by SIGINT")]
     Interrupted,
+    /// A read-only preview source exceeds the representation limits required by normal sync.
+    #[error("preview source budget exceeded for `{provider}`: {reason}")]
+    PreviewSourceBudget {
+        /// Stable provider identifier whose read-only result was rejected.
+        provider: &'static str,
+        /// Limit diagnostic, without implying a cache write was attempted.
+        reason: String,
+    },
     /// A fresh source could not be staged and no admissible cache was available.
     #[error("cache staging failed for `{provider}` without a usable fallback: {source}")]
     CacheStaging {
@@ -81,6 +89,21 @@ pub enum AppError {
         #[source]
         source: std::io::Error,
     },
+
+    /// The configuration changed after a human reviewed the proposed update.
+    #[error("configuration changed after the preview; rerun the command")]
+    ConfigurationChanged,
+
+    /// A requested source or safelist edit cannot be applied.
+    #[error("configuration edit failed: {reason}")]
+    ConfigurationEdit {
+        /// Operator-facing explanation, without embedding sensitive source URLs.
+        reason: String,
+    },
+
+    /// A proposed exemption expansion was not explicitly approved.
+    #[error("this change expands the safelist exemption; confirm it interactively or use --yes")]
+    ConfirmationRequired,
 
     /// Configuration text was malformed or violated domain constraints.
     #[error("config parse/validation failed: {source}")]

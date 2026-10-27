@@ -81,17 +81,32 @@ existing installation.
 
 ## Quick Start
 
-Initialize the default files and generated systemd units:
+For an interactive first-run guide, start setup in a terminal:
 
 ```bash
-sudo kidobo init
+sudo kidobo setup
 ```
 
-Configure your sources and safelist:
+Setup reviews the proposed configuration before saving it, provisions local
+files and service units, and runs `doctor` before offering an initial sync. It
+does not apply firewall changes unless you accept that sync. For automated or
+noninteractive provisioning, use `sudo kidobo init`.
+
+Configure your sources and safelist either in the TOML file or with the
+configuration commands:
 
 ```bash
 sudoedit /etc/kidobo/config.toml
+sudo kidobo sources list
+sudo kidobo allow list
+sudo kidobo config show
 ```
+
+`kidobo sources add URL` and `kidobo sources remove URL` edit configured feed
+URLs. `kidobo allow add IP_OR_CIDR` and `kidobo allow remove IP_OR_CIDR` edit
+the safelist. These commands save configuration only; run `sudo kidobo sync`
+to apply source changes. `config show` redacts URL credentials and query or
+fragment values.
 
 See the [configuration guide](docs/configuration.md) for every key, default,
 and limit.
@@ -112,6 +127,18 @@ sudo kidobo ban 203.0.113.7
 enforcement. See the [operations guide](docs/operations.md) for file and ASN
 bans, offline lookup, the timer, and failure recovery.
 
+Preview proposed counts and capacity without changing enforcement:
+
+```bash
+kidobo sync --dry-run
+```
+
+The preview uses validated local caches and stays offline by default. To
+explicitly allow feed, GitHub metadata, and ASN requests while keeping results
+in memory, use
+`kidobo sync --dry-run --allow-network`. A successful preview does not
+guarantee a later sync, because inputs and live state can change.
+
 Apply the configured blocklists. Repeat this after changing sources or
 configuration:
 
@@ -129,6 +156,10 @@ Lookup is offline and reports source overlaps, not the live enforced set.
 `sudo kidobo flush` removes managed firewall/ipset artifacts and remote cache;
 read the [operations guide](docs/operations.md#when-a-command-fails) before
 using it for recovery or uninstall.
+
+Generate a completion script with `kidobo completions bash`,
+`kidobo completions zsh`, or `kidobo completions fish`; the selected script is
+written to stdout.
 
 ## Minimal Config
 

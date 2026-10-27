@@ -161,6 +161,29 @@ starting. The CLI preserves operational diagnostics and returns 130 when SIGINT 
 Subprocess supervision covers both child exit and pipe EOF under one deadline, including pipes inherited
 by descendants after their parent exits; output limits apply independently to stdout and stderr.
 
+## Sync preview
+
+`sync --dry-run` uses the same bounded source loading, temporary-ban cutoff,
+family computation, external safelist admission, and capacity checks as sync,
+but it has no firewall mutation or cache-promotion/cleanup capability. It
+requires the existing sync lock file and acquires it nonblocking without
+creating it, so preview cannot overlap a sync that holds the same lock.
+
+The default preview selects local and temporary entries and validated cached
+remote-feed, ASN, and GitHub metadata. `--allow-network` is available only with
+`--dry-run`; it permits the existing source loaders to fetch or resolve into
+bounded in-memory results. Both modes stop on a required source failure and
+return no successful partial totals. Neither mode publishes normalized remote
+data, promotes manifests, removes staging generations, cleans caches, prunes
+expired temporary bans, or enters enforcement.
+
+The preview outcome keeps IPv4 and IPv6 counts and capacity results separate.
+It does not enumerate live set members, so its exact live delta is unavailable
+rather than zero or an estimate. It records no sync history or cache freshness
+receipt. Later sync still reloads and validates the current config, sources,
+cache generations, capacity, and live firewall wiring, so a preview cannot
+reserve those inputs or guarantee enforcement success.
+
 ## Remote cache generations
 
 Validated remote-feed and GitHub metadata writes use a private generation adapter. A complete generation is

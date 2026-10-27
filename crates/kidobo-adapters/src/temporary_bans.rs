@@ -17,6 +17,12 @@ pub const TEMPORARY_BANS_READ_LIMIT: usize = 16 * 1024 * 1024;
 #[derive(Debug, Default, Clone, Copy)]
 pub struct FileTemporaryBanRepository;
 
+impl kidobo_app::preview::TemporaryBanReader for FileTemporaryBanRepository {
+    fn load(&self, path: &Path) -> Result<TemporaryBans, AppError> {
+        TemporaryBanRepository::load(self, path)
+    }
+}
+
 impl TemporaryBanRepository for FileTemporaryBanRepository {
     fn load(&self, path: &Path) -> Result<TemporaryBans, AppError> {
         let contents = match read_to_string_with_limit(path, TEMPORARY_BANS_READ_LIMIT) {

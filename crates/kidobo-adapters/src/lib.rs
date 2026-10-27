@@ -32,6 +32,7 @@
 //! System adapter implementations for Kidobo.
 
 pub mod asn;
+pub mod bans;
 pub mod blocklist_file;
 pub mod blocklist_operations;
 mod cache_generation;
@@ -41,6 +42,7 @@ pub mod command_common;
 pub mod command_runner;
 pub mod config;
 pub mod config_edit;
+pub mod config_management;
 pub mod doctor;
 pub mod enforcement;
 pub mod flush;
@@ -50,12 +52,14 @@ pub mod http_cache;
 pub mod http_client;
 pub mod http_fetch;
 pub mod init;
+pub mod inspection;
 pub mod ipset;
 pub mod iptables;
 pub mod limited_io;
 pub mod lock;
 pub mod lookup_sources;
 pub mod path;
+pub mod preview_sources;
 pub mod prompt;
 mod remote_parse;
 pub mod source_files;

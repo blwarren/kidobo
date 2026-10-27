@@ -381,6 +381,22 @@ esac
     script_path
 }
 
+#[cfg(unix)]
+fn write_read_only_doctor_sudo(temp: &TempDir) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let bin_dir = temp.path().join("doctor-bin");
+    fs::create_dir_all(&bin_dir).expect("create doctor fake bin dir");
+    let script_path = bin_dir.join("sudo");
+    fs::write(&script_path, "#!/bin/sh\nexit 0\n").expect("write doctor fake sudo");
+    let mut permissions = fs::metadata(&script_path)
+        .expect("doctor fake sudo metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&script_path, permissions).expect("make doctor fake sudo executable");
+    script_path
+}
+
 fn write_fake_bgpq4_script(temp: &TempDir) -> PathBuf {
     let bin_dir = temp.path().join("bin");
     fs::create_dir_all(&bin_dir).expect("create fake bin dir");
@@ -964,48 +980,24 @@ fn lookup_human_output_shows_matches_no_matches_and_summary() {
 
     assert_eq!(output.status.code(), Some(0));
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let expected_borders = [
-        format!(
-            "┌{}┬{}┬{}┬{}┐",
-            "─".repeat(32),
-            "─".repeat(10),
-            "─".repeat(46),
-            "─".repeat(32)
-        ),
-        format!(
-            "├{}┼{}┼{}┼{}┤",
-            "─".repeat(32),
-            "─".repeat(10),
-            "─".repeat(46),
-            "─".repeat(32)
-        ),
-        format!(
-            "└{}┴{}┴{}┴{}┘",
-            "─".repeat(32),
-            "─".repeat(10),
-            "─".repeat(46),
-            "─".repeat(32)
-        ),
-    ];
     assert_eq!(
         stdout,
-        format!(
-            "{}\n│ {:<30} │ {:<8} │ {:<44} │ {:<30} │\n{}\n│ {:<30} │ {:<8} │ {:<44} │ {:<30} │\n│ {:<30} │ {:<8} │ {:<44} │ {:<30} │\n{}\n\nSummary\n  Targets:    2\n  Matched:    1\n  Unmatched:  1\n  Match rate: 50%\n",
-            expected_borders[0],
-            "Target",
-            "Status",
-            "Source",
-            "Matched Entry",
-            expected_borders[1],
-            "198.51.100.9",
-            "NO MATCH",
-            "—",
-            "—",
-            "203.0.113.7",
-            "MATCH",
-            "internal:blocklist",
-            "203.0.113.7",
-            expected_borders[2],
+        concat!(
+            "Offline source overlaps\n",
+            "Saved and cached source evidence; this does not establish live enforcement.\n",
+            "  Target: 198.51.100.9\n",
+            "  Status: NO MATCH\n",
+            "\n",
+            "  Target:        203.0.113.7\n",
+            "  Status:        MATCH\n",
+            "  Source:        internal:blocklist\n",
+            "  Matched Entry: 203.0.113.7\n",
+            "\n",
+            "Summary\n",
+            "  Targets:    2\n",
+            "  Matched:    1\n",
+            "  Unmatched:  1\n",
+            "  Match rate: 50%\n",
         )
     );
 }
@@ -1017,12 +1009,20 @@ fn lookup_human_single_no_match_is_explicit() {
 
     assert_eq!(output.status.code(), Some(0));
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("198.51.100.9"), "missing target: {stdout}");
-    assert!(stdout.contains("NO MATCH"), "missing status: {stdout}");
-    assert!(stdout.contains("Targets:    1"), "missing total: {stdout}");
-    assert!(
-        stdout.contains("Unmatched:  1"),
-        "missing miss count: {stdout}"
+    assert_eq!(
+        stdout,
+        concat!(
+            "Offline source overlaps\n",
+            "Saved and cached source evidence; this does not establish live enforcement.\n",
+            "  Target: 198.51.100.9\n",
+            "  Status: NO MATCH\n",
+            "\n",
+            "Summary\n",
+            "  Targets:    1\n",
+            "  Matched:    0\n",
+            "  Unmatched:  1\n",
+            "  Match rate: 0%\n",
+        )
     );
 }
 
@@ -1045,8 +1045,8 @@ fn lookup_human_wraps_long_source_without_losing_it() {
     assert_eq!(output.status.code(), Some(0));
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("https://example.com/a/very/long/path/to/a/bl")
-            && stdout.contains("ocklist/source/feed.txt"),
+        stdout.contains("https://example.com/a/very/long/path/to/a/blocklist/source/feed\n")
+            && stdout.contains("                 .txt"),
         "wrapped source must remain complete: {stdout}"
     );
 }
@@ -1941,6 +1941,136 @@ fn doctor_reports_path_inspection_failure_without_mutating_it() {
         fs::read_link(&blocklist).expect("preserved blocklist"),
         Path::new("blocklist.txt")
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_json_format_keeps_report_shape_on_stdout_without_mutating_root() {
+    let root = create_lookup_root("203.0.113.7\n");
+    let config_path = root.path().join("config/config.toml");
+    let blocklist_path = root.path().join("data/blocklist.txt");
+    let config_before = kidobo_adapters::limited_io::read_bytes_with_limit(&config_path, 65_536)
+        .expect("read config");
+    let blocklist_before =
+        kidobo_adapters::limited_io::read_bytes_with_limit(&blocklist_path, BLOCKLIST_READ_LIMIT)
+            .expect("read blocklist");
+    let fake_sudo = write_read_only_doctor_sudo(&root);
+    let mut command = kidobo_with_root_command(root.path(), &["doctor", "--format", "json"]);
+    command.env(
+        "PATH",
+        path_with_bin_prefix(fake_sudo.parent().expect("doctor fake bin")),
+    );
+
+    let output = command.output().expect("run doctor as JSON");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "doctor failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("UTF-8 doctor output");
+    assert!(
+        stdout.trim_start().starts_with('{') && stdout.trim_end().ends_with('}'),
+        "JSON should be the only stdout content: {stdout}"
+    );
+    let report: serde_json::Value = serde_json::from_str(&stdout).expect("doctor JSON");
+    assert_eq!(
+        report
+            .as_object()
+            .expect("report object")
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["checks", "overall"]
+    );
+    assert_eq!(report["overall"], "OK");
+    let checks = report["checks"].as_array().expect("check array");
+    assert_ne!(checks.len(), 0);
+    for check in checks {
+        assert_eq!(
+            check
+                .as_object()
+                .expect("check object")
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["detail", "name", "status"]
+        );
+    }
+    assert_eq!(
+        kidobo_adapters::limited_io::read_bytes_with_limit(&config_path, 65_536)
+            .expect("config after doctor"),
+        config_before
+    );
+    assert_eq!(
+        kidobo_adapters::limited_io::read_bytes_with_limit(&blocklist_path, BLOCKLIST_READ_LIMIT)
+            .expect("blocklist after doctor"),
+        blocklist_before
+    );
+    assert!(
+        !root.path().join("data/temporary-bans.toml").exists(),
+        "doctor must not create temporary-ban state"
+    );
+    assert!(
+        !root.path().join("cache/test-iptables").exists(),
+        "the fake sudo must not create firewall state"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_human_format_groups_checks_and_keeps_them_on_stdout() {
+    let root = create_lookup_root("203.0.113.7\n");
+    let fake_sudo = write_read_only_doctor_sudo(&root);
+    let mut command = kidobo_with_root_command(root.path(), &["doctor", "--format", "human"]);
+    command.env(
+        "PATH",
+        path_with_bin_prefix(fake_sudo.parent().expect("doctor fake bin")),
+    );
+
+    let output = command.output().expect("run doctor as human text");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "doctor failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("UTF-8 doctor output");
+    for group in [
+        "Configuration",
+        "Required tools",
+        "Local files and cache",
+        "Cache access",
+        "Firewall permissions",
+        "Summary",
+        "Next: sudo kidobo sync",
+    ] {
+        assert!(stdout.contains(group), "missing {group:?}: {stdout}");
+    }
+    assert!(
+        !stdout.starts_with('{'),
+        "human output must not be JSON: {stdout}"
+    );
+}
+
+#[test]
+fn help_describes_doctor_formats_and_terminal_examples() {
+    let root_help = run_kidobo(&["--help"]);
+    assert_eq!(root_help.status.code(), Some(0));
+    let root_stdout = String::from_utf8_lossy(&root_help.stdout);
+    assert!(root_stdout.contains("Everyday:"));
+    assert!(root_stdout.contains("Inspect and troubleshoot:"));
+    assert!(root_stdout.contains("Configuration and advanced:"));
+    assert!(root_stdout.contains("kidobo doctor"));
+
+    let doctor_help = run_kidobo(&["doctor", "--help"]);
+    assert_eq!(doctor_help.status.code(), Some(0));
+    let doctor_stdout = String::from_utf8_lossy(&doctor_help.stdout);
+    assert!(doctor_stdout.contains("--format <FORMAT>"));
+    assert!(doctor_stdout.contains("kidobo doctor --format human"));
+    assert!(doctor_stdout.contains("kidobo doctor --format json"));
 }
 
 #[test]

@@ -17,6 +17,7 @@ use crate::cached_fetch::{read_optional_json_lossy, read_validated_bytes_lossy};
 use crate::hash::sha256_hex;
 use crate::http_client::{HttpClient, HttpResponse, max_http_body_bytes};
 use crate::http_fetch::{ConditionalFetchResult, fetch_with_conditional_cache};
+use kidobo_app::source::{Notice, SourceProvenance};
 use kidobo_core::config::{
     DEFAULT_GITHUB_META_CATEGORIES, DEFAULT_GITHUB_META_URL, GithubMetaCategoryMode,
 };
@@ -92,6 +93,21 @@ pub(crate) struct PreparedGithubMetaLoad {
     pub(crate) fallback: Option<GithubMetaLoadResult>,
     pub(crate) pending_promotion: Option<StagedGeneration>,
     pub(crate) staging_failure: Option<GithubMetaLoadError>,
+}
+
+/// One admissible preview candidate without metadata-persistence capabilities.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReadOnlyGithubBatch {
+    pub(crate) networks: Vec<CanonicalCidr>,
+    pub(crate) provenance: SourceProvenance,
+}
+
+/// Data-only current and fallback candidates for the application's safelist admission checks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReadOnlyGithubMeta {
+    pub(crate) primary: ReadOnlyGithubBatch,
+    pub(crate) fallback: Option<Vec<CanonicalCidr>>,
+    pub(crate) notices: Vec<Notice>,
 }
 
 /// Failure to persist a fully validated GitHub metadata generation.
@@ -237,6 +253,100 @@ pub fn load_cached_github_meta_safelist(
     let paths = CachePaths::from_cache_dir(cache_dir);
 
     read_github_meta_cache(&paths, &selection, github_meta_url).networks
+}
+
+/// Selects compatible cached GitHub data, optionally refreshing in memory, without cache writes.
+pub(crate) fn read_github_meta_for_preview(
+    client: Option<&dyn HttpClient>,
+    cache_dir: &Path,
+    github_meta_url: &str,
+    category_mode: &GithubMetaCategoryMode,
+    env: &BTreeMap<OsString, OsString>,
+) -> ReadOnlyGithubMeta {
+    let selection = CategorySelection::from_mode(category_mode);
+    let cache = read_github_meta_cache(
+        &CachePaths::from_cache_dir(cache_dir),
+        &selection,
+        github_meta_url,
+    );
+    let Some(client) = client else {
+        return read_only_github_cached(cache, SourceProvenance::Cache, true);
+    };
+    let max_bytes = max_http_body_bytes(env).min(GITHUB_META_CACHE_READ_LIMIT);
+    let (etag, modified) = cache.http_validators();
+    match fetch_with_conditional_cache(
+        client,
+        github_meta_url,
+        max_bytes,
+        etag,
+        modified,
+        cache.networks.is_some(),
+        "github meta",
+    ) {
+        ConditionalFetchResult::CacheNotModified => {
+            read_only_github_cached(cache, SourceProvenance::Cache, false)
+        }
+        ConditionalFetchResult::FallbackCache => {
+            read_only_github_cached(cache, SourceProvenance::FallbackCache, false)
+        }
+        ConditionalFetchResult::Network(response) => {
+            let Some(networks) = validate_github_response(&response, max_bytes, &selection) else {
+                return read_only_github_cached(cache, SourceProvenance::FallbackCache, false);
+            };
+            ReadOnlyGithubMeta {
+                primary: ReadOnlyGithubBatch {
+                    networks,
+                    provenance: SourceProvenance::Network,
+                },
+                fallback: cache
+                    .into_fallback_result()
+                    .map(|fallback| fallback.networks),
+                notices: Vec::new(),
+            }
+        }
+    }
+}
+
+fn read_only_github_cached(
+    cache: GithubMetaCache,
+    provenance: SourceProvenance,
+    offline: bool,
+) -> ReadOnlyGithubMeta {
+    let GithubMetaCache {
+        networks, previous, ..
+    } = cache;
+    let fallback = previous.map(|fallback| fallback.networks);
+    let Some(networks) = networks else {
+        return ReadOnlyGithubMeta {
+            primary: ReadOnlyGithubBatch {
+                networks: Vec::new(),
+                provenance: SourceProvenance::Unavailable,
+            },
+            fallback,
+            notices: vec![Notice::warning(
+                "no compatible GitHub metadata is available for this preview",
+            )],
+        };
+    };
+    let notices = if offline {
+        vec![Notice::info(
+            "preview uses validated cached GitHub metadata without refreshing it; freshness is unknown",
+        )]
+    } else if provenance == SourceProvenance::FallbackCache {
+        vec![Notice::warning(
+            "GitHub metadata refresh was unavailable or rejected; preview uses validated cached data",
+        )]
+    } else {
+        Vec::new()
+    };
+    ReadOnlyGithubMeta {
+        primary: ReadOnlyGithubBatch {
+            networks,
+            provenance,
+        },
+        fallback,
+        notices,
+    }
 }
 
 fn read_github_meta_cache(
@@ -387,28 +497,9 @@ fn handle_network_response(
     cached: GithubMetaCache,
     selection: &CategorySelection,
 ) -> Result<PreparedGithubMetaLoad, GithubMetaLoadError> {
-    if !response.status.is_success() {
-        warn!(
-            "github meta fetch failed: unexpected status {}",
-            response.status
-        );
-        return Ok(prepared_github_fallback(cached));
-    }
-
-    if response.body.len() > max_bytes {
-        warn!(
-            "github meta fetch failed: body size {} exceeds max {} bytes",
-            response.body.len(),
-            max_bytes
-        );
-        return Ok(prepared_github_fallback(cached));
-    }
-
-    let Some(networks) = parse_and_extract_networks(&response.body, selection) else {
-        warn!("github meta fetch failed: response body has invalid JSON or category data");
+    let Some(networks) = validate_github_response(&response, max_bytes, selection) else {
         return Ok(prepared_github_fallback(cached));
     };
-
     let metadata = GithubMetaCacheMetadata {
         url: github_meta_url.to_string(),
         etag: response.etag,
@@ -446,6 +537,35 @@ fn handle_network_response(
         pending_promotion: Some(pending_promotion),
         staging_failure: None,
     })
+}
+
+fn validate_github_response(
+    response: &HttpResponse,
+    max_bytes: usize,
+    selection: &CategorySelection,
+) -> Option<Vec<CanonicalCidr>> {
+    if !response.status.is_success() {
+        warn!(
+            "github meta fetch failed: unexpected status {}",
+            response.status
+        );
+        return None;
+    }
+
+    if response.body.len() > max_bytes {
+        warn!(
+            "github meta fetch failed: body size {} exceeds max {} bytes",
+            response.body.len(),
+            max_bytes
+        );
+        return None;
+    }
+
+    let Some(networks) = parse_and_extract_networks(&response.body, selection) else {
+        warn!("github meta fetch failed: response body has invalid JSON or category data");
+        return None;
+    };
+    Some(networks)
 }
 
 fn stage_cache(
@@ -712,15 +832,17 @@ mod tests {
         GITHUB_META_CATEGORY_READ_LIMIT, GITHUB_META_META_CACHE_FILE, GITHUB_META_META_READ_LIMIT,
         GITHUB_META_RAW_CACHE_FILE, GithubMetaCacheMetadata, GithubMetaCategorySidecar,
         GithubMetaLoadResult, GithubMetaSource, load_github_meta_safelist,
-        parse_and_extract_networks, prepare_github_meta_safelist,
+        parse_and_extract_networks, prepare_github_meta_safelist, read_github_meta_for_preview,
     };
     use crate::cache_generation::generation_candidates;
     use crate::hash::sha256_hex;
+    use crate::http_cache::test_support::snapshot;
     use crate::http_client::test_support::CrossOriginRedirectFixture;
     use crate::http_client::{
         HttpClient, HttpClientError, HttpRequest, HttpResponse, ReqwestHttpClient,
     };
     use crate::limited_io::read_bytes_with_limit;
+    use kidobo_app::source::SourceProvenance;
     use kidobo_core::config::GithubMetaCategoryMode;
     use kidobo_core::network::{CanonicalCidr, Ipv4Cidr, Ipv6Cidr};
 
@@ -773,6 +895,253 @@ mod tests {
             .next()
             .expect("current GitHub cache generation")
             .directory
+    }
+
+    #[test]
+    fn preview_keeps_current_previous_legacy_and_unselected_git_cache_state_unchanged() {
+        for (corrupt, expected, fallback) in [
+            (0, "203.0.113.0/24", Some("198.51.100.0/24")),
+            (1, "198.51.100.0/24", Some("192.0.2.0/24")),
+            (2, "192.0.2.0/24", None),
+        ] {
+            let temp = TempDir::new().expect("root");
+            fs::write(
+                temp.path().join(GITHUB_META_RAW_CACHE_FILE),
+                br#"{"api":["192.0.2.0/24"]}"#,
+            )
+            .expect("legacy cache");
+            for body in [
+                br#"{"api":["198.51.100.0/24"]}"#.as_slice(),
+                br#"{"api":["203.0.113.0/24"]}"#.as_slice(),
+            ] {
+                load_github_meta_safelist(
+                    &MockHttpClient::new(vec![Ok(network_response(body))]),
+                    temp.path(),
+                    TEST_GITHUB_META_URL,
+                    &GithubMetaCategoryMode::All,
+                    &BTreeMap::new(),
+                )
+                .expect("seed GitHub cache");
+            }
+            let paths = CachePaths::from_cache_dir(temp.path());
+            for candidate in generation_candidates(&paths.generation_store)
+                .into_iter()
+                .take(corrupt)
+            {
+                fs::write(
+                    candidate.directory.join(super::GENERATION_RAW_FILE),
+                    "corrupt raw member",
+                )
+                .expect("corrupt generation");
+            }
+            for name in ["b".repeat(64), ".staging-preview-fixture".to_string()] {
+                let orphan = paths.generation_store.join("generations").join(name);
+                fs::create_dir(&orphan).expect("unselected directory");
+                fs::write(orphan.join("partial"), "retain unselected state").expect("partial file");
+            }
+            let before = snapshot(temp.path());
+            let loaded = read_github_meta_for_preview(
+                None,
+                temp.path(),
+                TEST_GITHUB_META_URL,
+                &GithubMetaCategoryMode::All,
+                &BTreeMap::new(),
+            );
+            assert_eq!(loaded.primary.provenance, SourceProvenance::Cache);
+            assert_eq!(
+                loaded
+                    .primary
+                    .networks
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>(),
+                [expected]
+            );
+            assert_eq!(
+                loaded
+                    .fallback
+                    .as_ref()
+                    .map(|networks| networks.iter().map(ToString::to_string).collect::<Vec<_>>()),
+                fallback.map(|target| vec![target.to_string()])
+            );
+            assert_eq!(snapshot(temp.path()), before);
+        }
+    }
+
+    #[test]
+    fn preview_github_refresh_admission_and_conditional_cache_never_persist() {
+        let temp = TempDir::new().expect("root");
+        load_github_meta_safelist(
+            &MockHttpClient::new(vec![Ok(network_response(br#"{"api":["203.0.113.0/24"]}"#))]),
+            temp.path(),
+            TEST_GITHUB_META_URL,
+            &GithubMetaCategoryMode::All,
+            &BTreeMap::new(),
+        )
+        .expect("seed cache");
+        let before = snapshot(temp.path());
+        for (response, provenance, expected) in [
+            (
+                Ok(network_response(br#"{"api":["198.51.100.0/24"]}"#)),
+                SourceProvenance::Network,
+                "198.51.100.0/24",
+            ),
+            (
+                Ok(network_response(b"invalid JSON")),
+                SourceProvenance::FallbackCache,
+                "203.0.113.0/24",
+            ),
+            (
+                Ok(network_response(br#"{"api":["0.0.0.0/0"]}"#)),
+                SourceProvenance::FallbackCache,
+                "203.0.113.0/24",
+            ),
+            (
+                Err(HttpClientError::Request {
+                    reason: "offline".to_string(),
+                }),
+                SourceProvenance::FallbackCache,
+                "203.0.113.0/24",
+            ),
+            (
+                Ok(HttpResponse {
+                    status: StatusCode::NOT_MODIFIED,
+                    body: Vec::new(),
+                    etag: None,
+                    last_modified: None,
+                }),
+                SourceProvenance::Cache,
+                "203.0.113.0/24",
+            ),
+        ] {
+            let client = MockHttpClient::new(vec![response]);
+            let loaded = read_github_meta_for_preview(
+                Some(&client),
+                temp.path(),
+                TEST_GITHUB_META_URL,
+                &GithubMetaCategoryMode::All,
+                &BTreeMap::new(),
+            );
+            assert_eq!(loaded.primary.provenance, provenance);
+            assert_eq!(
+                loaded
+                    .primary
+                    .networks
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>(),
+                [expected]
+            );
+            if provenance == SourceProvenance::Network {
+                assert_eq!(
+                    loaded
+                        .fallback
+                        .expect("fresh candidate cache fallback")
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>(),
+                    ["203.0.113.0/24"]
+                );
+            }
+            let requests = client.requests();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].if_none_match.as_deref(), Some("etag-1"));
+            assert_eq!(
+                requests[0].max_body_bytes,
+                super::GITHUB_META_CACHE_READ_LIMIT
+            );
+            assert_eq!(snapshot(temp.path()), before);
+        }
+    }
+
+    #[test]
+    fn preview_github_missing_cache_category_mismatch_and_304_are_read_only() {
+        let temp = TempDir::new().expect("root");
+        let cache = temp.path().join("missing-cache");
+        let before = snapshot(temp.path());
+        let offline = read_github_meta_for_preview(
+            None,
+            &cache,
+            TEST_GITHUB_META_URL,
+            &GithubMetaCategoryMode::All,
+            &BTreeMap::new(),
+        );
+        assert_eq!(offline.primary.provenance, SourceProvenance::Unavailable);
+        assert_eq!(offline.primary.networks, []);
+        let client = MockHttpClient::new(vec![
+            Ok(HttpResponse {
+                status: StatusCode::NOT_MODIFIED,
+                body: Vec::new(),
+                etag: None,
+                last_modified: None,
+            }),
+            Ok(network_response(br#"{"api":["198.51.100.0/24"]}"#)),
+        ]);
+        let loaded = read_github_meta_for_preview(
+            Some(&client),
+            &cache,
+            TEST_GITHUB_META_URL,
+            &GithubMetaCategoryMode::All,
+            &BTreeMap::new(),
+        );
+        assert_eq!(loaded.primary.provenance, SourceProvenance::Network);
+        assert_eq!(client.requests().len(), 2);
+        let client = MockHttpClient::new(vec![Ok(network_response(
+            br#"{"api":["198.51.100.0/24"]}"#,
+        ))]);
+        let mismatch = read_github_meta_for_preview(
+            Some(&client),
+            &cache,
+            TEST_GITHUB_META_URL,
+            &GithubMetaCategoryMode::Explicit(vec!["hooks".to_string()]),
+            &BTreeMap::new(),
+        );
+        assert_eq!(mismatch.primary.provenance, SourceProvenance::Unavailable);
+        assert_eq!(mismatch.primary.networks, []);
+        assert_eq!(snapshot(temp.path()), before);
+    }
+
+    #[test]
+    fn preview_github_enforces_body_cap_and_accepts_in_memory_data_when_staging_is_blocked() {
+        let temp = TempDir::new().expect("root");
+        fs::write(temp.path().join("v2"), "prevent persistent staging").expect("staging blocker");
+        let before = snapshot(temp.path());
+        let client = MockHttpClient::new(vec![Ok(network_response(
+            br#"{"api":["198.51.100.0/24"]}"#,
+        ))]);
+        let large_override = BTreeMap::from([(
+            crate::http_client::ENV_KIDOBO_MAX_HTTP_BODY_BYTES.into(),
+            crate::http_client::MAX_HTTP_BODY_BYTES.to_string().into(),
+        )]);
+        let loaded = read_github_meta_for_preview(
+            Some(&client),
+            temp.path(),
+            TEST_GITHUB_META_URL,
+            &GithubMetaCategoryMode::All,
+            &large_override,
+        );
+        assert_eq!(loaded.primary.provenance, SourceProvenance::Network);
+        assert_eq!(
+            client.requests()[0].max_body_bytes,
+            super::GITHUB_META_CACHE_READ_LIMIT
+        );
+        let client = MockHttpClient::new(vec![Ok(network_response(
+            br#"{"api":["198.51.100.0/24"]}"#,
+        ))]);
+        let small_override = BTreeMap::from([(
+            crate::http_client::ENV_KIDOBO_MAX_HTTP_BODY_BYTES.into(),
+            "5".into(),
+        )]);
+        let oversized = read_github_meta_for_preview(
+            Some(&client),
+            temp.path(),
+            TEST_GITHUB_META_URL,
+            &GithubMetaCategoryMode::All,
+            &small_override,
+        );
+        assert_eq!(oversized.primary.provenance, SourceProvenance::Unavailable);
+        assert_eq!(client.requests()[0].max_body_bytes, 5);
+        assert_eq!(snapshot(temp.path()), before);
     }
 
     #[test]

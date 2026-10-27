@@ -13,7 +13,8 @@ license = "MIT"
 rust-version = "1.97.1"
 
 [workspace.dependencies]
-clap = { version = "4.5", features = ["derive"] }
+clap = { version = "4.5", features = ["derive", "wrap_help"] }
+clap_complete = "=4.6.11"
 criterion = "0.8"
 ctrlc = "3.4"
 env_logger = "0.11"
@@ -22,6 +23,7 @@ kidobo-adapters = { path = "crates/kidobo-adapters" }
 kidobo-app = { path = "crates/kidobo-app" }
 kidobo-core = { path = "crates/kidobo-core" }
 log = "0.4"
+jiff = { version = "=0.2.38", default-features = false, features = ["std"] }
 nix = { version = "0.31", default-features = false, features = ["fs", "poll", "process", "signal"] }
 reqwest = { version = "0.13", default-features = false }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
@@ -30,6 +32,9 @@ serde_json = "1"
 sha2 = "0.11"
 tempfile = "3"
 thiserror = "2"
+terminal_size = "=0.4.4"
+unicode-width = "=0.2.2"
+unicode-segmentation = "=1.13.3"
 toml_edit = { version = "0.25", features = ["serde"] }
 url = "2.5"
 
@@ -70,18 +75,25 @@ path = "src/main.rs"
 
 [dependencies]
 clap.workspace = true
+clap_complete.workspace = true
 ctrlc.workspace = true
 env_logger.workspace = true
 kidobo-adapters.workspace = true
 kidobo-app.workspace = true
 log.workspace = true
+jiff.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+terminal_size.workspace = true
+unicode-width.workspace = true
+unicode-segmentation.workspace = true
+url.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
 fs2.workspace = true
 kidobo-core.workspace = true
+nix = { workspace = true, features = ["term"] }
 reqwest = { workspace = true, features = ["blocking", "rustls-no-provider"] }
 sha2.workspace = true
 tempfile.workspace = true

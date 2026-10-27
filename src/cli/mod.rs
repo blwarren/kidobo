@@ -1,10 +1,17 @@
 mod args;
+mod bans;
 mod blocklist;
 mod commands;
+mod configuration;
 mod doctor;
 mod flush;
 mod init;
+mod inspection;
 mod interrupt;
+mod mutation;
+pub(crate) mod presentation;
+mod preview;
+mod setup;
 mod sync;
 
 use std::env;
@@ -16,12 +23,38 @@ use clap::error::ErrorKind;
 
 use crate::error::KidoboError;
 
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent terminal and environment capabilities are injected for each stream"
+)]
 pub struct CliIo<'a> {
     pub input: &'a mut dyn PromptInput,
     pub stdout: &'a mut dyn Write,
     pub stderr: &'a mut dyn Write,
     pub stdout_is_terminal: bool,
+    pub stdin_is_terminal: bool,
+    pub stderr_is_terminal: bool,
+    pub terminal_width: usize,
+    pub term_dumb: bool,
+    pub under_systemd: bool,
     pub no_color: bool,
+}
+
+impl CliIo<'_> {
+    fn presentation(&self) -> presentation::Presentation {
+        presentation::Presentation::new(
+            self.terminal_width,
+            presentation::color_enabled(
+                self.stdout_is_terminal && !self.under_systemd,
+                self.no_color,
+                self.term_dumb,
+            ),
+        )
+    }
+
+    fn interactive(&self) -> bool {
+        self.stdin_is_terminal && self.stdout_is_terminal && !self.under_systemd
+    }
 }
 
 pub trait PromptInput {
@@ -71,14 +104,24 @@ pub fn run() -> ExitCode {
 
     let mut stdout = io::stdout();
     let stdout_is_terminal = stdout.is_terminal();
+    let stderr_is_terminal = stderr.is_terminal();
     let mut input = StdinPrompt(io::stdin());
     let dispatch_result = commands::dispatch_with(
-        cli.command,
+        cli.command.unwrap_or(args::Command::Status {
+            format: args::ReportFormat::Human,
+        }),
         &mut CliIo {
             input: &mut input,
             stdout: &mut stdout,
             stderr: &mut stderr,
             stdout_is_terminal,
+            stdin_is_terminal: io::stdin().is_terminal(),
+            stderr_is_terminal,
+            terminal_width: terminal_size::terminal_size()
+                .map_or(80, |(terminal_size::Width(width), _)| usize::from(width)),
+            term_dumb: env::var_os("TERM").is_some_and(|term| term == "dumb"),
+            under_systemd: env::var_os("INVOCATION_ID").is_some()
+                || env::var_os("JOURNAL_STREAM").is_some(),
             no_color: env::var_os("NO_COLOR").is_some(),
         },
     );
@@ -110,7 +153,11 @@ pub fn run() -> ExitCode {
 }
 
 fn report_error(output: &mut dyn Write, error: &KidoboError) {
-    let _write_result = writeln!(output, "{error}");
+    let _write_result = writeln!(
+        output,
+        "{}",
+        presentation::escape(&presentation::redact_urls(&error.to_string()))
+    );
 }
 
 fn clap_error_exit_code(err: &clap::Error) -> u8 {

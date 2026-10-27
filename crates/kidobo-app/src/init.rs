@@ -145,6 +145,51 @@ pub fn execute(
     request: &InitRequest,
     dependencies: &InitDependencies<'_>,
 ) -> Result<InitOutcome, AppError> {
+    execute_with_timer(request, dependencies, true)
+}
+
+/// Creates missing initialization artifacts without activating scheduling.
+///
+/// Setup uses this after saving reviewed configuration. Existing files are preserved, exactly as
+/// with [`execute`], and an existing host timer is neither stopped nor otherwise modified.
+///
+/// # Errors
+///
+/// Returns the same provisioning failures as [`execute`].
+pub fn provision(
+    request: &InitRequest,
+    dependencies: &InitDependencies<'_>,
+) -> Result<InitOutcome, AppError> {
+    execute_with_timer(request, dependencies, false)
+}
+
+/// Activates the existing managed timer only at normal host paths.
+///
+/// # Errors
+///
+/// Returns path-resolution, cancellation, or timer-activation failures. Alternate roots return
+/// `false` and never invoke host systemd.
+pub fn activate_timer(
+    request: &InitRequest,
+    dependencies: &InitDependencies<'_>,
+) -> Result<bool, AppError> {
+    dependencies.cancellation.check()?;
+    let paths = dependencies
+        .paths
+        .resolve(&request.paths, ConfigRequirement::Optional)?;
+    if paths.root_override.is_some() {
+        return Ok(false);
+    }
+    dependencies.cancellation.check()?;
+    dependencies.provisioner.enable_systemd_timer()?;
+    Ok(true)
+}
+
+fn execute_with_timer(
+    request: &InitRequest,
+    dependencies: &InitDependencies<'_>,
+    enable_timer: bool,
+) -> Result<InitOutcome, AppError> {
     dependencies.cancellation.check()?;
     let paths = dependencies
         .paths
@@ -193,7 +238,7 @@ pub fn execute(
         });
     }
 
-    if paths.root_override.is_none() {
+    if enable_timer && paths.root_override.is_none() {
         dependencies.cancellation.check()?;
         dependencies.provisioner.enable_systemd_timer()?;
         outcome.systemd_enabled = true;
@@ -380,6 +425,63 @@ mod tests {
                 .expect("events")
                 .contains(&"systemd".to_string())
         );
+    }
+
+    #[test]
+    fn setup_provisioning_defers_activation_until_a_separate_request() {
+        let provisioner = Provisioner::default();
+        let paths = Paths(None);
+        let dependencies = InitDependencies {
+            cancellation: &crate::ports::NoCancellation,
+            paths: &paths,
+            provisioner: &provisioner,
+        };
+        let outcome =
+            super::provision(&request(), &dependencies).expect("provision without scheduling");
+        assert_eq!(outcome.artifacts.len(), 10);
+        assert!(!outcome.systemd_enabled);
+        assert!(
+            !provisioner
+                .events
+                .lock()
+                .expect("events")
+                .contains(&"systemd".to_string())
+        );
+        assert!(super::activate_timer(&request(), &dependencies).expect("explicit scheduling"));
+        assert_eq!(
+            provisioner.events.lock().expect("events").last(),
+            Some(&"systemd".to_string())
+        );
+    }
+
+    #[test]
+    fn explicit_timer_activation_still_respects_relocation_and_cancellation() {
+        let provisioner = Provisioner::default();
+        assert!(
+            !super::activate_timer(
+                &request(),
+                &InitDependencies {
+                    cancellation: &crate::ports::NoCancellation,
+                    paths: &Paths(Some(PathBuf::from("/sandbox"))),
+                    provisioner: &provisioner,
+                }
+            )
+            .expect("relocated activation skipped")
+        );
+        let cancellation = std::sync::atomic::AtomicBool::new(true);
+        assert!(matches!(
+            super::activate_timer(
+                &request(),
+                &InitDependencies {
+                    cancellation: &cancellation,
+                    paths: &Paths(None),
+                    provisioner: &provisioner,
+                }
+            )
+            .expect_err("cancelled activation"),
+            AppError::Interrupted
+        ));
+        assert_eq!(provisioner.events.lock().expect("events").len(), 0);
     }
 
     #[test]

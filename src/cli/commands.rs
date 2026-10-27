@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use clap::CommandFactory;
 use log::warn;
 
 use crate::cli::CliIo;
@@ -20,30 +21,101 @@ use kidobo_app::lookup::{
 
 pub fn dispatch_with(command: Command, io: &mut CliIo<'_>) -> Result<(), KidoboError> {
     match command {
+        Command::Completions { shell } => write_completions(shell, io.stdout),
+        Command::Setup => super::setup::run(io),
+        Command::Sources { action } => {
+            super::configuration::sources(action.unwrap_or(super::args::SourceAction::List), io)
+        }
+        Command::Allow { action } => {
+            super::configuration::allow(action.unwrap_or(super::args::AllowAction::List), io)
+        }
+        Command::Config { action } => {
+            super::configuration::config(action.unwrap_or(super::args::ConfigAction::Show), io)
+        }
+        Command::Status { format } => super::inspection::status(format, io),
+        Command::Check { ip, format } => super::inspection::check(ip, format, io),
+        Command::Bans {
+            temporary,
+            permanent,
+            asn,
+            limit,
+            all,
+        } => super::bans::run(
+            if temporary {
+                kidobo_app::bans::BanLifetimeFilter::Temporary
+            } else if permanent {
+                kidobo_app::bans::BanLifetimeFilter::Permanent
+            } else {
+                kidobo_app::bans::BanLifetimeFilter::All
+            },
+            asn,
+            if all { None } else { Some(limit.get()) },
+            io,
+        ),
         Command::Init => run_init_command(io),
-        Command::Doctor => run_doctor_command(io),
-        Command::Sync { timer } => run_sync_command(timer),
-        Command::Flush { cache_only } => run_flush_command(cache_only),
+        Command::Doctor { format } => run_doctor_command(format, io),
+        Command::Sync {
+            timer,
+            dry_run,
+            allow_network,
+        } => {
+            if dry_run {
+                super::preview::run(allow_network, io)
+            } else {
+                run_sync_command(timer, io)
+            }
+        }
+        Command::Flush { cache_only, yes } => run_flush_command(cache_only, yes, io),
         Command::Lookup { ip, file, format } => run_lookup_command(ip, file, format, io),
         Command::Ban {
             target,
             file,
             asn,
             duration,
-        } => run_ban_command(
-            target.as_deref(),
-            file.as_deref(),
-            asn.as_deref(),
-            duration,
-            io,
-        ),
+            application,
+        } => {
+            let changed = run_ban_command(
+                target.as_deref(),
+                file.as_deref(),
+                asn.as_deref(),
+                duration,
+                io,
+            )?;
+            super::mutation::finish_change(application.mode(), changed, io, &mut |io| {
+                run_sync_command(false, io)
+            })
+        }
         Command::Unban {
             target,
             file,
             asn,
             yes,
-        } => run_unban_command(target.as_deref(), file.as_deref(), asn.as_deref(), yes, io),
+            application,
+        } => {
+            let changed =
+                run_unban_command(target.as_deref(), file.as_deref(), asn.as_deref(), yes, io)?;
+            super::mutation::finish_change(application.mode(), changed, io, &mut |io| {
+                run_sync_command(false, io)
+            })
+        }
     }
+}
+
+fn write_completions(
+    shell: super::args::CompletionShell,
+    output: &mut dyn std::io::Write,
+) -> Result<(), KidoboError> {
+    // The generator panics on writer errors. Static command metadata bounds this intermediate
+    // script; only the final write reaches fallible terminal or pipe output.
+    let mut script = Vec::new();
+    clap_complete::generate(
+        shell.generator(),
+        &mut super::args::Cli::command(),
+        "kidobo",
+        &mut script,
+    );
+    output.write_all(&script)?;
+    Ok(())
 }
 
 fn run_lookup_command(
@@ -67,7 +139,7 @@ fn run_lookup_command(
     let sources = build_offline_lookup_registry()?;
     let mut renderer = LookupRenderer {
         format,
-        color: should_color_lookup(io.stdout_is_terminal, io.no_color),
+        view: io.presentation(),
         header_written: false,
         unmatched_targets: Vec::new(),
         output: io.stdout,
@@ -110,14 +182,9 @@ fn run_lookup_command(
     Ok(())
 }
 
-const LOOKUP_TARGET_WIDTH: usize = 30;
-const LOOKUP_STATUS_WIDTH: usize = 8;
-const LOOKUP_SOURCE_WIDTH: usize = 44;
-const LOOKUP_ENTRY_WIDTH: usize = 30;
-
 struct LookupRenderer<'a> {
     format: LookupFormat,
-    color: bool,
+    view: crate::cli::presentation::Presentation,
     header_written: bool,
     unmatched_targets: Vec<String>,
     output: &'a mut dyn std::io::Write,
@@ -126,53 +193,50 @@ struct LookupRenderer<'a> {
 impl LookupRenderer<'_> {
     fn human_header(&mut self) -> Result<(), KidoboError> {
         if !self.header_written {
-            writeln!(self.output, "{}", lookup_table_border('┌', '┬', '┐'))?;
-            for row in
-                format_lookup_table_row(["Target", "Status", "Source", "Matched Entry"], false)
-            {
-                writeln!(self.output, "{row}")?;
-            }
-            writeln!(self.output, "{}", lookup_table_border('├', '┼', '┤'))?;
+            self.view.heading(self.output, "Offline source overlaps")?;
+            self.view.paragraph(
+                self.output,
+                "Saved and cached source evidence; this does not establish live enforcement.",
+            )?;
             self.header_written = true;
         }
         Ok(())
     }
 
     fn emit(&mut self, target: &str, matches: &[&LookupSourceEntry]) -> Result<(), KidoboError> {
-        let encoded_target = encode_lookup_field(target);
         match self.format {
             LookupFormat::Human => {
                 self.human_header()?;
                 if matches.is_empty() {
-                    for row in
-                        format_lookup_table_row([&encoded_target, "NO MATCH", "—", "—"], self.color)
-                    {
-                        writeln!(self.output, "{row}")?;
-                    }
+                    self.view
+                        .record(self.output, &[("Target", target), ("Status", "NO MATCH")])?;
                 }
                 for source in matches {
-                    let label = encode_lookup_field(&source.source_label);
-                    let entry = encode_lookup_field(&source.source_line);
-                    for row in format_lookup_table_row(
-                        [&encoded_target, "MATCH", &label, &entry],
-                        self.color,
-                    ) {
-                        writeln!(self.output, "{row}")?;
-                    }
+                    self.view.record(
+                        self.output,
+                        &[
+                            ("Target", target),
+                            ("Status", "MATCH"),
+                            ("Source", &source.source_label),
+                            ("Matched Entry", &source.source_line),
+                        ],
+                    )?;
                 }
+                writeln!(self.output)?;
             }
             LookupFormat::Tsv => {
+                let target = encode_lookup_field(target);
                 for source in matches {
                     writeln!(
                         self.output,
                         "{}\t{}\t{}",
-                        encoded_target,
+                        target,
                         encode_lookup_field(&source.source_label),
                         encode_lookup_field(&source.source_line)
                     )?;
                 }
                 if matches.is_empty() {
-                    self.unmatched_targets.push(encoded_target);
+                    self.unmatched_targets.push(target);
                 }
             }
         }
@@ -185,12 +249,16 @@ impl LookupRenderer<'_> {
         match self.format {
             LookupFormat::Human => {
                 self.human_header()?;
-                writeln!(self.output, "{}", lookup_table_border('└', '┴', '┘'))?;
                 let unmatched_count = total_count.saturating_sub(matched_count);
-                writeln!(
+                self.view.heading(self.output, "Summary")?;
+                self.view.key_values(
                     self.output,
-                    "\nSummary\n  Targets:    {total_count}\n  Matched:    {matched_count}\n  Unmatched:  {unmatched_count}\n  Match rate: {}",
-                    percent_str(matched_count, total_count)
+                    &[
+                        ("Targets", &total_count.to_string()),
+                        ("Matched", &matched_count.to_string()),
+                        ("Unmatched", &unmatched_count.to_string()),
+                        ("Match rate", &percent_str(matched_count, total_count)),
+                    ],
                 )?;
             }
             LookupFormat::Tsv if summary.file_mode => {
@@ -210,99 +278,7 @@ impl LookupRenderer<'_> {
 }
 
 fn encode_lookup_field(value: &str) -> String {
-    let mut encoded = String::with_capacity(value.len());
-    for character in value.chars() {
-        match character {
-            '\\' => encoded.push_str("\\\\"),
-            '\t' => encoded.push_str("\\t"),
-            '\r' => encoded.push_str("\\r"),
-            '\n' => encoded.push_str("\\n"),
-            character if character.is_ascii_control() => {
-                use std::fmt::Write as _;
-                let _write_result = write!(encoded, "\\x{:02X}", u32::from(character));
-            }
-            character if character.is_control() => {
-                use std::fmt::Write as _;
-                let _write_result = write!(encoded, "\\u{{{:X}}}", u32::from(character));
-            }
-            character => encoded.push(character),
-        }
-    }
-    encoded
-}
-
-fn should_color_lookup(stdout_is_terminal: bool, no_color_set: bool) -> bool {
-    stdout_is_terminal && !no_color_set
-}
-
-fn lookup_table_border(left: char, junction: char, right: char) -> String {
-    format!(
-        "{left}{}{junction}{}{junction}{}{junction}{}{right}",
-        "─".repeat(LOOKUP_TARGET_WIDTH + 2),
-        "─".repeat(LOOKUP_STATUS_WIDTH + 2),
-        "─".repeat(LOOKUP_SOURCE_WIDTH + 2),
-        "─".repeat(LOOKUP_ENTRY_WIDTH + 2),
-    )
-}
-
-fn format_lookup_table_row(cells: [&str; 4], color_status: bool) -> Vec<String> {
-    let [target, status, source, entry] = cells;
-    let wrapped_target = wrap_lookup_cell(target, LOOKUP_TARGET_WIDTH);
-    let wrapped_status = wrap_lookup_cell(status, LOOKUP_STATUS_WIDTH);
-    let wrapped_source = wrap_lookup_cell(source, LOOKUP_SOURCE_WIDTH);
-    let wrapped_entry = wrap_lookup_cell(entry, LOOKUP_ENTRY_WIDTH);
-    let height = [
-        wrapped_target.len(),
-        wrapped_status.len(),
-        wrapped_source.len(),
-        wrapped_entry.len(),
-    ]
-    .into_iter()
-    .max()
-    .unwrap_or(1);
-    let mut rows = Vec::with_capacity(height);
-
-    for line_idx in 0..height {
-        let displayed_target =
-            format_lookup_cell_line(&wrapped_target, line_idx, LOOKUP_TARGET_WIDTH);
-        let mut displayed_status =
-            format_lookup_cell_line(&wrapped_status, line_idx, LOOKUP_STATUS_WIDTH);
-        let displayed_source =
-            format_lookup_cell_line(&wrapped_source, line_idx, LOOKUP_SOURCE_WIDTH);
-        let displayed_entry = format_lookup_cell_line(&wrapped_entry, line_idx, LOOKUP_ENTRY_WIDTH);
-        if color_status && line_idx == 0 {
-            displayed_status = color_lookup_status(status, &displayed_status);
-        }
-        rows.push(format!(
-            "│ {displayed_target} │ {displayed_status} │ {displayed_source} │ {displayed_entry} │"
-        ));
-    }
-
-    rows
-}
-
-fn format_lookup_cell_line(lines: &[String], line_idx: usize, width: usize) -> String {
-    let value = lines.get(line_idx).map_or("", String::as_str);
-    format!("{value:<width$}")
-}
-
-fn wrap_lookup_cell(value: &str, width: usize) -> Vec<String> {
-    let chars = value.chars().collect::<Vec<_>>();
-    if chars.is_empty() {
-        return vec![String::new()];
-    }
-    chars
-        .chunks(width)
-        .map(|chunk| chunk.iter().collect())
-        .collect()
-}
-
-fn color_lookup_status(status: &str, padded: &str) -> String {
-    match status {
-        "MATCH" => format!("\x1b[1;36m{padded}\x1b[0m"),
-        "NO MATCH" => format!("\x1b[2m{padded}\x1b[0m"),
-        _ => padded.to_string(),
-    }
+    crate::cli::presentation::escape(value)
 }
 
 fn percent(numerator: usize, denominator: usize) -> usize {
@@ -318,10 +294,35 @@ fn percent_str(numerator: usize, denominator: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        color_lookup_status, encode_lookup_field, format_lookup_table_row, should_color_lookup,
-        wrap_lookup_cell,
-    };
+    use super::encode_lookup_field;
+
+    #[test]
+    fn completion_write_errors_keep_the_cli_exit_and_os_cause() {
+        struct FailingWriter;
+        impl std::io::Write for FailingWriter {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from_raw_os_error(28))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        for shell in [
+            crate::cli::args::CompletionShell::Bash,
+            crate::cli::args::CompletionShell::Zsh,
+            crate::cli::args::CompletionShell::Fish,
+        ] {
+            let error = super::write_completions(shell, &mut FailingWriter)
+                .expect_err("failed output is not a panic");
+            assert_eq!(error.exit_code(), 1);
+            match error {
+                crate::error::KidoboError::CliIo { source } => {
+                    assert_eq!(source.raw_os_error(), Some(28));
+                }
+                other => panic!("unexpected error: {other:?}"),
+            }
+        }
+    }
 
     #[test]
     fn renderers_encode_each_field_once_and_preserve_writer_errors() {
@@ -344,7 +345,7 @@ mod tests {
             let mut output = Vec::new();
             let mut renderer = super::LookupRenderer {
                 format,
-                color: false,
+                view: crate::cli::presentation::Presentation::new(120, false),
                 header_written: false,
                 unmatched_targets: Vec::new(),
                 output: &mut output,
@@ -361,7 +362,7 @@ mod tests {
             let mut broken = BrokenWriter;
             let mut renderer = super::LookupRenderer {
                 format,
-                color: false,
+                view: crate::cli::presentation::Presentation::new(120, false),
                 header_written: false,
                 unmatched_targets: Vec::new(),
                 output: &mut broken,
@@ -376,43 +377,6 @@ mod tests {
                 other => panic!("unexpected error: {other:?}"),
             }
         }
-    }
-
-    #[test]
-    fn lookup_color_requires_terminal_without_no_color() {
-        assert!(should_color_lookup(true, false));
-        assert!(!should_color_lookup(false, false));
-        assert!(!should_color_lookup(true, true));
-    }
-
-    #[test]
-    fn lookup_status_color_wraps_already_padded_cell() {
-        let colored = color_lookup_status("MATCH", "MATCH   ");
-        assert_eq!(colored, "\x1b[1;36mMATCH   \x1b[0m");
-    }
-
-    #[test]
-    fn lookup_no_match_color_is_dimmed() {
-        assert_eq!(
-            color_lookup_status("NO MATCH", "NO MATCH"),
-            "\x1b[2mNO MATCH\x1b[0m"
-        );
-    }
-
-    #[test]
-    fn lookup_table_colors_only_the_first_status_line() {
-        let long_source = "s".repeat(super::LOOKUP_SOURCE_WIDTH + 1);
-        let rows = format_lookup_table_row(["198.51.100.9", "NO MATCH", &long_source, "—"], true);
-
-        assert_eq!(rows.len(), 2);
-        assert!(rows[0].contains("\x1b[2mNO MATCH\x1b[0m"));
-        assert!(!rows[1].contains("\x1b["));
-    }
-
-    #[test]
-    fn lookup_cell_wrapping_preserves_content_and_width() {
-        let wrapped = wrap_lookup_cell("abcdefghij", 4);
-        assert_eq!(wrapped, vec!["abcd", "efgh", "ij"]);
     }
 
     #[test]
