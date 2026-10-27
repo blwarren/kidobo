@@ -929,6 +929,54 @@ fn runner_with_incus(dir: &Path, program: &Path) -> Runner {
     runner
 }
 
+#[test]
+fn incus_queries_preserve_api_scope_without_project_flag() {
+    let temp = TestDir::new();
+    let program = temp.path().join("fake-incus-query");
+    executable(
+        &program,
+        r#"#!/bin/bash
+set -eu
+if [[ "$1" == --project ]]; then
+    [[ "$2" == test-project ]]
+    shift 2
+    if [[ "$1" == query ]]; then
+        echo '--project cannot be used with the query command' >&2
+        exit 1
+    fi
+    [[ "$*" == 'list --format=json' ]]
+    printf '[]\n'
+else
+    [[ "$1" == query && "$#" == 2 ]]
+    case "$2" in
+        /1.0|/1.0/projects/test-project|/1.0/profiles/test-profile?project=test-project)
+            printf '%s\n' "$2" ;;
+        *) exit 2 ;;
+    esac
+fi
+"#,
+    );
+    let mut runner = runner_with_incus(temp.path(), &program);
+    for endpoint in [
+        "/1.0",
+        "/1.0/projects/test-project",
+        "/1.0/profiles/test-profile?project=test-project",
+    ] {
+        assert_eq!(
+            runner
+                .incus(&strings(&["query", endpoint]), 5)
+                .expect("raw API query"),
+            format!("{endpoint}\n")
+        );
+    }
+    assert_eq!(
+        runner
+            .incus(&strings(&["list", "--format=json"]), 5)
+            .expect("project-scoped list"),
+        "[]\n"
+    );
+}
+
 fn fake_incus(temp: &TestDir) -> (PathBuf, PathBuf) {
     let program = temp.path().join("fake-incus");
     let log = temp.path().join("incus-args.log");

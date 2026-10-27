@@ -482,7 +482,12 @@ impl Runner {
         Ok(activity)
     }
     fn incus(&mut self, args: &[String], seconds: u64) -> Result<String> {
-        let mut full = vec!["--project".into(), self.project.clone()];
+        // Raw API queries carry project scope in their URL and reject --project.
+        let mut full = if args.first().is_some_and(|arg| arg == "query") {
+            Vec::new()
+        } else {
+            vec!["--project".into(), self.project.clone()]
+        };
         full.extend_from_slice(args);
         let program = self.incus_program.to_string_lossy().into_owned();
         self.command(&program, &full, seconds)

@@ -45,8 +45,12 @@ from pathlib import Path
 state = Path(__file__).parent / "state"
 scenario = (state / "scenario").read_text().strip()
 args = sys.argv[1:]
-assert args[:2] == ["--project", "test-project"], args
-args = args[2:]
+if args[0] == "query":
+    assert args == ["query", "/1.0/profiles/test-profile?project=test-project"], args
+else:
+    assert args[:2] == ["--project", "test-project"], args
+    args = args[2:]
+    assert args[0] != "query", "--project cannot be used with the query command"
 
 
 def event(name, value):
