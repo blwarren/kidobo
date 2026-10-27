@@ -25,32 +25,17 @@ e2e_report_exit() {
   done
 }
 e2e_plan_checks() {
-  local phase=$1 mode=$2 name
-  while IFS= read -r name; do
-    [[ -n "$name" ]] || continue
-    printf 'E2E_CHECK\t%s\tPLAN\tscenario scheduled; expectation follows at START\n' "$name" >&9
-  done < <(
-    case "$phase" in
-      os-upgrade) printf '%s\n' 'operating system upgrade' ;;
-      start)
-        printf '%s\n' 'installation and initialization' 'initialization preserves existing files'
-        if [[ "$mode" == candidate ]]; then printf '%s\n' 'bad checksum rejected'; fi
-        printf '%s\n' 'HTTP sync and repeated firewall activation'
-        if [[ "$mode" == published ]]; then
-          printf '%s\n' 'published doctor and offline lookup'
-        else
-          printf '%s\n' 'invalid configuration preserves enforcement' 'safelist add and removal' \
-            'temporary ban and unban sync boundary' 'permanent ban and unban sync boundary' \
-            'offline doctor and lookup preserve runtime' 'IPv6 capacity failure preserves both families' \
-            'boot timer enabled and active'
-        fi
-        ;;
-      after-reboot) printf '%s\n' 'reboot restores timer enforcement' ;;
-      upgrade) printf '%s\n' 'baseline to target upgrade preserves data' 'published baseline enforcement' ;;
-      finish) printf '%s\n' 'failed uninstall preserves runtime' 'cache-only flush preserves enforcement' \
-        'flush removes only managed enforcement' 'successful uninstall removes managed runtime' ;;
-    esac
-  )
+  python3 - "${E2E_CHECK_MANIFEST:-$ROOT/checks.json}" "$2" "$1" <<'PYPLAN'
+import json
+import sys
+with open(sys.argv[1], encoding="utf-8") as source:
+    manifest = json.load(source)
+if manifest["version"] != 1:
+    raise SystemExit("unsupported guest check manifest")
+for name, count in manifest["profiles"][sys.argv[2]][sys.argv[3]].items():
+    for _ in range(count):
+        print(f"E2E_CHECK\t{name}\tPLAN\tscenario scheduled; expectation follows at START", file=sys.stderr)
+PYPLAN
 }
 trap 'e2e_report_exit "$?"' EXIT
 
@@ -58,9 +43,9 @@ readonly ROOT=/opt/kidobo-e2e MARKER=/etc/kidobo-e2e-owned
 readonly MARKER_CONTENT=kidobo-e2e-v1
 readonly RELEASE="$ROOT/release" BASELINE="$ROOT/baseline" STATE="$ROOT/state"
 readonly TEST_NS=kidobo-e2e HOST_IF=ke2eh0 PEER_IF=ke2ep0
-readonly V4_HOST=198.18.77.1 V4_PEER=198.18.77.2
-readonly V6_HOST=fd42:6b69:646f:626f::1 V6_PEER=fd42:6b69:646f:626f::2
-readonly TRAFFIC_PORT=39471 HTTP_PORT=39472 BAD_HTTP_PORT=39473 SOURCE_PORT=39474
+readonly V4_HOST=198.18.77.1 V4_PEER=198.18.77.2 V4_CONTROL=198.18.77.3
+readonly V6_HOST=fd42:6b69:646f:626f::1 V6_PEER=fd42:6b69:646f:626f::2 V6_CONTROL=fd42:6b69:646f:626f::3
+readonly TRAFFIC_PORT=39471 HTTP_PORT=39472 BAD_HTTP_PORT=39473 SOURCE_PORT=39474 IRR_PORT=39475
 readonly CONFIG=/etc/kidobo/config.toml BLOCKLIST=/var/lib/kidobo/blocklist.txt
 readonly SET4=kidobo-e2e SET6=kidobo-e2e-v6
 
@@ -217,11 +202,13 @@ setup_namespace() {
     nmcli -w 10 device set "$HOST_IF" managed no
     [[ "$(LC_ALL=C nmcli -g GENERAL.STATE device show "$HOST_IF")" == "10 "* ]] || fail 'NetworkManager still manages the fixture veth'
   fi
-  ip addr add "$V4_HOST/30" dev "$HOST_IF"
+  ip addr add "$V4_HOST/29" dev "$HOST_IF"
   ip -6 addr add "$V6_HOST/64" dev "$HOST_IF" nodad
   ip link set "$HOST_IF" up
-  ip netns exec "$TEST_NS" ip addr add "$V4_PEER/30" dev "$PEER_IF"
+  ip netns exec "$TEST_NS" ip addr add "$V4_PEER/29" dev "$PEER_IF"
   ip netns exec "$TEST_NS" ip -6 addr add "$V6_PEER/64" dev "$PEER_IF" nodad
+  ip netns exec "$TEST_NS" ip addr add "$V4_CONTROL/29" dev "$PEER_IF"
+  ip netns exec "$TEST_NS" ip -6 addr add "$V6_CONTROL/64" dev "$PEER_IF" nodad
   ip netns exec "$TEST_NS" ip link set lo up
   ip netns exec "$TEST_NS" ip link set "$PEER_IF" up
   ip netns exec "$TEST_NS" ip route add default via "$V4_HOST"
@@ -263,17 +250,121 @@ start_traffic_servers() {
     [[ -s "$ready_file" ]] || fail "traffic fixture $label did not become ready within 10 seconds; log: $log_file; $(tail -n 20 "$log_file" 2>/dev/null || true)"
   done
 }
-probe() {
-  local family=$1 address=$2 expectation=$3 status=0
-  e2e_check_start "$family traffic to $address: $expectation" "connectivity=$expectation; namespace=$TEST_NS; port=$TRAFFIC_PORT"
-  if ip netns exec "$TEST_NS" python3 "$ROOT/traffic.py" probe "$address" "$TRAFFIC_PORT"; then
-    [[ "$expectation" == allowed ]] || fail "$family traffic unexpectedly passed; expected blocked"
-    e2e_check_pass "probe exited 0; fixture response matched; connectivity=allowed"
+managed_drop_packets() {
+  local binary=$1 set_name=$2
+  "$binary" -w 5 -L kidobo-input -n -v -x | awk -v set_name="$set_name" '
+    $3 == "DROP" && index($0, "match-set " set_name " src") { count++; packets=$1 }
+    END { if (count != 1 || packets !~ /^[0-9]+$/) exit 1; print packets }'
+}
+probe_raw() {
+  local address=$1 source=$2 output=$3 status=0
+  ip netns exec "$TEST_NS" python3 "$ROOT/traffic.py" probe "$address" "$TRAFFIC_PORT" "$source" > "$output" || status=$?
+  printf '%s\n' "$status" > "$output.status"
+}
+probe_observation() {
+  local family=$1 address=$2 source=$3 expectation=$4 output=$5 before=${6:-0} after=${7:-0}
+  local status outcome
+  e2e_check_start "$family traffic to $address" "connectivity=$expectation; namespace=$TEST_NS; source=$source; port=$TRAFFIC_PORT"
+  status=$(<"$output.status")
+  outcome=$(python3 - "$output" "$address" "$source" <<'PYPROBE'
+import json
+import sys
+with open(sys.argv[1], encoding="utf-8") as source:
+    value = json.load(source)
+if value["address"] != sys.argv[2] or value["source"] != sys.argv[3]:
+    raise SystemExit("probe identity mismatch")
+print(value["outcome"])
+PYPROBE
+  ) || fail "$family probe did not return a valid structured observation"
+  if [[ "$expectation" == allowed ]]; then
+    [[ "$status" == 0 && "$outcome" == allowed ]] || fail "$family fixture/control failed; status=$status outcome=$outcome"
   else
-    status=$?
-    [[ "$expectation" == blocked ]] || fail "$family traffic failed; expected allowed"
-    e2e_check_pass "probe exited $status; connectivity=blocked (expected failure)"
+    [[ "$status" == 10 && "$outcome" == connect-timeout ]] || fail "$family blocking requires connect timeout, got status=$status outcome=$outcome"
+    [[ "$before" =~ ^[0-9]+$ && "$after" =~ ^[0-9]+$ && "$after" -gt "$before" ]] || fail "$family intended DROP counter did not increase ($before -> $after)"
   fi
+  e2e_check_pass "status=$status outcome=$outcome; intended DROP packets=$before->$after; source=$source"
+}
+probe_pair() {
+  local expectation=$1 before4=0 before6=0 after4=0 after6=0 pid4 pid6
+  local prefix="$STATE/probe-$phase"
+  if [[ "$expectation" == blocked ]]; then
+    before4=$(managed_drop_packets iptables "$SET4") || fail 'cannot read intended IPv4 DROP counter'
+    before6=$(managed_drop_packets ip6tables "$SET6") || fail 'cannot read intended IPv6 DROP counter'
+  fi
+  (
+    probe_raw "$V4_HOST" "$V4_CONTROL" "$prefix-v4-control.json"
+    probe_raw "$V4_HOST" "$V4_PEER" "$prefix-v4.json"
+  ) 9>&- & pid4=$!
+  (
+    probe_raw "$V6_HOST" "$V6_CONTROL" "$prefix-v6-control.json"
+    probe_raw "$V6_HOST" "$V6_PEER" "$prefix-v6.json"
+  ) 9>&- & pid6=$!
+  wait "$pid4" || fail 'IPv4 probe worker failed'
+  wait "$pid6" || fail 'IPv6 probe worker failed'
+  if [[ "$expectation" == blocked ]]; then
+    after4=$(managed_drop_packets iptables "$SET4") || fail 'cannot read intended IPv4 DROP counter after probe'
+    after6=$(managed_drop_packets ip6tables "$SET6") || fail 'cannot read intended IPv6 DROP counter after probe'
+  fi
+  probe_observation 'IPv4 control' "$V4_HOST" "$V4_CONTROL" allowed "$prefix-v4-control.json"
+  probe_observation 'IPv6 control' "$V6_HOST" "$V6_CONTROL" allowed "$prefix-v6-control.json"
+  probe_observation IPv4 "$V4_HOST" "$V4_PEER" "$expectation" "$prefix-v4.json" "$before4" "$after4"
+  probe_observation IPv6 "$V6_HOST" "$V6_PEER" "$expectation" "$prefix-v6.json" "$before6" "$after6"
+}
+# Kept as a narrow helper for local assertion regressions and single-family diagnostics.
+probe() {
+  local family=$1 address=$2 expectation=$3 output="$STATE/probe-single.json" before=0 after=0
+  local source=$V4_PEER binary=iptables set_name=$SET4
+  if [[ "$family" == IPv6 ]]; then source=$V6_PEER; binary=ip6tables; set_name=$SET6; fi
+  if [[ "$expectation" == blocked ]]; then before=$(managed_drop_packets "$binary" "$set_name"); fi
+  probe_raw "$address" "$source" "$output"
+  if [[ "$expectation" == blocked ]]; then after=$(managed_drop_packets "$binary" "$set_name"); fi
+  probe_observation "$family" "$address" "$source" "$expectation" "$output" "$before" "$after"
+}
+
+start_irr_fixture() {
+  local deadline=$((SECONDS + 5)) real_bgpq4
+  real_bgpq4=$(command -v bgpq4) || fail 'packaged bgpq4 is unavailable'
+  "$real_bgpq4" -v > "$STATE/bgpq4-version.txt" 2>&1
+  mkdir -p "$ROOT/asn-bin"
+  printf '#!/usr/bin/env bash\nexec %q -h 127.0.0.1:%q "$@"\n' "$real_bgpq4" "$IRR_PORT" > "$ROOT/asn-bin/bgpq4"
+  chmod 0755 "$ROOT/asn-bin/bgpq4"
+  stop_fixture "$STATE/irr.pid" "$ROOT/traffic.py irr $IRR_PORT"
+  rm -f "$STATE/irr.ready" "$STATE/irr.error"
+  : > "$STATE/irr-protocol.log"
+  python3 "$ROOT/traffic.py" irr "$IRR_PORT" "$STATE/irr.ready" "$STATE/irr-protocol.log" "$STATE/irr.error" > "$STATE/irr.log" 2>&1 9>&- &
+  printf '%s\n' "$!" > "$STATE/irr.pid"
+  while (( SECONDS < deadline )); do
+    [[ ! -s "$STATE/irr.error" ]] || fail 'IRR fixture rejected an unexpected request'
+    [[ ! -s "$STATE/irr.ready" ]] || return 0
+    sleep 0.05
+  done
+  fail 'IRR fixture did not become ready'
+}
+test_asn_resolver() {
+  e2e_check_start 'packaged ASN resolver and sync boundaries' 'actual bgpq4 resolves both families through local IRRd; ban/unban change enforcement only at sync; lookup works offline'
+  start_irr_fixture
+  local resolver_path="$ROOT/asn-bin:$PATH"
+  PATH="$resolver_path" kidobo ban --asn AS13335
+  grep -Fq 13335 "$CONFIG" || fail 'ASN ban did not update config'
+  if ipset test "$SET4" 203.0.113.80 >/dev/null 2>&1 || ipset test "$SET6" 2001:db8::80 >/dev/null 2>&1; then fail 'ASN ban changed enforcement before sync'; fi
+  PATH="$resolver_path" kidobo sync
+  assert_live_rules
+  ipset test "$SET4" 203.0.113.80 || fail 'ASN IPv4 prefix was not enforced'
+  ipset test "$SET6" 2001:db8::80 || fail 'ASN IPv6 prefix was not enforced'
+  grep -Eiq '^!gas13335$' "$STATE/irr-protocol.log" || fail 'packaged resolver did not request IPv4 prefixes'
+  grep -Eiq '^!6as13335$' "$STATE/irr-protocol.log" || fail 'packaged resolver did not request IPv6 prefixes'
+  [[ ! -s "$STATE/irr.error" ]] || fail 'packaged resolver used an unsupported IRRd request'
+  stop_fixture "$STATE/irr.pid" "$ROOT/traffic.py irr $IRR_PORT"
+  PATH="$resolver_path" kidobo lookup 203.0.113.80 --format tsv > "$STATE/asn-lookup-v4.tsv"
+  PATH="$resolver_path" kidobo lookup 2001:db8::80 --format tsv > "$STATE/asn-lookup-v6.tsv"
+  grep -Fxq "$(printf '203.0.113.80\tasn:AS13335\t203.0.113.80/32')" "$STATE/asn-lookup-v4.tsv" || fail 'offline ASN IPv4 lookup was incorrect'
+  grep -Fxq "$(printf '2001:db8::80\tasn:AS13335\t2001:db8::80/128')" "$STATE/asn-lookup-v6.tsv" || fail 'offline ASN IPv6 lookup was incorrect'
+  PATH="$resolver_path" kidobo unban --asn AS13335 --yes
+  ipset test "$SET4" 203.0.113.80 || fail 'ASN unban changed IPv4 enforcement before sync'
+  ipset test "$SET6" 2001:db8::80 || fail 'ASN unban changed IPv6 enforcement before sync'
+  sync_and_assert
+  if ipset test "$SET4" 203.0.113.80 >/dev/null 2>&1 || ipset test "$SET6" 2001:db8::80 >/dev/null 2>&1; then fail 'ASN prefixes remain after unban and sync'; fi
+  e2e_check_pass 'real packaged resolver queried both families; exact offline results match; ASN membership changed only after sync'
 }
 
 write_config() {
@@ -393,7 +484,8 @@ readonly_state_snapshot() {
 }
 
 test_init_idempotent() {
-  e2e_check_start 'initialization preserves existing files' 'repeat init leaves config and source hashes unchanged'
+  local profile=${1:-default}
+  e2e_check_start "initialization preserves $profile files" 'repeat init leaves config and source hashes unchanged'
   local files=("$CONFIG" "$BLOCKLIST")
   [[ -f "$CONFIG" && -f "$BLOCKLIST" ]] || fail 'kidobo init did not create required config and blocklist files'
   if [[ -f /var/lib/kidobo/temporary-bans.toml ]]; then
@@ -420,50 +512,16 @@ test_bad_checksum() {
   before_hash=$(sha256sum /usr/local/bin/kidobo | awk '{print $1}')
   before_mode=$(stat -c '%a' /usr/local/bin/kidobo)
   printf 'EXPECTED FAILURE: installer with corrupt SHA256SUMS\n' >&9
-  if KIDOBO_RELEASE_BASE_URL="http://127.0.0.1:$BAD_HTTP_PORT" "$installer" --version "$tag"; then
+  if KIDOBO_RELEASE_BASE_URL="http://127.0.0.1:$BAD_HTTP_PORT" "$installer" --version "$tag" > "$STATE/bad-checksum.stdout" 2> "$STATE/bad-checksum.stderr"; then
     fail 'installer accepted a bad candidate checksum'
   else
     printf 'EXPECTED FAILURE observed: corrupt-checksum installer exit status=%s\n' "$?" >&9
   fi
+  grep -Eiq "checksum|FAILED|did not match" "$STATE/bad-checksum.stdout" "$STATE/bad-checksum.stderr" || fail 'checksum failure did not identify a checksum rejection'
   [[ "$(kidobo --version)" == "$before" ]] || fail 'bad-checksum install changed the installed binary'
   [[ "$(sha256sum /usr/local/bin/kidobo | awk '{print $1}')" == "$before_hash" ]] || fail 'bad-checksum install changed binary bytes'
   [[ "$(stat -c '%a' /usr/local/bin/kidobo)" == "$before_mode" ]] || fail 'bad-checksum install changed binary mode'
   e2e_check_pass "installer rejected checksum; version=$before sha256=$before_hash mode=$before_mode preserved"
-}
-
-os_upgrade_phase() {
-  e2e_check_start 'operating system upgrade' 'upgrade uses the fresh provisioning metadata; transaction completes or requests reboot with status 102/103'
-  [[ -s "$STATE/provision.txt" ]] || fail 'OS upgrade requires provisioning metadata'
-  local family
-  family=$(sed -n 's/^family=//p' "$STATE/provision.txt")
-  # Several package managers use 102/103 to report a completed transaction
-  # that requires reboot. Record and accept those statuses; the host runner
-  # reboots before running the post-upgrade kernel checks.
-  run_upgrade() {
-    local rc=0
-    "$@" || rc=$?
-    case "$rc" in
-      0) ;;
-      102|103) printf 'package_manager_reboot_status=%s\n' "$rc" >> "$STATE/provision.txt"; printf 'EXPECTED STATUS: package manager requested reboot (status=%s)\n' "$rc" >&9 ;;
-      *) return "$rc" ;;
-    esac
-  }
-  case "$family" in
-    # provision.sh refreshed package metadata immediately before installing prerequisites.
-    # Reuse that per-VM metadata here; forcing another refresh adds network work without
-    # improving the OS upgrade coverage.
-    apt) export DEBIAN_FRONTEND=noninteractive; run_upgrade apt-get -y full-upgrade ;;
-    dnf|dnf-epel) run_upgrade dnf -y upgrade ;;
-    zypper) run_upgrade zypper --no-refresh --non-interactive update ;;
-    *) fail "unknown recorded package family: $family" ;;
-  esac
-  case "$family" in
-    apt) dpkg-query -W -f='${binary:Package}=${Version}\n' | sort > "$STATE/packages.txt" ;;
-    *) rpm -qa --qf '%{NAME}=%{EVR}\n' | sort > "$STATE/packages.txt" ;;
-  esac
-  printf 'os_upgrade_completed_utc=%s\n' "$(date -u +%FT%TZ)" >> "$STATE/provision.txt"
-  printf 'OS update completed for %s; runner must reboot then invoke bash /opt/kidobo-e2e/provision.sh --check-kernel\n' "$family"
-  e2e_check_pass "package transaction completed for $family; packages and upgrade time recorded; reboot required next"
 }
 
 start_phase() {
@@ -476,19 +534,18 @@ start_phase() {
   assert_installed_binary initial
   assert_init_artifacts
   e2e_check_pass "binary ownership/mode/archive hash and default config/systemd assertions passed; installed $tag"
-  test_init_idempotent
+  test_init_idempotent default
   write_config
   printf '%s\n' "$V4_PEER" "$V6_PEER" > "$BLOCKLIST"
   if [[ "$mode" == candidate ]]; then
-    test_init_idempotent
+    test_init_idempotent custom
   fi
   assert_target_version
   test_bad_checksum
   setup_namespace
   trap capture_namespace_and_cleanup EXIT
   start_traffic_servers
-  probe IPv4 "$V4_HOST" allowed
-  probe IPv6 "$V6_HOST" allowed
+  probe_pair allowed
 
   # Runtime sync fetches a real local HTTP source and blocks both address families.
   ensure_unrelated_sentinels
@@ -496,8 +553,7 @@ start_phase() {
   sync_and_assert
   # Repeated synchronization must preserve the exact managed wiring and unrelated rules.
   sync_and_assert
-  probe IPv4 "$V4_HOST" blocked
-  probe IPv6 "$V6_HOST" blocked
+  probe_pair blocked
   ipset list "$SET4" | grep -Fq 198.51.100.44 || fail 'HTTP IPv4 source was not enforced'
   ipset list "$SET6" | grep -Fq 2001:db8::44 || fail 'HTTP IPv6 source was not enforced'
   e2e_check_pass 'two syncs preserved exact wiring; IPv4/IPv6 probes blocked; source members 198.51.100.44 and 2001:db8::44 present'
@@ -523,22 +579,20 @@ start_phase() {
   cp -p "$CONFIG" "$STATE/config.good.toml"
   printf '\nunknown_key = true\n' >> "$CONFIG"
   printf 'EXPECTED FAILURE: sync with unknown configuration key\n' >&9
-  if kidobo sync; then fail 'invalid configuration unexpectedly synchronized'; else printf 'EXPECTED FAILURE observed: invalid-config sync exit status=%s\n' "$?" >&9; fi
+  if kidobo sync > "$STATE/invalid-config.stdout" 2> "$STATE/invalid-config.stderr"; then fail 'invalid configuration unexpectedly synchronized'; else printf 'EXPECTED FAILURE observed: invalid-config sync exit status=%s\n' "$?" >&9; fi
+  grep -Fq unknown_key "$STATE/invalid-config.stderr" || fail 'invalid config failed without identifying unknown_key'
   cp -p "$STATE/config.good.toml" "$CONFIG"
-  probe IPv4 "$V4_HOST" blocked
-  probe IPv6 "$V6_HOST" blocked
+  probe_pair blocked
   e2e_check_pass 'invalid-config sync rejected; restored config; both traffic probes remain blocked'
 
   # Exact safelist entries release only the test traffic source; removing them reapplies it.
   e2e_check_start 'safelist add and removal' 'both families become allowed with safelists and blocked after removal'
   write_config "$V4_PEER" "$V6_PEER"
   sync_and_assert
-  probe IPv4 "$V4_HOST" allowed
-  probe IPv6 "$V6_HOST" allowed
+  probe_pair allowed
   write_config
   sync_and_assert
-  probe IPv4 "$V4_HOST" blocked
-  probe IPv6 "$V6_HOST" blocked
+  probe_pair blocked
   e2e_check_pass 'IPv4/IPv6 probes allowed with safelists, blocked after safelist removal and sync'
 
   # Exercise a temporary source edit, offline lookup, sync boundary, and removal.
@@ -570,6 +624,8 @@ start_phase() {
   if ipset list "$SET4" | grep -Fq 203.0.113.78; then fail 'sync retained the removed permanent ban'; fi
   e2e_check_pass '203.0.113.78 added/removed in blocklist; live membership changed only after each sync'
 
+  test_asn_resolver
+
   # Read-only doctor and lookup must leave source files, sets, and firewall rules unchanged.
   e2e_check_start 'offline doctor and lookup preserve runtime' 'readonly-before and readonly-after snapshots match with HTTP source stopped'
   stop_fixture "$STATE/http-source.pid" "$ROOT/traffic.py source $ROOT/fixtures/feed.txt $SOURCE_PORT"
@@ -592,7 +648,8 @@ EOF
   local before after
   before=$(sets_snapshot)
   printf 'EXPECTED FAILURE: IPv6-only capacity overflow during sync\n' >&9
-  if kidobo sync; then fail 'capacity-limited sync unexpectedly succeeded'; else printf 'EXPECTED FAILURE observed: capacity-limited sync exit status=%s\n' "$?" >&9; fi
+  if kidobo sync > "$STATE/capacity.stdout" 2> "$STATE/capacity.stderr"; then fail 'capacity-limited sync unexpectedly succeeded'; else printf 'EXPECTED FAILURE observed: capacity-limited sync exit status=%s\n' "$?" >&9; fi
+  grep -Eiq "IPv6.*(capacity|maxelem)|capacity.*IPv6|maxelem" "$STATE/capacity.stderr" || fail 'capacity rejection did not identify capacity/maxelem'
   after=$(sets_snapshot)
   [[ "$before" == "$after" ]] || fail 'IPv6 capacity failure changed IPv4 or IPv6 sets/firewall rules'
   e2e_check_pass "firewall snapshot hashes match: before=$before after=$after; IPv6 capacity failure rejected"
@@ -628,92 +685,205 @@ wait_for_timer_run() {
   done
   fail 'kidobo-sync.timer did not start its service within 180 seconds after reboot'
 }
+assert_reboot_preparation() {
+  [[ -s "$ROOT/prepared/expected-kernel" && "$(uname -r)" == "$(<"$ROOT/prepared/expected-kernel")" ]] || fail 'application reboot did not retain the intended prepared kernel'
+  [[ -s "$ROOT/prepared/selinux-requested" ]] || fail 'application reboot lacks security preparation provenance'
+  if [[ "$(<"$ROOT/prepared/selinux-requested")" == enforcing ]]; then
+    [[ "$(getenforce)" == Enforcing && ! -e /.autorelabel ]] || fail 'application reboot lost completed enforcing SELinux state'
+  fi
+}
 after_reboot_phase() {
   e2e_check_start 'reboot restores timer enforcement' 'version retained; timer enabled/active; sync service succeeds; both traffic families blocked'
   assert_target_version
+  assert_reboot_preparation
   systemctl is-enabled --quiet kidobo-sync.timer || fail 'timer lost enabled state across reboot'
   systemctl is-active --quiet kidobo-sync.timer || fail 'timer is not active after reboot'
   wait_for_timer_run
+  ipset test "$SET4" 198.51.100.44 || fail 'boot sync lost cached remote IPv4 entry'
+  ipset test "$SET6" 2001:db8::44 || fail 'boot sync lost cached remote IPv6 entry'
+  kidobo lookup 198.51.100.44 --format tsv > "$STATE/reboot-remote-lookup.tsv"
+  grep -Fxq "$(printf '198.51.100.44\thttp://127.0.0.1:%s/feed.txt\t198.51.100.44/32' "$SOURCE_PORT")" "$STATE/reboot-remote-lookup.tsv" || fail 'boot offline lookup lost remote cache'
   kidobo doctor > "$STATE/doctor-after-reboot.json"
   start_source_fixture
   if [[ "$mode" == candidate ]]; then serve_dir "$RELEASE" "$HTTP_PORT" release-after-reboot; fi
   setup_namespace
   trap capture_namespace_and_cleanup EXIT
   start_traffic_servers
-  probe IPv4 "$V4_HOST" blocked
-  probe IPv6 "$V6_HOST" blocked
+  probe_pair blocked
   # Firewall rules and ipsets are volatile across reboot; recreate only the
   # test-owned sentinels before asserting post-reboot sync preservation.
   ensure_unrelated_sentinels
   sync_and_assert
-  probe IPv4 "$V4_HOST" blocked
-  probe IPv6 "$V6_HOST" blocked
+  probe_pair blocked
   printf 'after-reboot phase passed: %s (timer fired)\n' "$tag"
   e2e_check_pass "version=$tag; timer fired successfully; repeated sync preserved wiring; IPv4/IPv6 probes blocked"
 }
 
+configure_baseline_sources() {
+  python3 - "$CONFIG" "$SET4" "$SET6" "$SOURCE_PORT" <<'PYCONFIG'
+import re
+import sys
+from pathlib import Path
+path = Path(sys.argv[1])
+updates = {
+    "ipset": {"set_name": f'"{sys.argv[2]}"', "set_name_v6": f'"{sys.argv[3]}"', "enable_ipv6": "true", "chain_action": '"DROP"'},
+    "safe": {"ips": "[]", "include_github_meta": "false"},
+    "remote": {"urls": f'["http://127.0.0.1:{sys.argv[4]}/feed.txt"]'},
+    "asn": {"banned": "[]"},
+}
+section = ""
+seen = set()
+sections = set()
+lines = []
+def complete_section():
+    for name, value in updates.get(section, {}).items():
+        if (section, name) not in seen:
+            lines.append(f"{name} = {value}")
+            seen.add((section, name))
+for line in path.read_text(encoding="utf-8").splitlines():
+    match = re.fullmatch(r"\s*\[([^]]+)\]\s*", line)
+    if match:
+        complete_section()
+        section = match.group(1)
+        sections.add(section)
+    key = re.match(r"\s*([a-z0-9_]+)\s*=", line)
+    if key and key.group(1) in updates.get(section, {}):
+        name = key.group(1)
+        line = f"{name} = {updates[section][name]}"
+        seen.add((section, name))
+    lines.append(line)
+complete_section()
+if not set(updates).issubset(sections):
+    raise SystemExit(f"baseline config lacks expected stable tables: {set(updates) - sections}")
+path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+PYCONFIG
+}
+assert_remote_lookup() {
+  local label=$1 address=$2 cidr=$3
+  kidobo lookup "$address" --format tsv > "$STATE/$label.tsv"
+  grep -Fxq "$(printf '%s\thttp://127.0.0.1:%s/feed.txt\t%s' "$address" "$SOURCE_PORT" "$cidr")" "$STATE/$label.tsv" || fail "exact cached remote lookup failed: $label"
+}
+install_frozen_baseline() {
+  local baseline_tag=$1 directory="$ROOT/baseline-bin"
+  mkdir -p "$directory"
+  printf '#!/usr/bin/env bash\nexec python3 %q baseline-download %q %q "$@"\n' "$ROOT/traffic.py" "$BASELINE" "$baseline_tag" > "$directory/curl"
+  chmod 0755 "$directory/curl"
+  env -u KIDOBO_RELEASE_BASE_URL PATH="$directory:$PATH" "$BASELINE/installer.sh" --version "$baseline_tag" --init
+}
+create_recovered_baseline_cache() {
+  local isolated="$ROOT/baseline-cache-root" fake="$ROOT/baseline-cache-bin" name
+  mkdir -p "$isolated/config" "$isolated/data" "$fake"
+  cp -p "$CONFIG" "$isolated/config/config.toml"
+  cp -p "$BLOCKLIST" "$isolated/data/blocklist.txt"
+  for name in ipset iptables ip6tables; do
+    printf '#!/usr/bin/env bash\nexec python3 %q baseline-firewall %q "${0##*/}" "$@"\n' "$ROOT/traffic.py" "$isolated" > "$fake/$name"
+    chmod 0755 "$fake/$name"
+  done
+  # Only the old binary's cache writer uses these fakes, inside a separate root.
+  # The candidate and the guest's live firewall never see this PATH.
+  KIDOBO_ROOT="$isolated" PATH="$fake:$PATH" /usr/local/bin/kidobo sync > "$STATE/baseline-cache-generation.stdout" 2> "$STATE/baseline-cache-generation.stderr"
+  [[ -n "$(find "$isolated/cache/remote" -type f -print -quit)" ]] || fail 'recovered baseline did not generate a cache'
+  rm -rf /var/cache/kidobo/remote
+  cp -a "$isolated/cache/remote" /var/cache/kidobo/remote
+  printf 'generator=%s\nroot=%s\nfirewall=isolated-fakes-only\n' "$(kidobo --version)" "$isolated" > "$STATE/baseline-cache-provenance.txt"
+  find "$isolated/cache/remote" -type f -print0 | sort -z | xargs -0 -r sha256sum >> "$STATE/baseline-cache-provenance.txt"
+}
+test_candidate_temporary_reinstall() {
+  e2e_check_start 'candidate reinstall preserves temporary bans' 'nonempty temporary state and exact offline lookup survive binary reinstall and remain enforceable'
+  local target=203.0.113.79 preserved="$STATE/reinstall-temporary-bans.toml"
+  kidobo ban "$target" --for 1d
+  cp -p /var/lib/kidobo/temporary-bans.toml "$preserved"
+  install_target
+  assert_target_version
+  assert_installed_binary reinstalled
+  cmp -s "$preserved" /var/lib/kidobo/temporary-bans.toml || fail 'candidate reinstall changed nonempty temporary state'
+  kidobo lookup "$target" --format tsv > "$STATE/reinstall-temporary-lookup.tsv"
+  grep -Fxq "$(printf '%s\ttemporary:blocklist\t%s/32' "$target" "$target")" "$STATE/reinstall-temporary-lookup.tsv" || fail 'candidate reinstall lost the active temporary lookup'
+  sync_and_assert
+  ipset test "$SET4" "$target" || fail 'reinstalled candidate did not enforce temporary ban'
+  e2e_check_pass 'nonempty temporary file preserved byte-for-byte; exact offline lookup and enforcement passed'
+}
 upgrade_phase() {
-  e2e_check_start 'baseline to target upgrade preserves data' 'published baseline validated or narrowly recovered; target installed; config/blocklist/active temporary ban unchanged; preserved ban found offline and enforced'
+  e2e_check_start 'baseline to target upgrade preserves data' 'old binary generates config, permanent bans and cache; binary upgrade preserves them and works offline before refresh'
   start_source_fixture
-  if [[ "$mode" == candidate ]] && ! fixture_curl -fsS "http://127.0.0.1:$HTTP_PORT/" >/dev/null 2>&1; then
-    serve_dir "$RELEASE" "$HTTP_PORT" release-upgrade
-  fi
-  [[ -s "$ROOT/baseline-tag" ]] || fail 'runner must write /opt/kidobo-e2e/baseline-tag'
-  local baseline_tag baseline_installer="$BASELINE/installer.sh"
+  if [[ "$mode" == candidate ]]; then serve_dir "$RELEASE" "$HTTP_PORT" release-upgrade; fi
+  [[ -s "$ROOT/baseline-tag" ]] || fail 'runner must capture baseline-tag'
+  local baseline_tag baseline_archive baseline_hash installed_hash
   baseline_tag=$(<"$ROOT/baseline-tag")
-  [[ "$baseline_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z][0-9A-Za-z.-]*)?$ ]] || fail 'invalid baseline-tag'
-  [[ "$baseline_tag" != "$tag" ]] || fail 'baseline-tag must differ from target tag'
-  [[ -x "$baseline_installer" ]] || fail "missing baseline installer $baseline_installer"
-  [[ -s "$BASELINE/SHA256SUMS" ]] || fail 'baseline release checksums missing'
-  local upgrade_temporary_target=203.0.113.79
-  kidobo ban "$upgrade_temporary_target" --for 1d
-  local preserved_config="$STATE/upgrade-config.toml" preserved_blocklist="$STATE/upgrade-blocklist.txt"
-  local preserved_temporary="$STATE/upgrade-temporary-bans.toml"
-  cp -p "$CONFIG" "$preserved_config"
-  cp -p "$BLOCKLIST" "$preserved_blocklist"
-  cp -p /var/lib/kidobo/temporary-bans.toml "$preserved_temporary"
-
-  # The installer uninstall path is verified separately in finish; this phase
-  # performs a baseline install followed by an in-place target binary upgrade.
+  [[ "$baseline_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z][0-9A-Za-z.-]*)?$ && "$baseline_tag" != "$tag" ]] || fail 'invalid or equal baseline tag'
+  baseline_archive="$BASELINE/kidobo-${baseline_tag}-linux-x86_64.tar.gz"
+  [[ -s "$baseline_archive" && -s "$BASELINE/SHA256SUMS" && -x "$BASELINE/installer.sh" ]] || fail 'captured baseline assets are incomplete'
+  (cd "$BASELINE"; awk -v archive="${baseline_archive##*/}" '$2 == archive { print }' SHA256SUMS | sha256sum -c -) || fail 'captured baseline checksum mismatch'
   defer_timer_until_configuration_is_ready
   wait_for_sync_service_idle
   "$installer" --uninstall
-  # Use the release installer recovery path for the known systemd
-  # reset-failed response seen on a cleanly uninstalled guest.
-  env -u KIDOBO_RELEASE_BASE_URL "$baseline_installer" --version "$baseline_tag" --init
+  # Uninstall removes the deferral directory, so establish it again before old init.
+  clear_timer_deferral
+  defer_timer_until_configuration_is_ready
+  install_frozen_baseline "$baseline_tag"
+  [[ "$(kidobo --version)" == "kidobo ${baseline_tag#v}" ]] || fail 'captured baseline version did not install'
   assert_installed_binary baseline
+  baseline_hash=$(tar -xzOf "$baseline_archive" "kidobo-${baseline_tag}-linux-x86_64/kidobo" | sha256sum | awk '{print $1}')
+  installed_hash=$(sha256sum /usr/local/bin/kidobo | awk '{print $1}')
+  [[ "$baseline_hash" == "$installed_hash" ]] || fail 'installed baseline differs from frozen archive member'
+  printf '%s  baseline-binary\n' "$baseline_hash" > "$STATE/baseline-binary.sha256"
   assert_systemd_units
-  cp -p "$preserved_config" "$CONFIG"
-  cp -p "$preserved_blocklist" "$BLOCKLIST"
-  cp -p "$preserved_temporary" /var/lib/kidobo/temporary-bans.toml
-  local baseline_version
-  baseline_version=$(kidobo --version)
-  [[ "$baseline_version" == "kidobo ${baseline_tag#v}" ]] || fail 'baseline version did not install from published release'
-
-  # Exercise the baseline release against real dual-stack traffic before
-  # replacing it with the candidate binary.
+  configure_baseline_sources
+  kidobo ban "$V4_PEER"
+  kidobo ban "$V6_PEER"
+  kidobo ban --help > "$STATE/baseline-ban-help.txt"
+  local preserved_config="$STATE/upgrade-config.toml" preserved_blocklist="$STATE/upgrade-blocklist.txt"
+  local preserved_temporary=- temporary_supported=false
+  if grep -Eq -- '(^|[[:space:]])--for([[:space:]]|$)' "$STATE/baseline-ban-help.txt"; then
+    temporary_supported=true
+    kidobo ban 203.0.113.79 --for 1d
+    preserved_temporary="$STATE/upgrade-temporary-bans.toml"
+    cp -p /var/lib/kidobo/temporary-bans.toml "$preserved_temporary"
+  else
+    [[ ! -e /var/lib/kidobo/temporary-bans.toml ]] || fail 'legacy baseline unexpectedly created temporary state'
+  fi
+  printf '{"tag":"%s","temporary_bans":%s}\n' "$baseline_tag" "$temporary_supported" > "$STATE/baseline-capabilities.json"
+  cp -p "$CONFIG" "$preserved_config"
+  cp -p "$BLOCKLIST" "$preserved_blocklist"
   setup_namespace
   trap capture_namespace_and_cleanup EXIT
   start_traffic_servers
   run_baseline_enforcement_check "$baseline_tag" "$preserved_config" "$preserved_blocklist" "$preserved_temporary" /var/lib/kidobo/temporary-bans.toml
-
+  if [[ -s "$STATE/upgrade-recovery.txt" ]]; then create_recovered_baseline_cache; fi
+  assert_remote_lookup baseline-remote-v4 198.51.100.44 198.51.100.44/32
+  assert_remote_lookup baseline-remote-v6 2001:db8::44 2001:db8::44/128
+  find /var/cache/kidobo/remote -type f -print0 | sort -z | xargs -0 -r sha256sum > "$STATE/upgrade-cache-before.sha256"
+  stop_fixture "$STATE/http-source.pid" "$ROOT/traffic.py source $ROOT/fixtures/feed.txt $SOURCE_PORT"
   install_target
   assert_target_version
   assert_installed_binary upgraded
-  cmp -s "$preserved_config" "$CONFIG" || fail 'binary upgrade changed configuration'
-  cmp -s "$preserved_blocklist" "$BLOCKLIST" || fail 'binary upgrade changed blocklist data'
-  cmp -s "$preserved_temporary" /var/lib/kidobo/temporary-bans.toml || fail 'binary upgrade changed temporary-ban data'
-  kidobo lookup "$upgrade_temporary_target" --format tsv > "$STATE/upgrade-temporary-lookup.tsv"
-  grep -Fxq "$(printf '%s\ttemporary:blocklist\t%s/32' "$upgrade_temporary_target" "$upgrade_temporary_target")" "$STATE/upgrade-temporary-lookup.tsv" || fail 'binary upgrade lost the active temporary ban from offline lookup'
-  printf 'PRESERVATION: cmp upgrade-config.toml with %s, upgrade-blocklist.txt with %s, upgrade-temporary-bans.toml with temporary-bans.toml: all match\n' "$CONFIG" "$BLOCKLIST" >&9
+  cmp -s "$preserved_config" "$CONFIG" || fail 'binary upgrade changed baseline-generated config'
+  cmp -s "$preserved_blocklist" "$BLOCKLIST" || fail 'binary upgrade changed baseline-generated blocklist'
+  sha256sum -c "$STATE/upgrade-cache-before.sha256" || fail 'binary upgrade changed old remote-cache bytes'
+  if [[ "$preserved_temporary" != - ]]; then
+    cmp -s "$preserved_temporary" /var/lib/kidobo/temporary-bans.toml || fail 'binary upgrade changed baseline temporary data'
+    kidobo lookup 203.0.113.79 --format tsv > "$STATE/upgrade-temporary-lookup.tsv"
+    grep -Fxq "$(printf '203.0.113.79\ttemporary:blocklist\t203.0.113.79/32')" "$STATE/upgrade-temporary-lookup.tsv" || fail 'binary upgrade lost baseline temporary lookup'
+  else
+    [[ ! -e /var/lib/kidobo/temporary-bans.toml ]] || fail 'binary-only legacy upgrade unexpectedly created temporary state'
+  fi
+  assert_remote_lookup upgraded-remote-v4 198.51.100.44 198.51.100.44/32
+  assert_remote_lookup upgraded-remote-v6 2001:db8::44 2001:db8::44/128
+  sync_and_assert
+  ipset test "$SET4" 198.51.100.44 || fail 'offline upgraded sync lost old remote IPv4 cache'
+  ipset test "$SET6" 2001:db8::44 || fail 'offline upgraded sync lost old remote IPv6 cache'
+  if [[ "$preserved_temporary" != - ]]; then
+    ipset test "$SET4" 203.0.113.79 || fail 'offline upgraded sync lost the baseline-generated temporary ban'
+  fi
+  probe_pair blocked
+  start_source_fixture
+  # Initialize only after proving binary-only upgrade compatibility, including missing temporary state.
+  kidobo init
+  test_candidate_temporary_reinstall
   restore_boot_timer
   kidobo doctor > "$STATE/doctor-after-upgrade.json"
-  sync_and_assert
-  ipset test "$SET4" "$upgrade_temporary_target" || fail 'upgraded sync did not enforce the preserved temporary ban'
-  probe IPv4 "$V4_HOST" blocked
-  probe IPv6 "$V6_HOST" blocked
-  printf 'upgrade phase passed: baseline %s -> target %s with config/data retained\n' "$baseline_tag" "$tag"
-  e2e_check_pass "baseline=$baseline_tag target=$tag; three preserved files match; active temporary ban found offline and enforced; IPv4/IPv6 blocked after target sync"
+  printf 'upgrade phase passed: baseline %s -> target %s with baseline-generated files and cache retained\n' "$baseline_tag" "$tag"
+  e2e_check_pass "baseline=$baseline_tag target=$tag; old files/cache preserved; exact IPv4/IPv6 lookup and enforcement succeeded with source stopped"
 }
 
 assert_enforcement_absent() {
@@ -787,13 +957,13 @@ run_baseline_enforcement_check() {
   kidobo sync > "$STATE/baseline-sync.stdout" 2> "$STATE/baseline-sync.stderr" || baseline_sync_status=$?
   printf '%s\n' "$baseline_sync_status" > "$STATE/baseline-sync.status"
   printf 'BASELINE SYNC: observed exit status=%s; stdout follows\n' "$baseline_sync_status" >&9
+  printf '{"profile":"%s","status":%s}\n' "$([[ "$baseline_sync_status" == 0 ]] && printf live || printf recovery-candidate)" "$baseline_sync_status" > "$STATE/baseline-enforcement-profile.json"
   cat "$STATE/baseline-sync.stdout" >&9
   printf '\nBASELINE SYNC: stderr follows\n' >&9
   cat "$STATE/baseline-sync.stderr" >&9
   if [[ "$baseline_sync_status" == 0 ]]; then
     assert_live_rules
-    probe IPv4 "$V4_HOST" blocked
-    probe IPv6 "$V6_HOST" blocked
+    probe_pair blocked
     e2e_check_pass 'baseline sync exited 0; exact managed rules verified; IPv4/IPv6 probes blocked'
     return 0
   fi
@@ -801,16 +971,18 @@ run_baseline_enforcement_check() {
      ! baseline_missing_chain_diagnostic_matches "$baseline_sync_status" "$STATE/baseline-sync.stderr"; then
     fail "published baseline sync failed unexpectedly (status=$baseline_sync_status); see $STATE/baseline-sync.stderr"
   fi
+  printf '{"profile":"known-debian12-recovery","status":%s}\n' "$baseline_sync_status" > "$STATE/baseline-enforcement-profile.json"
   capture_upgrade_firewall_evidence "$STATE/baseline-firewall-after.txt"
   cmp -s "$preserved_config" "$CONFIG" || fail 'known baseline sync failure changed configuration'
   cmp -s "$preserved_blocklist" "$BLOCKLIST" || fail 'known baseline sync failure changed blocklist data'
-  cmp -s "$preserved_temporary" "$temporary_bans" || fail 'known baseline sync failure changed temporary-ban data'
+  if [[ "$preserved_temporary" != - ]]; then cmp -s "$preserved_temporary" "$temporary_bans" || fail 'known baseline sync failure changed temporary-ban data'; fi
   assert_unrelated_sentinels
   assert_no_managed_firewall_jumps
+  probe_pair allowed
   printf '%s\n' \
     "baseline recovery: $baseline_tag sync failed with the known Debian 12 iptables 1.8.9 nftables missing-chain diagnostic; evidence saved under $STATE; candidate enforcement is required next" \
     | tee "$STATE/upgrade-recovery.txt"
-  e2e_check_pass "KNOWN BASELINE RECOVERY: $baseline_tag sync status=$baseline_sync_status matched exact Debian 12 diagnostic; three preserved files match; unrelated sentinels intact; no managed jumps; candidate enforcement required next"
+  e2e_check_pass "KNOWN BASELINE RECOVERY: $baseline_tag sync status=$baseline_sync_status matched exact Debian 12 diagnostic; config/blocklist and applicable temporary state match; unrelated sentinels intact; no managed jumps; candidate enforcement required next"
 }
 test_uninstall_failure_preserves_runtime() {
   e2e_check_start 'failed uninstall preserves runtime' 'invalid-config uninstall fails; timer, binary hash, runtime files and exact dual-stack enforcement retained before repair'
@@ -822,14 +994,14 @@ test_uninstall_failure_preserves_runtime() {
   before_firewall=$(sets_snapshot)
   printf '\nunknown_key = true\n' >> "$CONFIG"
   printf 'EXPECTED FAILURE: uninstall with invalid runtime configuration\n' >&9
-  if "$installer" --uninstall; then fail 'uninstall unexpectedly succeeded with invalid runtime configuration'; else printf 'EXPECTED FAILURE observed: invalid-config uninstall exit status=%s\n' "$?" >&9; fi
+  if "$installer" --uninstall > "$STATE/failed-uninstall.stdout" 2> "$STATE/failed-uninstall.stderr"; then fail 'uninstall unexpectedly succeeded with invalid runtime configuration'; else printf 'EXPECTED FAILURE observed: invalid-config uninstall exit status=%s\n' "$?" >&9; fi
+  grep -Fq unknown_key "$STATE/failed-uninstall.stdout" "$STATE/failed-uninstall.stderr" || fail 'failed uninstall did not identify invalid configuration'
   systemctl is-active --quiet kidobo-sync.timer || fail 'failed uninstall did not restore the active timer'
   [[ -x /usr/local/bin/kidobo && -s "$CONFIG" && -s "$BLOCKLIST" ]] || fail 'failed uninstall removed runtime files or binary'
   [[ "$(sha256sum /usr/local/bin/kidobo | awk '{print $1}')" == "$before_hash" ]] || fail 'failed uninstall changed binary bytes'
   ipset list "$SET4" >/dev/null && ipset list "$SET6" >/dev/null || fail 'failed uninstall removed managed ipsets'
   [[ "$(sets_snapshot)" == "$before_firewall" ]] || fail 'failed uninstall changed live firewall enforcement'
-  probe IPv4 "$V4_HOST" blocked
-  probe IPv6 "$V6_HOST" blocked
+  probe_pair blocked
   cp -p "$STATE/finish-config.good.toml" "$CONFIG"
   sync_and_assert
   restore_boot_timer
@@ -851,16 +1023,14 @@ finish_phase() {
   local sync_lock_inode
   sync_lock_inode=$(stat -c '%i' /var/cache/kidobo/sync.lock)
   kidobo flush --cache-only
-  probe IPv4 "$V4_HOST" blocked
-  probe IPv6 "$V6_HOST" blocked
+  probe_pair blocked
   [[ -d /var/cache/kidobo/remote ]] || fail 'cache-only flush removed the remote cache directory'
   [[ -z "$(find /var/cache/kidobo/remote -type f -print -quit)" ]] || fail 'cache-only flush retained remote cache files'
   [[ "$(stat -c '%i' /var/cache/kidobo/sync.lock)" == "$sync_lock_inode" ]] || fail 'cache-only flush replaced the sync lock file'
   e2e_check_pass "remote cache empty; directory retained; sync lock inode=$sync_lock_inode unchanged; both probes blocked"
   e2e_check_start 'flush removes only managed enforcement' 'managed sets/chains absent; both families allowed; unrelated sentinels retained'
   kidobo flush
-  probe IPv4 "$V4_HOST" allowed
-  probe IPv6 "$V6_HOST" allowed
+  probe_pair allowed
   assert_enforcement_absent
   assert_unrelated_sentinels
   e2e_check_pass 'managed sets/chains absent; both probes allowed; unrelated IPv4/IPv6 sentinels present'
@@ -870,14 +1040,12 @@ finish_phase() {
   sync_and_assert
   ipset list "$SET4" >/dev/null || fail 'sync did not restore managed IPv4 set'
   ipset list "$SET6" >/dev/null || fail 'sync did not restore managed IPv6 set'
-  probe IPv4 "$V4_HOST" blocked
-  probe IPv6 "$V6_HOST" blocked
+  probe_pair blocked
   defer_timer_until_configuration_is_ready
   wait_for_sync_service_idle
   "$installer" --uninstall
   clear_timer_deferral
-  probe IPv4 "$V4_HOST" allowed
-  probe IPv6 "$V6_HOST" allowed
+  probe_pair allowed
   assert_no_managed_runtime
   assert_unrelated_sentinels
   e2e_check_pass 'binary/data/cache/units/sets/chains absent; timer inactive; IPv4/IPv6 allowed; unrelated sentinels retained'
@@ -887,7 +1055,6 @@ finish_phase() {
 }
 
 case "$phase" in
-  os-upgrade) os_upgrade_phase ;;
   start) start_phase ;;
   after-reboot) after_reboot_phase ;;
   upgrade) upgrade_phase ;;

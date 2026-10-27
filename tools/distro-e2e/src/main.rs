@@ -8,15 +8,18 @@ use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 const OWNER: &str = "kidobo-e2e-v1";
 
+mod contract;
+mod coordination;
 mod matrix;
+mod prepared;
 mod report;
 mod resume;
 use report::Report;
@@ -48,12 +51,15 @@ enum Action {
         /// Reuse completed target results for the same candidate and test inputs.
         #[arg(long, conflicts_with_all = ["published", "distro"])]
         resume: Option<String>,
+        /// Rebuild selected preparation images and rerun selected lifecycle results.
+        #[arg(long)]
+        refresh_images: bool,
     },
     Clean {
         run_id: String,
     },
 }
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Config {
     project: String,
@@ -64,8 +70,12 @@ struct Config {
     memory: String,
     disk: String,
     distros: Vec<Distro>,
+    #[serde(default = "default_parallelism")]
+    max_parallel_vms: usize,
+    #[serde(default)]
+    prepared_images: prepared::Settings,
 }
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Distro {
     id: String,
@@ -74,6 +84,14 @@ struct Distro {
     packages: Vec<String>,
     #[serde(default = "required_by_default")]
     required: bool,
+    #[serde(default = "default_selinux")]
+    selinux: String,
+}
+fn default_parallelism() -> usize {
+    2
+}
+fn default_selinux() -> String {
+    "image-default".into()
 }
 fn required_by_default() -> bool {
     true
@@ -102,6 +120,7 @@ struct Runner {
     cancelled: Arc<AtomicBool>,
     report: Report,
     command_poll_interval: Duration,
+    ignore_cancellation: bool,
 }
 /// Each command owns only one pair of temporary files, removed even on failure.
 struct Capture {
@@ -109,12 +128,41 @@ struct Capture {
     stdout: File,
     stderr: File,
 }
+struct ManagedChild {
+    child: Child,
+    completed: bool,
+}
+impl std::ops::Deref for ManagedChild {
+    type Target = Child;
+    fn deref(&self) -> &Child {
+        &self.child
+    }
+}
+impl std::ops::DerefMut for ManagedChild {
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.child
+    }
+}
+impl Drop for ManagedChild {
+    fn drop(&mut self) {
+        if !self.completed {
+            if let Ok(pid) = i32::try_from(self.child.id()) {
+                let _ = nix::sys::signal::killpg(
+                    nix::unistd::Pid::from_raw(pid),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+            }
+            let _ = self.child.wait();
+        }
+    }
+}
 impl Capture {
     fn new(root: &Path) -> Result<Self> {
+        static NEXT_CAPTURE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let dir = root.join(format!(
             ".capture-{}-{}",
             std::process::id(),
-            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+            NEXT_CAPTURE.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir(&dir)?;
         let result = (|| -> Result<Self> {
@@ -201,6 +249,17 @@ fn safe_name(value: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
 }
 impl Runner {
+    fn worker(&self, sink: std::sync::mpsc::SyncSender<report::Event>) -> Result<Self> {
+        Ok(Self {
+            project: self.project.clone(),
+            dir: self.dir.clone(),
+            incus_program: self.incus_program.clone(),
+            cancelled: Arc::clone(&self.cancelled),
+            report: self.report.worker(sink)?,
+            command_poll_interval: self.command_poll_interval,
+            ignore_cancellation: false,
+        })
+    }
     fn stage(&mut self, name: &str) -> Result<()> {
         self.report.finish_stage("passed")?;
         self.report.stage(name)
@@ -209,9 +268,7 @@ impl Runner {
         self.dir.join(".evidence")
     }
     fn command(&mut self, program: &str, args: &[String], seconds: u64) -> Result<String> {
-        let id = self.report.document["commands"]
-            .as_array()
-            .map_or(1, |v| v.len() + 1);
+        let id = self.report.next_command_id();
         let line = self.report.emit(&format!(
             "[{} | command {id}] START {} {} (timeout {seconds}s)",
             self.report.context,
@@ -227,12 +284,16 @@ impl Runner {
                 "code": null, "status": "running", "line": line,
             }));
         self.report.save()?;
-        let result = self.capture_command(id, program, args, seconds);
+        let result = if !self.ignore_cancellation && self.cancelled.load(Ordering::Relaxed) {
+            Ok((None, String::new(), Some("interrupted".into())))
+        } else {
+            self.capture_command(id, program, args, seconds)
+        };
         let (code, output, mut error) = match result {
             Ok((code, output, reason)) => (code, output, reason),
             Err(error) => (None, String::new(), Some(error.to_string())),
         };
-        let record = &mut self.report.document["commands"][id - 1];
+        let record = self.report.command_mut(id)?;
         record["code"] = json!(code);
         record["seconds"] = json!(started.elapsed().as_secs_f64());
         record["error"] = json!(error);
@@ -252,19 +313,30 @@ impl Runner {
             },
         )?;
         if error.is_none()
+            && let Err(failure) = contract::validate(
+                &self.report.document,
+                id,
+                args,
+                &self.evidence().join("inputs/checks.json"),
+            )
+        {
+            error = Some(failure.to_string());
+            self.report.command_mut(id)?["error"] = json!(error);
+            self.report.command_mut(id)?["status"] = json!("error");
+        }
+        if error.is_none()
             && self.report.document["checks"]
                 .as_array()
                 .is_some_and(|checks| {
-                    checks.iter().any(|check| {
-                        check["command"] == id
-                            && matches!(check["status"].as_str(), Some("failed" | "interrupted"))
-                    })
+                    checks
+                        .iter()
+                        .any(|check| check["command"] == id && check["status"] != "passed")
                 })
         {
             error =
                 Some("failed or unfinished guest checks despite successful command exit".into());
-            self.report.document["commands"][id - 1]["error"] = json!(error);
-            self.report.document["commands"][id - 1]["status"] = json!("error");
+            self.report.command_mut(id)?["error"] = json!(error);
+            self.report.command_mut(id)?["status"] = json!("error");
         }
         self.report.emit(&format!(
             "[{} | command {id}] END exit={} elapsed={:.1}s{}",
@@ -301,7 +373,7 @@ impl Runner {
         let capture = Capture::new(&self.dir)?;
         let mut out = File::open(capture.dir.join("stdout"))?;
         let mut err = File::open(capture.dir.join("stderr"))?;
-        let mut child = Command::new(program)
+        let child = Command::new(program)
             .args(args)
             .stdin(Stdio::null())
             .stdout(capture.stdout.try_clone()?)
@@ -309,11 +381,14 @@ impl Runner {
             .process_group(0)
             .spawn()
             .map_err(|e| format!("spawn failed: {e}"))?;
+        let mut child = ManagedChild {
+            child,
+            completed: false,
+        };
         let started = Instant::now();
         let mut heartbeat = Heartbeat::default();
         // Regular-file readers cannot block on inherited pipes. Bound each drain so
         // continuous output never prevents cancellation or timeout checks.
-        let mut completed = false;
         let result = (|| -> Result<(Option<i32>, Option<String>)> {
             loop {
                 let activity =
@@ -327,7 +402,7 @@ impl Runner {
                     ))?;
                 }
                 if let Some(status) = child.try_wait()? {
-                    completed = true;
+                    child.completed = true;
                     // The direct child is done; drain the bytes already captured without
                     // waiting for EOF from background descendants.
                     let out_len = out.metadata()?.len();
@@ -343,7 +418,7 @@ impl Runner {
                         (!status.success()).then(|| format!("{program} exited {status}")),
                     ));
                 }
-                if self.cancelled.load(Ordering::Relaxed) {
+                if !self.ignore_cancellation && self.cancelled.load(Ordering::Relaxed) {
                     return Ok((None, Some("interrupted".into())));
                 }
                 if elapsed > Duration::from_secs(seconds) {
@@ -354,7 +429,7 @@ impl Runner {
                 }
             }
         })();
-        if !completed {
+        if !child.completed {
             if let Ok(pid) = i32::try_from(child.id()) {
                 let _ = nix::sys::signal::killpg(
                     nix::unistd::Pid::from_raw(pid),
@@ -362,6 +437,7 @@ impl Runner {
                 );
             }
             let _ = child.wait();
+            child.completed = true;
             // Best effort on failure; preserve the original reporting/command error.
             for (stream, source) in [("stdout", &mut out), ("stderr", &mut err)] {
                 let end = source.metadata()?.len();
@@ -372,8 +448,8 @@ impl Runner {
                 }
             }
         }
-        self.report.document["commands"][id - 1]["stdout_bytes"] = json!(out.metadata()?.len());
-        self.report.document["commands"][id - 1]["stderr_bytes"] = json!(err.metadata()?.len());
+        self.report.command_mut(id)?["stdout_bytes"] = json!(out.metadata()?.len());
+        self.report.command_mut(id)?["stderr_bytes"] = json!(err.metadata()?.len());
         let (code, reason) = result?;
         if let Some(reason) = reason {
             return Ok((code, String::new(), Some(reason)));
@@ -425,7 +501,13 @@ impl Runner {
         self.incus(
             &strings(&[
                 "init",
-                &format!("images:{image}"),
+                &if image.contains(':')
+                    || (image.len() == 64 && image.bytes().all(|byte| byte.is_ascii_hexdigit()))
+                {
+                    image.to_owned()
+                } else {
+                    format!("images:{image}")
+                },
                 vm,
                 "--vm",
                 "--profile",
@@ -458,12 +540,17 @@ impl Runner {
         self.incus(&full, seconds)
     }
     fn ready(&mut self, vm: &str) -> Result<()> {
-        let deadline = Instant::now() + Duration::from_secs(300);
+        self.ready_with_timeout(vm, 300)
+    }
+    fn ready_with_timeout(&mut self, vm: &str, seconds: u64) -> Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(seconds);
         loop {
             if self.guest(vm, &strings(&["true"]), 15).is_ok() {
                 return Ok(());
             }
-            if self.cancelled.load(Ordering::Relaxed) || Instant::now() > deadline {
+            if (!self.ignore_cancellation && self.cancelled.load(Ordering::Relaxed))
+                || Instant::now() > deadline
+            {
                 return Err("VM agent did not become ready".into());
             }
             self.report.emit(&format!(
@@ -474,13 +561,16 @@ impl Runner {
         }
     }
     fn reboot(&mut self, vm: &str) -> Result<()> {
+        self.reboot_with_timeout(vm, 300)
+    }
+    fn reboot_with_timeout(&mut self, vm: &str, seconds: u64) -> Result<()> {
         let before = self.guest(
             vm,
             &strings(&["cat", "/proc/sys/kernel/random/boot_id"]),
             30,
         )?;
         self.incus(&strings(&["restart", vm, "--timeout=60"]), 120)?;
-        self.ready(vm)?;
+        self.ready_with_timeout(vm, seconds)?;
         let after = self.guest(
             vm,
             &strings(&["cat", "/proc/sys/kernel/random/boot_id"]),
@@ -705,6 +795,15 @@ fn prepare_baseline(runner: &mut Runner, vm: &str) -> Result<()> {
         "/opt/kidobo-e2e/baseline/SHA256SUMS",
         false,
     )?;
+    runner.push(
+        vm,
+        &runner.evidence().join("baseline-archive.tar.gz"),
+        &format!(
+            "/opt/kidobo-e2e/baseline/kidobo-{}-linux-x86_64.tar.gz",
+            baseline.trim()
+        ),
+        false,
+    )?;
     runner.guest(
         vm,
         &strings(&["chmod", "+x", "/opt/kidobo-e2e/baseline/installer.sh"]),
@@ -728,14 +827,16 @@ fn prerequisites(
     runner: &mut Runner,
     vm: &str,
     distro: &Distro,
-    tag: &str,
+    _tag: &str,
     published: bool,
     archive: Option<&Path>,
 ) -> Result<()> {
-    runner.stage(&format!("{} | provisioning", distro.id))?;
-    runner.ready(vm)?;
-    runner.guest(vm, &strings(&["sh", "-c", "printf '%s\\n' kidobo-e2e-v1 > /etc/kidobo-e2e-owned; mkdir -p /opt/kidobo-e2e/release"]), 30)?;
-    for script in ["provision.sh", "lifecycle.sh", "traffic.py"] {
+    runner.guest(
+        vm,
+        &strings(&["mkdir", "-p", "/opt/kidobo-e2e/release"]),
+        30,
+    )?;
+    for script in ["provision.sh", "lifecycle.sh", "traffic.py", "checks.json"] {
         runner.push(
             vm,
             &runner.evidence().join("inputs").join(script),
@@ -743,9 +844,6 @@ fn prerequisites(
             false,
         )?;
     }
-    let mut args = strings(&["bash", "/opt/kidobo-e2e/provision.sh", &distro.family]);
-    args.extend(distro.packages.clone());
-    runner.guest(vm, &args, 2400)?;
     runner.push(
         vm,
         &runner.evidence().join("inputs/installer.sh"),
@@ -781,30 +879,9 @@ fn prerequisites(
         runner.stage(&format!("{} | upgrade baseline preparation", distro.id))?;
         prepare_baseline(runner, vm)?;
     }
-    runner.stage(&format!("{} | OS upgrade", distro.id))?;
-    runner.guest(
-        vm,
-        &strings(&[
-            "bash",
-            "/opt/kidobo-e2e/lifecycle.sh",
-            "os-upgrade",
-            tag,
-            if published { "published" } else { "candidate" },
-        ]),
-        2400,
-    )?;
-    runner.stage(&format!(
-        "{} | OS reboot and kernel verification",
-        distro.id
-    ))?;
-    runner.reboot(vm)?;
-    runner.guest(
-        vm,
-        &strings(&["bash", "/opt/kidobo-e2e/provision.sh", "--check-kernel"]),
-        60,
-    )?;
     Ok(())
 }
+
 fn application(
     runner: &mut Runner,
     vm: &str,
@@ -903,6 +980,7 @@ fn run(cli: Cli) -> Result<()> {
     {
         return Err("unsafe resource identifier".into());
     }
+    prepared::validate_settings(&config)?;
     let mut ids = std::collections::BTreeSet::new();
     if config.distros.iter().any(|d| !ids.insert(&d.id))
         || !config.distros.iter().any(|d| d.required)
@@ -935,6 +1013,7 @@ fn run(cli: Cli) -> Result<()> {
         cancelled,
         report,
         command_poll_interval: Duration::from_millis(100),
+        ignore_cancellation: false,
     };
     let is_clean = matches!(&cli.action, Action::Clean { .. });
     if is_clean {
@@ -957,6 +1036,7 @@ fn run(cli: Cli) -> Result<()> {
             ),
             _ => ("setup", None, Vec::new()),
         };
+        runner.report.document["validation_contract"] = json!(contract::VERSION);
         runner.report.document["run_id"] = json!(run_id);
         runner.report.document["tag"] = json!(tag);
         runner.report.document["archive"] = json!(archive);
@@ -970,19 +1050,7 @@ fn run(cli: Cli) -> Result<()> {
         );
         let mut stages = vec![];
         for target in &targets {
-            for name in [
-                "VM creation",
-                "provisioning",
-                "upgrade baseline preparation",
-                "OS upgrade",
-                "OS reboot and kernel verification",
-                "installation and application checks",
-                "application reboot and timer recovery",
-                "upgrade and preservation",
-                "flush and uninstall",
-                "diagnostics",
-                "cleanup",
-            ] {
+            for &name in resume::LIFECYCLE_STAGES {
                 if published
                     && matches!(
                         name,
@@ -1004,7 +1072,9 @@ fn run(cli: Cli) -> Result<()> {
             runner.dir.display()
         ))?;
     }
+    let started = Instant::now();
     let outcome = execute(cli, &config, &run_id, &mut runner);
+    runner.report.document["run_wall_seconds"] = json!(started.elapsed().as_secs_f64());
     let restored = runner.dir.join(".resume-candidate");
     if restored.exists() {
         fs::remove_dir_all(restored)?;
@@ -1015,7 +1085,8 @@ fn run(cli: Cli) -> Result<()> {
             .finish_stage(if outcome.is_err() { "failed" } else { "passed" })?;
         return outcome;
     }
-    let interrupted = runner.cancelled.swap(false, Ordering::Relaxed);
+    let interrupted = runner.cancelled.load(Ordering::Relaxed);
+    runner.ignore_cancellation = true;
     runner.report.document["status"] = json!(if interrupted {
         "interrupted"
     } else if outcome.is_err() {
@@ -1042,6 +1113,11 @@ fn run(cli: Cli) -> Result<()> {
             "Evidence incomplete: {error}; working evidence retained at {}",
             runner.evidence().display()
         ))?;
+    }
+    runner.report.save()?;
+    runner.report.document["run_wall_seconds"] = json!(started.elapsed().as_secs_f64());
+    if interrupted || outcome.is_err() || archive.is_err() {
+        runner.report.document["release_gate_passed"] = json!(false);
     }
     runner.report.save()?;
     outcome?;
@@ -1074,8 +1150,15 @@ fn execute(cli: Cli, config: &Config, run_id: &str, runner: &mut Runner) -> Resu
             })?;
     }
     match cli.action {
-        Action::Setup => setup(runner, config),
-        Action::Clean { .. } => clean(runner, config),
+        Action::Setup => {
+            let _operation_lock = coordination::lock(runner)?;
+            setup(runner, config)
+        }
+        Action::Clean { .. } => {
+            let _operation_lock = coordination::lock(runner)?;
+            runner.ignore_cancellation = true;
+            clean(runner, config)
+        }
         Action::Run {
             archive,
             mut tag,
@@ -1084,7 +1167,9 @@ fn execute(cli: Cli, config: &Config, run_id: &str, runner: &mut Runner) -> Resu
             required_only,
             keep_failed,
             resume,
+            refresh_images,
         } => {
+            runner.report.document["refresh_images"] = json!(refresh_images);
             let previous = resume
                 .as_deref()
                 .map(|id| resume::Resume::load(runner, id))
@@ -1211,6 +1296,21 @@ fn execute(cli: Cli, config: &Config, run_id: &str, runner: &mut Runner) -> Resu
                 }
             }
 
+            if !published {
+                let baseline = read_text(&runner.evidence().join("baseline-tag"))?;
+                let baseline_archive = runner.evidence().join("baseline-archive.tar.gz");
+                if !baseline_archive.exists() {
+                    runner.command("curl",&strings(&["-fsSL","--retry","2","--max-time","120","-o",&baseline_archive.to_string_lossy(),
+                        &format!("https://github.com/blwarren/kidobo/releases/download/{baseline}/kidobo-{baseline}-linux-x86_64.tar.gz")]),400)?;
+                }
+                verify_baseline(runner, &baseline)?;
+            }
+            let _operation_lock = coordination::lock(runner)?;
+            let parallelism = coordination::preflight(runner, config)?;
+            runner.report.document["effective_parallelism"] = json!(parallelism);
+            if config.prepared_images.enabled {
+                prepared::prune(runner, config)?;
+            }
             let targets = selected_targets(config, distro.as_deref(), required_only);
             if targets.is_empty() {
                 return Err("no matching distros".into());
@@ -1230,12 +1330,34 @@ fn execute(cli: Cli, config: &Config, run_id: &str, runner: &mut Runner) -> Resu
                 keep_failed,
                 previous.as_ref(),
             )?;
+            if config.prepared_images.enabled {
+                prepared::prune(runner, config)?;
+            }
             if archive.as_deref().map(hash).transpose()? != artifact_hash {
                 return Err("candidate archive changed during testing".into());
             }
             Ok(())
         }
     }
+}
+fn verify_baseline(runner: &mut Runner, tag: &str) -> Result<()> {
+    let filename = format!("kidobo-{tag}-linux-x86_64.tar.gz");
+    let manifest = read_text(&runner.evidence().join("baseline-SHA256SUMS"))?;
+    let entries = manifest
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            Some((parts.next()?, parts.next()?))
+        })
+        .filter(|(_, name)| *name == filename)
+        .collect::<Vec<_>>();
+    if entries.len() != 1
+        || entries[0].0 != hash(&runner.evidence().join("baseline-archive.tar.gz"))?
+    {
+        return Err("captured baseline archive checksum mismatch".into());
+    }
+    runner.report.document["baseline_archive_sha256"] = json!(entries[0].0);
+    Ok(())
 }
 fn read_text(path: &Path) -> Result<String> {
     let mut text = String::new();
@@ -1262,11 +1384,32 @@ fn snapshot_inputs(dir: &Path, config: &Path) -> Result<()> {
     let inputs = dir.join("inputs");
     fs::create_dir(&inputs)?;
     let mut hashes = serde_json::Map::new();
+    let mut harness = Sha256::new();
+    for module in [
+        "main.rs",
+        "matrix.rs",
+        "report.rs",
+        "resume.rs",
+        "prepared.rs",
+        "coordination.rs",
+        "contract.rs",
+    ] {
+        harness.update(hash(&Path::new("tools/distro-e2e/src").join(module))?.as_bytes());
+    }
+    for input in ["Cargo.lock", "rust-toolchain.toml"] {
+        harness.update(hash(Path::new(input))?.as_bytes());
+    }
+    let mut identity = String::with_capacity(64);
+    for byte in harness.finalize() {
+        write!(&mut identity, "{byte:02x}")?;
+    }
+    hashes.insert("harness".into(), json!(identity));
     for (source, name) in [
         (Path::new("scripts/install.sh"), "installer.sh"),
         (Path::new("scripts/e2e/provision.sh"), "provision.sh"),
         (Path::new("scripts/e2e/lifecycle.sh"), "lifecycle.sh"),
         (Path::new("scripts/e2e/traffic.py"), "traffic.py"),
+        (Path::new("scripts/e2e/checks.json"), "checks.json"),
         (config, "e2e.toml"),
     ] {
         let destination = inputs.join(name);
@@ -1311,5 +1454,7 @@ mod guest_preservation_tests;
 mod guest_reporting_tests;
 #[cfg(test)]
 mod guest_upgrade_tests;
+#[cfg(test)]
+mod preparation_tests;
 #[cfg(test)]
 mod tests;

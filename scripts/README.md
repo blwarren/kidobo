@@ -48,8 +48,11 @@ that include those retired scaled cases.
 - `just e2e` (start the candidate build and complete distro matrix in detached tmux session
   `kidobo-e2e`; attach with `tmux attach -t kidobo-e2e` to watch progress and the final exit status)
 - `just e2e --required-only` (build and test only required targets in the detached session)
+- `just e2e --archive ARCHIVE --tag TAG` (rerun all configured targets against the same archive without rebuilding; supports cold/warm comparisons)
+- `just e2e --refresh-images` (rebuild prepared images and rerun every selected target)
 - `just e2e-artifact ARCHIVE TAG` (select every required target against an existing archive)
 - `just e2e-artifact ARCHIVE TAG --resume RUN_ID` (reuse compatible successful required targets for the exact archive)
+- `just e2e-artifact ARCHIVE TAG --resume RUN_ID --refresh-images` (retain the archive while rebuilding images and rerunning required coverage)
 - `just e2e-resume RUN_ID` (resume a candidate in the foreground using its frozen archive and tag)
 - `just e2e-resume RUN_ID --required-only` (resume only required coverage for the captured candidate)
 - `just e2e-published [tag]` (test a published release; default latest)
@@ -61,6 +64,7 @@ that include those retired scaled cases.
 - `just publish-release X.Y.Z` (complete local preparation, validation, required Incus coverage, upload, verification, and publication)
 - `just publish-release X.Y.Z --skip-e2e` (skip only the matrix and its Incus/agent-ISO prerequisites; other validation and upload verification remain enabled)
 - `just publish-release X.Y.Z --resume-e2e RUN_ID` (resume the retained exact candidate after checking its source, validation identity, and artifacts)
+- `just publish-release X.Y.Z --refresh-e2e-images` (rebuild required prepared images and rerun the matrix; can combine with `--resume-e2e RUN_ID`)
 - `just mutants`
 - `just mutants --shard 1/4`
 
@@ -81,12 +85,22 @@ Publication requires host `tar`. By default, it also requires configured Incus V
 lifecycle coverage against the exact packaged archive before pushing refs or uploading assets.
 The default required targets are Debian 12 and 13 and Ubuntu 24.04 and 26.04. Publication and
 `just e2e-artifact` select only those required targets. Use a separate `just e2e` run for all seven
-configured targets, including advisory Fedora 44 and AlmaLinux 9 and 10. Advisory prerequisite
-and application failures do not fail that broader run; cleanup, shared infrastructure, and
-evidence archive failures still do. Guest prerequisites are checked across
-pending targets before application lifecycles. An explicit `--skip-e2e` argument skips only that
-matrix and its Incus/agent-ISO
-prerequisites; CI, release-note validation, coverage, strict rustdoc, the release-binary exercise,
+configured targets, including advisory Fedora 44 and AlmaLinux 9 and 10 with enforcing SELinux.
+Advisory prerequisite and application failures do not fail that broader run; reports separately
+identify required-gate success and all-selected-target success. Full seven-platform qualification
+requires every target to pass. Cleanup, shared infrastructure, and evidence archive failures still
+fail the run. Guest prerequisites are checked across pending targets before application lifecycles.
+At most two VMs run by default, each with 2 vCPUs and 4 GiB RAM, with a memory preflight and
+1 GiB host headroom. Running guests in the suite project prevent a new matrix until stopped or cleaned.
+The runner admits fresh clones of private suite-owned prepared images, refreshing after seven days without extending freshness on
+hits. Preparation changes invalidate images immediately; upstream changes are picked up at expiry
+or forced refresh. Up to two unused completed generations per target are retained; generations
+referenced by retained guests are protected. Unused generations are pruned after fourteen days.
+Every clone verifies its kernel/modules, network, security state, and absence of Kidobo state; full application checks still run. See
+[prepared-image reuse](../docs/e2e.md#prepared-image-reuse).
+
+An explicit `--skip-e2e` argument skips only that matrix and its Incus/agent-ISO prerequisites;
+CI, release-note validation, coverage, strict rustdoc, the release-binary exercise,
 static compatibility, packaging, and upload verification still run. The publisher labels the
 skip before validation and repeats it before the final confirmation. This override does not reuse
 or imply evidence from an earlier matrix run. E2E command
@@ -102,7 +116,9 @@ After a matrix failure, `just publish-release X.Y.Z --resume-e2e RUN_ID` verifie
 source commit, reconstructed candidate tree and saved release date, and artifact hashes. It reuses
 the completed local validation gates and exact archive without rebuilding or repackaging, then
 resumes compatible distro successes and reruns pending targets. Source or artifact changes reject
-publisher resume. `--resume-e2e` cannot be combined with `--skip-e2e`.
+publisher resume. `--resume-e2e` cannot be combined with `--skip-e2e`. Add
+`--refresh-e2e-images` to rebuild preparation and rerun all required targets while retaining
+compatible local validation and the exact archive. It cannot combine with `--skip-e2e`.
 See [candidate resume](../docs/e2e.md#resume-a-candidate) for result compatibility and historical-run
 limits; old attempts without retained publisher metadata cannot resume publication. That guide
 also shows how to move a retained candidate aside before starting fresh after source changes;

@@ -30,6 +30,7 @@ impl Resume {
         }
         let document: Value = serde_json::from_slice(&bytes)?;
         if document["run_id"] != id
+            || document["validation_contract"] != super::contract::VERSION
             || !matches!(
                 document["status"].as_str(),
                 Some("passed" | "failed" | "interrupted")
@@ -87,7 +88,14 @@ impl Resume {
             serde_json::from_str(&Self::member(runner, &self.archive, "inputs/SHA256.json")?)?;
         let current: Value =
             serde_json::from_str(&read_text(&runner.evidence().join("inputs/SHA256.json"))?)?;
-        for name in ["installer.sh", "provision.sh", "lifecycle.sh", "traffic.py"] {
+        for name in [
+            "installer.sh",
+            "provision.sh",
+            "lifecycle.sh",
+            "traffic.py",
+            "checks.json",
+            "harness",
+        ] {
             if !old[name].is_string() || old[name] != current[name] {
                 return Err(format!("resume test input changed: {name}; start a fresh run").into());
             }
@@ -137,6 +145,27 @@ impl Resume {
             }
             fs::write(runner.evidence().join(name), contents)?;
         }
+        runner.command(
+            "tar",
+            &strings(&[
+                "-xzf",
+                self.archive.to_str().ok_or("non-UTF-8 evidence path")?,
+                "--no-same-owner",
+                "--no-same-permissions",
+                "-C",
+                runner
+                    .evidence()
+                    .to_str()
+                    .ok_or("non-UTF-8 evidence directory")?,
+                "./baseline-archive.tar.gz",
+            ]),
+            300,
+        )?;
+        if self.document["baseline_archive_sha256"]
+            != hash(&runner.evidence().join("baseline-archive.tar.gz"))?
+        {
+            return Err("resume baseline archive hash mismatch".into());
+        }
         runner.report.document["resume_from"] =
             json!({"run_id": self.id, "evidence_sha256": self.digest});
         fs::write(
@@ -157,6 +186,7 @@ impl Resume {
                 && old.image == target.image
                 && old.family == target.family
                 && old.packages == target.packages
+                && old.selinux == target.selinux
         });
         let matches = matching_target
             && self.config.project == config.project
@@ -166,8 +196,23 @@ impl Resume {
             && self.config.cpus == config.cpus
             && self.config.memory == config.memory
             && self.config.disk == config.disk
+            && self.document["validation_contract"] == super::contract::VERSION
             && completed_target(&self.document, &target.id);
         if !matches {
+            return Ok(false);
+        }
+        let preparation = self.document["results"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|result| result["distro"] == target.id)
+            .and_then(|result| result["preparation"]["preparation"]["prepared_at_unix"].as_u64());
+        if !preparation.is_some_and(|created| {
+            super::prepared::now()
+                .ok()
+                .and_then(|time| time.checked_sub(created))
+                .is_some_and(|age| age < config.prepared_images.max_age_hours * 3600)
+        }) {
             return Ok(false);
         }
         let result = self.document["results"]
@@ -190,6 +235,11 @@ impl Resume {
                 return Err("original resume evidence identity mismatch".into());
             }
             original.verify_test_inputs(runner)?;
+            if original.document["baseline_archive_sha256"]
+                != hash(&runner.evidence().join("baseline-archive.tar.gz"))?
+            {
+                return Err("original resume baseline archive changed".into());
+            }
             for name in [
                 "baseline-tag",
                 "baseline-installer.sh",
@@ -224,8 +274,8 @@ pub(super) const LIFECYCLE_STAGES: &[&str] = &[
     "VM creation",
     "provisioning",
     "upgrade baseline preparation",
-    "OS upgrade",
     "OS reboot and kernel verification",
+    "clone admission",
     "installation and application checks",
     "application reboot and timer recovery",
     "upgrade and preservation",
@@ -257,7 +307,7 @@ fn completed_target(document: &Value, id: &str) -> bool {
     if !LIFECYCLE_STAGES.iter().all(|name| {
         stages.iter().any(|s| {
             s["name"] == format!("{id} | {name}")
-                && matches!(s["status"].as_str(), Some("passed" | "reused"))
+                && matches!(s["status"].as_str(), Some("passed" | "reused" | "cached"))
         })
     }) {
         return false;
@@ -280,9 +330,7 @@ fn completed_target(document: &Value, id: &str) -> bool {
         .collect();
     checks.iter().all(|c| c["status"] == "passed")
         && [
-            "provisioning",
-            "OS upgrade",
-            "OS reboot and kernel verification",
+            "clone admission",
             "installation and application checks",
             "application reboot and timer recovery",
             "upgrade and preservation",

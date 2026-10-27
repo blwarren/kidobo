@@ -1,15 +1,18 @@
 ### Added
 
+- Reuse verified prepared VM images for seven days and allow explicit image refresh during candidate, artifact, resumed, and publication testing.
 - Add expiring IP/CIDR and ASN bans stored separately from permanent sources and applied by sync.
 - Allow an explicit version to be installed from a custom release directory with `KIDOBO_RELEASE_BASE_URL`, retaining checksum and binary verification.
 
 ### Changed
 
+- Run up to two distro test VMs with explicit required/advisory outcomes, preparation provenance, accurate wall time, enforcing SELinux coverage, and deterministic packaged ASN resolver checks.
 - Stream lookup matches with bounded retention and escape control characters in targets, source labels, and matched entries in human and TSV output.
 - Deduplicate canonical unban targets and index overlap checks for large batches while preserving confirmation and temporary-first persistence.
 
 ### Fixed
 
+- Reject skipped guest checks and infrastructure errors misreported as firewall blocking, verify intended kernels, and test upgrades against captured baseline artifacts and baseline-created offline state.
 - Preserve non-UTF-8 temporary directory paths when restoring ipsets during sync.
 - Report filesystem failures instead of treating unreadable configuration, blocklists, or caches as missing, and stop sync before enforcement when the local blocklist cannot be read.
 - Preserve files and cache generations when their metadata or selection manifest cannot be inspected, and distinguish inspection failures from missing paths in doctor reports.

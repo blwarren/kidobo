@@ -9,6 +9,10 @@ fn reporting_header() -> &'static str {
 
 fn fixture(body: &str) -> Output {
     Command::new("bash")
+        .env(
+            "E2E_CHECK_MANIFEST",
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../scripts/e2e/checks.json"),
+        )
         .args(["-c", &format!("{}\n{body}", reporting_header())])
         .output()
         .expect("run guest reporting with shell builtins only")
@@ -34,35 +38,48 @@ e2e_check_pass 'both exact string comparisons succeeded'
 }
 
 #[test]
-fn guest_checks_report_expected_probe_failures_and_abort_mismatches() {
+fn guest_checks_reject_infrastructure_errors_and_require_drop_evidence() {
+    use super::tests::TestDir;
     let script = include_str!("../../../scripts/e2e/lifecycle.sh");
-    let start = script.find("probe() {").expect("probe helper");
+    let start = script
+        .find("probe_observation() {")
+        .expect("probe observation helper");
     let end = script[start..]
-        .find("\nwrite_config() {")
-        .expect("probe end")
+        .find("\nprobe_pair() {")
+        .expect("probe observation end")
         + start;
-    for (status, expectation, success) in [
-        (0, "allowed", true),
-        (1, "blocked", true),
-        (0, "blocked", false),
-        (1, "allowed", false),
+    for (status, outcome, expectation, before, after, success) in [
+        (0, "allowed", "allowed", 0, 0, true),
+        (10, "connect-timeout", "blocked", 2, 3, true),
+        (10, "connect-timeout", "blocked", 2, 2, false),
+        (20, "infrastructure-error", "blocked", 2, 3, false),
+        (127, "infrastructure-error", "blocked", 2, 3, false),
+        (0, "allowed", "blocked", 2, 3, false),
+        (10, "connect-timeout", "allowed", 0, 0, false),
     ] {
+        let temp = TestDir::new();
+        let observation = temp.path().join("probe.json");
+        std::fs::write(
+            &observation,
+            format!(r#"{{"address":"198.18.77.1","source":"198.18.77.2","outcome":"{outcome}"}}"#),
+        )
+        .expect("probe fixture");
+        std::fs::write(
+            observation.with_extension("json.status"),
+            status.to_string(),
+        )
+        .expect("exit fixture");
         let output = fixture(&format!(
-            "TEST_NS=fake TRAFFIC_PORT=123 ROOT=/unused\n\
-             fail() {{ exit 1; }}\n\
-             ip() {{ return {status}; }}\n\
-             {}\n\
-             e2e_check_start outer expectation\n\
-             probe IPv4 198.18.77.1 {expectation}\n\
-             e2e_check_pass completed\n",
-            &script[start..end]
+            "TEST_NS=fake TRAFFIC_PORT=123\nfail() {{ exit 1; }}\n{}\ne2e_check_start outer expectation\nprobe_observation IPv4 198.18.77.1 198.18.77.2 {expectation} '{}' {before} {after}\ne2e_check_pass completed\n",
+            &script[start..end],
+            observation.display()
         ));
         let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.success(), success, "{stderr}");
         let markers: Vec<_> = stderr
             .lines()
             .filter(|line| line.starts_with("E2E_CHECK\t"))
             .collect();
-        assert_eq!(output.status.success(), success, "{stderr}");
         assert_eq!(
             markers.iter().any(|line| line.contains("\tPASS\t")),
             success
@@ -71,14 +88,6 @@ fn guest_checks_report_expected_probe_failures_and_abort_mismatches() {
             markers.iter().any(|line| line.contains("\tFAIL\t")),
             !success
         );
-        if !success {
-            assert!(
-                markers
-                    .iter()
-                    .any(|line| line.starts_with("E2E_CHECK\touter\tFAIL\t"))
-            );
-        }
-        assert_eq!(output.stdout, b"");
     }
 }
 

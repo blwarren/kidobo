@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
     cat <<'EOF'
-Usage: just publish-release [v]X.Y.Z [--skip-e2e | --resume-e2e RUN_ID]
+Usage: just publish-release [v]X.Y.Z [--skip-e2e | --resume-e2e RUN_ID] [--refresh-e2e-images]
 
 Prepares and validates a release in a temporary worktree, asks for confirmation,
 then atomically pushes the release commit and tag, uploads locally built assets
@@ -11,6 +11,7 @@ with GitHub CLI, verifies the uploaded archive, and publishes the GitHub release
 
   --skip-e2e           Skip the Incus VM matrix; all other release checks still run.
   --resume-e2e RUN_ID   Reuse the verified candidate and successful distro results.
+  --refresh-e2e-images Rebuild prepared images and rerun every selected distro target.
 EOF
 }
 
@@ -23,11 +24,12 @@ requested_version="$1"
 shift
 skip_e2e=false
 resume_e2e=""
+refresh_e2e_images=false
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --skip-e2e)
-            if [[ "${skip_e2e}" == true || -n "${resume_e2e}" ]]; then
-                echo "--skip-e2e and --resume-e2e are mutually exclusive and cannot repeat" >&2
+            if [[ "${skip_e2e}" == true || -n "${resume_e2e}" || "${refresh_e2e_images}" == true ]]; then
+                echo "--skip-e2e cannot repeat or combine with --resume-e2e or --refresh-e2e-images" >&2
                 usage >&2
                 exit 2
             fi
@@ -43,6 +45,15 @@ while [[ $# -gt 0 ]]; do
             fi
             resume_e2e="$2"
             shift 2
+            ;;
+        --refresh-e2e-images)
+            if [[ "${skip_e2e}" == true || "${refresh_e2e_images}" == true ]]; then
+                echo "--refresh-e2e-images cannot repeat or combine with --skip-e2e" >&2
+                usage >&2
+                exit 2
+            fi
+            refresh_e2e_images=true
+            shift
             ;;
         *)
             echo "unknown option: $1" >&2
@@ -368,6 +379,10 @@ if [[ "${skip_e2e}" == false ]]; then
         matrix_args+=(--resume "${resume_e2e}")
     else
         echo "[release] running required distro lifecycle matrix"
+    fi
+    if [[ "${refresh_e2e_images}" == true ]]; then
+        echo "[release] refreshing prepared images and rerunning every selected distro target"
+        matrix_args+=(--refresh-images)
     fi
     artifacts_resumable=true
     KIDOBO_E2E_RESULTS_DIR="${repo_root}/target/e2e" just e2e-artifact "${matrix_args[@]}"

@@ -29,7 +29,7 @@ fn failed_uninstall_observes_enforcement_before_any_repair() {
         super::tests::executable(&root.join("kidobo"), "#!/bin/sh\nexit 0\n");
         super::tests::executable(
             &root.join("installer"),
-            "#!/bin/bash\nprintf 'uninstall\\n' >> \"$EVENTS\"\nif [[ \"$DAMAGE\" == true ]]; then printf changed > \"$FIREWALL\"; fi\nexit 1\n",
+            "#!/bin/bash\nprintf 'uninstall\\n' >> \"$EVENTS\"\nif [[ \"$DAMAGE\" == true ]]; then printf changed > \"$FIREWALL\"; fi\nprintf 'unknown_key\\n' >&2\nexit 1\n",
         );
         let output = Command::new("bash")
             .args([
@@ -49,9 +49,9 @@ restore_boot_timer() {{ :; }}
 systemctl() {{ return 0; }}
 ipset() {{ return 0; }}
 sets_snapshot() {{ cat "$FIREWALL"; }}
-probe() {{
+probe_pair() {{
   [[ $(cat "$FIREWALL") == retained ]]
-  printf 'probe %s\n' "$1" >> "$EVENTS"
+  printf 'probe IPv4\nprobe IPv6\n' >> "$EVENTS"
 }}
 sync_and_assert() {{ printf 'repair\n' >> "$EVENTS"; printf retained > "$FIREWALL"; }}
 {function}
@@ -81,84 +81,54 @@ test_uninstall_failure_preserves_runtime
 }
 
 #[test]
-fn upgrade_checks_a_nonempty_temporary_ban_through_lookup_and_enforcement() {
-    let function = lifecycle_function("upgrade_phase() {", "\nassert_enforcement_absent() {");
+fn candidate_reinstall_checks_nonempty_temporary_state_lookup_and_enforcement() {
+    let function = lifecycle_function(
+        "test_candidate_temporary_reinstall() {",
+        "\nupgrade_phase() {",
+    );
     for scenario in ["preserved", "lost-file", "lost-lookup", "lost-enforcement"] {
         let temp = TestDir::new();
         let root = temp.path();
-        fs::create_dir(root.join("baseline")).expect("baseline fixture");
-        for name in ["config", "blocklist", "temporary", "baseline/SHA256SUMS"] {
-            fs::write(root.join(name), "initial").expect("source fixture");
-        }
-        fs::write(root.join("baseline-tag"), "v0.14.3").expect("baseline tag");
-        super::tests::executable(
-            &root.join("baseline/installer.sh"),
-            "#!/bin/bash\nprintf baseline > \"$ROOT/version\"\n",
-        );
-        super::tests::executable(&root.join("installer"), "#!/bin/sh\nexit 0\n");
         let output = Command::new("bash")
             .args(["-c", &format!(r#"
 set -euo pipefail
 exec 9>&2
-STATE=$ROOT BASELINE=$ROOT/baseline CONFIG=$ROOT/config BLOCKLIST=$ROOT/blocklist
-TEMPORARY=$ROOT/temporary installer=$ROOT/installer mode=candidate tag=v0.15.0 SET4=set4
-V4_HOST=198.18.77.1 V6_HOST=fd42::1 HTTP_PORT=39472
+STATE=$ROOT TEMPORARY=$ROOT/temporary SET4=set4
 e2e_check_start() {{ :; }}
 e2e_check_pass() {{ :; }}
 fail() {{ printf '%s\n' "$*" >&2; exit 1; }}
-start_source_fixture() {{ :; }}
-fixture_curl() {{ :; }}
-defer_timer_until_configuration_is_ready() {{ :; }}
-wait_for_sync_service_idle() {{ :; }}
+assert_target_version() {{ :; }}
 assert_installed_binary() {{ :; }}
-assert_systemd_units() {{ :; }}
-setup_namespace() {{ :; }}
-capture_namespace_and_cleanup() {{ :; }}
-start_traffic_servers() {{ :; }}
-restore_boot_timer() {{ :; }}
-probe() {{ :; }}
-assert_target_version() {{ [[ $(cat "$ROOT/version") == candidate ]]; }}
 kidobo() {{
-  case "$1" in
-    ban)
-      [[ "$2" == 203.0.113.79 && "$3" == --for && "$4" == 1d ]]
-      printf 'version = 1\n[[ips]]\ncidr = "203.0.113.79/32"\nexpires_at = 4102444800\n' > "$TEMPORARY"
-      ;;
-    --version) printf 'kidobo 0.14.3\n' ;;
-    lookup)
-      [[ "$SCENARIO" == lost-lookup ]] || printf '203.0.113.79\ttemporary:blocklist\t203.0.113.79/32\n'
-      return 0 ;;
-    doctor) : ;;
-    *) exit 90 ;;
-  esac
+ case "$1" in
+  ban) printf 'version = 1\n[[ips]]\ncidr = "203.0.113.79/32"\nexpires_at = 4102444800\n' > "$TEMPORARY" ;;
+  lookup) [[ "$SCENARIO" == lost-lookup ]] || printf '203.0.113.79\ttemporary:blocklist\t203.0.113.79/32\n'; return 0 ;;
+  *) exit 90 ;;
+ esac
 }}
-run_baseline_enforcement_check() {{ grep -Fq 'cidr = "203.0.113.79/32"' "$4"; }}
-install_target() {{
-  printf candidate > "$ROOT/version"
-  if [[ "$SCENARIO" == lost-file ]]; then printf 'version = 1\n' > "$TEMPORARY"; fi
-}}
-sync_and_assert() {{
-  if [[ "$SCENARIO" != lost-enforcement ]]; then printf '203.0.113.79\n' > "$ROOT/membership"; fi
-}}
+install_target() {{ if [[ "$SCENARIO" == lost-file ]]; then printf 'version = 1\n' > "$TEMPORARY"; fi; }}
+sync_and_assert() {{ if [[ "$SCENARIO" != lost-enforcement ]]; then printf enforced > "$ROOT/membership"; fi; }}
 ipset() {{ [[ "$1" == test && "$2" == set4 && "$3" == 203.0.113.79 && -f "$ROOT/membership" ]]; }}
 {function}
-upgrade_phase
+test_candidate_temporary_reinstall
 "#)])
             .env("ROOT", root)
             .env("SCENARIO", scenario)
             .output()
-            .expect("exercise upgrade with inert commands");
+            .expect("exercise reinstall with inert commands");
         if scenario == "preserved" {
             assert!(output.status.success(), "{output:?}");
-            let state = read_text(&root.join("temporary")).expect("upgraded temporary state");
-            assert!(state.contains("cidr = \"203.0.113.79/32\""));
-            assert!(state.contains("expires_at = 4102444800"));
+            assert!(
+                read_text(&root.join("temporary"))
+                    .expect("temporary state")
+                    .contains("203.0.113.79/32")
+            );
         } else {
             assert_eq!(output.status.code(), Some(1), "{scenario}: {output:?}");
             let expected = match scenario {
-                "lost-file" => "binary upgrade changed temporary-ban data",
-                "lost-lookup" => "binary upgrade lost the active temporary ban from offline lookup",
-                "lost-enforcement" => "upgraded sync did not enforce the preserved temporary ban",
+                "lost-file" => "candidate reinstall changed nonempty temporary state",
+                "lost-lookup" => "candidate reinstall lost the active temporary lookup",
+                "lost-enforcement" => "reinstalled candidate did not enforce temporary ban",
                 _ => unreachable!(),
             };
             assert!(

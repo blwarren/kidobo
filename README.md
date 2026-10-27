@@ -203,9 +203,11 @@ before every push; GitHub does not run project CI for pushes or tags. The comple
 checks formatting, lints, dependency policy, audits, and tests. Publication additionally
 requires coverage, strict rustdoc, the isolated release-binary exercise, static Debian/Alpine
 compatibility, and by default required Debian/Ubuntu coverage in the [Incus distro lifecycle
-matrix](docs/e2e.md). Separate `just e2e` runs also cover advisory Fedora and AlmaLinux targets.
-The isolated exercises use a temporary
-`KIDOBO_ROOT`, a loopback HTTP feed, and fake privileged commands; they never
+matrix](docs/e2e.md). Separate `just e2e` runs cover all seven configured targets, including
+advisory Fedora and AlmaLinux with enforcing SELinux. The suite reuses verified seven-day
+prepared images and permits two running VMs while retaining full application checks.
+The isolated exercises use a temporary `KIDOBO_ROOT`, a loopback HTTP feed, and fake privileged
+commands; they never
 touch the development host's firewall or systemd. The Incus matrix runs real privileged
 operations only inside disposable VMs. Dependabot update
 PRs are the only GitHub-hosted automation retained. Run
@@ -220,7 +222,9 @@ and failure recovery. Use `just publish-release X.Y.Z --skip-e2e` to omit the VM
 matrix while retaining all other release checks and uploaded-asset verification.
 After a failed matrix, `just publish-release X.Y.Z --resume-e2e RUN_ID` resumes the retained
 exact candidate and reuses compatible successful target results after verifying its validation
-identity. See [candidate resume](docs/e2e.md#resume-a-candidate) for requirements.
+identity. Add `--refresh-e2e-images` to rebuild preparation images and rerun required coverage,
+including when resuming the retained candidate. See [candidate resume](docs/e2e.md#resume-a-candidate)
+for requirements.
 
 Use `just --list` to see all available local and CI recipes.
 

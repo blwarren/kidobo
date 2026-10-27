@@ -39,7 +39,10 @@ validation or verified resume; ordinary pushes still run `just ci`.
 Coverage, strict rustdoc, the isolated release-binary exercise, static compatibility checks,
 and required coverage in the [Incus distro lifecycle matrix](e2e.md)
 are publication gates; they are not part of `just ci`. Fedora and AlmaLinux coverage is advisory
-and runs separately through `just e2e`, outside publication. The matrix can be omitted
+and runs separately through `just e2e`, outside publication, with enforcing SELinux on those
+targets. Full seven-platform qualification requires every selected target to pass; reports expose
+that outcome separately from the four-target release gate. Prepared-image reuse and bounded
+two-VM concurrency reduce repeated work without omitting application checks. The matrix can be omitted
 with the explicit publisher option `--skip-e2e`.
 
 CI/CD remains local. Dependabot version updates are the sole GitHub-hosted automation exception;
@@ -149,7 +152,10 @@ prerequisites, keeping all other gates. See the [command reference](../scripts/R
 for skip reporting. A failed matrix retains the exact packaged candidate and its validation
 identity for `just publish-release X.Y.Z --resume-e2e RUN_ID`. Resume verifies the unchanged
 source and candidate before reusing completed local gates and compatible successful distro
-results; it does not rebuild or repackage the candidate. See [candidate resume](e2e.md#resume-a-candidate)
+results within the preparation freshness limit; it does not rebuild or repackage the candidate.
+Add `--refresh-e2e-images` to force new prepared images and rerun required E2E coverage while
+retaining compatible local gates and the archive. This option cannot combine with `--skip-e2e`.
+See [candidate resume](e2e.md#resume-a-candidate)
 for eligibility and historical-run limits. The VM suite operates real guest
 firewalls and systemd only inside disposable VMs. Read [setup and diagnosis](e2e.md) for VM
 requirements and retained run evidence, and [commands and recovery](../scripts/README.md)

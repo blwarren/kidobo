@@ -28,15 +28,18 @@ fn runner_at(dir: &Path) -> Runner {
         cancelled: Arc::new(AtomicBool::new(false)),
         report: Report::open(dir).expect("report"),
         command_poll_interval: std::time::Duration::from_millis(1),
+        ignore_cancellation: false,
     }
 }
 
 fn successful_document() -> Value {
     json!({
         "run_id":"run-1-1", "tag":"v1.2.3", "status":"failed", "commands": [],
+        "validation_contract":crate::contract::VERSION,
         "coverage":"Candidate lifecycle lane including reboot, upgrade, and failure preservation",
         "results":[{"distro":"debian-12", "phase":"application", "error":null,
-            "cleanup_error":null, "diagnostic_errors":[], "image_fingerprint":"known-image", "transcript_line":4}],
+            "cleanup_error":null, "diagnostic_errors":[], "image_fingerprint":"known-image", "transcript_line":4,
+            "seconds":42.5, "preparation":{"preparation":{"prepared_at_unix":crate::prepared::now().expect("clock")}}}],
         "stages":LIFECYCLE_STAGES.iter().map(|name| json!({"name":format!("debian-12 | {name}"),"status":"passed"})).collect::<Vec<_>>(),
         "checks":LIFECYCLE_STAGES.iter().map(|name| json!({"context":format!("debian-12 | {name}"),"status":"passed"})).collect::<Vec<_>>(),
     })
@@ -46,7 +49,14 @@ fn write_inputs(runner: &Runner) {
     let dir = runner.evidence().join("inputs");
     fs::create_dir_all(dir.join("release")).expect("inputs");
     let mut hashes = serde_json::Map::new();
-    for name in ["installer.sh", "provision.sh", "lifecycle.sh", "traffic.py"] {
+    for name in [
+        "installer.sh",
+        "provision.sh",
+        "lifecycle.sh",
+        "traffic.py",
+        "checks.json",
+        "harness",
+    ] {
         let path = dir.join(name);
         fs::write(&path, format!("fixture {name}\n")).expect("script");
         hashes.insert(name.into(), json!(hash(&path).expect("hash")));
@@ -63,6 +73,11 @@ fn write_inputs(runner: &Runner) {
     )
     .expect("candidate");
     fs::write(dir.join("release/SHA256SUMS"), "exact checksum manifest\n").expect("checksums");
+    fs::write(
+        runner.evidence().join("baseline-archive.tar.gz"),
+        "baseline archive",
+    )
+    .expect("baseline archive");
     for (name, value) in [
         ("baseline-tag", "v1.2.2"),
         ("baseline-installer.sh", "baseline installer"),
@@ -76,6 +91,8 @@ fn source(root: &Path) {
     let mut runner = runner_at(&root.join("run-1-1"));
     write_inputs(&runner);
     runner.report.document = successful_document();
+    runner.report.document["baseline_archive_sha256"] =
+        json!(hash(&runner.evidence().join("baseline-archive.tar.gz")).expect("baseline hash"));
     runner.report.document["archive_sha256"] = json!(
         hash(
             &runner
@@ -359,6 +376,12 @@ fn verified_success_skips_vm_creation_and_links_the_original_evidence() {
         runner.report.document["results"][0]["reused_from"]["run_id"],
         "run-1-1"
     );
+    assert_eq!(runner.report.document["results"][0]["seconds"], 0.0);
+    assert_eq!(runner.report.document["results"][0]["source_seconds"], 42.5);
+    assert_eq!(
+        runner.report.document["results"][0]["source_transcript_line"],
+        4
+    );
     let ownership: Owned =
         serde_json::from_str(&read_text(&runner.dir.join("ownership.json")).expect("ownership"))
             .expect("json");
@@ -389,6 +412,7 @@ fn required_selection_includes_current_requirements_and_omits_advisory_targets()
             family: "apt".into(),
             packages: vec![],
             required: true,
+            selinux: "image-default".into(),
         },
         Distro {
             id: "advisory".into(),
@@ -396,6 +420,7 @@ fn required_selection_includes_current_requirements_and_omits_advisory_targets()
             family: "dnf".into(),
             packages: vec![],
             required: false,
+            selinux: "image-default".into(),
         },
     ]);
     let ids = |only_required| {

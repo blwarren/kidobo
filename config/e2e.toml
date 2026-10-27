@@ -2,9 +2,16 @@ project = "kidobo-e2e"
 profile = "kidobo-e2e"
 network = "kidoboe2e0"
 pool = "kidobo-e2e"
+max_parallel_vms = 2
 cpus = 2
 memory = "4GiB"
 disk = "30GiB"
+
+[prepared_images]
+enabled = true
+max_age_hours = 168
+max_generations = 2
+prune_after_hours = 336
 
 [[distros]]
 id = "debian-12"
@@ -35,6 +42,7 @@ required = false
 id = "fedora-44"
 image = "fedora/44"
 family = "dnf"
+selinux = "enforcing"
 packages = ["bash", "ca-certificates", "curl", "tar", "coreutils", "grep", "kmod", "sudo", "iproute", "python3", "ipset", "iptables", "bgpq4", "kernel-modules-extra"]
 
 [[distros]]
@@ -42,6 +50,7 @@ required = false
 id = "almalinux-9"
 image = "almalinux/9"
 family = "dnf-epel"
+selinux = "enforcing"
 packages = ["bash", "ca-certificates", "curl", "tar", "coreutils", "grep", "kmod", "sudo", "iproute", "python3", "ipset", "iptables", "bgpq4", "epel-release", "dnf-plugins-core", "kernel-modules-extra"]
 
 [[distros]]
@@ -49,4 +58,5 @@ required = false
 id = "almalinux-10"
 image = "almalinux/10"
 family = "dnf-epel"
+selinux = "enforcing"
 packages = ["bash", "ca-certificates", "curl", "tar", "coreutils", "grep", "kmod", "sudo", "iproute", "python3", "ipset", "iptables", "bgpq4", "epel-release", "dnf-plugins-core", "kernel-modules-extra"]

@@ -1,0 +1,92 @@
+{
+  "version": 1,
+  "profiles": {
+    "candidate": {
+      "start": {
+        "installation and initialization": 1,
+        "initialization preserves default files": 1,
+        "initialization preserves custom files": 1,
+        "bad checksum rejected": 1,
+        "HTTP sync and repeated firewall activation": 1,
+        "invalid configuration preserves enforcement": 1,
+        "safelist add and removal": 1,
+        "temporary ban and unban sync boundary": 1,
+        "permanent ban and unban sync boundary": 1,
+        "packaged ASN resolver and sync boundaries": 1,
+        "offline doctor and lookup preserve runtime": 1,
+        "IPv6 capacity failure preserves both families": 1,
+        "boot timer enabled and active": 1,
+        "IPv4 control traffic to 198.18.77.1": 5,
+        "IPv6 control traffic to fd42:6b69:646f:626f::1": 5,
+        "IPv4 traffic to 198.18.77.1": 5,
+        "IPv6 traffic to fd42:6b69:646f:626f::1": 5
+      },
+      "after-reboot": {
+        "reboot restores timer enforcement": 1,
+        "IPv4 control traffic to 198.18.77.1": 2,
+        "IPv6 control traffic to fd42:6b69:646f:626f::1": 2,
+        "IPv4 traffic to 198.18.77.1": 2,
+        "IPv6 traffic to fd42:6b69:646f:626f::1": 2
+      },
+      "upgrade": {
+        "baseline to target upgrade preserves data": 1,
+        "published baseline enforcement": 1,
+        "candidate reinstall preserves temporary bans": 1,
+        "IPv4 control traffic to 198.18.77.1": 2,
+        "IPv6 control traffic to fd42:6b69:646f:626f::1": 2,
+        "IPv4 traffic to 198.18.77.1": 2,
+        "IPv6 traffic to fd42:6b69:646f:626f::1": 2
+      },
+      "finish": {
+        "failed uninstall preserves runtime": 1,
+        "cache-only flush preserves enforcement": 1,
+        "flush removes only managed enforcement": 1,
+        "successful uninstall removes managed runtime": 1,
+        "IPv4 control traffic to 198.18.77.1": 5,
+        "IPv6 control traffic to fd42:6b69:646f:626f::1": 5,
+        "IPv4 traffic to 198.18.77.1": 5,
+        "IPv6 traffic to fd42:6b69:646f:626f::1": 5
+      }
+    },
+    "published": {
+      "start": {
+        "installation and initialization": 1,
+        "initialization preserves default files": 1,
+        "HTTP sync and repeated firewall activation": 1,
+        "published doctor and offline lookup": 1,
+        "IPv4 control traffic to 198.18.77.1": 2,
+        "IPv6 control traffic to fd42:6b69:646f:626f::1": 2,
+        "IPv4 traffic to 198.18.77.1": 2,
+        "IPv6 traffic to fd42:6b69:646f:626f::1": 2
+      },
+      "finish": {
+        "failed uninstall preserves runtime": 1,
+        "cache-only flush preserves enforcement": 1,
+        "flush removes only managed enforcement": 1,
+        "successful uninstall removes managed runtime": 1,
+        "IPv4 control traffic to 198.18.77.1": 5,
+        "IPv6 control traffic to fd42:6b69:646f:626f::1": 5,
+        "IPv4 traffic to 198.18.77.1": 5,
+        "IPv6 traffic to fd42:6b69:646f:626f::1": 5
+      }
+    },
+    "preparation": {
+      "--prepare": {
+        "guest route and DNS readiness": 1,
+        "guest dependency provisioning": 1,
+        "operating system upgrade": 1,
+        "intended boot kernel and security preparation": 1
+      },
+      "--check-kernel": {
+        "post-upgrade kernel and firewall backends": 1,
+        "prepared SELinux enforcement": 1
+      },
+      "--sanitize": {
+        "prepared image is pristine and sanitized": 1
+      },
+      "--admit": {
+        "prepared clone admission": 1
+      }
+    }
+  }
+}

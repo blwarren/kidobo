@@ -6,6 +6,15 @@ use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{Sender, SyncSender};
+use std::time::Instant;
+
+pub(super) enum Event {
+    Write(String, Sender<std::result::Result<(usize, usize), String>>),
+    Snapshot(Value, Sender<std::result::Result<(), String>>),
+}
 
 pub(super) struct Report {
     dir: PathBuf,
@@ -14,6 +23,11 @@ pub(super) struct Report {
     pub(super) context: String,
     pub(super) line: usize,
     marker_buffers: BTreeMap<usize, Vec<u8>>,
+    sink: Option<SyncSender<Event>>,
+    quiet: bool,
+    command_ids: Arc<AtomicUsize>,
+    check_ids: Arc<AtomicUsize>,
+    stage_started: Option<Instant>,
 }
 
 impl Report {
@@ -66,6 +80,8 @@ impl Report {
         let line = BufReader::new(File::open(dir.join("transcript.log"))?)
             .split(b'\n')
             .try_fold(0, |count, row| row.map(|_| count + 1))?;
+        let command_id = next_id(&document["commands"]);
+        let check_id = next_id(&document["checks"]);
         Ok(Self {
             dir: dir.to_owned(),
             transcript,
@@ -73,7 +89,95 @@ impl Report {
             context: "preparation".into(),
             line,
             marker_buffers: BTreeMap::new(),
+            sink: None,
+            quiet: false,
+            command_ids: Arc::new(AtomicUsize::new(command_id)),
+            check_ids: Arc::new(AtomicUsize::new(check_id)),
+            stage_started: None,
         })
+    }
+
+    pub(super) fn worker(&self, sink: SyncSender<Event>) -> Result<Self> {
+        let mut report = self.silent()?;
+        report.sink = Some(sink);
+        report.quiet = false;
+        Ok(report)
+    }
+
+    pub(super) fn silent(&self) -> Result<Self> {
+        Ok(Self {
+            dir: self.dir.clone(),
+            transcript: OpenOptions::new().write(true).open("/dev/null")?,
+            document: json!({"commands":[], "checks":[], "stages":[], "results":[]}),
+            context: "preparation".into(),
+            line: self.line,
+            marker_buffers: BTreeMap::new(),
+            sink: None,
+            quiet: true,
+            command_ids: Arc::clone(&self.command_ids),
+            check_ids: Arc::clone(&self.check_ids),
+            stage_started: None,
+        })
+    }
+
+    pub(super) fn next_command_id(&self) -> usize {
+        self.command_ids.fetch_add(1, Ordering::Relaxed)
+    }
+
+    pub(super) fn command_mut(&mut self, id: usize) -> Result<&mut Value> {
+        self.document["commands"]
+            .as_array_mut()
+            .and_then(|records| records.iter_mut().find(|record| record["id"] == id))
+            .ok_or_else(|| format!("missing command {id}").into())
+    }
+
+    pub(super) fn accept(&mut self, event: Event, failed: Option<&str>) -> Result<()> {
+        match event {
+            Event::Write(record, reply) => {
+                let result = if let Some(error) = failed {
+                    Err(error.into())
+                } else {
+                    self.write_record(record)
+                };
+                let acknowledgement = result
+                    .as_ref()
+                    .map(|line| (*line, self.line))
+                    .map_err(ToString::to_string);
+                let _ = reply.send(acknowledgement);
+                result.map(|_| ())
+            }
+            Event::Snapshot(document, reply) => {
+                let result = if let Some(error) = failed {
+                    Err(error.into())
+                } else {
+                    self.merge(&document).and_then(|()| self.save())
+                };
+                let _ = reply.send(result.as_ref().copied().map_err(ToString::to_string));
+                result
+            }
+        }
+    }
+
+    fn merge(&mut self, document: &Value) -> Result<()> {
+        for (key, identity) in [("commands", "id"), ("checks", "id"), ("stages", "name")] {
+            let records = self.document[key]
+                .as_array_mut()
+                .ok_or("invalid report records")?;
+            for record in document[key].as_array().ok_or("invalid worker records")? {
+                if let Some(current) = records
+                    .iter_mut()
+                    .find(|item| item[identity] == record[identity])
+                {
+                    current.clone_from(record);
+                } else {
+                    records.push(record.clone());
+                }
+            }
+            if identity == "id" {
+                records.sort_by_key(|record| record["id"].as_u64());
+            }
+        }
+        Ok(())
     }
 
     /// Returns the first one-based line reference of this record.
@@ -82,6 +186,19 @@ impl Report {
     }
 
     fn write_record(&mut self, mut record: String) -> Result<usize> {
+        if let Some(sink) = &self.sink {
+            let (reply, acknowledgement) = std::sync::mpsc::channel();
+            sink.send(Event::Write(record, reply))?;
+            let (first, last) = acknowledgement
+                .recv()?
+                .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> { error.into() })?;
+            self.line = last;
+            return Ok(first);
+        }
+        if self.quiet {
+            self.line += 1;
+            return Ok(self.line);
+        }
         let first = self.line + 1;
         if !record.ends_with('\n') {
             record.push('\n');
@@ -141,14 +258,14 @@ impl Report {
         let (Some(name), Some(status), Some(detail)) =
             (fields.next(), fields.next(), fields.next())
         else {
-            return Ok(());
+            return self.marker_error(command, "incomplete check marker");
         };
         let label = match status {
             "PLAN" => "PLANNED",
             "START" => "CHECK",
             "PASS" => "PASS",
             "FAIL" => "FAIL",
-            _ => return Ok(()),
+            _ => return self.marker_error(command, &format!("unknown check outcome: {status}")),
         };
         if matches!(status, "PASS" | "FAIL")
             && !self.document["checks"].as_array().is_some_and(|checks| {
@@ -159,11 +276,10 @@ impl Report {
                 })
             })
         {
-            self.emit(&format!(
-                "[{}] Ignored unmatched check outcome: {name} ({status})",
-                self.context
-            ))?;
-            return Ok(());
+            return self.marker_error(
+                command,
+                &format!("unmatched check outcome: {name} ({status})"),
+            );
         }
         let detail_label = if matches!(status, "START" | "PLAN") {
             "expected"
@@ -192,7 +308,7 @@ impl Report {
                     }
                     return self.save();
                 }
-                let id = checks.len() + 1;
+                let id = self.check_ids.fetch_add(1, Ordering::Relaxed);
                 checks.push(json!({
                     "id": id, "command": command, "context": self.context,
                     "name": name, "status": if status == "PLAN" { "not-run" } else { "running" }, "expectation": detail,
@@ -215,11 +331,30 @@ impl Report {
         self.save()
     }
 
+    fn marker_error(&mut self, command: usize, error: &str) -> Result<()> {
+        if self.document["check_protocol_errors"].is_null() {
+            self.document["check_protocol_errors"] = json!([]);
+        }
+        self.document["check_protocol_errors"]
+            .as_array_mut()
+            .ok_or("invalid check errors")?
+            .push(json!({"command":command,"error":error}));
+        self.emit(&format!(
+            "[{}] Invalid check protocol: {error}",
+            self.context
+        ))?;
+        self.save()
+    }
+
     pub(super) fn finish_checks(&mut self, command: usize, status: &str) -> Result<()> {
         self.marker_buffers.remove(&command);
         if let Some(checks) = self.document["checks"].as_array_mut() {
             for check in checks {
-                if check["command"] == command && check["status"] == "running" {
+                if check["command"] == command
+                    && (check["status"] == "running"
+                        || (matches!(status, "passed" | "incomplete")
+                            && check["status"] == "not-run"))
+                {
                     check["status"] = json!(if status == "interrupted" {
                         "interrupted"
                     } else {
@@ -234,6 +369,7 @@ impl Report {
     }
 
     pub(super) fn stage(&mut self, context: &str) -> Result<()> {
+        self.stage_started = Some(Instant::now());
         context.clone_into(&mut self.context);
         let line = self.emit(&format!("[{}] STAGE", self.context))?;
         self.document["current_stage"] = json!(context);
@@ -255,6 +391,12 @@ impl Report {
                 if stage["name"] == self.context && stage["status"] == "running" {
                     stage["status"] = json!(status);
                     stage["end_line"] = json!(self.line);
+                    let seconds = self
+                        .stage_started
+                        .take()
+                        .map_or(0.0, |start| start.elapsed().as_secs_f64());
+                    stage["active_seconds"] =
+                        json!(stage["active_seconds"].as_f64().unwrap_or(0.0) + seconds);
                 }
             }
         }
@@ -262,6 +404,14 @@ impl Report {
     }
 
     pub(super) fn save(&self) -> Result<()> {
+        if let Some(sink) = &self.sink {
+            let (reply, acknowledgement) = std::sync::mpsc::channel();
+            sink.send(Event::Snapshot(self.document.clone(), reply))?;
+            return acknowledgement.recv()?.map_err(Into::into);
+        }
+        if self.quiet {
+            return Ok(());
+        }
         atomic_write(
             &self.dir,
             "results.json",
@@ -269,6 +419,18 @@ impl Report {
         )?;
         atomic_write(&self.dir, "summary.txt", summary(&self.document).as_bytes())
     }
+}
+
+fn next_id(records: &Value) -> usize {
+    records
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|record| record["id"].as_u64())
+        .filter_map(|id| usize::try_from(id).ok())
+        .max()
+        .unwrap_or(0)
+        + 1
 }
 
 fn atomic_write(dir: &Path, name: &str, bytes: &[u8]) -> Result<()> {
@@ -337,14 +499,24 @@ fn summary(document: &Value) -> String {
         "archive",
         "targets",
         "required_targets",
+        "configured_required_targets",
         "advisory_targets",
         "resume_from",
         "coverage",
+        "validation_contract",
+        "requested_parallelism",
+        "effective_parallelism",
+        "run_wall_seconds",
+        "release_gate_passed",
+        "all_selected_targets_passed",
+        "active_targets",
+        "platforms",
         "current_stage",
         "evidence",
         "warnings",
         "error",
         "evidence_error",
+        "emergency_cleanup",
     ] {
         if !document[key].is_null() {
             let _ = writeln!(text, "{key}: {}", display(&document[key]));
@@ -357,18 +529,26 @@ fn summary(document: &Value) -> String {
                 format!("FAIL: {}", display(&result["error"]))
             } else if !result["cleanup_error"].is_null() {
                 format!("FAIL: cleanup: {}", display(&result["cleanup_error"]))
+            } else if result["diagnostic_errors"].is_array()
+                && result["diagnostic_errors"] != json!([])
+            {
+                "FAIL: diagnostics incomplete".to_owned()
             } else {
                 "PASS".to_owned()
             };
             let _ = writeln!(
                 text,
-                "{}: {status}; phase {}; {} seconds",
+                "{}: {status}; phase {}; residence {} seconds",
                 display(&result["distro"]),
                 display(&result["phase"]),
                 display(&result["seconds"])
             );
             for key in [
                 "required",
+                "active_seconds",
+                "parked_seconds",
+                "source_seconds",
+                "preparation",
                 "reused_from",
                 "source_transcript_line",
                 "image",
@@ -589,6 +769,88 @@ mod tests {
         );
         assert!(text.contains("debian-13: FAIL: cleanup: deletion failed"));
         assert!(!text.contains("PASS"));
+    }
+
+    #[test]
+    fn coordinator_keeps_interleaved_workers_ids_contexts_and_line_references() -> Result<()> {
+        let dir = Directory::new();
+        let mut coordinator = Report::open(&dir.0)?;
+        let (sender, receiver) = std::sync::mpsc::sync_channel(8);
+        std::thread::scope(|scope| -> Result<()> {
+            let mut handles = Vec::new();
+            for target in ["one", "two"] {
+                let mut worker = coordinator.worker(sender.clone())?;
+                handles.push(scope.spawn(move || -> Result<()> {
+                    worker.stage(&format!("{target} | scenario"))?;
+                    let id = worker.next_command_id();
+                    let line = worker.emit(&format!("{target} command {id}"))?;
+                    worker.document["commands"]
+                        .as_array_mut()
+                        .ok_or("commands")?
+                        .push(json!({"id":id,"context":worker.context,"line":line}));
+                    worker.save()?;
+                    worker.output(id, "stderr", b"E2E_CHECK\tsame name\tSTA")?;
+                    worker.output(id, "stderr", b"RT\texpected\n")?;
+                    worker.output(id, "stderr", b"E2E_CHECK\tsame name\tPASS\tobserved\n")?;
+                    worker.finish_checks(id, "passed")?;
+                    worker.finish_stage("passed")
+                }));
+            }
+            drop(sender);
+            for event in receiver {
+                coordinator.accept(event, None)?;
+            }
+            for handle in handles {
+                handle.join().expect("worker must not panic")?;
+            }
+            Ok(())
+        })?;
+        assert_eq!(
+            coordinator.document["commands"]
+                .as_array()
+                .expect("commands")
+                .len(),
+            2
+        );
+        let checks = coordinator.document["checks"].as_array().expect("checks");
+        assert_eq!(checks.len(), 2);
+        assert_ne!(checks[0]["id"], checks[1]["id"]);
+        assert_ne!(checks[0]["context"], checks[1]["context"]);
+        assert!(checks.iter().all(|check| check["status"] == "passed"));
+        let transcript = crate::read_text(&dir.0.join("transcript.log"))?;
+        for check in checks {
+            let line = usize::try_from(check["line"].as_u64().expect("line"))?;
+            assert!(
+                transcript
+                    .lines()
+                    .nth(line - 1)
+                    .expect("line exists")
+                    .contains("CHECK: same name")
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn coordinator_reports_write_failure_to_waiting_worker() -> Result<()> {
+        let dir = Directory::new();
+        let mut coordinator = Report::open(&dir.0)?;
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let mut worker = coordinator.worker(sender)?;
+        let handle = std::thread::spawn(move || worker.emit("record"));
+        let event = receiver.recv_timeout(std::time::Duration::from_secs(5))?;
+        coordinator
+            .accept(event, Some("report failure"))
+            .expect_err("sink failure");
+        assert_eq!(
+            handle
+                .join()
+                .expect("worker exits")
+                .expect_err("worker notified")
+                .to_string(),
+            "report failure"
+        );
+        Ok(())
     }
 
     #[test]

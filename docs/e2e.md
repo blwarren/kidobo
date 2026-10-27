@@ -14,6 +14,8 @@ additional compatibility coverage. Run `just e2e` separately to cover all seven 
 including advisory Fedora 44 and AlmaLinux 9 and 10. In that broader run, advisory prerequisite
 and application failures are reported without failing the run when every required target passes.
 Cleanup failures and shared infrastructure or evidence archive failures still block the run.
+Reports distinguish required release-gate success from success on every selected target; full
+seven-platform qualification requires every selected target to pass.
 In [the matrix configuration](../config/e2e.toml), `required` defaults to `true`; advisory targets
 explicitly set `required = false`. Changing this policy changes release coverage and should be
 reviewed accordingly. The explicit publisher option `--skip-e2e` omits the entire release matrix.
@@ -61,22 +63,74 @@ directory-backed storage pool `kidobo-e2e`. Existing resources must belong to th
 conflicts fail setup. Rerunning setup restores missing owned profile devices and applies
 changed device/resource settings; an unchanged owned profile is left untouched. Review
 [the matrix configuration](../config/e2e.toml) for image selectors
-and resource settings. Commands execute sequentially, with 2 vCPUs, 4 GiB memory, and a
-30 GiB virtual disk per VM by default. Successfully prepared VMs are stopped until their
-application checks, keeping at most one VM running. Allow disk space for all pending targets
-as well as images and failure artifacts.
-Incus images and distro repositories require network access.
+and resource settings. The default `max_parallel_vms = 2` allows two running VMs, each with 2 vCPUs,
+4 GiB memory, and a 30 GiB virtual disk. Set it to `1` for diagnosis or comparisons.
+Preflight reserves 1 GiB of host memory beyond the guests, reduces concurrency to one when
+necessary, and fails before creating guests if one cannot fit. Any running guest in the suite
+project prevents a new matrix; stop or clean retained guests first. A host-wide coordinator lock
+for the local Incus server/project prevents competing operations from racing cache maintenance
+or exceeding the configured limit. Allow disk space for pending targets, prepared images, upstream
+images, and failure artifacts. Incus images and distro repositories require
+network access when preparing images.
 
-The runner prepares fresh VMs for all pending targets before starting application lifecycles.
-Preparation installs packaged prerequisites, updates each distro within its pinned release line,
-reboots, and checks the running kernel's required firewall modules and backends. It then stops
-each prepared VM; application testing starts it again and repeats kernel checks before installation.
-AlmaLinux enables EPEL/CRB. A required target's package, image, or kernel prerequisite failure
-stops the application batch before the longer lifecycle checks, while diagnostics and cleanup
-still run. An advisory prerequisite failure leaves successful targets eligible to continue.
-The suite requires packaged prerequisites and does not build
-replacements for unavailable packages. Resume can reuse compatible successful targets without
-creating VMs for them.
+The runner admits prerequisites for all pending targets before starting application lifecycles.
+A target receives a fresh clone of a compatible prepared image, or builds a new prepared image
+when needed. Preparation installs packaged prerequisites, updates each distro within its pinned
+release line, selects and reboots into the intended installed kernel, and verifies its required
+firewall modules and backends. Every clone repeats kernel, module, network, security-state, and
+pristine-application-state checks. The final prepared batch can proceed directly to application
+checks without an unnecessary stop/start cycle.
+
+AlmaLinux enables EPEL/CRB. Fedora and AlmaLinux application lifecycles run under enforcing
+SELinux; preparation safely relabels previously disabled images before enforcement. A required
+target's package, image, kernel, or admission failure stops the application batch, while diagnostics
+and cleanup still run. An advisory prerequisite failure leaves successful targets eligible to
+continue. The suite requires packaged prerequisites and does not build replacements for unavailable
+packages. Resume can reuse compatible successful targets without creating VMs for them.
+
+## Prepared-image reuse
+
+The suite stores private prepared images in its owned Incus project. Each reusable generation is
+created before installing Kidobo and contains no candidate archives, application data, active
+fixtures, or previous application results. Instance identity is sanitized before publication and
+clone admission verifies the running kernel, required modules, networking, security state, and
+absence of Kidobo state. A cache hit changes OS preparation only; application checks still run.
+Set `prepared_images.enabled` to `false` to prepare every disposable VM afresh without publishing or reusing prepared images.
+
+The `[prepared_images]` settings in `config/e2e.toml` default to:
+
+| Setting | Default | Behavior |
+| --- | --- | --- |
+| `enabled` | `true` | Reuse verified preparation generations. |
+| `max_age_hours` | `168` | Refresh after seven days from successful preparation; hits do not extend this deadline. |
+| `max_generations` | `2` | Retain two unused completed generations per target; generations referenced by retained guests are protected. |
+| `prune_after_hours` | `336` | Prune unused generations after fourteen days. |
+
+Preparation code, the host validation contract, prerequisite packages, target and VM resource/profile
+definitions, architecture, or SELinux requirements changing invalidates an image immediately.
+Upstream image changes alone do not invalidate a generation within its freshness window. A refresh resolves the current upstream
+fingerprint and installs current distro packages. Reports retain the preparation time, packages,
+kernel, security state, image identity, and verification evidence.
+
+A refresh failure never falls back to expired images. Rejected clone admission invalidates its
+generation and permits one fresh rebuild; the rejected attempt remains diagnostic evidence.
+Interrupted or incomplete publication never makes a generation reusable. Pruning checks ownership
+and usage and does not remove unrelated images or active generations. Maintenance happens during
+suite commands; there is no background scheduler.
+
+Force rebuilding preparation images and rerunning every selected target with:
+
+```bash
+just e2e --refresh-images
+just e2e-artifact "${RELEASE_ARCHIVE:?set RELEASE_ARCHIVE}" "${RELEASE_TAG:?set RELEASE_TAG}" --refresh-images
+just e2e-resume RUN_ID --required-only --refresh-images
+just publish-release X.Y.Z --refresh-e2e-images
+```
+
+Forced refresh also reruns targets that would otherwise qualify for resume. Publisher resume may
+still reuse the identical archive and completed local validation with
+`--resume-e2e RUN_ID --refresh-e2e-images`. The refresh publisher option cannot combine with
+`--skip-e2e`.
 
 ## Guest network prerequisites
 
@@ -122,24 +176,36 @@ just e2e-published
 just e2e-published "${RELEASE_TAG:?set RELEASE_TAG to a published tag}" --distro debian-12
 ```
 
-Candidate testing builds the static release binary and uses the same archive packager as
-publication. `just e2e` writes each archive into a new directory under
+By default, candidate testing builds the static release binary and uses the same archive packager
+as publication. `just e2e` writes each archive into a new directory under
 `target/e2e-candidate/<tag>/`; concurrent invocations do not overwrite each other. Each
 guest serves the captured archive through a local HTTP fixture and runs the real
 installer, including checksums, extraction, and binary replacement. The installer variable
 `KIDOBO_RELEASE_BASE_URL` selects this release directory and requires an explicit `--version`;
-normal installation continues to download from GitHub.
+normal installation continues to download from GitHub. To test an existing archive without
+rebuilding or repackaging it, use `just e2e --archive ARCHIVE --tag TAG`. This retains detached
+tmux execution and selects all configured targets unless `--required-only` is supplied. The
+`--archive=ARCHIVE` spelling is also accepted.
 
 The candidate lane covers initialization, preserved configuration, offline inspection,
 IPv4/IPv6 blocked and allowed traffic, safelists, source edits, systemd/timer execution,
 reboot recovery, failure preservation, upgrade, flush, and uninstall. Probes use network
 namespaces inside guests; host firewall commands are never test targets. Each distro keeps
-its installed iptables backend and security configuration. HTTP fixtures make source data
-deterministic; external IRR query availability is outside the gate.
+its installed iptables backend. The expected SELinux mode is explicit per target, with
+`selinux = "enforcing"` on Fedora and AlmaLinux and `"image-default"` elsewhere. HTTP and local
+IRR fixtures make source data deterministic; external IRR availability is outside the gate.
+ASN checks execute the actual packaged `bgpq4` with only its server endpoint redirected to the
+local fixture. They cover both families, source persistence, sync boundaries, and offline caches.
+
+Traffic assertions distinguish a connection timeout from fixture or infrastructure failures.
+Blocked traffic requires a DROP-rule packet-counter increase and working allowed control traffic.
+Paired IPv4/IPv6 probes use one-second blocked-connect deadlines and run concurrently. A shared,
+versioned check manifest requires every phase's expected checks to complete; missing markers,
+unstarted planned checks, duplicate outcomes, and unexpected check IDs cannot qualify a phase.
 
 The published lane resolves `latest` once and installs the selected release from genuine
 GitHub assets, then tests initialization, configuration, doctor, synchronization, and
-uninstall. Provisioning still updates and reboots each fresh guest before installing Kidobo.
+uninstall. Its guests use the same prepared-image freshness and clone-admission rules as candidates.
 This smoke lane omits the candidate's post-install reboot and upgrade scenarios. It requires
 GitHub access and runs independently of publication.
 
@@ -157,7 +223,8 @@ just e2e-artifact "${release_archive}" "${release_tag}"
 ```
 
 This command selects every configured required target and excludes advisory targets. It accepts
-only an optional `--resume RUN_ID`; selecting an individual distro cannot bypass the release gate.
+optional `--resume RUN_ID` and `--refresh-images` arguments, in either order; selecting an individual
+distro cannot bypass the release gate.
 A filtered diagnosis alone does not satisfy publication; every required target needs a compatible
 successful lifecycle result. The underlying runner's `--required-only` option selects required
 targets, and the report records that selection.
@@ -186,15 +253,17 @@ just e2e-artifact "${release_archive}" "${release_tag}" --resume RUN_ID
 ```
 
 Reuse requires the exact candidate archive hash and tag, matching installer and guest-script
-hashes, matching target and VM resource definitions, and the same upgrade baseline tag, installer,
-and checksum manifest. A reused target must have completed the full candidate lifecycle with
+hashes and validation contract, matching target and VM resource definitions, and the same upgrade
+baseline tag, archive, installer, and checksum manifest. Preparation provenance must remain within
+the seven-day freshness limit. A reused target must have completed the full candidate lifecycle with
 successful stages, diagnostics, and cleanup. Changes to a target's definition or VM resources
 invalidate that target's earlier success. A changed candidate, installer, guest script, or checksum
 manifest rejects resume and requires a fresh run for all targets.
 Published smoke results cannot substitute for candidate lifecycle coverage.
 
-Historical candidate runs can be considered when their retained reports and evidence establish
-these checks. Resume verifies the source evidence archive's recorded SHA-256 before using it.
+Historical reports remain readable, but evidence predating the current validation contract cannot
+qualify the strengthened checks. Resume verifies the source evidence archive's recorded SHA-256
+before using it.
 Keep source runs and evidence when preserving a chain of resumed results.
 
 For a failed publication attempt created with resume support, use:
@@ -219,7 +288,8 @@ mv "${candidate_dir}" "${saved_dir}/candidate"
 just publish-release "${release_tag}"
 ```
 
-`--resume-e2e` and `--skip-e2e` are mutually exclusive. Older publisher attempts without retained
+`--resume-e2e` and `--skip-e2e` are mutually exclusive. `--refresh-e2e-images` can combine with
+resume, but cannot combine with `--skip-e2e`. Older publisher attempts without retained
 validation metadata cannot use publisher resume, even if their evidence remains eligible for
 `just e2e-resume`.
 
@@ -254,8 +324,9 @@ tail -f "$run_dir/transcript.log"
 ```
 
 The transcript preserves ordering within each output stream; ordering between stdout and
-stderr reflects when the runner observed the output. Shell tracing includes script, function,
-and line context and uses a separate descriptor so captured command results remain intact.
+stderr reflects when the coordinator observed the output. Concurrent targets have explicit command
+and stage identities and may interleave. Shell tracing includes script, function, and line context
+and uses a separate descriptor so captured command results remain intact.
 
 Background fixtures close the tracing descriptor as well as redirecting stdout/stderr.
 Otherwise the fixture can keep an Incus exec stream open after the lifecycle shell exits,
@@ -267,7 +338,8 @@ OS upgrades reuse the package metadata refreshed during prerequisite provisionin
 Temporary timer deferral resets inherited triggers before setting a delay relative to timer
 activation, preventing the normal boot trigger from racing configuration changes.
 The candidate's post-install reboot still tests the generated two-minute boot timer;
-that wait and fresh-VM package upgrades remain part of lifecycle coverage.
+that wait remains part of every candidate lifecycle. Package updates run during prepared-image
+creation and refresh, with each consuming run retaining their provenance.
 
 Local harness regression tests require Bash, curl, Python 3, and coreutils on the development
 host. They use fake privileged commands, temporary files, and loopback sockets without
@@ -277,13 +349,21 @@ The archive contains image fingerprints, package/kernel details, guest journals,
 snapshots, and scenario logs. Frozen installer, guest scripts, and matrix configuration are
 under `inputs/`, with hashes in `inputs/SHA256.json`. Candidate artifacts and their checksum
 manifest are under `inputs/release/`; all guests use the same captured inputs. The runner
-also checks that the original archive remains unchanged. Inspect archive contents without
-unpacking everything:
+also checks that the original archive remains unchanged. Upgrade baselines include the captured
+archive, installer, and checksum manifest; guests consume the same verified bytes. The baseline
+binary creates the old installation's configuration, permanent bans, and caches. Candidate upgrade
+checks retain that state and prove offline cache readability and enforcement before fresh downloads.
+Older baselines without temporary bans exercise missing-state upgrade, while a separate candidate
+reinstall check proves nonempty temporary-state preservation. The narrowly recognized historical
+Debian 12 baseline failure remains explicit in evidence; any isolated old-cache fixture records
+that it was generated by the frozen baseline with fake firewall commands.
+
+Inspect archive contents without unpacking everything:
 
 ```bash
 tar -tzf "$run_dir/evidence.tar.gz"
 tar -xOf "$run_dir/evidence.tar.gz" ./inputs/SHA256.json
-tar -xOf "$run_dir/evidence.tar.gz" ./debian-13/state/provision.txt
+tar -xOf "$run_dir/evidence.tar.gz" ./debian-13/preparation.json
 ```
 
 Working evidence lives in `.evidence/` during execution and is removed only after archive
@@ -296,8 +376,17 @@ Advisory target prerequisite and application failures remain visible in the summ
 results. Cleanup, shared infrastructure, and evidence archive failures still fail the run. Inspect the
 earliest failed command and its diagnostics before retrying.
 
-VMs are deleted after diagnostics by default. `--keep-failed` retains failed guests for
-inspection. Interrupted runs retain ownership records so cleanup can be retried safely:
+The report distinguishes overall wall time, active stage time, parked time, preparation builds,
+cache hits, and reused historical durations. Overall wall time covers runner execution and evidence
+archive finalization; the external candidate build and packaging are excluded. Do not sum overlapping
+target durations to infer wall time. Required-gate success and all-selected-target success are separate
+outcomes; inspect advisory failures, actual firewall backends, and security states before claiming
+seven-platform qualification.
+Diagnostic failures remain failures or incomplete evidence rather than a target PASS.
+
+VMs are deleted after diagnostics by default. `--keep-failed` retains failed guests stopped for
+inspection, so they do not consume another worker's running-VM slot. Interrupted runs retain
+ownership records so cleanup can be retried safely:
 
 ```bash
 just e2e-clean RUN_ID
@@ -306,6 +395,41 @@ just e2e-clean RUN_ID
 If the run used `KIDOBO_E2E_RESULTS_DIR`, pass the same results root during cleanup so the
 runner can find its ownership manifest. Cleanup only removes VMs whose suite ownership and
 run identity match recorded resources. Do not remove the shared project, bridge, or storage pool to clean a single run.
+
+## Validate a harness change
+
+Agents must not launch the VM matrix unless explicitly and expressly asked. Local harness
+regressions use fake commands, temporary roots, and loopback fixtures. `just ci` does not establish
+VM acceptance. The earlier historical runs below also do not qualify a changed validation contract.
+
+Use the same captured archive and tag for cold/warm comparison. The following cold command
+rebuilds preparation images and runs every configured target in the detached session:
+
+```bash
+release_archive="${RELEASE_ARCHIVE:?set RELEASE_ARCHIVE to the captured candidate archive}"
+release_tag="${RELEASE_TAG:?set RELEASE_TAG to the candidate tag}"
+just e2e --archive "$release_archive" --tag "$release_tag" --refresh-images
+```
+
+Attach with `tmux attach -t kidobo-e2e` and review the finished result. After the cold run has
+completed, remove its retained session and launch the warm run against the identical archive:
+
+```bash
+tmux kill-session -t kidobo-e2e
+just e2e --archive "$release_archive" --tag "$release_tag"
+```
+
+The warm command reuses eligible prepared images and reruns every selected application lifecycle.
+It creates a new report rather than crediting completed application coverage from resume. Remove
+the completed warm session before the next candidate run as well.
+
+User-run acceptance should also cover compatible resume. Verify enforcing SELinux on all three advisory targets and
+both nftables and legacy backend coverage. Full seven-platform qualification requires all selected
+targets to pass, even though publication requires only four. Compare cold/warm wall time and stage
+timings; report measured savings and identify any unverified paths.
+
+The separate Debian 11/Alpine gate verifies static-binary startup and offline lookup only. It is not
+full firewall or systemd qualification on those platforms.
 
 ## Initial validation: 22 October 2026
 

@@ -1,105 +1,237 @@
-use super::{
-    read_text,
-    tests::{TestDir, executable},
-};
+use super::{read_text, tests::TestDir};
 use std::fs;
 use std::process::Command;
 
-fn extracted_os_upgrade_phase() -> &'static str {
-    let lifecycle = include_str!("../../../scripts/e2e/lifecycle.sh");
-    let start = lifecycle
-        .find("os_upgrade_phase() {")
-        .expect("find OS upgrade function");
-    let end = lifecycle[start..]
-        .find("\nstart_phase() {")
-        .map(|offset| start + offset)
-        .expect("find next lifecycle phase");
-    &lifecycle[start..end]
-}
-
-fn exercise_upgrade(family: &str, manager_status: i32) -> (i32, String, String) {
-    let temp = TestDir::new();
-    let fake_bin = temp.path().join("bin");
-    let state = temp.path().join("state");
-    fs::create_dir(&fake_bin).expect("create fake bin directory");
-    fs::create_dir(&state).expect("create fake state directory");
-    fs::write(state.join("provision.txt"), format!("family={family}\n"))
-        .expect("write provisioning metadata");
-
-    executable(
-        &fake_bin.join("package-manager"),
-        "#!/bin/sh\nprintf '%s' \"${0##*/}\" >> \"$CALL_LOG\"\nfor arg in \"$@\"; do printf ' <%s>' \"$arg\" >> \"$CALL_LOG\"; done\nprintf '\\n' >> \"$CALL_LOG\"\nexit \"$UPGRADE_STATUS\"\n",
-    );
-    for manager in ["apt-get", "dnf", "zypper"] {
-        let link = fake_bin.join(manager);
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(fake_bin.join("package-manager"), link)
-            .expect("link fake package manager");
-    }
-    executable(
-        &fake_bin.join("dpkg-query"),
-        "#!/bin/sh\nprintf 'dpkg-query\\n' >> \"$CALL_LOG\"\nprintf 'pkg=1\\n'\n",
-    );
-    executable(
-        &fake_bin.join("rpm"),
-        "#!/bin/sh\nprintf 'rpm\\n' >> \"$CALL_LOG\"\nprintf 'pkg=1\\n'\n",
-    );
-
-    let script = temp.path().join("exercise.sh");
-    let body = format!(
-        "#!/usr/bin/env bash\nset -euo pipefail\nexec 9>&2\nSTATE='{}'\ne2e_check_start() {{ :; }}\ne2e_check_pass() {{ :; }}\nfail() {{ printf '%s\\n' \"$*\" >&2; exit 1; }}\n{}\nos_upgrade_phase\n",
-        state.display(),
-        extracted_os_upgrade_phase()
-    );
-    executable(&script, &body);
-
-    let log = temp.path().join("calls.log");
-    let output = Command::new("bash")
-        .arg(&script)
-        .env("PATH", format!("{}:/usr/bin:/bin", fake_bin.display()))
-        .env("CALL_LOG", &log)
-        .env("UPGRADE_STATUS", manager_status.to_string())
-        .output()
-        .expect("run extracted upgrade phase");
-    let calls = read_text(&log).unwrap_or_default();
-    let metadata = read_text(&state.join("provision.txt")).expect("read metadata");
-    (output.status.code().unwrap_or(128), calls, metadata)
+fn lifecycle_function(start: &str, end: &str) -> String {
+    let script = include_str!("../../../scripts/e2e/lifecycle.sh");
+    let offset = script
+        .find(&format!("\n{start}"))
+        .expect("lifecycle helper")
+        + 1;
+    let length = script[offset..].find(end).expect("following helper");
+    script[offset..offset + length].to_owned()
 }
 
 #[test]
-fn os_upgrade_reuses_provisioned_metadata_for_all_package_families() {
-    let cases = [
-        ("apt", "apt-get <-y> <full-upgrade>", "dpkg-query\n"),
-        ("dnf", "dnf <-y> <upgrade>", "rpm\n"),
-        ("dnf-epel", "dnf <-y> <upgrade>", "rpm\n"),
+fn frozen_baseline_transport_rejects_other_assets_and_arguments() {
+    let temp = TestDir::new();
+    fs::write(temp.path().join("SHA256SUMS"), "captured manifest\n").expect("manifest");
+    let output = Command::new("python3")
+        .args([
+            "-c",
+            r"
+import runpy, sys
+from pathlib import Path
+copy = runpy.run_path(sys.argv[1])['baseline_download']
+root = Path(sys.argv[2]); target = root / 'download'
+base = 'https://github.com/blwarren/kidobo/releases/download/v0.14.2/'
+copy(['-fsSL', '-o', str(target), base+'SHA256SUMS'], root, 'v0.14.2')
+assert target.read_bytes() == b'captured manifest\n'
+for args in [
+ ['-fsSL','-o',str(target),base+'other.tar.gz'],
+ ['-fsSL','-o',str(target),'https://example.invalid/SHA256SUMS'],
+ ['-fsSL','-o',str(target),base+'../SHA256SUMS'],
+ ['-o',str(target),base+'SHA256SUMS'],
+]:
+ try: copy(args, root, 'v0.14.2')
+ except ValueError: pass
+ else: raise AssertionError(args)
+assert target.read_bytes() == b'captured manifest\n'
+",
+        ])
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../scripts/e2e/traffic.py"
+        ))
+        .arg(temp.path())
+        .output()
+        .expect("exercise frozen transport");
+    assert!(output.status.success(), "{output:?}");
+}
+
+#[test]
+fn baseline_fixture_edits_preserve_old_generated_configuration() {
+    let function = lifecycle_function(
+        "configure_baseline_sources() {",
+        "\nassert_remote_lookup() {",
+    );
+    let temp = TestDir::new();
+    let config = temp.path().join("old-config.toml");
+    fs::write(
+        &config,
+        "# generated by the published baseline\n[ipset]\nset_name = \"old\"\nset_name_v6 = \"old-v6\"\nenable_ipv6 = false\nchain_action = \"DROP\"\nmaxelem = 123456\n[safe]\nips = []\ninclude_github_meta = true\n[remote]\nurls = []\ntimeout_secs = 17\n[asn]\nbanned = []\ncache_stale_after_secs = 86400\n",
+    )
+    .expect("old generated configuration");
+    let output = Command::new("bash")
+        .args([
+            "-c",
+            &format!(
+                "set -euo pipefail\nCONFIG=$OLD_CONFIG SET4=fixture4 SET6=fixture6 SOURCE_PORT=39474\n{function}\nconfigure_baseline_sources\n"
+            ),
+        ])
+        .env("OLD_CONFIG", &config)
+        .output()
+        .expect("configure published baseline without replacing its generated file");
+    assert!(output.status.success(), "{output:?}");
+    let text = read_text(&config).expect("configured baseline file");
+    assert!(text.starts_with("# generated by the published baseline\n"));
+    assert!(text.contains("maxelem = 123456\n"));
+    assert!(text.contains("timeout_secs = 17\n"));
+    assert!(text.contains("set_name = \"fixture4\"\n"));
+    assert!(text.contains("urls = [\"http://127.0.0.1:39474/feed.txt\"]\n"));
+}
+
+#[test]
+fn offline_upgrade_lookup_requires_exact_source_and_prefix() {
+    let function = lifecycle_function("assert_remote_lookup() {", "\ninstall_frozen_baseline() {");
+    for (record, succeeds) in [
         (
-            "zypper",
-            "zypper <--no-refresh> <--non-interactive> <update>",
-            "rpm\n",
+            "198.51.100.44\thttp://127.0.0.1:39474/feed.txt\t198.51.100.44/32\n",
+            true,
         ),
-    ];
-
-    for (family, expected_transaction, expected_inventory) in cases {
-        for status in [0, 102, 103] {
-            let (exit_code, calls, metadata) = exercise_upgrade(family, status);
-            assert_eq!(exit_code, 0, "{family} status {status} should be accepted");
-            assert_eq!(
-                calls,
-                format!("{expected_transaction}\n{expected_inventory}"),
-                "{family} must perform its upgrade and inventory without refreshing metadata"
+        (
+            "198.51.100.44\tinternal:blocklist\t198.51.100.44/32\n",
+            false,
+        ),
+        (
+            "198.51.100.44\thttp://127.0.0.1:39474/feed.txt\t198.51.100.0/24\n",
+            false,
+        ),
+        ("", false),
+    ] {
+        let temp = TestDir::new();
+        let output = Command::new("bash")
+            .args([
+                "-c",
+                &format!(
+                    "set -euo pipefail\nSTATE=$FIXTURE_ROOT SOURCE_PORT=39474\nfail() {{ printf '%s\\n' \"$*\" >&2; exit 1; }}\nkidobo() {{ printf '%s' \"$RECORD\"; }}\n{function}\nassert_remote_lookup upgrade 198.51.100.44 198.51.100.44/32\n"
+                ),
+            ])
+            .env("FIXTURE_ROOT", temp.path())
+            .env("RECORD", record)
+            .output()
+            .expect("exercise exact cached-source lookup assertion");
+        assert_eq!(output.status.success(), succeeds, "{output:?}");
+        if !succeeds {
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .contains("exact cached remote lookup failed")
             );
-            assert!(metadata.contains("os_upgrade_completed_utc="));
-            if status == 0 {
-                assert!(!metadata.contains("package_manager_reboot_status="));
-            } else {
-                assert!(metadata.contains(&format!("package_manager_reboot_status={status}")));
-            }
         }
-
-        let (exit_code, calls, metadata) = exercise_upgrade(family, 7);
-        assert_eq!(exit_code, 7, "{family} must propagate transaction failure");
-        assert_eq!(calls, format!("{expected_transaction}\n"));
-        assert!(!metadata.contains("os_upgrade_completed_utc="));
-        assert!(!metadata.contains("package_manager_reboot_status="));
     }
+}
+
+#[test]
+fn old_cache_firewall_fakes_keep_normalization_scoped_to_the_isolated_root() {
+    let temp = TestDir::new();
+    let output = Command::new("python3")
+        .args([
+            "-c",
+            r"
+import runpy, sys
+from pathlib import Path
+run = runpy.run_path(sys.argv[1])['baseline_firewall']
+root = Path(sys.argv[2])
+for program in ['iptables', 'ip6tables']:
+ def command(*args): return run(root, program, ['-w','5',*args])
+ assert command('-A','INPUT','-j','unrelated') == 0
+ assert command('-A','kidobo-input','-m','set','--match-set','fixture','src','-j','DROP') == 0
+ assert command('-A','kidobo-input-stage','-j','kidobo-input') == 0
+ assert command('-I','INPUT','1','-j','kidobo-input-stage') == 0
+ assert command('-I','INPUT','1','-j','kidobo-input') == 0
+ assert command('-D','INPUT','-j','kidobo-input-stage') == 0
+ assert command('-C','INPUT','-j','unrelated') == 0
+ assert command('-C','INPUT','-j','kidobo-input') == 0
+ assert command('-C','INPUT','-j','kidobo-input-stage') == 1
+ assert command('-S','INPUT') == 0
+assert run(root, 'ipset', ['list','fixture','-terse']) == 1
+assert sorted(p.name for p in root.iterdir()) == ['ip6tables.json', 'iptables.json']
+try: run(root, 'sudo', ['unexpected'])
+except ValueError: pass
+else: raise AssertionError('unknown program was accepted')
+",
+        ])
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../scripts/e2e/traffic.py"
+        ))
+        .arg(temp.path())
+        .output()
+        .expect("exercise isolated old-cache firewall substitute");
+    assert!(output.status.success(), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("-A INPUT -j unrelated"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("does not exist"));
+}
+
+#[test]
+fn application_reboot_requires_the_prepared_kernel_and_enforcing_security_state() {
+    let function = lifecycle_function("assert_reboot_preparation() {", "\nafter_reboot_phase() {")
+        .replace("! -e /.autorelabel", "! -e \"$ROOT/autorelabel\"");
+    for (kernel, mode, relabel, succeeds) in [
+        ("intended-kernel", "Enforcing", false, true),
+        ("old-kernel", "Enforcing", false, false),
+        ("intended-kernel", "Permissive", false, false),
+        ("intended-kernel", "Disabled", false, false),
+        ("intended-kernel", "Enforcing", true, false),
+    ] {
+        let temp = TestDir::new();
+        fs::create_dir(temp.path().join("prepared")).expect("prepared state");
+        fs::write(
+            temp.path().join("prepared/expected-kernel"),
+            "intended-kernel\n",
+        )
+        .expect("intended kernel");
+        fs::write(
+            temp.path().join("prepared/selinux-requested"),
+            "enforcing\n",
+        )
+        .expect("required security state");
+        if relabel {
+            fs::write(temp.path().join("autorelabel"), "pending\n").expect("pending relabel");
+        }
+        let output = Command::new("bash")
+            .args([
+                "-c",
+                &format!(
+                    "set -euo pipefail\nROOT=$FIXTURE_ROOT\nuname() {{ printf '%s\\n' \"$FAKE_KERNEL\"; }}\ngetenforce() {{ printf '%s\\n' \"$FAKE_MODE\"; }}\nfail() {{ printf '%s\\n' \"$*\" >&2; exit 1; }}\n{function}\nassert_reboot_preparation\n"
+                ),
+            ])
+            .env("FIXTURE_ROOT", temp.path())
+            .env("FAKE_KERNEL", kernel)
+            .env("FAKE_MODE", mode)
+            .output()
+            .expect("exercise prepared-state reboot checks with inert probes");
+        assert_eq!(output.status.success(), succeeds, "{output:?}");
+    }
+}
+
+#[test]
+fn legacy_generated_defaults_gain_explicit_ipv6_fixture_settings_without_replacement() {
+    let function = lifecycle_function(
+        "configure_baseline_sources() {",
+        "\nassert_remote_lookup() {",
+    );
+    let temp = TestDir::new();
+    let config = temp.path().join("config.toml");
+    fs::write(
+        &config,
+        "[ipset]\nset_name = \"kidobo\"\nchain_action = \"DROP\"\n[safe]\nips = []\ninclude_github_meta = true\ngithub_meta_url = \"https://api.github.com/meta\"\n[remote]\ntimeout_secs = 30\nurls = []\n[asn]\nbanned = []\ncache_stale_after_secs = 86400\n",
+    )
+    .expect("captured shape of old generated defaults");
+    let output = Command::new("bash")
+        .args([
+            "-c",
+            &format!(
+                "set -euo pipefail\nCONFIG=$OLD_CONFIG SET4=fixture4 SET6=fixture6 SOURCE_PORT=39474\n{function}\nconfigure_baseline_sources\n"
+            ),
+        ])
+        .env("OLD_CONFIG", &config)
+        .output()
+        .expect("configure legacy generated defaults with implicit IPv6 settings");
+    assert!(output.status.success(), "{output:?}");
+    let text = read_text(&config).expect("customized old defaults");
+    assert!(text.contains("set_name_v6 = \"fixture6\"\n"));
+    assert!(text.contains("enable_ipv6 = true\n"));
+    assert!(text.contains("github_meta_url = \"https://api.github.com/meta\"\n"));
+    assert!(text.contains("timeout_secs = 30\n"));
 }

@@ -139,10 +139,10 @@ fn lifecycle_upgrade_test_helpers() -> String {
 fn lifecycle_probe_function() -> String {
     let lifecycle = include_str!("../../../scripts/e2e/lifecycle.sh");
     let start = lifecycle
-        .find("probe() {")
+        .find("managed_drop_packets() {")
         .expect("find traffic probe helper in guest lifecycle script");
     let end = lifecycle[start..]
-        .find("\nwrite_config() {")
+        .find("\nstart_irr_fixture() {")
         .map(|offset| start + offset)
         .expect("find end of traffic probe helper");
     format!(
@@ -152,6 +152,10 @@ fn lifecycle_probe_function() -> String {
     )
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "The faithful stateful shell fixture keeps dual-stack probes, packet counters, and baseline recovery in one observable process boundary"
+)]
 fn fake_baseline_check_script(temp: &TestDir, scenario: &str) -> (PathBuf, PathBuf) {
     let fake_bin = temp.path().join("baseline-bin");
     let state = temp.path().join("baseline-state");
@@ -166,6 +170,10 @@ printf '%s\n' "$*" >> "$FAKE_CALLS"
 case "$*" in
   --version) [[ "$(basename "$0")" == ip6tables ]] && printf 'ip6tables v1.8.9 (nf_tables)\n' || printf 'iptables v1.8.9 (nf_tables)\n' ;;
   '-S kidobo-input') if [[ "$(basename "$0")" == ip6tables ]]; then printf '%s\n' '-A kidobo-input -m set --match-set kidobo-e2e-v6 src -j DROP'; else printf '%s\n' '-A kidobo-input -m set --match-set kidobo-e2e src -j DROP'; fi ;;
+  '-w 5 -L kidobo-input -n -v -x')
+    if [[ "${0##*/}" == ip6tables ]]; then family=6; set_name=kidobo-e2e-v6; else family=4; set_name=kidobo-e2e; fi
+    packets=0; [[ ! -f "$FAKE_COUNTER_DIR/$family" ]] || packets=$(<"$FAKE_COUNTER_DIR/$family")
+    printf '%s 0 DROP all -- * * anywhere anywhere match-set %s src\n' "$packets" "$set_name" ;;
   '-S INPUT') printf '%s\n' '-A INPUT -j kidobo-input' '-A INPUT -j E2E-UNRELATED-SENTINEL' ;;
   '-S kidobo-input-stage') exit 1 ;;
   *) exit 0 ;;
@@ -187,14 +195,37 @@ esac
     );
     executable(
         &fake_bin.join("ip"),
-        "#!/bin/bash\nprintf '%s\\n' \"$*\" >> \"$FAKE_CALLS\"\nexit 1\n",
+        r#"#!/bin/bash
+set -eu
+printf '%s\n' "$*" >> "$FAKE_CALLS"
+address=$7 source=$9 outcome=allowed status=0
+if [[ "$source" != 198.18.77.3 && "$source" != fd42:6b69:646f:626f::3 && "$FAKE_SYNC_RESULT" != expected ]]; then
+  outcome=connect-timeout status=10
+  if [[ "$FAKE_SYNC_RESULT" == healthy ]]; then
+    if [[ "$address" == *:* ]]; then family=6 other=4; else family=4 other=6; fi
+    : > "$FAKE_COUNTER_DIR/reached-$family"
+    deadline=$((SECONDS + 2))
+    until [[ -f "$FAKE_COUNTER_DIR/reached-$other" ]]; do
+      if (( SECONDS >= deadline )); then
+        printf '{"address":"%s","source":"%s","outcome":"infrastructure-error"}\n' "$address" "$source"
+        exit 20
+      fi
+      sleep 0.01
+    done
+    count=0; [[ ! -f "$FAKE_COUNTER_DIR/$family" ]] || count=$(<"$FAKE_COUNTER_DIR/$family")
+    printf '%s\n' "$((count + 1))" > "$FAKE_COUNTER_DIR/$family"
+  fi
+fi
+printf '{"address":"%s","source":"%s","outcome":"%s"}\n' "$address" "$source" "$outcome"
+exit "$status"
+"#,
     );
     let error = "firewall operation failed: firewall command failed `iptables -w 5 -S kidobo-input` with status Exited(1): iptables v1.8.9 (nf_tables): chain `kidobo-input' in table `filter' is incompatible, use 'nft' tool.";
     let error_shell = error.replace('\'', "'\\''");
     executable(
         &fake_bin.join("kidobo"),
         &format!(
-            "#!/bin/bash\nprintf 'kidobo %s\\n' \"$*\" >> \"$FAKE_CALLS\"\ncase \"$FAKE_SYNC_RESULT\" in healthy) exit 0;; expected) printf '%s\\n' '{error_shell}' >&2; exit 1;; unexpected) printf '%s\\n' 'firewall operation failed: permission denied' >&2; exit 1;; esac\n"
+            "#!/bin/bash\nprintf 'kidobo %s\\n' \"$*\" >> \"$FAKE_CALLS\"\ncase \"$FAKE_SYNC_RESULT\" in healthy|no-counter) exit 0;; expected) printf '%s\\n' '{error_shell}' >&2; exit 1;; unexpected) printf '%s\\n' 'firewall operation failed: permission denied' >&2; exit 1;; esac\n"
         ),
     );
     let config = temp.path().join("config.toml");
@@ -219,8 +250,10 @@ esac
     writeln!(script, "TEMPORARY='{}'", temporary.display()).expect("write temporary path");
     writeln!(script, "CALLS='{}'", calls.display()).expect("write call log path");
     writeln!(script, "FAKE_CALLS='{}'", calls.display()).expect("write fake call log path");
-    script.push_str("ROOT=/opt/kidobo-e2e\nSET4=kidobo-e2e\nSET6=kidobo-e2e-v6\nTEST_NS=kidobo-e2e\nV4_HOST=198.18.77.1\nV6_HOST=fd42:6b69:646f:626f::1\nTRAFFIC_PORT=39471\n");
+    script.push_str("ROOT=/opt/kidobo-e2e\nSET4=kidobo-e2e\nSET6=kidobo-e2e-v6\nTEST_NS=kidobo-e2e\nV4_HOST=198.18.77.1\nV4_PEER=198.18.77.2\nV4_CONTROL=198.18.77.3\nV6_HOST=fd42:6b69:646f:626f::1\nV6_PEER=fd42:6b69:646f:626f::2\nV6_CONTROL=fd42:6b69:646f:626f::3\nTRAFFIC_PORT=39471\nphase=baseline\n");
     writeln!(script, "FAKE_SYNC_RESULT='{scenario}'").expect("write fake sync behavior");
+    writeln!(script, "FAKE_COUNTER_DIR='{}'", state.display()).expect("write counter path");
+    script.push_str("export FAKE_COUNTER_DIR\n");
     let allow_recovery = i32::from(scenario != "healthy");
     writeln!(script, "FAKE_ALLOW_RECOVERY='{allow_recovery}'")
         .expect("write recovery guard behavior");
@@ -469,6 +502,8 @@ fn baseline_check_keeps_healthy_dual_stack_enforcement_probes() {
         "netns exec kidobo-e2e python3 /opt/kidobo-e2e/traffic.py probe 198.18.77.1 39471"
     ));
     assert!(calls.contains("netns exec kidobo-e2e python3 /opt/kidobo-e2e/traffic.py probe fd42:6b69:646f:626f::1 39471"));
+    assert!(calls.contains("39471 198.18.77.3"));
+    assert!(calls.contains("39471 fd42:6b69:646f:626f::3"));
     assert_eq!(
         read_text(&temp.path().join("baseline-state/baseline-sync.status"))
             .expect("read baseline status"),
@@ -482,6 +517,25 @@ fn baseline_check_keeps_healthy_dual_stack_enforcement_probes() {
     );
     assert!(
         temp.path()
+            .join("baseline-state/candidate.candidate")
+            .exists()
+    );
+}
+
+#[test]
+fn baseline_blocked_probes_require_the_intended_drop_counter_to_increase() {
+    let temp = TestDir::new();
+    let (script, _) = fake_baseline_check_script(&temp, "no-counter");
+    let mut runner = runner(temp.path());
+    let error = runner
+        .command("bash", &[script.to_string_lossy().into_owned()], 5)
+        .expect_err("a timeout without DROP evidence cannot establish enforcement");
+    assert!(error.to_string().contains("exited exit status: 1"));
+    let stderr = command_output(temp.path(), 1, "stderr").expect("counter rejection evidence");
+    assert!(stderr.contains("intended DROP counter did not increase"));
+    assert!(
+        !temp
+            .path()
             .join("baseline-state/candidate.candidate")
             .exists()
     );
@@ -596,7 +650,7 @@ esac
         .expect("write fake NetworkManager state");
     script.push_str("export CALL_LOG FAKE_NM_STATE\n");
     script.push_str(
-        "TEST_NS=kidobo-e2e\nHOST_IF=ke2eh0\nPEER_IF=ke2ep0\nV4_HOST=198.18.77.1\nV4_PEER=198.18.77.2\nV6_HOST=fd42:6b69:646f:626f::1\nV6_PEER=fd42:6b69:646f:626f::2\n",
+        "TEST_NS=kidobo-e2e\nHOST_IF=ke2eh0\nPEER_IF=ke2ep0\nV4_HOST=198.18.77.1\nV4_PEER=198.18.77.2\nV4_CONTROL=198.18.77.3\nV6_HOST=fd42:6b69:646f:626f::1\nV6_PEER=fd42:6b69:646f:626f::2\nV6_CONTROL=fd42:6b69:646f:626f::3\n",
     );
     script.push_str(
         r#"
@@ -823,14 +877,18 @@ fn guest_namespace_setup_unmanages_host_veth_before_assigning_addresses() {
         .expect("NetworkManager managed=no call");
     let host_address = calls
         .lines()
-        .position(|line| line == "ip addr add 198.18.77.1/30 dev ke2eh0")
+        .position(|line| line == "ip addr add 198.18.77.1/29 dev ke2eh0")
         .expect("host IPv4 address assignment");
     assert!(
         managed < host_address,
         "NetworkManager call must precede address assignment:\n{calls}"
     );
     assert!(calls.contains("ip -6 addr add fd42:6b69:646f:626f::1/64 dev ke2eh0 nodad"));
-    assert!(calls.contains("ip netns exec kidobo-e2e ip addr add 198.18.77.2/30 dev ke2ep0"));
+    assert!(calls.contains("ip netns exec kidobo-e2e ip addr add 198.18.77.2/29 dev ke2ep0"));
+    assert!(calls.contains("ip netns exec kidobo-e2e ip addr add 198.18.77.3/29 dev ke2ep0"));
+    assert!(calls.contains(
+        "ip netns exec kidobo-e2e ip -6 addr add fd42:6b69:646f:626f::3/64 dev ke2ep0 nodad"
+    ));
 }
 
 #[test]
@@ -861,6 +919,7 @@ fn runner(dir: &Path) -> Runner {
         cancelled: Arc::new(AtomicBool::new(false)),
         report: Report::open(dir).expect("open test report"),
         command_poll_interval: Duration::from_millis(1),
+        ignore_cancellation: false,
     }
 }
 
@@ -958,6 +1017,8 @@ fn setup_config() -> Config {
         cpus: 4,
         memory: "4GiB".into(),
         disk: "20GiB".into(),
+        max_parallel_vms: 1,
+        prepared_images: crate::prepared::Settings::default(),
         distros: vec![],
     }
 }
@@ -1267,7 +1328,7 @@ fn runner_timeout_kills_descendants_in_its_process_group() {
 fn runner_records_interruption_metadata() {
     let temp = TestDir::new();
     let program = temp.path().join("wait");
-    executable(&program, "#!/bin/sh\nsleep 30\n");
+    executable(&program, "#!/bin/sh\ntouch \"${0}.started\"\nsleep 30\n");
     let mut runner = runner(temp.path());
     runner.cancelled.store(true, Ordering::Relaxed);
 
@@ -1276,6 +1337,10 @@ fn runner_records_interruption_metadata() {
         .expect_err("cancelled command must fail");
 
     assert!(error.to_string().contains("interrupted"));
+    assert!(
+        !program.with_extension("started").exists(),
+        "cancelled command must never spawn"
+    );
     let metadata: serde_json::Value = serde_json::from_str(
         &command_metadata_text(temp.path(), 1).expect("read interruption metadata"),
     )

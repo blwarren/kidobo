@@ -1285,6 +1285,9 @@ fn publisher_rejects_conflicting_or_malformed_resume_options_before_tools() {
         vec!["--skip-e2e", "--resume-e2e", "run-123-456"],
         vec!["--resume-e2e", "run-123-456", "--resume-e2e", "run-123-789"],
         vec!["--skip-e2e", "--skip-e2e"],
+        vec!["--skip-e2e", "--refresh-e2e-images"],
+        vec!["--refresh-e2e-images", "--skip-e2e"],
+        vec!["--refresh-e2e-images", "--refresh-e2e-images"],
     ] {
         let fixture = CommandFixture::new();
         let output = fixture
@@ -1295,6 +1298,68 @@ fn publisher_rejects_conflicting_or_malformed_resume_options_before_tools() {
         assert_eq!(output.status.code(), Some(2), "{options:?}");
         assert!(!fixture.event_log.exists());
     }
+}
+
+#[test]
+fn publisher_forwards_prepared_image_refresh_to_the_required_matrix() {
+    let fixture = ReleaseFixture::new();
+    let output = fixture
+        .publisher_command()
+        .arg("--refresh-e2e-images")
+        .env("KIDOBO_TEST_FAIL_E2E", "1")
+        .output()
+        .expect("request fresh prepared images at the fake matrix gate");
+    assert_eq!(output.status.code(), Some(45));
+    let events = read_to_string_with_limit(&fixture.event_log, FIXTURE_LOG_READ_LIMIT);
+    let matrix = events
+        .lines()
+        .find(|line| line.starts_with("just e2e-artifact "))
+        .expect("required matrix invocation");
+    assert!(matrix.ends_with("--refresh-images"));
+    assert!(!matrix.contains("--resume"));
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains("refreshing prepared images and rerunning every selected distro target")
+    );
+    assert!(!fixture.tag_exists());
+    assert!(!fixture.gh_release_dir.join("published").exists());
+}
+
+#[test]
+fn publisher_refreshes_images_on_resume_without_repeating_local_validation() {
+    let fixture = ReleaseFixture::new();
+    let first = fixture
+        .publisher_command()
+        .env("KIDOBO_TEST_FAIL_E2E", "1")
+        .output()
+        .expect("retain the candidate after a fake matrix failure");
+    assert_eq!(first.status.code(), Some(45));
+    let resumed = run_with_confirmation(
+        fixture
+            .publisher_command()
+            .args(["--resume-e2e", "run-123-456", "--refresh-e2e-images"])
+            .env("KIDOBO_TEST_FAIL_GATE", "ci"),
+        "y\n",
+    );
+    assert_success(&resumed, "refresh image coverage for a retained candidate");
+    let events = read_to_string_with_limit(&fixture.event_log, FIXTURE_LOG_READ_LIMIT);
+    for gate in [
+        "ci",
+        "coverage",
+        "release-notes-check",
+        "rustdoc",
+        "exercise-release",
+        "release-compat",
+    ] {
+        assert_eq!(events.matches(&format!("just {gate}\n")).count(), 1);
+    }
+    let matrix_events = events
+        .lines()
+        .filter(|line| line.starts_with("just e2e-artifact "))
+        .collect::<Vec<_>>();
+    assert_eq!(matrix_events.len(), 2);
+    assert!(matrix_events[1].ends_with("--resume run-123-456 --refresh-images"));
+    assert!(fixture.gh_release_dir.join("published").is_file());
 }
 
 #[test]
@@ -1474,6 +1539,125 @@ fn skipping_e2e_still_blocks_publication_on_other_gate_failures() {
 }
 
 #[test]
+fn candidate_recipe_runs_an_existing_archive_without_building_or_packaging() {
+    let fixture = CommandFixture::new();
+    let justfile = fixture.repo.join("Justfile");
+    fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("Justfile"),
+        &justfile,
+    )
+    .expect("copy recipes into isolated repository");
+    write_executable(
+        &fixture.fake_bin.join("cargo"),
+        "#!/bin/bash\n[[ \"$1\" == run ]] || exit 91\nprintf '%s\\n' \"$@\"\n",
+    );
+    write_executable(
+        &fixture.repo.join("scripts/package-release.sh"),
+        "#!/bin/bash\nprintf unexpected-package > \"$KIDOBO_TEST_EVENT_LOG\"\nexit 92\n",
+    );
+    for options in [
+        vec![
+            "--archive".to_owned(),
+            "/tmp/existing candidate.tar.gz".to_owned(),
+            "--tag".to_owned(),
+            RELEASE_TAG.to_owned(),
+        ],
+        vec![
+            "--archive=/tmp/existing candidate.tar.gz".to_owned(),
+            format!("--tag={RELEASE_TAG}"),
+            "--refresh-images".to_owned(),
+        ],
+    ] {
+        let output = Command::new("just")
+            .arg("--justfile")
+            .arg(&justfile)
+            .arg("_e2e")
+            .args(&options)
+            .env("PATH", path_with_prefix(&fixture.fake_bin))
+            .env("KIDOBO_TEST_EVENT_LOG", &fixture.event_log)
+            .output()
+            .expect("forward an existing archive without a build");
+        assert_success(&output, "run the prebuilt candidate recipe");
+        assert_eq!(
+            String::from_utf8(output.stdout).expect("UTF-8 candidate arguments"),
+            format!(
+                "run\n--locked\n-p\nkidobo-e2e\n--\nrun\n{}\n",
+                options.join("\n")
+            )
+        );
+        assert!(
+            !fixture.event_log.exists(),
+            "prebuilt archives must not be repackaged"
+        );
+    }
+}
+
+#[test]
+fn candidate_recipe_still_builds_and_packages_when_no_archive_is_supplied() {
+    let fixture = CommandFixture::new();
+    let justfile = fixture.repo.join("Justfile");
+    fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("Justfile"),
+        &justfile,
+    )
+    .expect("copy recipes into isolated repository");
+    write_executable(
+        &fixture.fake_bin.join("cargo"),
+        r#"#!/bin/bash
+set -euo pipefail
+printf 'cargo %s\n' "$1" >> "$KIDOBO_TEST_EVENT_LOG"
+case "$1" in
+  build)
+    binary="$CARGO_TARGET_DIR/x86_64-unknown-linux-musl/release/kidobo"
+    mkdir -p "${binary%/*}"
+    printf '#!/bin/bash\nprintf '\''kidobo %s\\n'\''\n' "$KIDOBO_TEST_BINARY_VERSION" > "$binary"
+    chmod 0755 "$binary"
+    ;;
+  run) printf '%s\n' "$@" ;;
+  *) exit 91 ;;
+esac
+"#,
+    );
+    write_executable(
+        &fixture.repo.join("scripts/package-release.sh"),
+        r#"#!/bin/bash
+set -euo pipefail
+[[ -x "$1" && "$2" == "v$KIDOBO_TEST_BINARY_VERSION" && -d "$3" ]]
+printf 'package %s\n' "$2" >> "$KIDOBO_TEST_EVENT_LOG"
+: > "$3/kidobo-$2-linux-x86_64.tar.gz"
+"#,
+    );
+    let output = Command::new("just")
+        .arg("--justfile")
+        .arg(&justfile)
+        .args(["_e2e", "--keep-failed"])
+        .env("PATH", path_with_prefix(&fixture.fake_bin))
+        .env("CARGO_TARGET_DIR", fixture.repo.join("custom build target"))
+        .env("KIDOBO_TEST_EVENT_LOG", &fixture.event_log)
+        .env("KIDOBO_TEST_BINARY_VERSION", RELEASE_VERSION)
+        .output()
+        .expect("build and package a candidate with inert tools");
+    assert_success(&output, "build the normal candidate recipe");
+    assert_eq!(
+        read_to_string_with_limit(&fixture.event_log, FIXTURE_LOG_READ_LIMIT),
+        format!("cargo build\npackage {RELEASE_TAG}\ncargo run\n")
+    );
+    let arguments = String::from_utf8(output.stdout).expect("UTF-8 candidate arguments");
+    let arguments = arguments.lines().collect::<Vec<_>>();
+    let archive = arguments
+        .windows(2)
+        .find(|pair| pair[0] == "--archive")
+        .expect("packaged archive argument")[1];
+    assert!(fixture.repo.join(archive).is_file());
+    assert!(archive.ends_with(&format!("kidobo-{RELEASE_TAG}-linux-x86_64.tar.gz")));
+    assert_eq!(
+        &arguments[arguments.len() - 3..],
+        &["--tag", RELEASE_TAG, "--keep-failed"]
+    );
+    assert!(!arguments.contains(&"--required-only"));
+}
+
+#[test]
 fn publication_recipe_forwards_the_skip_option_as_an_argument() {
     let fixture = CommandFixture::new();
     let justfile = fixture.repo.join("Justfile");
@@ -1500,7 +1684,7 @@ fn publication_recipe_forwards_the_skip_option_as_an_argument() {
 }
 
 #[test]
-fn artifact_recipe_only_allows_resume_and_preserves_argument_boundaries() {
+fn artifact_recipe_allows_resume_and_refresh_and_preserves_argument_boundaries() {
     let fixture = CommandFixture::new();
     let justfile = fixture.repo.join("Justfile");
     fs::copy(
@@ -1533,10 +1717,39 @@ fn artifact_recipe_only_allows_resume_and_preserves_argument_boundaries() {
         )
     );
     for options in [
+        vec!["--refresh-images"],
+        vec!["--resume", "run-123-456", "--refresh-images"],
+        vec!["--refresh-images", "--resume", "run-123-456"],
+    ] {
+        let output = Command::new("just")
+            .arg("--justfile")
+            .arg(&justfile)
+            .env("PATH", path_with_prefix(&fixture.fake_bin))
+            .args([
+                "e2e-artifact",
+                "/tmp/candidate with spaces.tar.gz",
+                RELEASE_TAG,
+            ])
+            .args(&options)
+            .output()
+            .expect("forward artifact refresh arguments");
+        assert_success(&output, "forward artifact image refresh");
+        assert_eq!(
+            String::from_utf8(output.stdout).expect("UTF-8 forwarded arguments"),
+            format!(
+                "run\n--locked\n-p\nkidobo-e2e\n--\nrun\n--required-only\n--archive\n/tmp/candidate with spaces.tar.gz\n--tag\n{RELEASE_TAG}\n{}\n",
+                options.join("\n")
+            )
+        );
+    }
+    for options in [
         vec!["--distro", "debian-12"],
         vec!["--resume"],
         vec!["--resume", "../run-123-456"],
         vec!["--resume", "run-123-456", "--distro", "debian-12"],
+        vec!["--resume", "run-123-456", "--resume", "run-123-789"],
+        vec!["--refresh-images", "--refresh-images"],
+        vec!["--refresh-image"],
     ] {
         let output = Command::new("just")
             .arg("--justfile")
@@ -1553,7 +1766,7 @@ fn artifact_recipe_only_allows_resume_and_preserves_argument_boundaries() {
 }
 
 #[test]
-fn resume_recipe_defaults_to_all_targets_and_only_accepts_required_only_selection() {
+fn resume_recipe_forwards_required_only_and_refresh_without_filtering_targets() {
     let fixture = CommandFixture::new();
     let justfile = fixture.repo.join("Justfile");
     fs::copy(
@@ -1565,7 +1778,13 @@ fn resume_recipe_defaults_to_all_targets_and_only_accepts_required_only_selectio
         &fixture.fake_bin.join("cargo"),
         "#!/bin/bash\nprintf '%s\\n' \"$@\"\n",
     );
-    for options in [vec![], vec!["--required-only"]] {
+    for options in [
+        vec![],
+        vec!["--required-only"],
+        vec!["--refresh-images"],
+        vec!["--required-only", "--refresh-images"],
+        vec!["--refresh-images", "--required-only"],
+    ] {
         let output = Command::new("just")
             .arg("--justfile")
             .arg(&justfile)
@@ -1576,9 +1795,9 @@ fn resume_recipe_defaults_to_all_targets_and_only_accepts_required_only_selectio
             .expect("forward resume target selection");
         assert_success(&output, "forward resume target selection");
         let expected_suffix = if options.is_empty() {
-            ""
+            String::new()
         } else {
-            "--required-only\n"
+            format!("{}\n", options.join("\n"))
         };
         assert_eq!(
             String::from_utf8(output.stdout).expect("UTF-8 forwarded arguments"),
@@ -1591,6 +1810,8 @@ fn resume_recipe_defaults_to_all_targets_and_only_accepts_required_only_selectio
         vec!["--distro", "debian-12"],
         vec!["--required-only", "--distro", "debian-12"],
         vec!["--required-only", "--required-only"],
+        vec!["--refresh-images", "--refresh-images"],
+        vec!["--refresh-image"],
     ] {
         let output = Command::new("just")
             .arg("--justfile")
