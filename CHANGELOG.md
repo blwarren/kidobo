@@ -8,20 +8,17 @@
 - Add an interactive first-run setup, saved source and safelist commands, and redacted configuration inspection.
 - Offer interactive sync after saved ban changes, add `--apply`/`--no-apply` controls, and confirm full interactive flush before cleanup.
 - Add read-only status and per-IP live enforcement checks, plus a bounded inventory of saved temporary and permanent bans.
-- Reuse verified prepared VM images for seven days and allow explicit image refresh during candidate, artifact, resumed, and publication testing.
 - Add expiring IP/CIDR and ASN bans stored separately from permanent sources and applied by sync.
 - Allow an explicit version to be installed from a custom release directory with `KIDOBO_RELEASE_BASE_URL`, retaining checksum and binary verification.
 
 ### Changed
 
 - Group terminal doctor output and stream width-aware human lookup records while preserving JSON and TSV output for scripts; add explicit doctor format selection and grouped command help.
-- Run up to two distro test VMs with explicit required/advisory outcomes, preparation provenance, accurate wall time, enforcing SELinux coverage, and deterministic packaged ASN resolver checks.
 - Stream lookup matches with bounded retention and escape control characters in targets, source labels, and matched entries in human and TSV output.
 - Deduplicate canonical unban targets and index overlap checks for large batches while preserving confirmation and temporary-first persistence.
 
 ### Fixed
 
-- Reject skipped guest checks and infrastructure errors misreported as firewall blocking, verify intended kernels, and test upgrades against captured baseline artifacts and baseline-created offline state.
 - Preserve non-UTF-8 temporary directory paths when restoring ipsets during sync.
 - Report filesystem failures instead of treating unreadable configuration, blocklists, or caches as missing, and stop sync before enforcement when the local blocklist cannot be read.
 - Preserve files and cache generations when their metadata or selection manifest cannot be inspected, and distinguish inspection failures from missing paths in doctor reports.
@@ -32,7 +29,6 @@
 - Reject normalized remote cache refreshes above 16 MiB before publication, using a validated fallback when available or stopping sync before set replacement.
 - Accept every ASCII letter case of the AS prefix in ASN ban and unban arguments.
 - Probe only ipset names in doctor and allow initialization to continue when reset-failed reports the sync service is not loaded.
-- Package the validated release candidate from the configured Cargo target directory.
 - Recognize absent firewall chains on Debian 12 with iptables 1.8.9 (nf_tables), while preserving failures for existing incompatible chains.
 
 ## [0.14.3] - 2026-10-22
