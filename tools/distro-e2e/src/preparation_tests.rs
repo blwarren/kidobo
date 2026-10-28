@@ -22,146 +22,132 @@ fn run(root: &std::path::Path, body: &str) -> Output {
 }
 
 #[test]
-fn kernel_mismatch_fails_before_loading_modules_or_touching_firewalls() {
-    let temp = TestDir::new();
-    let root = temp.path();
-    fs::write(root.join("expected-kernel"), "6.12.0-new\n").expect("expected kernel");
-    fs::write(root.join("expected-initramfs"), "/unused\n").expect("initramfs");
-    let body = format!(
-        r#"
+fn running_kernel_capabilities_are_required_regardless_of_installed_version() {
+    for (failure, expected) in [
+        ("", ""),
+        ("ip_set", "required module ip_set cannot be loaded"),
+        ("xt_set", "required module xt_set cannot be loaded"),
+        (
+            "ip_set_hash_net",
+            "required module ip_set_hash_net cannot be loaded",
+        ),
+        ("iptables", "default IPv4 iptables backend is unavailable"),
+        ("ip6tables", "default IPv6 iptables backend is unavailable"),
+    ] {
+        let temp = TestDir::new();
+        let root = temp.path();
+        fs::write(root.join("packages.txt"), "kernel-core=6.12.0-new\n")
+            .expect("newer installed kernel inventory");
+        let body = format!(
+            r#"
 set -euo pipefail
 PREPARED=$FIXTURE_ROOT
 fail() {{ printf '%s\n' "$*" >&2; exit 1; }}
 uname() {{ printf '6.12.0-old\n'; }}
-capture_boot_diagnostics() {{ printf captured > "$PREPARED/diagnostic"; }}
-verify_kernel_artifacts() {{ printf called >> "$PREPARED/side-effects"; }}
-modprobe() {{ printf called >> "$PREPARED/side-effects"; }}
-iptables() {{ printf called >> "$PREPARED/side-effects"; }}
-ip6tables() {{ printf called >> "$PREPARED/side-effects"; }}
+probe() {{ printf '%s\n' "$1" >> "$PREPARED/probes"; [[ "$1" != '{failure}' ]]; }}
+modprobe() {{ probe "$1"; }}
+iptables() {{ probe iptables; }}
+ip6tables() {{ probe ip6tables; }}
 {}
 verify_running_kernel
 "#,
-        helper("verify_running_kernel", "finish_selinux")
-    );
-    let output = run(root, &body);
-    assert_eq!(output.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("does not match intended kernel"));
-    assert_eq!(
-        read_text(&root.join("diagnostic")).expect("diagnostics"),
-        "captured"
-    );
-    assert!(!root.join("side-effects").exists());
-}
-
-#[test]
-fn intended_kernel_requires_all_module_files_before_selection_qualifies() {
-    for missing in ["", "xt_set"] {
-        let temp = TestDir::new();
-        let root = temp.path();
-        fs::create_dir_all(root.join("boot")).expect("boot");
-        fs::create_dir_all(root.join("lib/modules/6.12.0-new")).expect("modules");
-        fs::write(root.join("boot/vmlinuz-6.12.0-new"), "kernel").expect("kernel");
-        fs::write(root.join("boot/initramfs"), "initramfs").expect("initramfs");
-        for module in ["ip_set", "xt_set", "ip_set_hash_net"] {
-            if module != missing {
-                fs::write(
-                    root.join(format!("lib/modules/6.12.0-new/{module}.ko")),
-                    "module",
-                )
-                .expect("module");
-            }
-        }
-        let function = helper("verify_kernel_artifacts", "select_boot_kernel")
-            .replace("/boot/", "${FIXTURE_ROOT}/boot/")
-            .replace("/lib/modules/", "${FIXTURE_ROOT}/lib/modules/");
-        let body = format!(
-            r#"
-set -euo pipefail
-fail() {{ printf '%s\n' "$*" >&2; exit 1; }}
-modinfo() {{ printf '%s/lib/modules/%s/%s.ko\n' "$FIXTURE_ROOT" "$2" "$4"; }}
-{function}
-verify_kernel_artifacts 6.12.0-new "$FIXTURE_ROOT/boot/initramfs"
-"#
+            helper("verify_running_kernel", "finish_selinux")
         );
         let output = run(root, &body);
-        if missing.is_empty() {
-            assert!(output.status.success(), "{output:?}");
-        } else {
-            assert_eq!(output.status.code(), Some(1));
-            assert!(String::from_utf8_lossy(&output.stderr).contains("module file is missing"));
-        }
-    }
-}
-
-#[test]
-fn rpm_boot_default_must_match_the_selected_kernel() {
-    for agrees in [true, false] {
-        let temp = TestDir::new();
-        let root = temp.path();
-        fs::create_dir(root.join("boot")).expect("boot");
-        fs::write(root.join("boot/initramfs-6.12.0-new.img"), "initramfs").expect("initramfs");
-        fs::write(root.join("os-release"), "ID=almalinux\n").expect("guest distribution");
-        let function = helper("select_boot_kernel", "prepare_selinux")
-            .replace("/boot/", "${FIXTURE_ROOT}/boot/")
-            .replace("/etc/os-release", "${FIXTURE_ROOT}/os-release");
-        let default = if agrees { "new" } else { "old" };
-        let body = format!(
-            r#"
-set -euo pipefail
-PREPARED=$FIXTURE_ROOT
-fail() {{ printf '%s\n' "$*" >&2; exit 1; }}
-grubby() {{
-  if [[ "$1" == --default-kernel ]]; then printf '%s/boot/vmlinuz-6.12.0-{default}\n' "$FIXTURE_ROOT";
-  else printf '%s\n' "$*" >> "$PREPARED/events"; fi
-}}
-verify_kernel_artifacts() {{ printf 'artifacts %s\n' "$1" >> "$PREPARED/events"; }}
-{function}
-select_boot_kernel dnf 6.12.0-new
-"#
-        );
-        let output = run(root, &body);
-        let events = read_text(&root.join("events")).expect("boot selection events");
-        assert!(events.contains("--set-default"));
-        if agrees {
-            assert!(output.status.success(), "{output:?}");
-            assert!(events.contains("artifacts 6.12.0-new"));
+        assert_eq!(output.status.success(), failure.is_empty(), "{output:?}");
+        assert!(String::from_utf8_lossy(&output.stdout).contains("running_kernel=6.12.0-old"));
+        let probes = read_text(&root.join("probes")).expect("capability probes");
+        if failure.is_empty() {
             assert_eq!(
-                read_text(&root.join("expected-kernel")).expect("selected kernel"),
-                "6.12.0-new\n"
+                probes,
+                "ip_set\nxt_set\nip_set_hash_net\niptables\nip6tables\n"
             );
         } else {
-            assert_eq!(output.status.code(), Some(1));
             assert!(
-                String::from_utf8_lossy(&output.stderr)
-                    .contains("did not select the intended kernel")
+                String::from_utf8_lossy(&output.stderr).contains(expected),
+                "{output:?}"
             );
-            assert!(!root.join("expected-kernel").exists());
-            assert!(!events.contains("artifacts"));
+            assert_eq!(probes.lines().last(), Some(failure));
         }
+        assert!(!root.join("expected-kernel").exists());
+        assert!(!root.join("expected-initramfs").exists());
     }
 }
 
 #[test]
-fn latest_installed_kernel_ignores_apt_meta_packages_and_uses_version_order() {
+fn fresh_preparation_leaves_kernel_selection_to_the_distribution() {
     let temp = TestDir::new();
-    let function = helper("installed_kernel", "verify_kernel_artifacts");
+    let source = include_str!("../../../scripts/e2e/provision.sh")
+        .split_once("\nif [[ \"${BASH_SOURCE[0]}\"")
+        .expect("script entrypoint")
+        .0
+        .replace("/opt/kidobo-e2e", "${FIXTURE_ROOT}");
     let body = format!(
-        r"
+        r#"
 set -euo pipefail
-fail() {{ exit 1; }}
-dpkg-query() {{ printf 'installed linux-image-6.1.0-9-amd64\ninstalled linux-image-6.1.0-10-amd64\ninstalled linux-image-amd64\nconfig-files linux-image-6.1.0-99-amd64\n'; }}
-rpm() {{ printf '6.12.0-211.9.el10.x86_64\n6.12.0-211.10.el10.x86_64\n'; }}
-{function}
-installed_kernel apt
-installed_kernel dnf
-"
+{source}
+require_guest() {{ :; }}
+wait_for_network() {{ :; }}
+install_dependencies() {{ printf 'dependencies\n' >> "$FIXTURE_ROOT/events"; }}
+upgrade_operating_system() {{ printf 'upgrade\n' >> "$FIXTURE_ROOT/events"; }}
+record_packages() {{ printf 'kernel-core=6.12.0-new\n' > "$2"; }}
+uname() {{ printf '6.12.0-old\n'; }}
+grubby() {{ fail 'unexpected boot selection'; }}
+update-grub() {{ fail 'unexpected GRUB generation'; }}
+grub2-mkconfig() {{ fail 'unexpected GRUB generation'; }}
+update-initramfs() {{ fail 'unexpected initramfs generation'; }}
+dracut() {{ fail 'unexpected initramfs generation'; }}
+provision_main --prepare dnf image-default kmod
+"#
     );
     let output = run(temp.path(), &body);
     assert!(output.status.success(), "{output:?}");
     assert_eq!(
-        output.stdout,
-        b"6.1.0-10-amd64\n6.12.0-211.10.el10.x86_64\n"
+        read_text(&temp.path().join("events")).expect("provisioning events"),
+        "dependencies\nupgrade\n"
     );
+    assert_eq!(
+        read_text(&temp.path().join("prepared/selinux-requested")).expect("security policy"),
+        "image-default\n"
+    );
+    assert!(!temp.path().join("prepared/expected-kernel").exists());
+    assert!(!temp.path().join("prepared/expected-initramfs").exists());
+    assert!(
+        read_text(&temp.path().join("state/provision.txt"))
+            .expect("observed kernel")
+            .contains("kernel=6.12.0-old")
+    );
+}
+
+#[test]
+fn rpm_dependencies_keep_module_packages_and_only_need_grubby_for_selinux() {
+    for selinux in ["image-default", "enforcing"] {
+        let temp = TestDir::new();
+        let body = format!(
+            r#"
+set -euo pipefail
+fail() {{ printf '%s\n' "$*" >&2; exit 1; }}
+dnf() {{ printf '%s\n' "$@" > "$FIXTURE_ROOT/packages"; }}
+command() {{ [[ "$1" == -v ]]; }}
+{}
+install_dependencies dnf {selinux} kmod kernel-modules-extra
+"#,
+            helper("install_dependencies", "run_upgrade")
+        );
+        let output = run(temp.path(), &body);
+        assert!(output.status.success(), "{output:?}");
+        let packages = read_text(&temp.path().join("packages")).expect("requested packages");
+        assert!(!packages.lines().any(|package| package == "kernel"));
+        assert!(
+            packages
+                .lines()
+                .any(|package| package == "kernel-modules-extra")
+        );
+        assert_eq!(
+            packages.lines().any(|package| package == "grubby"),
+            selinux == "enforcing"
+        );
+    }
 }
 
 #[test]
@@ -170,7 +156,7 @@ fn disabled_selinux_is_prepared_for_permissive_relabel_before_enforcement() {
     let root = temp.path();
     let config = root.join("selinux-config");
     fs::write(&config, "SELINUX=disabled\nSELINUXTYPE=targeted\n").expect("security config");
-    let function = helper("prepare_selinux", "capture_boot_diagnostics")
+    let function = helper("prepare_selinux", "verify_running_kernel")
         .replace("/etc/selinux/config", "${FIXTURE_ROOT}/selinux-config")
         .replace("/etc/systemd/system", "${FIXTURE_ROOT}/units");
     let body = format!(
@@ -499,7 +485,7 @@ fn preparation_upgrade_reuses_metadata_and_accepts_only_zypper_reboot_statuses()
             let temp = TestDir::new();
             let root = temp.path();
             fs::write(root.join("provision.txt"), "family=test\n").expect("metadata");
-            let functions = helper("run_upgrade", "installed_kernel");
+            let functions = helper("run_upgrade", "prepare_agent_selinux");
             let body = format!(
                 r#"
 set -euo pipefail

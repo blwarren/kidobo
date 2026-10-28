@@ -214,7 +214,7 @@ elif operation == "exec":
         if guest[1] == "-c":
             if "=== pre-reboot snapshot ===" in guest[2]:
                 event("pre-reboot", vm)
-                print("current=fixture-kernel intended=fixture-next-kernel boot=before-restart", flush=True)
+                print("current=fixture-kernel boot=before-restart", flush=True)
                 if scenario == "pre-reboot-interrupted" and vm.endswith("-primary"):
                     (state / "interruption-ready").touch()
                     time.sleep(60)
@@ -237,7 +237,17 @@ elif operation == "exec":
                     barrier(vm, scenario == "interrupt-both")
             elif phase == "--check-kernel":
                 event("kernel", vm)
-                if scenario == "prerequisite-failure" and vm.endswith("-secondary"):
+                failures = {
+                    "prerequisite-failure": "fixture prerequisite failed",
+                    "missing-module": "required module ip_set cannot be loaded for running kernel fixture-kernel",
+                    "ipv4-backend": "default IPv4 iptables backend is unavailable",
+                    "ipv6-backend": "default IPv6 iptables backend is unavailable",
+                }
+                if scenario in failures and vm.endswith("-secondary"):
+                    checks = json.loads((state / "checks.json").read_text())["profiles"]["preparation"][phase]
+                    name = next(iter(checks))
+                    print(f"E2E_CHECK\t{name}\tSTART\tfixture capability expectation", file=sys.stderr)
+                    print(f"E2E_CHECK\t{name}\tFAIL\t{failures[scenario]}", file=sys.stderr)
                     raise SystemExit(70)
             elif phase == "--validate":
                 event("validate", vm)
@@ -478,30 +488,51 @@ fn each_target_completes_its_lifecycle_before_the_next_target_is_created() {
 }
 
 #[test]
-fn required_prerequisite_failure_does_not_suppress_other_target_lifecycles() {
-    let mut fixture = Fixture::new("prerequisite-failure", true);
-    fixture.config.distros.swap(0, 1);
-    fixture
-        .execute()
-        .expect_err("required prerequisites must fail qualification");
-    let events = fixture.events();
-    assert!(events.contains(&format!("start {RUN_ID}-primary")));
-    assert!(!events.contains(&format!("start {RUN_ID}-secondary")));
-    for id in ["primary", "secondary"] {
-        assert!(events.contains(&format!("delete {RUN_ID}-{id}")));
-        assert_eq!(fixture.result(id)["cleanup_error"], Value::Null);
+fn required_capability_failures_do_not_suppress_other_target_lifecycles() {
+    for (scenario, reason) in [
+        (
+            "missing-module",
+            "required module ip_set cannot be loaded for running kernel fixture-kernel",
+        ),
+        (
+            "ipv4-backend",
+            "default IPv4 iptables backend is unavailable",
+        ),
+        (
+            "ipv6-backend",
+            "default IPv6 iptables backend is unavailable",
+        ),
+    ] {
+        let mut fixture = Fixture::new(scenario, true);
+        fixture.config.distros.swap(0, 1);
+        fixture
+            .execute()
+            .expect_err("required capabilities must fail qualification");
+        let events = fixture.events();
+        assert!(events.contains(&format!("start {RUN_ID}-primary")));
+        assert!(!events.contains(&format!("start {RUN_ID}-secondary")));
+        for id in ["primary", "secondary"] {
+            assert!(events.contains(&format!("delete {RUN_ID}-{id}")));
+            assert_eq!(fixture.result(id)["cleanup_error"], Value::Null);
+            assert!(
+                !fixture
+                    .temp
+                    .path()
+                    .join(format!("state/{RUN_ID}-{id}"))
+                    .exists()
+            );
+        }
+        assert_eq!(fixture.result("primary")["error"], Value::Null);
+        assert_eq!(fixture.result("primary")["phase"], "application");
+        assert!(fixture.result("secondary")["error"].is_string());
+        assert_eq!(fixture.result("secondary")["phase"], "provisioning");
+        let transcript = read_text(&fixture.runner.dir.join("targets/secondary/transcript.log"))
+            .expect("failed target transcript");
         assert!(
-            !fixture
-                .temp
-                .path()
-                .join(format!("state/{RUN_ID}-{id}"))
-                .exists()
+            transcript.contains(reason),
+            "missing failure reason: {reason}"
         );
     }
-    assert_eq!(fixture.result("primary")["error"], Value::Null);
-    assert_eq!(fixture.result("primary")["phase"], "application");
-    assert!(fixture.result("secondary")["error"].is_string());
-    assert_eq!(fixture.result("secondary")["phase"], "provisioning");
 }
 
 #[test]
@@ -851,7 +882,7 @@ fn pre_reboot_snapshot_survives_agent_loss_and_normal_cleanup() {
     let snapshot = fixture.runner.evidence().join("secondary/pre-reboot");
     assert_eq!(
         read_text(&snapshot.join("snapshot.log")).expect("pre-reboot identity retained"),
-        "current=fixture-kernel intended=fixture-next-kernel boot=before-restart\n"
+        "current=fixture-kernel boot=before-restart\n"
     );
     let status: Value = serde_json::from_str(
         &read_text(&snapshot.join("snapshot.capture.json")).expect("capture status"),

@@ -66,8 +66,7 @@ install_dependencies() {
       apt-get install -y --no-install-recommends "${packages[@]}"
       ;;
     dnf|dnf-epel)
-      packages+=(kernel grubby)
-      if [[ "$selinux" == enforcing ]]; then packages+=(selinux-policy-targeted libselinux-utils policycoreutils); fi
+      if [[ "$selinux" == enforcing ]]; then packages+=(grubby selinux-policy-targeted libselinux-utils policycoreutils); fi
       if [[ "$family" == dnf-epel ]]; then
         dnf -y --refresh install epel-release dnf-plugins-core
         if command -v crb >/dev/null 2>&1; then
@@ -85,7 +84,7 @@ install_dependencies() {
       ;;
     *) fail "unsupported package family: $family" ;;
   esac
-  for command in bash curl tar sha256sum sudo ip python3 ipset iptables ip6tables bgpq4 systemctl modinfo modprobe; do
+  for command in bash curl tar sha256sum sudo ip python3 ipset iptables ip6tables bgpq4 systemctl modprobe; do
     command -v "$command" >/dev/null 2>&1 || fail "required command unavailable after package install: $command"
   done
 }
@@ -116,88 +115,6 @@ upgrade_operating_system() {
   esac
   record_packages "$family" "$PREPARED/packages.txt"
   printf 'os_upgrade_completed_utc=%s\n' "$(date -u +%FT%TZ)" >> "$PREPARED/provision.txt"
-}
-
-installed_kernel() {
-  local family=$1
-  case "$family" in
-    apt)
-      dpkg-query -W -f='${db:Status-Status} ${Package}\n' 'linux-image-[0-9]*' |
-        sed -n -E 's/^installed linux-image-([0-9].*)$/\1/p' | sort -V | tail -n 1
-      ;;
-    dnf|dnf-epel) rpm -q kernel-core --qf '%{VERSION}-%{RELEASE}.%{ARCH}\n' | sort -V | tail -n 1 ;;
-    zypper) find /boot -maxdepth 1 -name 'vmlinuz-*' -printf '%f\n' | sed 's/^vmlinuz-//' | sort -V | tail -n 1 ;;
-    *) fail "unsupported package family: $family" ;;
-  esac
-}
-
-verify_kernel_artifacts() {
-  local kernel=$1 initramfs=$2 module location
-  [[ "$kernel" =~ ^[0-9][0-9A-Za-z._+-]*$ ]] || fail "invalid intended kernel release: $kernel"
-  [[ -s "/boot/vmlinuz-$kernel" ]] || fail "intended kernel image is missing: /boot/vmlinuz-$kernel"
-  [[ -s "$initramfs" ]] || fail "intended kernel initramfs is missing: $initramfs"
-  [[ -d "/lib/modules/$kernel" ]] || fail "intended kernel module directory is missing: $kernel"
-  for module in ip_set xt_set ip_set_hash_net; do
-    location=$(modinfo -k "$kernel" -n "$module") || fail "intended kernel $kernel lacks required module $module"
-    [[ "$location" == '(builtin)' || -s "$location" ]] || fail "intended kernel module file is missing: $location"
-  done
-}
-
-capture_boot_configuration() {
-  local label=$1 file
-  {
-    printf '%s\n' '=== mounted filesystems ==='; findmnt -o TARGET,SOURCE,FSTYPE,UUID
-    printf '%s\n' '=== boot identities ==='
-    grub2-probe --target=fs_uuid /boot/grub2
-    grub2-mkrelpath /boot/grub2
-    for file in /proc/cmdline /etc/kernel/cmdline /etc/default/grub \
-        /etc/grub2.cfg /etc/grub2-efi.cfg /boot/grub2/grub.cfg /boot/loader/entries/*.conf; do
-      printf '\n=== %s ===\n' "$file"
-      ls -ld "$file"
-      [[ ! -L "$file" ]] || readlink -f "$file"
-      head -c 1048576 "$file"
-    done
-    while IFS= read -r file; do
-      printf '\n=== %s ===\n' "$file"
-      case "$file" in
-        */grubenv) grub2-editenv "$file" list ;;
-        *) head -c 1048576 "$file" ;;
-      esac
-    done < <(find /boot/grub2 /boot/efi/EFI -maxdepth 4 -type f \( -name grub.cfg -o -name grubenv \))
-  } > "$PREPARED/boot-config-$label.txt" 2>&1 || true
-}
-
-select_boot_kernel() {
-  local family=$1 kernel=$2 initramfs first_linux
-  case "$family" in
-    apt)
-      initramfs="/boot/initrd.img-$kernel"
-      [[ -s "$initramfs" ]] || update-initramfs -c -k "$kernel"
-      install -d -m 0755 /etc/default/grub.d
-      printf 'GRUB_DEFAULT=0\nGRUB_SAVEDEFAULT=false\n' > /etc/default/grub.d/99-kidobo-e2e.cfg
-      update-grub
-      first_linux=$(sed -n -E '/^[[:space:]]*linux(efi)?[[:space:]]/{p;q;}' /boot/grub/grub.cfg)
-      [[ "$first_linux" == *"/vmlinuz-$kernel "* ]] || fail "first GRUB kernel is not the intended $kernel: $first_linux"
-      ;;
-    dnf|dnf-epel)
-      initramfs="/boot/initramfs-$kernel.img"
-      [[ -s "$initramfs" ]] || dracut --force "$initramfs" "$kernel"
-      grubby --set-default "/boot/vmlinuz-$kernel"
-      [[ "$(grubby --default-kernel)" == "/boot/vmlinuz-$kernel" ]] || fail 'grubby did not select the intended kernel'
-      ;;
-    zypper)
-      initramfs="/boot/initrd-$kernel"
-      [[ -s "$initramfs" ]] || dracut --force "$initramfs" "$kernel"
-      sed -i -E 's/^GRUB_DEFAULT=.*/GRUB_DEFAULT=0/' /etc/default/grub
-      grub2-mkconfig -o /boot/grub2/grub.cfg
-      first_linux=$(sed -n -E '/^[[:space:]]*linux(efi)?[[:space:]]/{p;q;}' /boot/grub2/grub.cfg)
-      [[ "$first_linux" == *"/vmlinuz-$kernel "* ]] || fail "first GRUB kernel is not the intended $kernel: $first_linux"
-      ;;
-    *) fail "unsupported package family: $family" ;;
-  esac
-  verify_kernel_artifacts "$kernel" "$initramfs"
-  printf '%s\n' "$kernel" > "$PREPARED/expected-kernel"
-  printf '%s\n' "$initramfs" > "$PREPARED/expected-initramfs"
 }
 
 prepare_agent_selinux() {
@@ -248,33 +165,12 @@ UNIT
   esac
 }
 
-capture_boot_diagnostics() {
-  capture_boot_configuration current
-  {
-    printf '%s\n' '=== observed kernel ==='; uname -a
-    printf '%s\n' '=== kernel command line ==='; cat /proc/cmdline
-    printf '%s\n' '=== expected kernel ==='; cat "$PREPARED/expected-kernel"
-    printf '%s\n' '=== boot files ==='; find /boot -maxdepth 3 -type f -printf '%p %s bytes\n'
-    if command -v grubby >/dev/null 2>&1; then grubby --default-kernel; grubby --info=ALL; fi
-    if command -v grub2-editenv >/dev/null 2>&1; then grub2-editenv list; fi
-    if command -v grub-editenv >/dev/null 2>&1; then grub-editenv list; fi
-    printf '%s\n' '=== package inventory ==='; cat "$PREPARED/packages.txt"
-    printf '%s\n' '=== current boot journal ==='; journalctl -b --no-pager
-  } > "$PREPARED/boot-diagnostics.txt" 2>&1 || true
-}
-
 verify_running_kernel() {
-  local expected actual module
-  [[ -s "$PREPARED/expected-kernel" && -s "$PREPARED/expected-initramfs" ]] || fail 'kernel verification requires completed boot preparation'
-  expected=$(<"$PREPARED/expected-kernel")
+  local actual module
   actual=$(uname -r)
-  if [[ "$actual" != "$expected" ]]; then
-    capture_boot_diagnostics
-    fail "running kernel $actual does not match intended kernel $expected; see prepared/boot-diagnostics.txt"
-  fi
-  verify_kernel_artifacts "$expected" "$(<"$PREPARED/expected-initramfs")"
+  printf 'running_kernel=%s\n' "$actual"
   for module in ip_set xt_set ip_set_hash_net; do
-    modprobe "$module" || fail "required running-kernel module cannot be loaded: $module"
+    modprobe "$module" || fail "required module $module cannot be loaded for running kernel $actual"
   done
   iptables -w 5 -S >/dev/null || fail 'default IPv4 iptables backend is unavailable'
   ip6tables -w 5 -S >/dev/null || fail 'default IPv6 iptables backend is unavailable'
@@ -368,7 +264,7 @@ provision_main() {
   set -x
   trap 'e2e_report_exit "$?"' EXIT
   require_guest
-  local mode=${1:-} family selinux=image-default kernel
+  local mode=${1:-} family selinux=image-default
   case "$mode" in
     --boot-status)
       [[ $# == 1 ]] || fail '--boot-status accepts no additional arguments'
@@ -405,12 +301,12 @@ provision_main() {
       ;;
     --check-kernel)
       [[ $# == 1 ]] || fail '--check-kernel accepts no additional arguments'
-      e2e_check_start 'post-upgrade kernel and firewall backends' 'running kernel equals intended kernel; required modules load; both firewall backends work'
+      e2e_check_start 'running kernel capabilities and firewall backends' 'required modules load for the running kernel; both firewall backends work'
       verify_running_kernel
       family=$(sed -n 's/^family=//p' "$PREPARED/provision.txt")
       wait_for_network "$family"
       printf 'post_upgrade_kernel=%s\n' "$(uname -r)" >> "$PREPARED/provision.txt"
-      e2e_check_pass "intended kernel=$(uname -r); required modules loaded; both firewall backends and network available"
+      e2e_check_pass "running kernel=$(uname -r); required modules loaded; both firewall backends and network available"
       e2e_check_start 'prepared SELinux enforcement' 'requested security mode verified after relabeling; persistent enforcement configured where required'
       finish_selinux
       rm -f /etc/systemd/system/selinux-autorelabel.service.d/kidobo-e2e.conf
@@ -456,12 +352,9 @@ provision_main() {
         e2e_check_start 'operating system upgrade' 'upgrade reuses fresh provisioning metadata; package transaction and inventory succeed'
         upgrade_operating_system "$family"
         e2e_check_pass "OS upgrade completed for $family; refreshed inventory recorded"
-        e2e_check_start 'intended boot kernel and security preparation' 'installed target kernel, initramfs and module files exist; bootloader selects target; security transition prepared'
-        kernel=$(installed_kernel "$family")
-        [[ -n "$kernel" ]] || fail 'no installed kernel package was found'
-        select_boot_kernel "$family" "$kernel"
+        e2e_check_start 'guest security preparation' 'requested security transition prepared for reboot'
         prepare_selinux "$family" "$selinux"
-        e2e_check_pass "intended_kernel=$kernel; requested_selinux=$selinux; relabel_scheduled=$(<"$PREPARED/relabel-scheduled")"
+        e2e_check_pass "requested_selinux=$selinux; relabel_scheduled=$(<"$PREPARED/relabel-scheduled")"
       fi
       install -d -m 0755 "$BASE/state"
       cp "$PREPARED/provision.txt" "$BASE/state/provision.txt"

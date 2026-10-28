@@ -236,7 +236,7 @@ fn prepare_guest(runner: &mut Runner, config: &Config, target: &Distro, vm: &str
         30,
     )?;
     runner.stage(&format!(
-        "{} | OS reboot and kernel verification",
+        "{} | OS reboot and capability verification",
         target.id
     ))?;
     reboot_prepared(

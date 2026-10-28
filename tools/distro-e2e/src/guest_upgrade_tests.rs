@@ -254,28 +254,25 @@ printf 'old binary cache bytes\n' > "$KIDOBO_ROOT/cache/remote/generated"
 }
 
 #[test]
-fn application_reboot_requires_the_prepared_kernel_and_enforcing_security_state() {
+fn application_reboot_requires_security_state_without_kernel_identity() {
     let function = lifecycle_function("assert_reboot_preparation() {", "\nafter_reboot_phase() {")
         .replace("! -e /.autorelabel", "! -e \"$ROOT/autorelabel\"");
-    for (kernel, mode, relabel, succeeds) in [
-        ("intended-kernel", "Enforcing", false, true),
-        ("old-kernel", "Enforcing", false, false),
-        ("intended-kernel", "Permissive", false, false),
-        ("intended-kernel", "Disabled", false, false),
-        ("intended-kernel", "Enforcing", true, false),
+    for (mode, relabel, provenance, succeeds) in [
+        ("Enforcing", false, true, true),
+        ("Permissive", false, true, false),
+        ("Disabled", false, true, false),
+        ("Enforcing", true, true, false),
+        ("Enforcing", false, false, false),
     ] {
         let temp = TestDir::new();
         fs::create_dir(temp.path().join("prepared")).expect("prepared state");
-        fs::write(
-            temp.path().join("prepared/expected-kernel"),
-            "intended-kernel\n",
-        )
-        .expect("intended kernel");
-        fs::write(
-            temp.path().join("prepared/selinux-requested"),
-            "enforcing\n",
-        )
-        .expect("required security state");
+        if provenance {
+            fs::write(
+                temp.path().join("prepared/selinux-requested"),
+                "enforcing\n",
+            )
+            .expect("required security state");
+        }
         if relabel {
             fs::write(temp.path().join("autorelabel"), "pending\n").expect("pending relabel");
         }
@@ -283,15 +280,116 @@ fn application_reboot_requires_the_prepared_kernel_and_enforcing_security_state(
             .args([
                 "-c",
                 &format!(
-                    "set -euo pipefail\nROOT=$FIXTURE_ROOT\nuname() {{ printf '%s\\n' \"$FAKE_KERNEL\"; }}\ngetenforce() {{ printf '%s\\n' \"$FAKE_MODE\"; }}\nfail() {{ printf '%s\\n' \"$*\" >&2; exit 1; }}\n{function}\nassert_reboot_preparation\n"
+                    "set -euo pipefail\nROOT=$FIXTURE_ROOT\ngetenforce() {{ printf '%s\\n' \"$FAKE_MODE\"; }}\nfail() {{ printf '%s\\n' \"$*\" >&2; exit 1; }}\n{function}\nassert_reboot_preparation\n"
                 ),
             ])
             .env("FIXTURE_ROOT", temp.path())
-            .env("FAKE_KERNEL", kernel)
             .env("FAKE_MODE", mode)
             .output()
             .expect("exercise prepared-state reboot checks with inert probes");
         assert_eq!(output.status.success(), succeeds, "{output:?}");
+    }
+}
+
+#[test]
+fn changed_reboot_kernel_still_requires_timer_and_enforcement_success() {
+    let functions =
+        lifecycle_function("wait_for_timer_run() {", "\nconfigure_baseline_sources() {")
+            .replace("! -e /.autorelabel", "! -e \"$ROOT/autorelabel\"");
+    for (scenario, error) in [
+        ("success", ""),
+        ("timer-failed", "kidobo-sync.service failed after reboot"),
+        (
+            "timer-result",
+            "timer service failed (result=exit-code status=0)",
+        ),
+        (
+            "timer-status",
+            "timer service failed (result=success status=1)",
+        ),
+        ("IPv4", "IPv4 traffic was allowed"),
+        ("IPv6", "IPv6 traffic was allowed"),
+    ] {
+        let temp = TestDir::new();
+        let root = temp.path();
+        fs::create_dir(root.join("prepared")).expect("preparation directory");
+        fs::write(root.join("prepared/selinux-requested"), "enforcing\n")
+            .expect("security requirement");
+        fs::write(
+            root.join("provision.txt"),
+            "post_upgrade_kernel=older-kernel\n",
+        )
+        .expect("prior kernel observation");
+        let body = format!(
+            r#"
+set -euo pipefail
+ROOT=$FIXTURE_ROOT STATE=$FIXTURE_ROOT
+SET4=fixture4 SET6=fixture6 SOURCE_PORT=39474 tag=v0.14.3 mode=published
+fail() {{ printf '%s\n' "$*" >&2; exit 1; }}
+uname() {{ printf 'different-kernel\n'; }}
+getenforce() {{ printf 'Enforcing\n'; }}
+modprobe() {{ fail 'test must not load modules for the application'; }}
+e2e_check_start() {{ :; }}
+e2e_check_pass() {{ printf 'reboot check passed\n'; }}
+assert_target_version() {{ :; }}
+systemctl() {{
+  case "$*" in
+    'is-enabled --quiet kidobo-sync.timer'|'is-active --quiet kidobo-sync.timer') return 0 ;;
+    *--property=ExecMainStartTimestamp*) printf 'recent\n' ;;
+    *--property=ActiveState*) if [[ "$SCENARIO" == timer-failed ]]; then printf 'failed\n'; else printf 'inactive\n'; fi ;;
+    *--property=Result*) if [[ "$SCENARIO" == timer-result ]]; then printf 'exit-code\n'; else printf 'success\n'; fi ;;
+    *--property=ExecMainStatus*) if [[ "$SCENARIO" == timer-status ]]; then printf '1\n'; else printf '0\n'; fi ;;
+    *) fail "unexpected systemctl: $*" ;;
+  esac
+}}
+ipset() {{ :; }}
+kidobo() {{
+  case "$1" in
+    lookup) printf '198.51.100.44\thttp://127.0.0.1:39474/feed.txt\t198.51.100.44/32\n' ;;
+    doctor) printf '{{}}\n' ;;
+    *) fail "unexpected kidobo: $*" ;;
+  esac
+}}
+start_source_fixture() {{ :; }}
+setup_namespace() {{ :; }}
+capture_namespace_and_cleanup() {{ :; }}
+start_traffic_servers() {{ :; }}
+probe_pair() {{
+  [[ "$1" == blocked ]] || fail 'expected blocked traffic'
+  if [[ "$SCENARIO" == IPv4 || "$SCENARIO" == IPv6 ]]; then fail "$SCENARIO traffic was allowed"; fi
+}}
+ensure_unrelated_sentinels() {{ :; }}
+sync_and_assert() {{ :; }}
+{functions}
+after_reboot_phase
+"#
+        );
+        let output = Command::new("bash")
+            .args(["-c", &body])
+            .env("FIXTURE_ROOT", root)
+            .env("SCENARIO", scenario)
+            .output()
+            .expect("isolated reboot phase");
+        assert_eq!(
+            output.status.success(),
+            scenario == "success",
+            "{scenario}: {output:?}"
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(
+            stdout.contains("reboot check passed"),
+            scenario == "success"
+        );
+        assert!(stdout.contains("post_application_reboot_kernel=different-kernel"));
+        assert_eq!(
+            read_text(&root.join("provision.txt")).expect("kernel observations"),
+            "post_upgrade_kernel=older-kernel\npost_application_reboot_kernel=different-kernel\n"
+        );
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("test must not load modules"));
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(error),
+            "{scenario}: {output:?}"
+        );
     }
 }
 

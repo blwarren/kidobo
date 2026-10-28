@@ -18,8 +18,6 @@ printf '%s\n' '=== boot ID ==='
 attempt cat /proc/sys/kernel/random/boot_id
 printf '%s\n' '=== kernel command line ==='
 attempt cat /proc/cmdline
-printf '%s\n' '=== intended kernel ==='
-attempt cat /opt/kidobo-e2e/prepared/expected-kernel
 printf '%s\n' '=== relabel scheduled ==='
 attempt cat /opt/kidobo-e2e/prepared/relabel-scheduled
 optional() {
@@ -37,7 +35,6 @@ for file in /etc/os-release /etc/kernel/cmdline /etc/default/grub /etc/default/g
     /etc/grub2.cfg /etc/grub2-efi.cfg /boot/grub/grub.cfg /boot/grub2/grub.cfg \
     /boot/loader/loader.conf /boot/loader/entries/*.conf \
     /etc/selinux/config /.autorelabel /sys/fs/selinux/enforce \
-    /opt/kidobo-e2e/prepared/expected-initramfs \
     /opt/kidobo-e2e/prepared/relabel-boot-id; do
     read_file "$file"
 done
@@ -366,10 +363,6 @@ fi
         for (path, text) in [
             ("proc/sys/kernel/random/boot_id", "fixture-boot\n"),
             ("proc/cmdline", "fixture-command-line\n"),
-            (
-                "opt/kidobo-e2e/prepared/expected-kernel",
-                "fixture-intended\n",
-            ),
             ("opt/kidobo-e2e/prepared/relabel-scheduled", "1\n"),
         ] {
             let path = temp.path().join(path);
@@ -391,7 +384,8 @@ fi
         );
         let output = String::from_utf8(output.stdout).expect("snapshot text");
         assert!(output.contains("fixture-boot"));
-        assert!(output.contains("fixture-intended"));
+        assert!(!output.contains("expected-kernel"));
+        assert!(!output.contains("expected-initramfs"));
         assert!(output.contains("unavailable tool: grubby"));
         assert!(output.contains("unavailable tool: systemctl"));
         executable(
@@ -436,9 +430,6 @@ fi
             String::from_utf8_lossy(&output.stdout)
                 .contains("=== recent agent and relabel journal ===")
         );
-        fs::remove_file(temp.path().join("opt/kidobo-e2e/prepared/expected-kernel"))
-            .expect("remove required identity");
-        assert_eq!(run().status.code(), Some(1));
     }
 
     #[test]

@@ -23,6 +23,12 @@ add orchestration platforms, background services, automatic repair, or fallback 
 make an environment failure disappear. Report environment failures separately from application
 failures; neither justifies weakening assertions.
 
+Kernel compatibility is established by the running kernel's required capabilities and Kidobo's
+observed behavior. Kernel freshness, version equality, and boot-default management are non-goals.
+A different installed kernel or a version change across reboot is informational, not a warning
+or failure. Missing required modules, unavailable firewall backends, and broken enforcement
+remain failures. Do not add kernel selection, boot repair, or fallback to hide those failures.
+
 For each proposed addition, identify the Kidobo behavior it proves and why existing coverage
 is insufficient. New platforms, scenarios, persistent state, reuse mechanisms, repair/fallback
 behavior, and release-policy changes require explicit user scope. Ordinary fixes within the
@@ -55,6 +61,8 @@ The required release targets are Debian 12/13 and Ubuntu 24.04/26.04. Publicatio
 including advisory Fedora 44 and AlmaLinux 9/10. Advisory environment or application failures
 remain visible but do not fail the required release gate. Full seven-platform qualification
 requires every selected target to pass. A filtered run does not qualify publication.
+Acceptance applies to the recorded environment; it does not establish compatibility with every
+kernel available for that distribution.
 
 The [matrix configuration](../config/e2e.toml) records package prerequisites and target security
 requirements. `required` defaults to `true`; advisory targets explicitly set it to `false`.
@@ -111,9 +119,17 @@ with a named diagnostic. Explicitly retained guests remain protected and are sto
 Each worker completes one target through creation, provisioning, environment validation,
 application tests, diagnostics, and cleanup before taking another target. There is no prepare-all
 barrier or parking stage. Preparation resolves an upstream image fingerprint, installs packaged
-prerequisites, updates within the pinned distro release, selects the kernel using ordinary distro
-tools, and reboots. It validates the running kernel, firewall modules/backends, network, requested
-SELinux mode, and absence of pre-existing Kidobo state before installing the artifact.
+prerequisites, updates within the pinned distro release, and reboots using the distro's boot
+defaults. Ordinary package-manager boot hooks remain in effect; the harness does not select a
+kernel or generate initramfs files. Before installing the artifact, it requires successful loading
+of `ip_set`, `xt_set`, and `ip_set_hash_net`, working IPv4/IPv6 firewall backends, network readiness,
+the requested SELinux mode, and absence of pre-existing Kidobo state. Running kernel versions
+before and after preparation and application reboot, plus package inventories, identify what
+was tested without imposing version requirements.
+
+After the application reboot, the existing timer, service, restored-set, and IPv4/IPv6 traffic
+assertions prove that Kidobo restored enforcement. The harness does not preload modules to help
+that boot behavior pass; the requested SELinux state must also persist.
 
 AlmaLinux enables EPEL/CRB. SELinux setup retains a bounded readiness deadline, observes completion
 of relabeling across boot identities, and requires a saved successful enforcement result plus an

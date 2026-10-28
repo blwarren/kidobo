@@ -84,10 +84,10 @@
         "guest route and DNS readiness": 1,
         "guest dependency provisioning": 1,
         "operating system upgrade": 1,
-        "intended boot kernel and security preparation": 1
+        "guest security preparation": 1
       },
       "--check-kernel": {
-        "post-upgrade kernel and firewall backends": 1,
+        "running kernel capabilities and firewall backends": 1,
         "prepared SELinux enforcement": 1
       },
       "--validate": {

@@ -686,7 +686,6 @@ wait_for_timer_run() {
   fail 'kidobo-sync.timer did not start its service within 180 seconds after reboot'
 }
 assert_reboot_preparation() {
-  [[ -s "$ROOT/prepared/expected-kernel" && "$(uname -r)" == "$(<"$ROOT/prepared/expected-kernel")" ]] || fail 'application reboot did not retain the intended prepared kernel'
   [[ -s "$ROOT/prepared/selinux-requested" ]] || fail 'application reboot lacks security preparation provenance'
   if [[ "$(<"$ROOT/prepared/selinux-requested")" == enforcing ]]; then
     [[ "$(getenforce)" == Enforcing && ! -e /.autorelabel ]] || fail 'application reboot lost completed enforcing SELinux state'
@@ -694,6 +693,10 @@ assert_reboot_preparation() {
 }
 after_reboot_phase() {
   e2e_check_start 'reboot restores timer enforcement' 'version retained; timer enabled/active; sync service succeeds; both traffic families blocked'
+  local kernel
+  kernel=$(uname -r)
+  printf 'post_application_reboot_kernel=%s\n' "$kernel" >> "$STATE/provision.txt"
+  printf 'post_application_reboot_kernel=%s\n' "$kernel"
   assert_target_version
   assert_reboot_preparation
   systemctl is-enabled --quiet kidobo-sync.timer || fail 'timer lost enabled state across reboot'
