@@ -46,7 +46,8 @@ that include those retired scaled cases.
 - `just release-compat` (release-only static ELF, Debian 11, and Alpine 3.22 gate)
 - `just e2e-setup` (configure suite-owned Incus infrastructure; see [distro testing](../docs/e2e.md))
 - `just e2e` (start the candidate build and complete distro matrix in detached tmux session
-  `kidobo-e2e`; attach with `tmux attach -t kidobo-e2e` to watch progress and the final exit status)
+  `kidobo-e2e`; attach with `tmux attach -t kidobo-e2e` to watch progress; the session closes
+  automatically and saves output and exit status under `target/e2e/launcher-*/`)
 - `just e2e --required-only` (build and test only required targets in the detached session)
 - `just e2e --archive ARCHIVE --tag TAG` (rerun all configured targets against the same archive without rebuilding; supports cold/warm comparisons)
 - `just e2e --refresh-images` (rebuild prepared images and rerun every selected target)

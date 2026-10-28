@@ -923,7 +923,7 @@ fn runner(dir: &Path) -> Runner {
     }
 }
 
-fn runner_with_incus(dir: &Path, program: &Path) -> Runner {
+pub(super) fn runner_with_incus(dir: &Path, program: &Path) -> Runner {
     let mut runner = runner(dir);
     runner.incus_program = program.to_path_buf();
     runner

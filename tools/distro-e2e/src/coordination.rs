@@ -61,9 +61,7 @@ pub(super) fn preflight(runner: &mut Runner, config: &Config) -> Result<usize> {
     }
     let instances: Vec<Value> =
         serde_json::from_str(&runner.incus(&strings(&["list", "--format=json"]), 30)?)?;
-    if instances.iter().any(|vm| vm["status"] == "Running") {
-        return Err("E2E project already has running guests; stop or clean retained guests before starting a matrix".into());
-    }
+    recover_abandoned(runner, &instances)?;
     let available = memory_available(&read_text(Path::new("/proc/meminfo"))?)?;
     let effective = memory_slots(
         available,
@@ -78,6 +76,60 @@ pub(super) fn preflight(runner: &mut Runner, config: &Config) -> Result<usize> {
     ))?;
     runner.report.save()?;
     Ok(effective)
+}
+
+// Called only while holding the server/project coordinator lock. The PID check
+// also protects legacy runs which predate that lock and conservatively rejects reuse.
+fn recover_abandoned(runner: &mut Runner, instances: &[Value]) -> Result<()> {
+    let mut failures = Vec::new();
+    for instance in instances {
+        let name = instance["name"].as_str().unwrap_or("<unnamed>");
+        let result = (|| -> Result<()> {
+            super::validate_vm_config(instance)?;
+            let mut parts = name.splitn(4, '-');
+            if parts.next() != Some("run")
+                || parts
+                    .next()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .is_none()
+            {
+                return Err("unrecognized E2E run name; left untouched".into());
+            }
+            let pid = parts
+                .next()
+                .and_then(|value| value.parse::<u32>().ok())
+                .filter(|pid| *pid > 0)
+                .ok_or("invalid E2E owner PID; left untouched")?;
+            if parts.next().is_none_or(str::is_empty) || !super::safe_name(name) {
+                return Err("invalid E2E guest name; left untouched".into());
+            }
+            if Path::new("/proc").join(pid.to_string()).try_exists()? {
+                return Err(format!("owner PID {pid} still exists; left untouched").into());
+            }
+            if instance["config"]["user.kidobo-e2e-retained"] == "true" {
+                if instance["status"] != "Stopped" {
+                    runner.retain(name)?;
+                }
+                runner
+                    .report
+                    .emit(&format!("Preserved explicitly retained E2E guest {name}"))?;
+            } else {
+                runner.delete(name)?;
+                runner
+                    .report
+                    .emit(&format!("Removed abandoned E2E guest {name}"))?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            failures.push(format!("{name}: {error}"));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("E2E guest recovery incomplete: {}", failures.join("; ")).into())
+    }
 }
 
 fn memory_available(text: &str) -> Result<u64> {
@@ -122,6 +174,132 @@ fn memory_slots(available: u64, per_vm: u64, requested: usize) -> Result<usize> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn guest(name: &str, retained: bool) -> Value {
+        json!({"name":name,"type":"virtual-machine","status":"Running",
+            "config":{"user.kidobo-e2e":super::super::OWNER,
+                "user.kidobo-e2e-retained":if retained { "true" } else { "false" }}})
+    }
+
+    fn recovery_runner(temp: &crate::tests::TestDir, instances: &[Value]) -> Runner {
+        let program = temp.path().join("incus");
+        std::fs::write(
+            temp.path().join("instances.json"),
+            serde_json::to_vec(instances).expect("JSON"),
+        )
+        .expect("instances");
+        crate::tests::executable(
+            &program,
+            r#"#!/bin/bash
+set -eu
+cd "$(dirname "$0")"
+[[ "$1" == --project && "$2" == test-project ]]
+shift 2
+if [[ "$1" == list ]]; then
+    cat instances.json
+else
+    printf '%s\n' "$*" >> calls
+    if [[ "$1" == delete && "$2" == *-fail ]]; then exit 1; fi
+fi
+"#,
+        );
+        crate::tests::runner_with_incus(temp.path(), &program)
+    }
+
+    #[test]
+    fn recovery_cleans_orphans_without_manifests_and_preserves_retained_guests() {
+        let temp = crate::tests::TestDir::new();
+        let mut stopped = guest("run-1-4294967295-stopped", false);
+        stopped["status"] = json!("Stopped");
+        let mut retained_stopped = guest("run-1-4294967295-retained-stopped", true);
+        retained_stopped["status"] = json!("Stopped");
+        let instances = vec![
+            guest("run-1-4294967295-running", false),
+            stopped,
+            guest("run-1-4294967295-retained", true),
+            retained_stopped,
+        ];
+        let mut runner = recovery_runner(&temp, &instances);
+        recover_abandoned(&mut runner, &instances).expect("recovered all abandoned guests");
+        assert_eq!(
+            read_text(&temp.path().join("calls")).expect("calls"),
+            "delete run-1-4294967295-running --force\ndelete run-1-4294967295-stopped --force\nconfig set run-1-4294967295-retained user.kidobo-e2e-retained=true\nstop run-1-4294967295-retained --timeout=60\n"
+        );
+    }
+
+    #[test]
+    fn recovery_skips_active_foreign_and_malformed_guests_but_finishes_other_cleanup() {
+        let temp = crate::tests::TestDir::new();
+        let mut foreign = guest("run-1-4294967295-foreign", false);
+        foreign["config"]["user.kidobo-e2e"] = json!("other");
+        let instances = vec![
+            foreign,
+            guest("not-a-run", false),
+            guest(&format!("run-1-{}-active", std::process::id()), false),
+            guest("run-1-4294967295-fail", false),
+            guest("run-1-4294967295-clean", false),
+        ];
+        let mut runner = recovery_runner(&temp, &instances);
+        let error = recover_abandoned(&mut runner, &instances)
+            .expect_err("blocked recovery")
+            .to_string();
+        assert!(error.contains("unowned"));
+        assert!(error.contains("unrecognized"));
+        assert!(error.contains("still exists"));
+        assert!(error.contains("run-1-4294967295-fail"));
+        assert_eq!(
+            read_text(&temp.path().join("calls")).expect("calls"),
+            "delete run-1-4294967295-fail --force\ndelete run-1-4294967295-clean --force\n"
+        );
+    }
+
+    #[test]
+    fn recovery_rechecks_ownership_before_deletion() {
+        let temp = crate::tests::TestDir::new();
+        let mut foreign = guest("run-1-4294967295-changed", false);
+        foreign["config"]["user.kidobo-e2e"] = json!("other");
+        let mut runner = recovery_runner(&temp, &[foreign]);
+        let error = recover_abandoned(&mut runner, &[guest("run-1-4294967295-changed", false)])
+            .expect_err("owner changed")
+            .to_string();
+        assert!(error.contains("unowned"));
+        assert!(!temp.path().join("calls").exists());
+    }
+
+    #[test]
+    fn explicit_cleanup_attempts_remaining_guests_after_a_delete_failure() {
+        let temp = crate::tests::TestDir::new();
+        let run = temp
+            .path()
+            .file_name()
+            .expect("run name")
+            .to_str()
+            .expect("UTF-8");
+        let failed = format!("{run}-fail");
+        let cleaned = format!("{run}-clean");
+        let mut runner = recovery_runner(&temp, &[guest(&failed, false), guest(&cleaned, false)]);
+        let owned = super::super::Owned {
+            owner: super::super::OWNER.into(),
+            project: "test-project".into(),
+            instances: vec![failed.clone(), cleaned.clone()],
+        };
+        std::fs::write(
+            temp.path().join("ownership.json"),
+            serde_json::to_vec(&owned).expect("JSON"),
+        )
+        .expect("manifest");
+        let mut config: Config =
+            toml_edit::de::from_str(include_str!("../../../config/e2e.toml")).expect("config");
+        config.project = "test-project".into();
+        let error = super::super::clean(&mut runner, &config)
+            .expect_err("cleanup failure")
+            .to_string();
+        assert!(error.contains(&failed));
+        assert_eq!(
+            read_text(&temp.path().join("calls")).expect("calls"),
+            format!("delete {failed} --force\ndelete {cleaned} --force\n")
+        );
+    }
     #[test]
     fn coordinator_lock_is_exclusive_releases_on_drop_and_rejects_symlinks() {
         let temp = crate::tests::TestDir::new();

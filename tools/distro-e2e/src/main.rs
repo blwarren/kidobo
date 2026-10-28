@@ -601,6 +601,23 @@ impl Runner {
         self.incus(&strings(&["delete", vm, "--force"]), 120)?;
         Ok(())
     }
+    fn retain(&mut self, vm: &str) -> Result<()> {
+        let instances: Vec<serde_json::Value> =
+            serde_json::from_str(&self.incus(&strings(&["list", vm, "--format=json"]), 30)?)?;
+        let instance = instances
+            .iter()
+            .find(|instance| instance["name"] == vm)
+            .ok_or("VM missing")?;
+        validate_vm_config(instance)?;
+        self.incus(
+            &strings(&["config", "set", vm, "user.kidobo-e2e-retained=true"]),
+            30,
+        )?;
+        if instance["status"] != "Stopped" {
+            self.incus(&strings(&["stop", vm, "--timeout=60"]), 90)?;
+        }
+        Ok(())
+    }
 }
 fn strings(args: &[&str]) -> Vec<String> {
     args.iter().map(|v| (*v).to_owned()).collect()
@@ -944,15 +961,26 @@ fn clean(runner: &mut Runner, config: &Config) -> Result<()> {
         .ok_or("ownership directory has no run ID")?
         .to_string_lossy();
     validate_owned_manifest(&owned, &config.project, &run_id)?;
+    let mut failures = Vec::new();
     for vm in owned.instances {
-        // A previous cleanup may already have removed this VM.
-        let output = runner.incus(&strings(&["list", "--format=json"]), 30)?;
-        let list: Vec<serde_json::Value> = serde_json::from_str(&output)?;
-        if list.iter().any(|v| v["name"] == vm) {
-            runner.delete(&vm)?;
+        let result = (|| -> Result<()> {
+            // A previous cleanup may already have removed this VM.
+            let output = runner.incus(&strings(&["list", "--format=json"]), 30)?;
+            let list: Vec<serde_json::Value> = serde_json::from_str(&output)?;
+            if list.iter().any(|v| v["name"] == vm) {
+                runner.delete(&vm)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            failures.push(format!("{vm}: {error}"));
         }
     }
-    Ok(())
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("VM cleanup failed: {}", failures.join("; ")).into())
+    }
 }
 fn validate_owned_manifest(owned: &Owned, project: &str, run_id: &str) -> Result<()> {
     if owned.owner != OWNER

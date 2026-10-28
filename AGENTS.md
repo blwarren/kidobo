@@ -21,6 +21,10 @@ deterministic computation, operator compatibility, and reliable installation and
   asks them to run it. Requests to change, document, or review the E2E workflow do not authorize
   execution. This applies to all candidate, artifact, published-release, and publication paths
   that launch the matrix, including filtered runs.
+- E2E must clean up its own VMs and completed tmux sessions after success, failure, or handled
+  interruption. Preserve logs and evidence, honor explicit `--keep-failed` retention, and recover
+  abandoned suite-owned resources safely on the next run. Do not make routine reruns depend on
+  manual session or VM cleanup.
 - New commands, configuration surface, or runtime modes require explicit scope. Changes to cache
   format, fallback, or staleness semantics require explicit approval.
 - `CHANGELOG.md` is generated; never hand-edit it. After any repository change, run

@@ -66,8 +66,12 @@ changed device/resource settings; an unchanged owned profile is left untouched. 
 and resource settings. The default `max_parallel_vms = 2` allows two running VMs, each with 2 vCPUs,
 4 GiB memory, and a 30 GiB virtual disk. Set it to `1` for diagnosis or comparisons.
 Preflight reserves 1 GiB of host memory beyond the guests, reduces concurrency to one when
-necessary, and fails before creating guests if one cannot fit. Any running guest in the suite
-project prevents a new matrix; stop or clean retained guests first. A host-wide coordinator lock
+necessary, and fails before creating guests if one cannot fit. Existing guests in the suite
+project are checked before a new matrix. Under the coordinator lock, the runner removes abandoned
+suite-owned guests, including leftovers whose old ownership files are missing. It requires a valid
+run name and an absent owner PID; foreign guests, malformed names, or an existing owner PID block
+recovery with a named diagnostic. Explicitly retained guests are preserved and stopped if needed.
+A host-wide coordinator lock
 for the local Incus server/project prevents competing operations from racing cache maintenance
 or exceeding the configured limit. Allow disk space for pending targets, prepared images, upstream
 images, and failure artifacts. Incus images and distro repositories require
@@ -162,9 +166,11 @@ tmux attach -t kidobo-e2e
 ```
 
 Detach with **Ctrl+b**, then **d**. Reattach with the same command after reconnecting.
-The pane remains after completion and prints the matrix command's exit status.
-An existing session prevents another candidate run. After reviewing the completed result,
-remove the session with `tmux kill-session -t kidobo-e2e` before starting a new run.
+The session closes automatically after success or failure. The launcher prints a unique
+`target/e2e/launcher-*/` directory containing `output.log` and `exit-status`, including
+build failures before a matrix report exists. `KIDOBO_E2E_RESULTS_DIR` also controls these logs.
+An active session prevents another candidate run. Completed sessions left by older launchers
+are archived under `recovered-session-*/` and removed automatically before starting a new run.
 Killing a session while the matrix is active interrupts it. Artifact and published-release
 recipes continue to run in the foreground.
 
@@ -384,9 +390,13 @@ outcomes; inspect advisory failures, actual firewall backends, and security stat
 seven-platform qualification.
 Diagnostic failures remain failures or incomplete evidence rather than a target PASS.
 
-VMs are deleted after diagnostics by default. `--keep-failed` retains failed guests stopped for
-inspection, so they do not consume another worker's running-VM slot. Interrupted runs retain
-ownership records so cleanup can be retried safely:
+VMs are deleted after diagnostics by default. `--keep-failed` marks failed guests for retention
+and stops them for inspection, so they do not consume another worker's running-VM slot or get
+removed by startup recovery. SIGINT, SIGTERM, and SIGHUP request cancellation and cleanup;
+cleanup continues across other guests if one deletion fails. A forced kill or host shutdown
+cannot execute cleanup, so the next run recovers abandoned guests under the ownership checks above.
+Legacy guests without the retention marker are treated as abandoned after their owner process exits.
+Logs and evidence remain on disk. Ownership records also support explicit cleanup:
 
 ```bash
 just e2e-clean RUN_ID
@@ -411,17 +421,16 @@ release_tag="${RELEASE_TAG:?set RELEASE_TAG to the candidate tag}"
 just e2e --archive "$release_archive" --tag "$release_tag" --refresh-images
 ```
 
-Attach with `tmux attach -t kidobo-e2e` and review the finished result. After the cold run has
-completed, remove its retained session and launch the warm run against the identical archive:
+Attach with `tmux attach -t kidobo-e2e` while the run is active, then review its saved output
+and exit status. After the cold run has completed, launch the warm run against the identical archive:
 
 ```bash
-tmux kill-session -t kidobo-e2e
 just e2e --archive "$release_archive" --tag "$release_tag"
 ```
 
 The warm command reuses eligible prepared images and reruns every selected application lifecycle.
-It creates a new report rather than crediting completed application coverage from resume. Remove
-the completed warm session before the next candidate run as well.
+It creates a new report rather than crediting completed application coverage from resume.
+Both sessions close automatically when their commands finish.
 
 User-run acceptance should also cover compatible resume. Verify enforcing SELinux on all three advisory targets and
 both nftables and legacy backend coverage. Full seven-platform qualification requires all selected

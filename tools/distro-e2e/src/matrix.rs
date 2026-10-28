@@ -76,16 +76,19 @@ fn park_owned(runner: &mut Runner, config: &Config, run_id: &str) -> Result<()> 
     super::validate_owned_manifest(&owned, &config.project, run_id)?;
     let instances: Vec<Value> =
         serde_json::from_str(&runner.incus(&strings(&["list", "--format=json"]), 30)?)?;
+    let mut failures = Vec::new();
     for vm in owned.instances {
-        if instances
-            .iter()
-            .any(|instance| instance["name"] == vm && instance["status"] == "Running")
+        if instances.iter().any(|instance| instance["name"] == vm)
+            && let Err(error) = runner.retain(&vm)
         {
-            runner.verify(&vm)?;
-            runner.incus(&strings(&["stop", &vm, "--timeout=60"]), 90)?;
+            failures.push(format!("{vm}: {error}"));
         }
     }
-    Ok(())
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("VM retention failed: {}", failures.join("; ")).into())
+    }
 }
 
 fn batch<'a, F>(runner: &mut Runner, jobs: Vec<Trial<'a>>, action: F) -> Result<Vec<Trial<'a>>>
@@ -561,11 +564,7 @@ printf '%s\n' '=== kidobo service journal ==='; journalctl -u kidobo-sync.servic
     let mut cleanup_error = None;
     if vm_exists != Some(false) {
         let cleanup = if keep_failed && trial.error.is_some() {
-            runner.verify(vm).and_then(|()| {
-                runner
-                    .incus(&strings(&["stop", vm, "--timeout=60"]), 90)
-                    .map(|_| ())
-            })
+            runner.retain(vm)
         } else {
             runner.delete(vm)
         };
