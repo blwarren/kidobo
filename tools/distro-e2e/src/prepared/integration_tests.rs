@@ -132,6 +132,8 @@ elif operation in {'start','stop','restart'}:
     else:
         vm['status'] = 'Running'
         vm['boot'] += 1
+        if operation == 'restart' and scenario == 'post-reboot-agent-loss':
+            vm['agent_down'] = True
 elif operation == 'delete':
     del state['instances'][args[1]]
 elif operation == 'publish':
@@ -155,6 +157,9 @@ elif operation == 'exec':
     vm = state['instances'][name]
     assert vm['status'] == 'Running', name
     command = args[4:]
+    if vm.get('agent_down'):
+        print('VM agent is unavailable after restart', file=sys.stderr)
+        fail(255)
     if command[0] == 'cat':
         path = command[1]
         if path == '/proc/sys/kernel/random/boot_id':
@@ -169,6 +174,8 @@ elif operation == 'exec':
                               'kernel':'fixture-kernel', 'selinux':vm['manifest']['selinux_actual']}))
         else:
             raise AssertionError(command)
+    elif command[:2] == ['bash', '-c'] and '=== pre-reboot snapshot ===' in command[2]:
+        print(f"pre-reboot kernel=fixture-kernel boot={vm['boot']}")
     elif command[0] in {'true','sh','test'}:
         pass
     elif command[:2] == ['bash','/opt/kidobo-e2e/provision.sh']:
@@ -343,6 +350,12 @@ fn cold_preparation_publishes_a_private_image_only_after_clone_admission() {
     let metadata = outcome.expect("cold preparation");
     assert_eq!(metadata["cache_hit"], false);
     assert_eq!(fixture.count("publish", None), 1);
+    assert!(
+        runner
+            .evidence()
+            .join("primary/pre-reboot/snapshot.log")
+            .is_file()
+    );
     assert_eq!(fixture.guest_count("--prepare"), 1);
     assert_eq!(fixture.guest_count("--sanitize"), 1);
     assert_eq!(fixture.guest_count("--admit"), 1);
@@ -405,6 +418,7 @@ fn warm_hit_preserves_preparation_age_and_avoids_packages_alias_lookup_and_publi
     let (runner, second) = fixture.prepare(2, false);
     let second = second.expect("warm preparation");
     assert_eq!(second["cache_hit"], true);
+    assert!(!runner.evidence().join("primary/pre-reboot").exists());
     assert_eq!(second["image_fingerprint"], fingerprint);
     assert_eq!(fixture.guest_count("--prepare"), 1);
     assert_eq!(fixture.count("image", Some("info")), 1);
@@ -768,6 +782,60 @@ fn preparation_readiness_bounds_failure_timeout_and_cancellation() {
         assert_eq!(fixture.guest_count("--check-kernel"), 0);
         assert_eq!(fixture.count("publish", None), 0);
     }
+}
+
+#[test]
+fn successful_restart_then_agent_loss_keeps_snapshot_and_expires_before_admission() {
+    let fixture = Fixture::new();
+    fixture.change(|state| state["scenario"] = json!("post-reboot-agent-loss"));
+    let mut runner = fixture.runner(1);
+    let vm = "run-100-1-primary";
+    runner
+        .create_vm("fixture/image", vm, "test-profile")
+        .expect("fixture VM");
+    let target = runner.evidence().join("primary");
+    crate::diagnostics::pre_reboot(&mut runner, vm, &target).expect("snapshot before restart");
+    let error = reboot_prepared(
+        &mut runner,
+        vm,
+        true,
+        Duration::from_millis(500),
+        Duration::from_millis(1),
+    )
+    .expect_err("agent never returned after successful restart")
+    .to_string();
+    assert!(error.contains("deadline expired"), "{error}");
+    assert_eq!(fixture.count("restart", None), 1);
+    assert_eq!(fixture.state()["instances"][vm]["boot"], 2);
+    let restart = runner.report.document["commands"]
+        .as_array()
+        .expect("commands")
+        .iter()
+        .find(|command| {
+            command["args"]
+                .as_array()
+                .is_some_and(|args| args.iter().any(|arg| arg == "restart"))
+        })
+        .expect("restart command");
+    assert_eq!(restart["code"], 0);
+    assert!(fixture.guest_count("--boot-status") > 0);
+    assert_eq!(fixture.guest_count("--check-kernel"), 0);
+    assert_eq!(fixture.guest_count("--admit"), 0);
+    assert_eq!(fixture.count("publish", None), 0);
+    let diagnostics = crate::diagnostics::collect(&mut runner, vm, &target);
+    assert_eq!(diagnostics.errors, Vec::<String>::new());
+    runner.delete(vm).expect("normal cleanup after lost agent");
+    assert_eq!(fixture.state()["instances"], json!({}));
+    assert_eq!(
+        read_text(&target.join("pre-reboot/snapshot.log"))
+            .expect("snapshot survives diagnostics and cleanup"),
+        "pre-reboot kernel=fixture-kernel boot=1\n"
+    );
+    let status: Value = serde_json::from_str(
+        &read_text(&target.join("pre-reboot/snapshot.capture.json")).expect("snapshot sidecar"),
+    )
+    .expect("JSON");
+    assert_eq!(status["status"], "captured");
 }
 
 #[test]

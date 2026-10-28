@@ -35,7 +35,8 @@ host packages, change user groups, or initialize unrelated Incus resources. Rele
 also need the repository's pinned Rust target, `musl-gcc`, `readelf`, and `just`.
 
 Install `tar` on the host to package retained evidence, and `genisoimage` or `mkisofs`
-to generate the agent configuration ISO.
+to generate the agent configuration ISO. Bounded diagnostic capture uses GNU coreutils
+`head` and `stdbuf`; unbuffered capture retains short partial output on timeout or interruption.
 Every test VM attaches an
 [Incus `agent:config` disk](https://linuxcontainers.org/incus/docs/main/reference/devices_disk/#types-of-disk-devices),
 which supplies the guest agent when the kernel cannot load it through `9p`. Setup and run
@@ -386,11 +387,30 @@ This does not count as captured serial evidence. QEMU runtime logs remain requir
 errors and failed runtime-log captures remain diagnostic failures. Failed captures retain their available
 output, other captures still run, and diagnostics never exempt the VM from cleanup.
 
+Every fresh preparation saves `<target>/pre-reboot/snapshot.log` and its adjacent
+`snapshot.capture.json` on the host before the controlled reboot. The snapshot records current and
+intended kernels, boot ID, final boot configuration and BLS entries, GRUB environment, SELinux/relabel
+state, and available agent service configuration, executable labels, and recent journal messages.
+Capture has a 30-second deadline and 1 MiB limit; truncation is explicit in the metadata. Capture
+failure prevents reboot and retains partial output. Later diagnostics and cleanup preserve this
+snapshot even if the guest agent never returns. Warm prepared-image clones retain their existing
+admission checks without repeating the fresh-preparation snapshot.
+
 Preparation records boot transitions and agent context before enforcement; the detached enforcement
-job saves its own log and exit status. Fedora preparation also records root and boot mount identities,
-EFI and GRUB configuration, BLS entries, and kernel arguments before and after boot selection. It repairs
-the recognized image boot layout and stale image-builder root arguments before selecting the intended
-kernel; post-reboot admission still requires that exact kernel and enforcing SELinux.
+job saves its own log and exit status. Fedora preparation measures filesystem-relative kernel and
+initramfs paths: `/boot/vmlinuz-…` for the observed shared root/boot layout and `/vmlinuz-…` for a
+separate boot filesystem. It verifies that both artifacts belong to the measured GRUB filesystem,
+repairs stale image-builder root arguments, and establishes the EFI forwarding stub and canonical
+GRUB selection. Validation recognizes the generated header and guarded fallback-counting block,
+rejects unexpected overrides, and clears next-entry and boot-counter overrides for the qualification
+boot. It rechecks the final boot configuration after SELinux argument changes. Post-reboot admission
+still requires the exact intended kernel, required modules, and enforcing SELinux.
+
+The retained Fedora failures include a confirmed post-reboot kernel mismatch and later preparation
+parser failures. The earlier guest-agent timeout lacks sufficient evidence to establish its cause.
+The new snapshot improves diagnosis of a recurrence; it does not establish a fix for that historical
+timeout. Captured Fedora configurations now back the isolated regressions, while real VM acceptance
+remains a separate user-run check.
 
 Inspect archive contents without unpacking everything:
 
@@ -398,6 +418,7 @@ Inspect archive contents without unpacking everything:
 tar -tzf "$run_dir/evidence.tar.gz"
 tar -xOf "$run_dir/evidence.tar.gz" ./inputs/SHA256.json
 tar -xOf "$run_dir/evidence.tar.gz" ./debian-13/preparation.json
+tar -xOf "$run_dir/evidence.tar.gz" ./fedora-44/pre-reboot/snapshot.log
 ```
 
 Working evidence lives in `.evidence/` during execution and is removed only after archive

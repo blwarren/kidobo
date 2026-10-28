@@ -174,7 +174,7 @@ import shlex
 import sys
 from pathlib import Path
 
-mode, root_uuid, boot_uuid, grub_path, kernel, prepared = sys.argv[1:]
+mode, root_uuid, boot_uuid, grub_path, kernel_path, initramfs_path, prepared = sys.argv[1:]
 prepared = Path(prepared)
 efi = Path('/boot/efi/EFI/fedora/grub.cfg')
 canonical = Path('/boot/grub2/grub.cfg')
@@ -212,11 +212,23 @@ def entries():
     require(bool(paths), 'no BLS entries')
     return paths
 
-def selected_entry():
-    matches = [path for path in entries()
-               if re.search(r'^linux\s+/vmlinuz-' + re.escape(kernel) + r'\s*$',
-                            path.read_text(), re.M)]
-    require(len(matches) == 1, 'intended kernel must have exactly one BLS entry')
+def selected_entry() -> Path:
+    matches = []
+    observed = []
+    for path in entries():
+        text = path.read_text()
+        linux = re.findall(r'^\s*linux[ \t]+([^\n]*)$', text, re.M)
+        observed.append(path.name + ': ' + repr(linux))
+        require(len(linux) == 1 and len(linux[0].split()) == 1,
+                'BLS entry must have exactly one kernel path: ' + str(path))
+        if linux[0].strip() == kernel_path:
+            initrds = re.findall(r'^\s*initrd[ \t]+([^\n]*)$', text, re.M)
+            require(sum(line.split().count(initramfs_path) for line in initrds) == 1,
+                    'BLS entry does not reference intended initramfs ' + initramfs_path + ': ' + str(path))
+            matches.append(path)
+    require(len(matches) == 1,
+            'intended kernel ' + kernel_path + ' must have exactly one BLS entry; matched '
+            + str(len(matches)) + '; entries: ' + '; '.join(observed))
     return matches[0]
 
 stub = ('search --no-floppy --fs-uuid --set=dev ' + boot_uuid + '\n'
@@ -242,19 +254,103 @@ def recognized_layout():
     require(re.search(r'^\s*(blscfg|menuentry\s)', text, re.M),
             'unrecognized full EFI configuration')
 
-def verify_canonical():
+def grub_tokens(text: str) -> list[str]:
+    lexer = shlex.shlex(text, posix=False, punctuation_chars=';')
+    lexer.whitespace_split = True
+    return list(lexer)
+
+def grub_section(text: str, name: str) -> str:
+    sections = re.findall(r'^### BEGIN /etc/grub.d/' + re.escape(name)
+                          + r' ###\n(.*?)^### END /etc/grub.d/' + re.escape(name)
+                          + r' ###$', text, re.M | re.S)
+    require(len(sections) == 1,
+            'canonical configuration lacks environment-based BLS selection: expected one ' + name)
+    return sections[0]
+
+def consume_grub(text: str, fragment: str, reason: str) -> str:
+    # Match known generated control flow, ignoring only comments and whitespace.
+    expected = ' ' + ' '.join(grub_tokens(fragment)) + ' '
+    require(text.count(expected) == 1, reason)
+    return text.replace(expected, ' ', 1)
+
+def verify_canonical() -> None:
     text = canonical.read_text()
-    defaults = re.findall(r'^\s*set\s+default=(.*?)\s*$', text, re.M)
-    require(re.search(r'^\s*load_env(?:\s|$)', text, re.M)
-            and defaults in (["\"${saved_entry}\""], ["\"${next_entry}\"", "\"${saved_entry}\""])
-            and re.search(r'^\s*blscfg\s*$', text, re.M),
-            'canonical configuration lacks environment-based BLS selection')
-    require(not re.search(r'^\s*(set\s+prefix=|configfile\s)', text, re.M),
-            'canonical configuration redirects boot selection')
+    header = ' ' + ' '.join(grub_tokens(grub_section(text, '00_header'))) + ' '
+    selection = '''
+if [ "${next_entry}" ] ; then
+  set default="${next_entry}"
+  set next_entry=
+  if [ "${env_block}" ] ; then
+    save_env -f "${env_block}" next_entry
+  else
+    save_env next_entry
+  fi
+  set boot_once=true
+else
+  set default="${saved_entry}"
+fi
+'''
+    environment = '''
+if [ -f ${config_directory}/grubenv ]; then
+  load_env -f ${config_directory}/grubenv
+elif [ -s $prefix/grubenv ]; then
+  load_env
+fi
+'''
+    alternate_environment = '''
+if [ "${env_block}" ] ; then
+  if [ "${dev}" ]; then
+    set env_block="(${dev})${env_block}"
+  else
+    set env_block="(${root})${env_block}"
+  fi
+  export env_block
+  load_env -f "${env_block}"
+fi
+'''
+    reason = 'canonical configuration lacks environment-based BLS selection'
+    consume_grub(header, environment, reason)
+    consume_grub(header, selection, reason)
+    remaining = ' ' + ' '.join(grub_tokens(text)) + ' '
+    for block in (environment, alternate_environment, selection):
+        remaining = consume_grub(remaining, block, reason)
+    fallback = grub_section(text, '08_fallback_counting')
+    expected_fallback = '''
+insmod increment
+if [ -n "${boot_counter}" -a "${boot_success}" = "0" ]; then
+  if [ "${boot_counter}" = "0" -o "${boot_counter}" = "-1" ]; then
+    set default=1
+    set boot_counter=-1
+  else
+    decrement boot_counter
+  fi
+  if [ "${env_block}" ]; then
+    save_env -f "${env_block}" boot_counter
+  else
+    save_env boot_counter
+  fi
+fi
+'''
+    require(grub_tokens(fallback) == grub_tokens(expected_fallback),
+            'canonical configuration has an unrecognized fallback guard')
+    remaining = consume_grub(remaining, fallback, 'ambiguous fallback configuration')
+    tokens = grub_tokens(remaining)
+    require('blscfg' in tokens, reason)
+    for index, token in enumerate(tokens):
+        require(token not in ('load_env', 'configfile'),
+                'canonical configuration redirects boot selection')
+        if token == 'set' and index + 1 < len(tokens):
+            name = tokens[index + 1].split('=', 1)[0]
+            require(name not in ('default', 'prefix', 'boot_counter'),
+                    'canonical configuration has an unexpected boot override: ' + name)
 
 require(re.fullmatch(r'[0-9A-Fa-f]+(?:-[0-9A-Fa-f]+)*', root_uuid or ''), 'missing or ambiguous root UUID')
 require(re.fullmatch(r'[0-9A-Fa-f]+(?:-[0-9A-Fa-f]+)*', boot_uuid or ''), 'missing or ambiguous boot UUID')
 require(grub_path in ('/boot/grub2', '/grub2'), 'unrecognized GRUB filesystem path')
+for artifact in (kernel_path, initramfs_path):
+    require(artifact.startswith('/') and not re.search(r'\s', artifact)
+            and not any(part in ('.', '..') for part in artifact.split('/')),
+            'unrecognized boot artifact path: ' + artifact)
 
 if mode == 'prepare':
     recognized_layout()
@@ -296,7 +392,8 @@ elif mode == 'verify':
     environment = (prepared / 'canonical-grubenv.txt').read_text().splitlines()
     require(environment.count('saved_entry=' + selected.stem) == 1,
             'canonical GRUB environment does not select the intended BLS entry')
-    require(not any(line.startswith(('next_entry=', 'prev_saved_entry=')) for line in environment),
+    require(not any(line.startswith(('next_entry=', 'prev_saved_entry=', 'boot_counter=', 'env_block='))
+                    for line in environment),
             'canonical GRUB environment still overrides the next boot')
     for path in entries():
         options = re.findall(r'^options[ \t]+(.*)$', path.read_text(), re.M)
@@ -308,22 +405,39 @@ else:
 PY
 }
 
-prepare_fedora_boot() (
-  local kernel=$1 root_uuid boot_uuid grub_path
-  capture_boot_configuration before
-  trap 'capture_boot_configuration after' EXIT
+fedora_boot_identity() {
+  local kernel=$1 artifact
   root_uuid=$(findmnt --noheadings --output UUID --target /)
   boot_uuid=$(grub2-probe --target=fs_uuid /boot/grub2)
   grub_path=$(grub2-mkrelpath /boot/grub2)
-  fedora_boot_configuration prepare "$root_uuid" "$boot_uuid" "$grub_path" "$kernel" "$PREPARED"
+  kernel_path=$(grub2-mkrelpath "/boot/vmlinuz-$kernel")
+  initramfs_path=$(grub2-mkrelpath "/boot/initramfs-$kernel.img")
+  for artifact in "/boot/vmlinuz-$kernel" "/boot/initramfs-$kernel.img"; do
+    [[ "$(grub2-probe --target=fs_uuid "$artifact")" == "$boot_uuid" ]] || fail "boot artifact is on a different GRUB filesystem: $artifact"
+  done
+}
+
+verify_fedora_boot() (
+  local kernel=$1 root_uuid boot_uuid grub_path kernel_path initramfs_path
+  trap 'capture_boot_configuration final' EXIT
+  fedora_boot_identity "$kernel"
+  grub2-editenv /boot/grub2/grubenv list > "$PREPARED/canonical-grubenv.txt"
+  fedora_boot_configuration verify "$root_uuid" "$boot_uuid" "$grub_path" "$kernel_path" "$initramfs_path" "$PREPARED"
+)
+
+prepare_fedora_boot() (
+  local kernel=$1 root_uuid boot_uuid grub_path kernel_path initramfs_path
+  capture_boot_configuration before
+  trap 'capture_boot_configuration after' EXIT
+  fedora_boot_identity "$kernel"
+  fedora_boot_configuration prepare "$root_uuid" "$boot_uuid" "$grub_path" "$kernel_path" "$initramfs_path" "$PREPARED"
   grub2-mkconfig -o /boot/grub2/grub.cfg
-  fedora_boot_configuration forward "$root_uuid" "$boot_uuid" "$grub_path" "$kernel" "$PREPARED"
+  fedora_boot_configuration forward "$root_uuid" "$boot_uuid" "$grub_path" "$kernel_path" "$initramfs_path" "$PREPARED"
   grubby --set-default "/boot/vmlinuz-$kernel"
   [[ "$(grubby --default-kernel)" == "/boot/vmlinuz-$kernel" ]] || fail 'grubby did not select the intended kernel'
   grub2-editenv /boot/grub2/grubenv set "saved_entry=$(<"$PREPARED/selected-bls-entry")"
-  grub2-editenv /boot/grub2/grubenv unset next_entry prev_saved_entry
-  grub2-editenv /boot/grub2/grubenv list > "$PREPARED/canonical-grubenv.txt"
-  fedora_boot_configuration verify "$root_uuid" "$boot_uuid" "$grub_path" "$kernel" "$PREPARED"
+  grub2-editenv /boot/grub2/grubenv unset next_entry prev_saved_entry boot_counter
+  verify_fedora_boot "$kernel"
 )
 
 select_boot_kernel() {
@@ -614,7 +728,7 @@ provision_main() {
   set -x
   trap 'e2e_report_exit "$?"' EXIT
   require_guest
-  local mode=${1:-} family selinux=image-default kernel
+  local mode=${1:-} family selinux=image-default kernel ID=
   case "$mode" in
     --boot-status)
       [[ $# == 1 ]] || fail '--boot-status accepts no additional arguments'
@@ -714,6 +828,10 @@ provision_main() {
         [[ -n "$kernel" ]] || fail 'no installed kernel package was found'
         select_boot_kernel "$family" "$kernel"
         prepare_selinux "$family" "$selinux"
+        # SELinux preparation edits the selected entries through grubby.
+        # shellcheck disable=SC1091
+        . /etc/os-release
+        if [[ "$ID" == fedora ]]; then verify_fedora_boot "$kernel"; fi
         e2e_check_pass "intended_kernel=$kernel; requested_selinux=$selinux; relabel_scheduled=$(<"$PREPARED/relabel-scheduled")"
       fi
       install -d -m 0755 "$BASE/state"

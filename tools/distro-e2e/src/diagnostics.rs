@@ -1,4 +1,4 @@
-//! Agent-independent evidence captured before guest restart or deletion.
+//! Bounded guest snapshots and agent-independent host diagnostics.
 use crate::{Result, Runner, read_text, strings};
 use serde_json::{Value, json};
 use std::fs;
@@ -6,6 +6,103 @@ use std::path::Path;
 
 const LOG_LIMIT: u64 = 1024 * 1024;
 const VM_CONSOLE_UNSUPPORTED: &str = "Error: Instance is not container type\n";
+
+const PRE_REBOOT_SNAPSHOT: &str = r#"set -euo pipefail
+printf '%s\n' '=== pre-reboot snapshot ===' '=== running kernel ==='
+uname -a
+printf '%s\n' '=== boot ID ==='
+cat /proc/sys/kernel/random/boot_id
+printf '%s\n' '=== kernel command line ==='
+cat /proc/cmdline
+printf '%s\n' '=== intended kernel ==='
+cat /opt/kidobo-e2e/prepared/expected-kernel
+printf '%s\n' '=== relabel scheduled ==='
+cat /opt/kidobo-e2e/prepared/relabel-scheduled
+optional() {
+    if command -v "$1" >/dev/null 2>&1; then "$@"
+    else printf 'unavailable tool: %s\n' "$1"; fi
+}
+read_file() {
+    if [[ -e "$1" || -L "$1" ]]; then
+        printf '\n=== %s ===\n' "$1"
+        cat "$1"
+    else printf 'absent file: %s\n' "$1"; fi
+}
+shopt -s nullglob
+for file in /etc/os-release /etc/kernel/cmdline /etc/default/grub /etc/default/grub.d/* \
+    /etc/grub2.cfg /etc/grub2-efi.cfg /boot/grub/grub.cfg /boot/grub2/grub.cfg \
+    /boot/loader/loader.conf /boot/loader/entries/*.conf \
+    /etc/selinux/config /.autorelabel /sys/fs/selinux/enforce \
+    /opt/kidobo-e2e/prepared/expected-initramfs \
+    /opt/kidobo-e2e/prepared/relabel-boot-id; do
+    read_file "$file"
+done
+for directory in /boot/grub /boot/grub2 /boot/efi/EFI; do
+    if [[ -d "$directory" ]]; then
+        listing=$(find "$directory" -maxdepth 4 -type f \( -name grub.cfg -o -name grubenv \))
+        while IFS= read -r file; do
+            [[ -n "$file" ]] || continue
+            read_file "$file"
+            if [[ "$file" == */grubenv ]]; then
+                if command -v grub2-editenv >/dev/null 2>&1; then grub2-editenv "$file" list
+                elif command -v grub-editenv >/dev/null 2>&1; then grub-editenv "$file" list; fi
+            fi
+        done <<< "$listing"
+    fi
+done
+printf '\n%s\n' '=== boot selection ==='
+optional grubby --default-kernel
+optional grubby --info=ALL
+printf '\n%s\n' '=== SELinux state ==='
+optional getenforce
+optional sestatus
+printf '\n%s\n' '=== agent and relabel units and configuration ==='
+if command -v systemctl >/dev/null 2>&1; then
+    for unit in incus-agent.service incus-agent-setup.service lxd-agent.service selinux-autorelabel.service; do
+        if load=$(systemctl show "$unit" --property=LoadState --value); then
+            load_status=0
+        else load_status=$?; fi
+        printf '%s LoadState=%s\n' "$unit" "$load"
+        [[ "$load" != not-found ]] || continue
+        (( load_status == 0 )) || exit "$load_status"
+        systemctl cat "$unit"
+        systemctl show "$unit" --property=ActiveState,SubState,FragmentPath,DropInPaths,ExecStart,ExecStartPre
+    done
+else printf '%s\n' 'unavailable tool: systemctl'; fi
+printf '\n%s\n' '=== agent executable and configuration labels ==='
+for directory in /run/incus_agent /run/lxd_agent /var/lib/incus-agent /var/lib/lxd-agent; do
+    if [[ -d "$directory" ]]; then
+        ls -ldZ "$directory"
+        find "$directory" -maxdepth 2 -type f -exec ls -lZ -- '{}' +
+    fi
+done
+for file in /usr/bin/incus-agent /usr/sbin/incus-agent /usr/bin/lxd-agent; do
+    if [[ -e "$file" || -L "$file" ]]; then ls -lZ -- "$file"; fi
+done
+printf '\n%s\n' '=== recent agent and relabel journal ==='
+optional journalctl -b --no-pager -n 250 -u incus-agent.service -u incus-agent-setup.service -u lxd-agent.service -u selinux-autorelabel.service
+"#;
+
+pub(super) fn pre_reboot(runner: &mut Runner, vm: &str, target: &Path) -> Result<()> {
+    runner.verify(vm)?;
+    let directory = target.join("pre-reboot");
+    fs::create_dir_all(&directory)?;
+    capture(
+        runner,
+        &strings(&[
+            "--project",
+            &runner.project,
+            "exec",
+            vm,
+            "--mode=non-interactive",
+            "--",
+            "bash",
+            "-c",
+            PRE_REBOOT_SNAPSHOT,
+        ]),
+        &directory.join("snapshot.log"),
+    )
+}
 
 #[derive(Default, serde::Serialize)]
 pub(super) struct Diagnostics {
@@ -119,12 +216,21 @@ fn record_unsupported_console(destination: &Path) -> Result<bool> {
 }
 
 fn capture(runner: &mut Runner, args: &[String], destination: &Path) -> Result<()> {
-    // Head bounds storage even for continuously producing commands. Keep stderr in
-    // the artifact so failed API requests retain their explanation as well.
+    capture_with_timeout(runner, args, destination, 30)
+}
+
+fn capture_with_timeout(
+    runner: &mut Runner,
+    args: &[String],
+    destination: &Path,
+    seconds: u64,
+) -> Result<()> {
+    // Head bounds storage even for continuously producing commands. Disable its
+    // buffering so a timeout or cancellation retains even short partial output.
     let script = r#"destination=$1
 limit=$2
 shift 2
-"$@" 2>&1 | head -c "$limit" > "$destination"
+"$@" 2>&1 | stdbuf -o0 head -c "$limit" > "$destination"
 statuses=("${PIPESTATUS[@]}")
 printf '%s %s\n' "${statuses[0]}" "${statuses[1]}"
 "#;
@@ -138,7 +244,7 @@ printf '%s %s\n' "${statuses[0]}" "${statuses[1]}"
     ]);
     command.extend_from_slice(args);
     fs::File::create(destination)?;
-    let outcome = runner.command("bash", &command, 30);
+    let outcome = runner.command("bash", &command, seconds);
     let bytes = fs::metadata(destination)?.len();
     let truncated = bytes > LOG_LIMIT;
     if truncated {
@@ -180,6 +286,177 @@ mod tests {
     use std::io::Read;
 
     #[test]
+    fn pre_reboot_snapshot_refuses_unowned_guests_before_reading() {
+        let temp = TestDir::new();
+        let program = temp.path().join("fake-incus");
+        executable(
+            &program,
+            r#"#!/bin/bash
+if [[ "$3" == list ]]; then
+    printf '%s\n' '[{"name":"vm-foreign","type":"virtual-machine","config":{"user.kidobo-e2e":"someone-else"}}]'
+else
+    touch "$(dirname "$0")/unexpected-read"
+    exit 99
+fi
+"#,
+        );
+        let mut runner = runner_with_incus(temp.path(), &program);
+        assert!(
+            pre_reboot(&mut runner, "vm-foreign", temp.path())
+                .expect_err("ownership rejection")
+                .to_string()
+                .contains("unowned")
+        );
+        assert!(!temp.path().join("unexpected-read").exists());
+        assert!(!temp.path().join("pre-reboot").exists());
+    }
+
+    #[test]
+    fn pre_reboot_guest_reads_tolerate_absent_optional_tools_but_propagate_errors() {
+        let temp = TestDir::new();
+        let bin = temp.path().join("bin");
+        fs::create_dir(&bin).expect("fake guest tools");
+        for tool in ["uname", "cat", "find", "ls"] {
+            std::os::unix::fs::symlink(format!("/usr/bin/{tool}"), bin.join(tool))
+                .expect("read-only guest utility");
+        }
+        let mut script = PRE_REBOOT_SNAPSHOT.to_owned();
+        for prefix in [
+            "/opt/",
+            "/proc/",
+            "/etc/",
+            "/sys/fs/",
+            "/boot/",
+            "/run/",
+            "/var/",
+            "/usr/",
+            "/.autorelabel",
+        ] {
+            script = script.replace(prefix, &format!("{}{prefix}", temp.path().display()));
+        }
+        for (path, text) in [
+            ("proc/sys/kernel/random/boot_id", "fixture-boot\n"),
+            ("proc/cmdline", "fixture-command-line\n"),
+            (
+                "opt/kidobo-e2e/prepared/expected-kernel",
+                "fixture-intended\n",
+            ),
+            ("opt/kidobo-e2e/prepared/relabel-scheduled", "1\n"),
+        ] {
+            let path = temp.path().join(path);
+            fs::create_dir_all(path.parent().expect("fixture parent")).expect("guest directories");
+            fs::write(path, text).expect("guest identity");
+        }
+        let run = || {
+            std::process::Command::new("/bin/bash")
+                .args(["-c", &script])
+                .env("PATH", &bin)
+                .output()
+                .expect("inert guest reads")
+        };
+        let output = run();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let output = String::from_utf8(output.stdout).expect("snapshot text");
+        assert!(output.contains("fixture-boot"));
+        assert!(output.contains("fixture-intended"));
+        assert!(output.contains("unavailable tool: grubby"));
+        assert!(output.contains("unavailable tool: systemctl"));
+        executable(
+            &bin.join("systemctl"),
+            "#!/bin/bash\nprintf 'not-found\\n'\nexit 4\n",
+        );
+        let output = run();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .contains("lxd-agent.service LoadState=not-found")
+        );
+        executable(
+            &bin.join("systemctl"),
+            "#!/bin/bash\nprintf 'systemd query failed\\n' >&2\nexit 19\n",
+        );
+        let output = run();
+        assert_eq!(output.status.code(), Some(19));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("systemd query failed"));
+        fs::remove_file(bin.join("systemctl")).expect("remove optional systemctl");
+        executable(
+            &bin.join("getenforce"),
+            "#!/bin/bash\necho 'SELinux read failed' >&2\nexit 17\n",
+        );
+        let output = run();
+        assert_eq!(output.status.code(), Some(17));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("SELinux read failed"));
+        fs::remove_file(bin.join("getenforce")).expect("remove optional tool");
+        fs::remove_file(temp.path().join("opt/kidobo-e2e/prepared/expected-kernel"))
+            .expect("remove required identity");
+        assert_eq!(run().status.code(), Some(1));
+    }
+
+    #[test]
+    fn bounded_capture_retains_partial_output_and_sidecar_after_timeout_or_cancellation() {
+        for cancelled in [false, true] {
+            let temp = TestDir::new();
+            let program = temp.path().join("fake-incus");
+            executable(
+                &program,
+                "#!/bin/bash\nprintf 'partial boot evidence\\n'\nsleep 60\n",
+            );
+            let mut runner = runner_with_incus(temp.path(), &program);
+            let log = temp.path().join("snapshot.log");
+            let cancellation = std::sync::Arc::clone(&runner.cancelled);
+            let observed_log = log.clone();
+            let watcher = cancelled.then(|| {
+                std::thread::spawn(move || {
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                    while fs::metadata(&observed_log).map_or(true, |value| value.len() == 0)
+                        && std::time::Instant::now() < deadline
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    cancellation.store(true, std::sync::atomic::Ordering::Relaxed);
+                })
+            });
+            let error = capture_with_timeout(&mut runner, &strings(&["exec", "vm"]), &log, 1)
+                .expect_err("incomplete snapshot fails")
+                .to_string();
+            if let Some(watcher) = watcher {
+                watcher.join().expect("cancel watcher");
+            }
+            let expected = if cancelled {
+                "interrupted"
+            } else {
+                "timed out"
+            };
+            assert!(error.contains(expected), "{error}");
+            assert_eq!(
+                read_text(&log).expect("partial snapshot"),
+                "partial boot evidence\n"
+            );
+            let metadata: Value = serde_json::from_str(
+                &read_text(&log.with_extension("capture.json")).expect("sidecar"),
+            )
+            .expect("JSON");
+            assert_eq!(metadata["status"], "failed");
+            assert_eq!(metadata["exit_status"], Value::Null);
+            assert_eq!(metadata["truncated"], false);
+            assert!(
+                metadata["error"]
+                    .as_str()
+                    .expect("capture reason")
+                    .contains(expected)
+            );
+        }
+    }
+
+    #[test]
     fn host_logs_are_not_read_for_an_unowned_guest() {
         let temp = TestDir::new();
         let program = temp.path().join("fake-incus");
@@ -204,21 +481,24 @@ fi
     }
 
     #[test]
-    fn oversized_binary_stderr_is_bounded_and_marked_as_truncated() {
+    fn oversized_pre_reboot_stderr_is_bounded_and_marked_as_truncated() {
         let temp = TestDir::new();
         let program = temp.path().join("fake-incus");
         executable(
             &program,
-            "#!/bin/bash\nhead -c 2097152 /dev/zero | tr '\\000' '\\377' >&2\n",
+            r#"#!/bin/bash
+if [[ "$3" == list ]]; then
+    printf '%s\n' '[{"name":"vm-owned","type":"virtual-machine","config":{"user.kidobo-e2e":"kidobo-e2e-v1"}}]'
+else
+    [[ "$3" == exec && "$4" == vm-owned ]] || exit 99
+    head -c 2097152 /dev/zero | tr '\000' '\377' >&2
+fi
+"#,
         );
         let mut runner = runner_with_incus(temp.path(), &program);
-        let log = temp.path().join("console with spaces.log");
-        capture(
-            &mut runner,
-            &strings(&["console", "fixture", "--show-log"]),
-            &log,
-        )
-        .expect("bounded capture");
+        let target = temp.path().join("target with spaces");
+        pre_reboot(&mut runner, "vm-owned", &target).expect("bounded snapshot");
+        let log = target.join("pre-reboot/snapshot.log");
         assert_eq!(fs::metadata(&log).expect("log metadata").len(), LOG_LIMIT);
         let mut bytes = [0; 4];
         fs::File::open(&log)

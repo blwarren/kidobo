@@ -179,6 +179,10 @@ elif operation == "restart":
     boot = state / vm / "boot"
     boot.write_text(str(int(boot.read_text()) + 1) + "\n")
     event("reboot", vm)
+    if scenario == "post-restart-agent-loss" and vm.endswith("-secondary"):
+        (state / vm / "agent-down").touch()
+        print("restart lost the guest agent", file=sys.stderr)
+        raise SystemExit(75)
 elif operation == "delete":
     vm = args[1]
     event("delete", vm)
@@ -210,7 +214,16 @@ elif operation == "exec":
             raise AssertionError(guest)
     elif guest[0] == "bash":
         if guest[1] == "-c":
-            if "=== uname ===" in guest[2]:
+            if "=== pre-reboot snapshot ===" in guest[2]:
+                event("pre-reboot", vm)
+                print("current=fixture-kernel intended=fixture-next-kernel boot=before-restart", flush=True)
+                if scenario == "pre-reboot-interrupted" and vm.endswith("-primary"):
+                    (state / "interruption-ready").touch()
+                    time.sleep(60)
+                if scenario == "pre-reboot-failure" and vm.endswith("-secondary"):
+                    print("boot configuration read failed", file=sys.stderr)
+                    raise SystemExit(74)
+            elif "=== uname ===" in guest[2]:
                 if scenario == "diagnostics-failure" and vm.endswith("-secondary"):
                     raise SystemExit(73)
                 print("fake guest diagnostics")
@@ -824,6 +837,120 @@ fn host_diagnostic_failure_preserves_partial_evidence_and_still_cleans_guests() 
         .expect("read archived serial log");
     assert!(archived.status.success());
     assert_eq!(archived.stdout, b"serial boot evidence\n");
+}
+
+#[test]
+fn pre_reboot_snapshot_survives_agent_loss_and_normal_cleanup() {
+    let mut fixture = Fixture::new("post-restart-agent-loss", false);
+    fixture.execute().expect("required target passed");
+    let snapshot = fixture.runner.evidence().join("secondary/pre-reboot");
+    assert_eq!(
+        read_text(&snapshot.join("snapshot.log")).expect("pre-reboot identity retained"),
+        "current=fixture-kernel intended=fixture-next-kernel boot=before-restart\n"
+    );
+    let status: Value = serde_json::from_str(
+        &read_text(&snapshot.join("snapshot.capture.json")).expect("capture status"),
+    )
+    .expect("JSON");
+    assert_eq!(status["status"], "captured");
+    assert_eq!(status["truncated"], false);
+    assert_eq!(fixture.result("secondary")["cleanup_error"], Value::Null);
+    assert!(
+        fixture.result("secondary")["error"]
+            .as_str()
+            .expect("restart failure")
+            .contains("75")
+    );
+    assert!(
+        !fixture
+            .temp
+            .path()
+            .join(format!("state/{RUN_ID}-secondary"))
+            .exists()
+    );
+    let events = fixture.events();
+    let snapshot = events
+        .iter()
+        .position(|event| event == &format!("pre-reboot {RUN_ID}-secondary"))
+        .expect("snapshot event");
+    let reboot = events
+        .iter()
+        .position(|event| event == &format!("reboot {RUN_ID}-secondary"))
+        .expect("restart event");
+    assert!(snapshot < reboot);
+}
+
+#[test]
+fn failed_pre_reboot_snapshot_retains_partial_evidence_and_prevents_restart() {
+    let mut fixture = Fixture::new("pre-reboot-failure", false);
+    fixture.execute().expect("required target passed");
+    let snapshot = fixture.runner.evidence().join("secondary/pre-reboot");
+    let output = read_text(&snapshot.join("snapshot.log")).expect("partial pre-reboot evidence");
+    assert!(output.contains("boot=before-restart"));
+    assert!(output.contains("boot configuration read failed"));
+    let status: Value = serde_json::from_str(
+        &read_text(&snapshot.join("snapshot.capture.json")).expect("failed capture status"),
+    )
+    .expect("JSON");
+    assert_eq!(status["status"], "failed");
+    assert_eq!(status["exit_status"], json!([74, 0]));
+    assert!(
+        status["error"]
+            .as_str()
+            .expect("capture error")
+            .contains("74")
+    );
+    assert!(
+        !fixture
+            .events()
+            .contains(&format!("reboot {RUN_ID}-secondary"))
+    );
+    assert_eq!(fixture.result("secondary")["cleanup_error"], Value::Null);
+    assert!(
+        !fixture
+            .temp
+            .path()
+            .join(format!("state/{RUN_ID}-secondary"))
+            .exists()
+    );
+}
+
+#[test]
+fn interrupted_pre_reboot_snapshot_retains_evidence_and_cleans_without_restart() {
+    let mut fixture = Fixture::new("pre-reboot-interrupted", true);
+    fixture
+        .interrupt_during_preparation()
+        .expect_err("snapshot interrupted");
+    let snapshot = fixture.runner.evidence().join("primary/pre-reboot");
+    assert!(
+        read_text(&snapshot.join("snapshot.log"))
+            .expect("interrupted snapshot")
+            .contains("boot=before-restart")
+    );
+    let status: Value = serde_json::from_str(
+        &read_text(&snapshot.join("snapshot.capture.json")).expect("capture status"),
+    )
+    .expect("JSON");
+    assert_eq!(status["status"], "failed");
+    assert!(
+        status["error"]
+            .as_str()
+            .expect("capture error")
+            .contains("interrupted")
+    );
+    assert!(
+        !fixture
+            .events()
+            .contains(&format!("reboot {RUN_ID}-primary"))
+    );
+    assert_eq!(fixture.result("primary")["cleanup_error"], Value::Null);
+    assert!(
+        !fixture
+            .temp
+            .path()
+            .join(format!("state/{RUN_ID}-primary"))
+            .exists()
+    );
 }
 
 #[test]

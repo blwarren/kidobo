@@ -432,6 +432,8 @@ fn build(
     ]);
     args.extend(target.packages.clone());
     runner.guest(vm, &args, 4800)?;
+    runner.stage(&format!("{} | pre-reboot evidence", target.id))?;
+    crate::diagnostics::pre_reboot(runner, vm, &runner.evidence().join(&target.id))?;
     let relabel = runner.guest(
         vm,
         &strings(&["cat", "/opt/kidobo-e2e/prepared/relabel-scheduled"]),
