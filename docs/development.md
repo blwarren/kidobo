@@ -56,8 +56,18 @@ vendor-image pins; `just e2e-images-check` reports updates, while `just e2e-imag
 verifies/imports sources and changes pins for review without starting VMs. Startup discovery is
 advisory, has a 30-second budget, and never changes the matrix. See the
 [image update workflow](e2e.md#image-sources-and-reviewed-updates) for verification and acceptance.
-The matrix can be omitted with the explicit publisher option
-`--skip-e2e`.
+The explicit publisher option `--skip-e2e` omits all E2E-specific validation, including local
+infrastructure checks and image operations as well as the matrix. Ordinary developer commands
+keep their existing scope: formatting, lint, coverage, and rustdoc include the harness, and
+`just test` runs every local E2E regression.
+
+The skip path uses private `_release-ci-without-e2e`, `_release-coverage-without-e2e`, and
+`_release-rustdoc-without-e2e` recipes backed by `scripts/release-validation.sh`. Their shared
+selection covers the four application packages and root integration targets other than `e2e_*`.
+Keep E2E-specific root tests under that prefix and their dedicated helpers outside non-E2E
+module trees. New packages or targets must be accounted for by the selection policy and its
+inventory regressions. Exclude E2E compilation through Cargo target/package selection, rather
+than test-name filters or coverage-report exclusions alone.
 
 CI/CD remains local. Dependabot version updates are the sole GitHub-hosted automation exception;
 do not add GitHub Actions workflows without explicit approval. Dependency changes must also follow
@@ -162,9 +172,16 @@ Incus VM targets against that archive. Separate `just e2e` runs also cover advis
 Each target validates its environment and then runs its application lifecycle; one target's
 failure does not suppress the others. The publisher then uses GitHub CLI to upload, verify,
 and publish the archive only after required coverage succeeds.
-`just publish-release X.Y.Z --skip-e2e` skips only the matrix and its Incus/agent-ISO
-prerequisites, keeping all other gates. See the [command reference](../scripts/README.md)
-for skip reporting. Every attempt runs the gates, builds and packages a new candidate, and
+`just publish-release X.Y.Z --skip-e2e` excludes E2E compilation, formatting, linting,
+documentation, harness/launcher/integration tests, image operations, and VM execution, without
+requiring E2E-only tools or invoking E2E cleanup. It retains application CI, all non-E2E
+integration tests in coverage, and strict application rustdoc. Region, function, and line
+coverage thresholds remain 90%. Shared dependency audits and license/policy checks still run;
+reading shared Cargo manifests and lockfile metadata is permitted. Release-note validation,
+static builds, binary exercises, compatibility, packaging, confirmation, source/artifact mutation
+checks, upload verification, and recovery remain unchanged. See the
+[command reference](../scripts/README.md) for skip reporting.
+Every attempt runs its selected gates, builds and packages a new candidate, and
 checks its source and artifact identity before publication. Prior local or E2E successes are
 not reused. A failure before refs are pushed removes newly created release artifacts, while
 E2E logs and frozen evidence remain in the original checkout. Existing artifacts are never

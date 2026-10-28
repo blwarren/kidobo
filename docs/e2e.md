@@ -23,6 +23,20 @@ in Incus metadata, bootstrapping the Incus agent, and reporting available image/
 Image pins are reviewed changes. Discovery must not automatically adopt images, add or retire
 targets, or change required/advisory policy. No background monitoring service is permitted.
 
+The publisher's explicit `--skip-e2e` flag excludes all E2E-specific validation: compilation,
+formatting, linting, documentation, harness and launcher tests, E2E integration fixtures, image
+operations, and VM execution. It requires no E2E-only tools and performs no E2E cleanup.
+Application checks and publication safeguards remain mandatory, including the existing coverage
+thresholds. Shared dependency audits and license/policy checks remain enabled; reading Cargo
+manifests and lockfile metadata does not execute E2E code.
+
+Keep future E2E-specific packages and targets outside that skip path. The harness lives in
+`kidobo-e2e`, and root-package E2E integration targets must be named `e2e_*`. Dedicated E2E
+helpers must not be included by non-E2E fixtures or traversed by their formatter inputs; only
+neutral fixture utilities may be shared. Package and target selection must exclude E2E from
+compilation, not merely filter test names or coverage reports. Default publishing and standalone
+developer commands retain their full scope; `just test` runs all local E2E infrastructure tests.
+
 The harness is not a general VM/image manager, distro-image or bootloader repair tool,
 historical-result reuse system, or duplicate of the exhaustive application unit tests. Do not
 add orchestration platforms, background services, automatic repair, or fallback systems to
@@ -253,7 +267,9 @@ including checksum verification, extraction, and replacement. `KIDOBO_RELEASE_BA
 this fixture directory and requires an explicit installer `--version`; ordinary installation
 continues to use GitHub. The publisher tests its packaged archive without rebuilding it and
 verifies source/artifact identity before publication. Every publisher attempt reruns its gates.
-The explicit `--skip-e2e` override skips only the matrix and its Incus/ISO prerequisites.
+The explicit `--skip-e2e` override skips all E2E-specific validation as defined in the
+[scope contract](#scope-and-non-goals), including local harness checks and image operations.
+It retains application validation, shared dependency checks, and publication safeguards.
 
 The candidate lane covers initialization, configuration preservation, offline inspection,
 IPv4/IPv6 blocked and allowed traffic, safelists, source edits, systemd/timers, reboot recovery,

@@ -1,407 +1,32 @@
 #![cfg(unix)]
 
+#[path = "support/release_fixture.rs"]
+mod release_fixture;
+
 use std::fs;
-use std::io::{Read, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use release_fixture::{
+    CommandFixture, FIXTURE_LOG_READ_LIMIT, RELEASE_TAG, RELEASE_VERSION,
+    REPOSITORY_LOCAL_GIT_ENV_VARS, ReleaseFixture, assert_success, path_with_prefix,
+    publisher_path, read_to_string_with_limit, run_git_at, run_with_confirmation, write_executable,
+};
 use tempfile::TempDir;
 
-const CURRENT_VERSION: &str = "0.11.1";
-const RELEASE_VERSION: &str = "0.12.0";
-const RELEASE_TAG: &str = "v0.12.0";
 const PRERELEASE_VERSION: &str = "0.12.0-rc.1";
 const PRERELEASE_TAG: &str = "v0.12.0-rc.1";
-const GITHUB_REPOSITORY: &str = "blwarren/kidobo";
-const GITHUB_REMOTE_URL: &str = "https://github.com/blwarren/kidobo.git";
-const FIXTURE_LOG_READ_LIMIT: usize = 1024 * 1024;
-const REPOSITORY_LOCAL_GIT_ENV_VARS: [&str; 9] = [
-    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-    "GIT_COMMON_DIR",
-    "GIT_DIR",
-    "GIT_GRAFT_FILE",
-    "GIT_INDEX_FILE",
-    "GIT_OBJECT_DIRECTORY",
-    "GIT_PREFIX",
-    "GIT_SHALLOW_FILE",
-    "GIT_WORK_TREE",
-];
-
-fn read_to_string_with_limit(path: &Path, limit: usize) -> String {
-    let file = fs::File::open(path).expect("open bounded fixture file");
-    assert!(
-        file.metadata().expect("fixture metadata").len()
-            <= u64::try_from(limit).expect("read limit fits u64"),
-        "fixture exceeds {limit} byte read limit: {}",
-        path.display()
-    );
-    let mut contents = String::new();
-    file.take(u64::try_from(limit).expect("read limit fits u64"))
-        .read_to_string(&mut contents)
-        .expect("read bounded UTF-8 fixture file");
-    contents
-}
-
-fn publisher_path() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/publish-release.sh")
-}
 
 fn compatibility_script_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/check-release-compat.sh")
 }
 
-fn write_executable(path: &Path, contents: &str) {
-    fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
-    fs::write(path, contents).expect("write executable");
-    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("chmod");
-}
-
-fn path_with_prefix(path: &Path) -> String {
-    match std::env::var("PATH") {
-        Ok(existing) if !existing.is_empty() => format!("{}:{existing}", path.display()),
-        _ => path.display().to_string(),
-    }
-}
-
-fn clear_repository_local_git_env(command: &mut Command) {
-    for variable in REPOSITORY_LOCAL_GIT_ENV_VARS {
-        command.env_remove(variable);
-    }
-}
-
-fn run_git_at(path: &Path, args: &[&str]) -> Output {
-    let mut command = Command::new("/usr/bin/git");
-    command.args(args).current_dir(path);
-    clear_repository_local_git_env(&mut command);
-    command.output().expect("run git")
-}
-
-fn assert_success(output: &Output, context: &str) {
-    assert!(
-        output.status.success(),
-        "{context} failed: stdout={} stderr={}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-fn run_with_confirmation(command: &mut Command, confirmation: &str) -> Output {
-    let mut child = command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn publisher");
-    child
-        .stdin
-        .take()
-        .expect("publisher stdin")
-        .write_all(confirmation.as_bytes())
-        .expect("write confirmation");
-    child.wait_with_output().expect("wait for publisher")
-}
-
-struct CommandFixture {
-    _temp: TempDir,
-    repo: PathBuf,
-    fake_bin: PathBuf,
-    event_log: PathBuf,
-}
-
-impl CommandFixture {
-    fn new() -> Self {
-        let temp = TempDir::new().expect("tempdir");
-        let repo = temp.path().join("repo");
-        let fake_bin = temp.path().join("fake-bin");
-        let event_log = temp.path().join("events.log");
-        fs::create_dir_all(repo.join("scripts")).expect("create recipe directory");
-        for tool in ["git", "cargo", "gh"] {
-            write_executable(
-                &fake_bin.join(tool),
-                "#!/bin/bash\nprintf 'unexpected tool: %s\\n' \"$0\" >> \"$KIDOBO_TEST_EVENT_LOG\"\nexit 99\n",
-            );
-        }
-        Self {
-            _temp: temp,
-            repo,
-            fake_bin,
-            event_log,
-        }
-    }
-
-    fn publisher_command(&self) -> Command {
-        let mut command = Command::new(publisher_path());
-        command
-            .arg(RELEASE_VERSION)
-            .current_dir(&self.repo)
-            .env("PATH", path_with_prefix(&self.fake_bin))
-            .env("KIDOBO_TEST_EVENT_LOG", &self.event_log);
-        command
-    }
-}
-
-struct ReleaseFixture {
-    temp: TempDir,
-    repo: PathBuf,
-    remote: PathBuf,
-    fake_bin: PathBuf,
-    event_log: PathBuf,
-    git_log: PathBuf,
-    gh_log: PathBuf,
-    gh_release_dir: PathBuf,
-}
-
 impl ReleaseFixture {
-    #[expect(
-        clippy::too_many_lines,
-        reason = "keep the isolated repository setup and embedded release-tool fakes in one fixture"
-    )]
-    fn new() -> Self {
-        let temp = TempDir::new().expect("tempdir");
-        let repo = temp.path().join("repo");
-        let remote = temp.path().join("origin.git");
-        let fake_bin = temp.path().join("fake-bin");
-        let event_log = temp.path().join("events.log");
-        let git_log = temp.path().join("git.log");
-        let gh_log = temp.path().join("gh.log");
-        let gh_release_dir = temp.path().join("github-release");
-        fs::create_dir_all(&repo).expect("mkdir repo");
-
-        assert_success(
-            &run_git_at(
-                temp.path(),
-                &["init", "--bare", remote.to_str().expect("remote path")],
-            ),
-            "init bare origin",
-        );
-        assert_success(&run_git_at(&repo, &["init", "-b", "main"]), "init repo");
-        assert_success(
-            &run_git_at(&repo, &["config", "user.name", "Kidobo Test"]),
-            "configure user name",
-        );
-        assert_success(
-            &run_git_at(&repo, &["config", "user.email", "kidobo@example.test"]),
-            "configure user email",
-        );
-
-        fs::create_dir_all(repo.join("release-notes")).expect("mkdir release notes");
-        fs::write(
-            repo.join("Cargo.toml"),
-            format!("[package]\nname = \"kidobo\"\nversion = \"{CURRENT_VERSION}\"\n"),
-        )
-        .expect("write Cargo.toml");
-        fs::write(repo.join("Cargo.lock"), "# fixture lockfile\n").expect("write lockfile");
-        fs::write(
-            repo.join("README.md"),
-            format!("install --version v{CURRENT_VERSION}\n"),
-        )
-        .expect("write README");
-        fs::write(repo.join("LICENSE"), "fixture license\n").expect("write license");
-        fs::write(
-            repo.join("release-notes/unreleased.md"),
-            "- Test release behavior.\n",
-        )
-        .expect("write unreleased notes");
-        fs::write(repo.join("release-notes/dates.tsv"), "").expect("write dates");
-        fs::write(repo.join("CHANGELOG.md"), "# Changelog\n").expect("write changelog");
-        fs::write(repo.join(".gitignore"), "/target\n").expect("write gitignore");
-        fs::copy(publisher_path(), repo.join("publish-release.sh")).expect("copy publisher");
-        fs::create_dir_all(repo.join("scripts")).expect("mkdir scripts");
-        fs::copy(
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/package-release.sh"),
-            repo.join("scripts/package-release.sh"),
-        )
-        .expect("copy packager");
-
-        assert_success(&run_git_at(&repo, &["add", "."]), "stage fixture");
-        assert_success(
-            &run_git_at(&repo, &["commit", "-m", "Initial fixture"]),
-            "commit fixture",
-        );
-        assert_success(
-            &run_git_at(&repo, &["remote", "add", "origin", GITHUB_REMOTE_URL]),
-            "add origin",
-        );
-        let rewrite_key = format!("url.{}.insteadOf", remote.display());
-        assert_success(
-            &run_git_at(&repo, &["config", &rewrite_key, GITHUB_REMOTE_URL]),
-            "configure GitHub URL rewrite",
-        );
-        assert_success(
-            &run_git_at(&repo, &["push", "-u", "origin", "main"]),
-            "push initial main",
-        );
-
-        write_executable(
-            &fake_bin.join("git"),
-            r#"#!/usr/bin/env bash
-set -euo pipefail
-printf '%s\n' "$*" >> "${KIDOBO_TEST_GIT_LOG}"
-printf 'git %s\n' "$*" >> "${KIDOBO_TEST_EVENT_LOG}"
-if [[ -n "${KIDOBO_TEST_READY_MARKER:-}" && "$*" == '--no-pager diff --cached' ]]; then
-  : > "${KIDOBO_TEST_READY_MARKER}"
-fi
-exec "${KIDOBO_TEST_REAL_GIT}" "$@"
-"#,
-        );
-        write_executable(
-            &fake_bin.join("cargo"),
-            "#!/usr/bin/env bash\nset -euo pipefail\nexit 0\n",
-        );
-        write_executable(
-            &fake_bin.join("just"),
-            r#"#!/usr/bin/env bash
-set -euo pipefail
-printf 'just %s\n' "$*" >> "${KIDOBO_TEST_EVENT_LOG}"
-if [[ "$1" == "${KIDOBO_TEST_FAIL_GATE:-}" ]]; then exit 44; fi
-if [[ "$1" == "e2e-artifact" ]]; then
-  [[ "${KIDOBO_E2E_RESULTS_DIR}" == "${KIDOBO_TEST_REPO_ROOT}/target/e2e" ]] || exit 46
-  mkdir -p "${KIDOBO_E2E_RESULTS_DIR}"
-  cp "$2" "${KIDOBO_E2E_RESULTS_DIR}/frozen-candidate.tar.gz"
-  if [[ "${KIDOBO_TEST_FAIL_E2E:-0}" == "1" ]]; then exit 45; fi
-  if [[ "${KIDOBO_TEST_MUTATE_ARCHIVE:-0}" == "1" ]]; then printf corrupt >> "$2"; fi
-fi
-if [[ "$*" == "exercise-release" ]]; then
-  binary="${CARGO_TARGET_DIR:-target}/x86_64-unknown-linux-musl/release/kidobo"
-  mkdir -p "$(dirname "$binary")"
-  printf '#!/usr/bin/env bash\nprintf '\''kidobo %%s\\n'\'' %q\n' \
-    "${KIDOBO_TEST_BINARY_VERSION}" > "$binary"
-  chmod 0755 "$binary"
-  mkdir -p "${KIDOBO_TEST_GH_RELEASE_DIR}"
-  cp "$binary" "${KIDOBO_TEST_GH_RELEASE_DIR}/validated-candidate"
-fi
-exit 0
-"#,
-        );
-        for command in ["docker", "genisoimage", "incus", "musl-gcc", "readelf"] {
-            write_executable(
-                &fake_bin.join(command),
-                "#!/usr/bin/env bash\nset -euo pipefail\nexit 0\n",
-            );
-        }
-        write_executable(
-            &fake_bin.join("gh"),
-            r#"#!/usr/bin/env bash
-set -euo pipefail
-printf '%s\n' "$*" >> "${KIDOBO_TEST_GH_LOG}"
-printf 'gh %s\n' "$*" >> "${KIDOBO_TEST_EVENT_LOG}"
-
-if [[ "$1" == "auth" && "$2" == "status" ]]; then
-  [[ "${KIDOBO_TEST_FAIL_GH_AUTH:-0}" != "1" ]]
-  exit
-fi
-if [[ "$1" == "repo" && "$2" == "view" ]]; then
-  printf '%s\n' "${KIDOBO_TEST_GITHUB_REPOSITORY}"
-  exit 0
-fi
-if [[ "$1" == "release" && "$2" == "view" ]]; then
-  if [[ "${KIDOBO_TEST_EXISTING_RELEASE:-0}" == "1" \
-      || -e "${KIDOBO_TEST_GH_RELEASE_DIR}/draft" \
-      || -e "${KIDOBO_TEST_GH_RELEASE_DIR}/published" ]]; then
-    printf 'https://github.com/%s/releases/tag/%s\n' \
-      "${KIDOBO_TEST_GITHUB_REPOSITORY}" "$3"
-    exit 0
-  fi
-  exit 1
-fi
-if [[ "$1" == "release" && "$2" == "create" ]]; then
-  if [[ "${KIDOBO_TEST_FAIL_GH_CREATE:-0}" == "1" ]]; then
-    echo "injected GitHub release creation failure" >&2
-    exit 41
-  fi
-  mkdir -p "${KIDOBO_TEST_GH_RELEASE_DIR}"
-  for argument in "$@"; do
-    if [[ -f "${argument}" ]]; then
-      case "$(basename "${argument}")" in
-        *.tar.gz|SHA256SUMS)
-          cp "${argument}" "${KIDOBO_TEST_GH_RELEASE_DIR}/"
-          ;;
-      esac
-    fi
-  done
-  : > "${KIDOBO_TEST_GH_RELEASE_DIR}/draft"
-  exit 0
-fi
-if [[ "$1" == "release" && "$2" == "download" ]]; then
-  if [[ "${KIDOBO_TEST_FAIL_GH_DOWNLOAD:-0}" == "1" ]]; then
-    echo "injected GitHub release download failure" >&2
-    exit 42
-  fi
-  destination=""
-  while [[ $# -gt 0 ]]; do
-    if [[ "$1" == "--dir" ]]; then
-      destination="$2"
-      shift 2
-      continue
-    fi
-    shift
-  done
-  mkdir -p "${destination}"
-  cp "${KIDOBO_TEST_GH_RELEASE_DIR}"/*.tar.gz \
-    "${KIDOBO_TEST_GH_RELEASE_DIR}/SHA256SUMS" "${destination}/"
-  if [[ "${KIDOBO_TEST_CORRUPT_DOWNLOAD:-0}" == "1" ]]; then
-    printf 'corrupt\n' >> "${destination}"/*.tar.gz
-  fi
-  exit 0
-fi
-if [[ "$1" == "release" && "$2" == "edit" ]]; then
-  if [[ "${KIDOBO_TEST_FAIL_GH_EDIT:-0}" == "1" ]]; then
-    echo "injected GitHub release publication failure" >&2
-    exit 43
-  fi
-  rm -f "${KIDOBO_TEST_GH_RELEASE_DIR}/draft"
-  : > "${KIDOBO_TEST_GH_RELEASE_DIR}/published"
-  exit 0
-fi
-
-echo "unexpected gh invocation: $*" >&2
-exit 44
-"#,
-        );
-        write_executable(
-            &fake_bin.join("uname"),
-            r#"#!/usr/bin/env bash
-set -euo pipefail
-if [[ "$1" == "-s" ]]; then
-  printf 'Linux\n'
-elif [[ "$1" == "-m" ]]; then
-  printf '%s\n' "${KIDOBO_TEST_UNAME_MACHINE:-x86_64}"
-else
-  exec /usr/bin/uname "$@"
-fi
-"#,
-        );
-
-        Self {
-            temp,
-            repo,
-            remote,
-            fake_bin,
-            event_log,
-            git_log,
-            gh_log,
-            gh_release_dir,
-        }
-    }
-
-    fn git(&self, args: &[&str]) -> Output {
-        run_git_at(&self.repo, args)
-    }
-
     fn git_success(&self, args: &[&str], context: &str) {
         assert_success(&self.git(args), context);
-    }
-
-    fn head(&self) -> String {
-        let output = self.git(&["rev-parse", "HEAD"]);
-        assert_success(&output, "read HEAD");
-        String::from_utf8(output.stdout)
-            .expect("UTF-8 HEAD")
-            .trim()
-            .to_string()
     }
 
     fn branch(&self) -> String {
@@ -411,66 +36,6 @@ fi
             .expect("UTF-8 branch")
             .trim()
             .to_string()
-    }
-
-    fn tag_exists(&self) -> bool {
-        self.local_tag_exists(RELEASE_TAG)
-    }
-
-    fn local_tag_exists(&self, tag: &str) -> bool {
-        self.git(&["rev-parse", "--verify", "--quiet", tag])
-            .status
-            .success()
-    }
-
-    fn remote_tag_exists(&self, tag: &str) -> bool {
-        run_git_at(
-            &self.remote,
-            &[
-                "rev-parse",
-                "--verify",
-                "--quiet",
-                &format!("refs/tags/{tag}"),
-            ],
-        )
-        .status
-        .success()
-    }
-
-    fn artifact_root(&self, tag: &str) -> PathBuf {
-        self.repo.join("target/release-artifacts").join(tag)
-    }
-
-    fn publisher_command(&self) -> Command {
-        self.publisher_command_for(RELEASE_VERSION)
-    }
-
-    fn publisher_command_for(&self, version: &str) -> Command {
-        let mut command = Command::new(self.repo.join("publish-release.sh"));
-        let path = match std::env::var("PATH") {
-            Ok(existing) if !existing.is_empty() => {
-                format!("{}:{existing}", self.fake_bin.display())
-            }
-            _ => self.fake_bin.display().to_string(),
-        };
-        command
-            .arg(version)
-            .current_dir(&self.repo)
-            .env("PATH", path)
-            .env_remove("CARGO_TARGET_DIR")
-            .env("KIDOBO_TEST_REPO_ROOT", &self.repo)
-            .env("KIDOBO_TEST_EVENT_LOG", &self.event_log)
-            .env("KIDOBO_TEST_GIT_LOG", &self.git_log)
-            .env("KIDOBO_TEST_GH_LOG", &self.gh_log)
-            .env("KIDOBO_TEST_GH_RELEASE_DIR", &self.gh_release_dir)
-            .env("KIDOBO_TEST_GITHUB_REPOSITORY", GITHUB_REPOSITORY)
-            .env("KIDOBO_TEST_REAL_GIT", "/usr/bin/git")
-            .env(
-                "KIDOBO_TEST_BINARY_VERSION",
-                version.strip_prefix('v').unwrap_or(version),
-            );
-        clear_repository_local_git_env(&mut command);
-        command
     }
 
     fn run_publisher(&self, confirmation: &str) -> Output {
@@ -651,11 +216,7 @@ fn publisher_fixture_clears_repository_local_git_environment() {
 
 #[test]
 fn publisher_requires_exactly_one_version() {
-    for args in [
-        vec![],
-        vec![RELEASE_VERSION, RELEASE_VERSION],
-        vec![RELEASE_VERSION, "--skip-e2e", "extra"],
-    ] {
+    for args in [vec![], vec![RELEASE_VERSION, RELEASE_VERSION]] {
         let output = Command::new(publisher_path())
             .args(&args)
             .output()
@@ -911,8 +472,7 @@ fn publisher_atomically_pushes_then_verifies_and_publishes_local_artifacts() {
 
     assert_success(&output, "publish fixture release");
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("running required distro lifecycle matrix"));
-    assert!(stdout.contains("PASSED (required targets; advisory coverage separate)"));
+    assert!(stdout.contains("is ready to publish"));
     let release_head = fixture.head();
     assert_ne!(release_head, original_head);
     assert!(fixture.tag_exists());
@@ -1002,8 +562,7 @@ fn publisher_atomically_pushes_then_verifies_and_publishes_local_artifacts() {
         .find("gh release edit ")
         .expect("draft publication event");
     assert!(exercise_position < compatibility_position);
-    let e2e_position = events.find("just e2e-artifact ").expect("distro gate");
-    assert!(compatibility_position < e2e_position && e2e_position < push_position);
+    assert!(compatibility_position < push_position);
     assert!(push_position < create_position);
     assert!(create_position < download_position);
     assert!(download_position < edit_position);
@@ -1091,86 +650,6 @@ fn publisher_retains_recovery_state_after_post_push_failures() {
 }
 
 #[test]
-fn distro_gate_failure_or_artifact_changes_prevent_publication() {
-    for variable in ["KIDOBO_TEST_FAIL_E2E", "KIDOBO_TEST_MUTATE_ARCHIVE"] {
-        let fixture = ReleaseFixture::new();
-        let output = fixture
-            .publisher_command()
-            .env(variable, "1")
-            .output()
-            .expect("run failing distro gate");
-        assert!(
-            !output.status.success(),
-            "{variable} must block publication"
-        );
-        assert!(!fixture.tag_exists());
-        assert!(!fixture.artifact_root(RELEASE_TAG).exists());
-        assert!(
-            fixture
-                .repo
-                .join("target/e2e/frozen-candidate.tar.gz")
-                .is_file()
-        );
-        let events = read_to_string_with_limit(&fixture.event_log, FIXTURE_LOG_READ_LIMIT);
-        assert!(events.contains("just e2e-artifact "));
-        assert!(!events.contains("git -c core.hooksPath=/dev/null push --atomic "));
-        assert!(!events.contains("gh release create "));
-    }
-}
-
-#[test]
-fn publisher_reruns_all_gates_after_a_failed_matrix() {
-    let fixture = ReleaseFixture::new();
-    let original_head = fixture.head();
-    let first = fixture
-        .publisher_command()
-        .env("KIDOBO_TEST_FAIL_E2E", "1")
-        .output()
-        .expect("fail the first matrix");
-    assert_eq!(first.status.code(), Some(45));
-    assert!(!fixture.artifact_root(RELEASE_TAG).exists());
-    assert!(
-        fixture
-            .repo
-            .join("target/e2e/frozen-candidate.tar.gz")
-            .is_file()
-    );
-    assert_eq!(fixture.head(), original_head);
-    assert!(!fixture.tag_exists());
-
-    assert_success(&fixture.run_publisher("y\n"), "publish a fresh candidate");
-    let events = read_to_string_with_limit(&fixture.event_log, FIXTURE_LOG_READ_LIMIT);
-    for gate in [
-        "ci",
-        "coverage",
-        "release-notes-check",
-        "rustdoc",
-        "exercise-release",
-        "release-compat",
-    ] {
-        assert_eq!(
-            events.matches(&format!("just {gate}\n")).count(),
-            2,
-            "{gate}"
-        );
-    }
-    assert_eq!(
-        events
-            .lines()
-            .filter(|line| line.starts_with("just e2e-artifact "))
-            .count(),
-        2
-    );
-    assert!(
-        !fixture
-            .artifact_root(RELEASE_TAG)
-            .join("candidate.txt")
-            .exists()
-    );
-    assert!(fixture.gh_release_dir.join("published").is_file());
-}
-
-#[test]
 fn publisher_preserves_preexisting_artifact_directories() {
     let fixture = ReleaseFixture::new();
     let artifact_root = fixture.artifact_root(RELEASE_TAG);
@@ -1191,99 +670,15 @@ fn publisher_preserves_preexisting_artifact_directories() {
 }
 
 #[test]
-fn publisher_rejects_removed_options_before_tools() {
-    for options in [
-        vec!["--resume-e2e", "run-123-456"],
-        vec!["--refresh-e2e-images"],
-        vec!["--skip-e2e", "--resume-e2e", "run-123-456"],
-        vec!["--skip-e2e", "--skip-e2e"],
-    ] {
-        let fixture = CommandFixture::new();
-        let output = fixture
-            .publisher_command()
-            .args(&options)
-            .output()
-            .expect("reject removed options");
-        assert_eq!(output.status.code(), Some(2), "{options:?}");
-        assert!(!fixture.event_log.exists());
-    }
-}
-
-#[test]
-fn publisher_can_skip_e2e_without_vm_tools_and_keeps_other_gates() {
-    let fixture = ReleaseFixture::new();
-    let no_vm_tools = fixture.temp.path().join("no-vm-tools.sh");
-    fs::write(
-        &no_vm_tools,
-        r#"
-command() {
-  if [[ "$1" == -v ]]; then
-    case "$2" in incus|genisoimage|mkisofs) return 1 ;; esac
-  fi
-  builtin command "$@"
-}
-"#,
-    )
-    .expect("hide VM tools independently of the host PATH");
-    let default = fixture
-        .publisher_command()
-        .env("BASH_ENV", &no_vm_tools)
-        .output()
-        .expect("check default VM prerequisites");
-    assert_eq!(default.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&default.stderr).contains("missing required command: incus"));
-
-    let output = run_with_confirmation(
-        fixture
-            .publisher_command()
-            .arg("--skip-e2e")
-            .env("BASH_ENV", &no_vm_tools)
-            .env("KIDOBO_TEST_FAIL_E2E", "1"),
-        "y\n",
-    );
-    assert_success(
-        &output,
-        "publish without VM prerequisites or matrix execution",
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let notice = "Distro lifecycle matrix: SKIPPED (--skip-e2e)";
-    let first_notice = stdout.find(notice).expect("initial skipped-gate notice");
-    assert!(first_notice < stdout.find("running local CI").expect("local CI"));
-    let last_notice = stdout
-        .rfind(notice)
-        .expect("confirmation skipped-gate notice");
-    assert!(
-        last_notice
-            > stdout
-                .find("is ready to publish")
-                .expect("publication review")
-    );
-    let events = read_to_string_with_limit(&fixture.event_log, FIXTURE_LOG_READ_LIMIT);
-    assert!(!events.contains("just e2e-artifact "));
-    for gate in [
-        "ci",
-        "release-notes-check",
-        "coverage",
-        "rustdoc",
-        "exercise-release",
-        "release-compat",
-    ] {
-        assert!(events.contains(&format!("just {gate}\n")), "missing {gate}");
-    }
-    assert!(events.contains("gh release download "));
-    assert!(fixture.gh_release_dir.join("published").exists());
-}
-
-#[test]
 fn publisher_rejects_unknown_options_before_running_tools() {
     let fixture = CommandFixture::new();
     let output = fixture
         .publisher_command()
-        .arg("--skip-e2")
+        .arg("--unknown-option")
         .output()
         .expect("reject misspelled option");
     assert_eq!(output.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("unknown option: --skip-e2"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unknown option: --unknown-option"));
     assert!(!fixture.event_log.exists());
 }
 
@@ -1311,10 +706,10 @@ fn publisher_runs_explicit_gates_without_repeating_git_hooks() {
     );
     let events = read_to_string_with_limit(&fixture.event_log, FIXTURE_LOG_READ_LIMIT);
     for gate in [
-        "ci",
+        "_release-ci-without-e2e",
         "release-notes-check",
-        "coverage",
-        "rustdoc",
+        "_release-coverage-without-e2e",
+        "_release-rustdoc-without-e2e",
         "exercise-release",
         "release-compat",
     ] {
@@ -1392,224 +787,4 @@ fn publisher_rejects_artifact_changes_while_awaiting_confirmation() {
         assert!(!fixture.remote_tag_exists(RELEASE_TAG));
         assert!(!fixture.artifact_root(RELEASE_TAG).exists());
     }
-}
-
-#[test]
-fn skipping_e2e_still_blocks_publication_on_other_gate_failures() {
-    for gate in ["ci", "release-compat"] {
-        let fixture = ReleaseFixture::new();
-        let output = fixture
-            .publisher_command()
-            .arg("--skip-e2e")
-            .env("KIDOBO_TEST_FAIL_GATE", gate)
-            .output()
-            .expect("exercise retained gate failure");
-        assert_eq!(output.status.code(), Some(44), "{gate}");
-        assert!(!fixture.tag_exists());
-        assert!(!fixture.remote_tag_exists(RELEASE_TAG));
-        let events = read_to_string_with_limit(&fixture.event_log, FIXTURE_LOG_READ_LIMIT);
-        assert!(!events.contains("git -c core.hooksPath=/dev/null push --atomic "));
-        assert!(!events.contains("gh release create "));
-    }
-}
-
-#[test]
-fn candidate_recipe_runs_an_existing_archive_without_building_or_packaging() {
-    let fixture = CommandFixture::new();
-    let justfile = fixture.repo.join("Justfile");
-    fs::copy(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("Justfile"),
-        &justfile,
-    )
-    .expect("copy recipes into isolated repository");
-    write_executable(
-        &fixture.fake_bin.join("cargo"),
-        "#!/bin/bash\n[[ \"$1\" == run ]] || exit 91\nprintf '%s\\n' \"$@\"\n",
-    );
-    write_executable(
-        &fixture.repo.join("scripts/package-release.sh"),
-        "#!/bin/bash\nprintf unexpected-package > \"$KIDOBO_TEST_EVENT_LOG\"\nexit 92\n",
-    );
-    for options in [
-        vec![
-            "--archive".to_owned(),
-            "/tmp/existing candidate.tar.gz".to_owned(),
-            "--tag".to_owned(),
-            RELEASE_TAG.to_owned(),
-        ],
-        vec![
-            "--archive=/tmp/existing candidate.tar.gz".to_owned(),
-            format!("--tag={RELEASE_TAG}"),
-        ],
-    ] {
-        let output = Command::new("just")
-            .arg("--justfile")
-            .arg(&justfile)
-            .arg("_e2e")
-            .args(&options)
-            .env("PATH", path_with_prefix(&fixture.fake_bin))
-            .env("KIDOBO_TEST_EVENT_LOG", &fixture.event_log)
-            .output()
-            .expect("forward an existing archive without a build");
-        assert_success(&output, "run the prebuilt candidate recipe");
-        assert_eq!(
-            String::from_utf8(output.stdout).expect("UTF-8 candidate arguments"),
-            format!(
-                "run\n--locked\n-p\nkidobo-e2e\n--\nrun\n{}\n",
-                options.join("\n")
-            )
-        );
-        assert!(
-            !fixture.event_log.exists(),
-            "prebuilt archives must not be repackaged"
-        );
-    }
-}
-
-#[test]
-fn candidate_recipe_still_builds_and_packages_when_no_archive_is_supplied() {
-    let fixture = CommandFixture::new();
-    let justfile = fixture.repo.join("Justfile");
-    fs::copy(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("Justfile"),
-        &justfile,
-    )
-    .expect("copy recipes into isolated repository");
-    write_executable(
-        &fixture.fake_bin.join("cargo"),
-        r#"#!/bin/bash
-set -euo pipefail
-printf 'cargo %s\n' "$1" >> "$KIDOBO_TEST_EVENT_LOG"
-case "$1" in
-  build)
-    binary="$CARGO_TARGET_DIR/x86_64-unknown-linux-musl/release/kidobo"
-    mkdir -p "${binary%/*}"
-    printf '#!/bin/bash\nprintf '\''kidobo %s\\n'\''\n' "$KIDOBO_TEST_BINARY_VERSION" > "$binary"
-    chmod 0755 "$binary"
-    ;;
-  run) printf '%s\n' "$@" ;;
-  *) exit 91 ;;
-esac
-"#,
-    );
-    write_executable(
-        &fixture.repo.join("scripts/package-release.sh"),
-        r#"#!/bin/bash
-set -euo pipefail
-[[ -x "$1" && "$2" == "v$KIDOBO_TEST_BINARY_VERSION" && -d "$3" ]]
-printf 'package %s\n' "$2" >> "$KIDOBO_TEST_EVENT_LOG"
-: > "$3/kidobo-$2-linux-x86_64.tar.gz"
-"#,
-    );
-    let output = Command::new("just")
-        .arg("--justfile")
-        .arg(&justfile)
-        .args(["_e2e", "--keep-failed"])
-        .env("PATH", path_with_prefix(&fixture.fake_bin))
-        .env("CARGO_TARGET_DIR", fixture.repo.join("custom build target"))
-        .env("KIDOBO_TEST_EVENT_LOG", &fixture.event_log)
-        .env("KIDOBO_TEST_BINARY_VERSION", RELEASE_VERSION)
-        .output()
-        .expect("build and package a candidate with inert tools");
-    assert_success(&output, "build the normal candidate recipe");
-    assert_eq!(
-        read_to_string_with_limit(&fixture.event_log, FIXTURE_LOG_READ_LIMIT),
-        format!("cargo build\npackage {RELEASE_TAG}\ncargo run\n")
-    );
-    let arguments = String::from_utf8(output.stdout).expect("UTF-8 candidate arguments");
-    let arguments = arguments.lines().collect::<Vec<_>>();
-    let archive = arguments
-        .windows(2)
-        .find(|pair| pair[0] == "--archive")
-        .expect("packaged archive argument")[1];
-    assert!(fixture.repo.join(archive).is_file());
-    assert!(archive.ends_with(&format!("kidobo-{RELEASE_TAG}-linux-x86_64.tar.gz")));
-    assert_eq!(
-        &arguments[arguments.len() - 3..],
-        &["--tag", RELEASE_TAG, "--keep-failed"]
-    );
-    assert!(!arguments.contains(&"--required-only"));
-}
-
-#[test]
-fn publication_recipe_forwards_the_skip_option_as_an_argument() {
-    let fixture = CommandFixture::new();
-    let justfile = fixture.repo.join("Justfile");
-    fs::copy(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("Justfile"),
-        &justfile,
-    )
-    .expect("copy recipes into isolated repository");
-    write_executable(
-        &fixture.repo.join("scripts/publish-release.sh"),
-        "#!/bin/bash\nprintf '%s\\n' \"$@\"\n",
-    );
-    let output = Command::new("just")
-        .arg("--justfile")
-        .arg(&justfile)
-        .args(["publish-release", RELEASE_VERSION, "--skip-e2e"])
-        .output()
-        .expect("exercise recipe with an inert publisher");
-    assert_success(&output, "forward publisher arguments");
-    assert_eq!(
-        String::from_utf8(output.stdout).expect("forwarded arguments"),
-        format!("{RELEASE_VERSION}\n--skip-e2e\n")
-    );
-}
-
-#[test]
-fn artifact_recipe_preserves_arguments_and_rejects_extra_options() {
-    let fixture = CommandFixture::new();
-    let justfile = fixture.repo.join("Justfile");
-    fs::copy(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("Justfile"),
-        &justfile,
-    )
-    .expect("copy recipe into isolated repository");
-    write_executable(
-        &fixture.fake_bin.join("cargo"),
-        "#!/bin/bash\nprintf '%s\\n' \"$@\"\n",
-    );
-    let output = Command::new("just")
-        .arg("--justfile")
-        .arg(&justfile)
-        .env("PATH", path_with_prefix(&fixture.fake_bin))
-        .args([
-            "e2e-artifact",
-            "/tmp/candidate with spaces.tar.gz",
-            RELEASE_TAG,
-        ])
-        .output()
-        .expect("forward exact archive and tag");
-    assert_success(&output, "forward artifact arguments");
-    assert_eq!(
-        String::from_utf8(output.stdout).expect("UTF-8 arguments"),
-        format!(
-            "run\n--locked\n-p\nkidobo-e2e\n--\nrun\n--required-only\n--archive\n/tmp/candidate with spaces.tar.gz\n--tag\n{RELEASE_TAG}\n"
-        )
-    );
-    for options in [
-        vec!["--distro", "debian-12"],
-        vec!["--resume", "run-123-456"],
-        vec!["--refresh-images"],
-    ] {
-        let output = Command::new("just")
-            .arg("--justfile")
-            .arg(&justfile)
-            .env("PATH", path_with_prefix(&fixture.fake_bin))
-            .args(["e2e-artifact", "/tmp/candidate.tar.gz", RELEASE_TAG])
-            .args(&options)
-            .output()
-            .expect("reject extra artifact arguments");
-        assert!(!output.status.success(), "{options:?}");
-        assert_eq!(output.stdout, [] as [u8; 0]);
-    }
-    let output = Command::new("just")
-        .arg("--justfile")
-        .arg(&justfile)
-        .args(["e2e-resume", "run-123-456"])
-        .output()
-        .expect("reject removed recipe");
-    assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("does not contain recipe"));
 }

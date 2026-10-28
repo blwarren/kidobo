@@ -129,6 +129,19 @@ ci: && lint deny audit test-app
 coverage:
     @cargo llvm-cov --workspace --all-features --fail-under-regions 90 --fail-under-functions 90 --fail-under-lines 90
 
+# Publisher-only validation scopes; ordinary developer commands remain unchanged.
+[private]
+_release-ci-without-e2e:
+    @bash ./scripts/release-validation.sh ci
+
+[private]
+_release-coverage-without-e2e:
+    @bash ./scripts/release-validation.sh coverage
+
+[private]
+_release-rustdoc-without-e2e:
+    @bash ./scripts/release-validation.sh rustdoc
+
 # Run local mutation tests. Agents must not run this recipe.
 mutants *args:
     @env CARGO_MUTANTS_JOBS="${CARGO_MUTANTS_JOBS:-4}" cargo mutants -vV {{ args }}

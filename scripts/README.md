@@ -20,6 +20,8 @@ gh auth login
 - `cooldown.toml`: fail-closed seven-day minimum publish age for dependency updates.
 - `scripts/install.sh`: public install/uninstall flow used by operators.
 - `scripts/publish-release.sh`: guarded, transactional release preparation and publication.
+- `scripts/release-validation.sh`: internal application-only CI, coverage, and rustdoc selection
+  for the publisher's `--skip-e2e` path.
 - `scripts/package-release.sh`: shared static archive packaging for candidates and publication.
 - `scripts/check-release-compat.sh`: static ELF and Debian/Alpine release compatibility gate.
 - `scripts/changelog/*`: release-notes normalization and changelog generation.
@@ -62,7 +64,7 @@ that include those retired scaled cases.
 - `just udeps` (manual nightly-toolchain dependency-usage audit)
 - `just release-notes-check` (required after repository changes and during release validation)
 - `just publish-release X.Y.Z` (complete local preparation, validation, required Incus coverage, upload, verification, and publication)
-- `just publish-release X.Y.Z --skip-e2e` (skip only the matrix and its Incus/agent-ISO prerequisites; other validation and upload verification remain enabled)
+- `just publish-release X.Y.Z --skip-e2e` (skip all E2E-specific validation and execution; application checks, shared dependency checks, and publication safeguards remain enabled)
 - `just mutants`
 - `just mutants --shard 1/4`
 
@@ -101,12 +103,24 @@ diff and obtain explicitly authorized fresh lifecycle acceptance before committi
 [image updates and storage](../docs/e2e.md#image-sources-and-reviewed-updates).
 Read the [E2E scope contract](../docs/e2e.md#scope-and-non-goals) before changing this workflow.
 
-An explicit `--skip-e2e` argument skips only that matrix and its Incus/agent-ISO prerequisites;
-CI, release-note validation, coverage, strict rustdoc, the release-binary exercise,
-static compatibility, packaging, and upload verification still run. The publisher labels the
-skip before validation and repeats it before the final confirmation. This override does not reuse
-or imply evidence from an earlier matrix run. E2E command
-transcript and results remain under the original checkout's `target/e2e/<run-id>/`,
+An explicit `--skip-e2e` argument skips E2E compilation, formatting, linting, documentation,
+harness and launcher tests, E2E integration fixtures, image discovery/import, and VM execution.
+It requires no Incus, tmux, image-processing, or agent-ISO tools and invokes no E2E cleanup.
+Application CI, non-E2E coverage with the same 90% region/function/line thresholds, and strict
+application rustdoc still run through private recipes backed by `scripts/release-validation.sh`.
+Shared dependency audits and license/policy checks remain enabled; reading shared Cargo manifests
+and lockfile metadata is allowed. Release-note validation, static builds, the release-binary
+exercise, compatibility, packaging, confirmation, source/artifact mutation detection, upload
+verification, and recovery remain unchanged.
+
+The publisher reports `E2E validation skipped` before validation and at final confirmation,
+covering both infrastructure checks and VM execution. Default publication and standalone
+`just ci`, `just coverage`, `just rustdoc`, and `just test` retain their existing scope.
+Root E2E integration targets use the `e2e_*` prefix; the harness package is `kidobo-e2e`.
+Future E2E packages, targets, and dedicated helpers must stay outside the publisher's skip path.
+This override does not reuse or imply evidence from an earlier matrix run.
+
+E2E command transcripts and results remain under the original checkout's `target/e2e/<run-id>/`,
 including when the publisher removes its temporary worktree. Start with `summary.txt` and
 the paths and local line references into `targets/<distro>/transcript.log`. Each target owns
 its full transcript and structured results; the terminal and root transcript show progress and

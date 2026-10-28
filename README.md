@@ -257,8 +257,11 @@ Authenticate with `gh auth login` before publishing, then run
 packages the release locally, pushes the release commit and tag atomically,
 verifies the draft's downloaded assets, and only then publishes it. See the
 [development-command reference](scripts/README.md) for the complete workflow
-and failure recovery. Use `just publish-release X.Y.Z --skip-e2e` to omit the VM
-matrix while retaining all other release checks and uploaded-asset verification.
+and failure recovery. Use `just publish-release X.Y.Z --skip-e2e` to omit all E2E-specific
+validation: harness compilation, formatting, linting, documentation, local E2E tests, image
+operations, and the VM matrix. Application checks, unchanged coverage thresholds, shared
+dependency audits/license checks, and publication safeguards remain enabled. Standalone
+developer commands retain their existing scope, including local E2E infrastructure validation.
 Every publication attempt reruns validation and builds its candidate; prior E2E results are not
 reused. E2E logs and frozen evidence survive a failed attempt. The command reference distinguishes
 retrying before publication from recovery after Git refs have been pushed.

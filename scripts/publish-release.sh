@@ -9,7 +9,8 @@ Prepares and validates a release in a temporary worktree, asks for confirmation,
 then atomically pushes the release commit and tag, uploads locally built assets
 with GitHub CLI, verifies the uploaded archive, and publishes the GitHub release.
 
-  --skip-e2e           Skip the Incus VM matrix; all other release checks still run.
+  --skip-e2e           Skip all E2E-specific validation, including harness checks,
+                      image operations, and VMs. Other release checks still run.
 EOF
 }
 
@@ -49,7 +50,7 @@ release_version="${release_tag#v}"
 matrix_result="not run"
 if [[ "${skip_e2e}" == true ]]; then
     matrix_result="SKIPPED (--skip-e2e)"
-    echo "[release] Distro lifecycle matrix: ${matrix_result}"
+    echo "[release] E2E validation skipped (--skip-e2e): harness checks, image operations, and VM matrix"
 fi
 required_commands=(gh cargo cat cmp date docker git grep head install just mkdir mktemp musl-gcc readelf rm rustup sed sha256sum sort tar uname)
 if [[ "${skip_e2e}" == false ]]; then
@@ -281,11 +282,20 @@ git add Cargo.toml Cargo.lock README.md CHANGELOG.md release-notes
 validated_tree="$(git write-tree)"
 
 echo "[release] running local CI on the prepared candidate"
-just ci
+if [[ "${skip_e2e}" == true ]]; then
+    just _release-ci-without-e2e
+else
+    just ci
+fi
 echo "[release] running release-only validation"
 just release-notes-check
-just coverage
-just rustdoc
+if [[ "${skip_e2e}" == true ]]; then
+    just _release-coverage-without-e2e
+    just _release-rustdoc-without-e2e
+else
+    just coverage
+    just rustdoc
+fi
 just exercise-release
 just release-compat
 git diff --check --cached
@@ -318,6 +328,9 @@ fi
 
 echo
 echo "Release ${release_tag} is ready to publish:"
+if [[ "${skip_e2e}" == true ]]; then
+    echo "E2E validation skipped (--skip-e2e): harness checks, image operations, and VM matrix"
+fi
 echo "Distro lifecycle matrix: ${matrix_result}"
 git --no-pager diff --cached --stat
 echo
