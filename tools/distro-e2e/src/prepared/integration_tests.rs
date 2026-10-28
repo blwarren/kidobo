@@ -48,7 +48,9 @@ state_path = root / 'state.json'
 state = json.loads(state_path.read_text())
 args = sys.argv[1:]
 if args[0] == 'query':
-    assert args == ['query', '/1.0/profiles/test-profile?project=test-project'] or '/1.0/instances/' in args[1], args
+    assert '--project' not in args, args
+    assert args[-1].endswith('?project=test-project'), args
+    assert args == ['query', '/1.0/profiles/test-profile?project=test-project'] or args[-1].startswith('/1.0/instances/'), args
 else:
     assert args[:2] == ['--project', 'test-project'], args
     args = args[2:]
@@ -82,10 +84,13 @@ def markers(phase):
 
 operation = args[0]
 if operation == 'query':
-    if '/instances/' in args[1]:
-        if '/logs?' in args[1]:
-            print(json.dumps({'metadata':['/1.0/instances/fixture/logs/qemu.log']}))
+    if '/instances/' in args[-1]:
+        path = args[-1].split('?')[0]
+        if path.endswith('/logs'):
+            assert args[1] == args[-1], args
+            print(json.dumps({'metadata':[path + '/qemu.log']}))
         else:
+            assert args[1] == '--raw' and path.endswith('/logs/qemu.log'), args
             print('fixture QEMU log')
     else:
         print(json.dumps({'metadata':state['profile']}))
@@ -477,6 +482,19 @@ fn failed_cached_admission_invalidates_and_rebuilds_once_with_diagnostics() {
     assert_eq!(metadata["rejected_cache"]["fingerprint"], fingerprint);
     assert_eq!(fixture.guest_count("--prepare"), 2);
     assert_eq!(fixture.guest_count("--admit"), 3);
+    assert_eq!(
+        runner.report.document["cache_rejection_diagnostics"]["errors"],
+        json!([])
+    );
+    assert_eq!(
+        read_text(
+            &runner
+                .evidence()
+                .join("primary/rejected-cache/host-diagnostics/qemu.log")
+        )
+        .expect("rejected clone runtime log"),
+        "fixture QEMU log\n"
+    );
     assert_eq!(
         fixture.state()["images"][&fingerprint]["properties"]["kidobo_e2e_ready"],
         "false"

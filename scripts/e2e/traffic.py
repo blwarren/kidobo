@@ -91,7 +91,7 @@ def probe(
                 client.bind((source, 0))
             try:
                 client.connect((address, port))
-            except TimeoutError:
+            except (socket.timeout, TimeoutError):
                 observation["outcome"] = "connect-timeout"
                 return 10, observation
             deadline = time.monotonic() + PROBE_TIMEOUT_SECONDS

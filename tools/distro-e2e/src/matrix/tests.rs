@@ -142,6 +142,9 @@ if operation == "query":
 elif operation == "console":
     assert args[2] == "--show-log", args
     event("serial-log", args[1])
+    if scenario == "console-unsupported":
+        print("Error: Instance is not container type", file=sys.stderr)
+        raise SystemExit(1)
     print("serial boot evidence")
 elif operation == "image":
     assert args[1] == "info", args
@@ -736,6 +739,53 @@ fn advisory_diagnostic_failure_is_visible_and_does_not_qualify_all_targets() {
                 < deleted
         );
     }
+}
+
+#[test]
+fn unsupported_vm_console_warns_without_failing_coverage_or_cleanup() {
+    let mut fixture = Fixture::new("console-unsupported", true);
+    fixture
+        .execute()
+        .expect("valid lifecycle and required runtime diagnostics pass");
+    assert_eq!(fixture.runner.report.document["release_gate_passed"], true);
+    assert_eq!(
+        fixture.runner.report.document["all_selected_targets_passed"],
+        true
+    );
+    assert_eq!(
+        fixture.runner.report.document["warnings"]
+            .as_array()
+            .expect("warnings")
+            .len(),
+        2
+    );
+    for id in ["primary", "secondary"] {
+        assert_eq!(fixture.result(id)["diagnostic_errors"], json!([]));
+        assert_eq!(fixture.result(id)["cleanup_error"], Value::Null);
+        assert_eq!(
+            fixture.result(id)["diagnostic_warnings"]
+                .as_array()
+                .expect("target warning")
+                .len(),
+            1
+        );
+        let host = fixture.runner.evidence().join(id).join("host-diagnostics");
+        assert_eq!(
+            read_text(&host.join("qemu.log")).expect("required runtime log"),
+            "QEMU boot evidence\n"
+        );
+        assert!(
+            !fixture
+                .temp
+                .path()
+                .join(format!("state/{RUN_ID}-{id}"))
+                .exists()
+        );
+    }
+    let summary = read_text(&fixture.runner.dir.join("summary.txt")).expect("summary");
+    assert!(summary.contains("primary: PASS"));
+    assert!(summary.contains("does not support saved serial-console logs for VMs"));
+    assert!(summary.contains("diagnostic_warnings:"));
 }
 
 #[test]

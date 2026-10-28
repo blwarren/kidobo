@@ -559,7 +559,7 @@ fn summary(document: &Value) -> String {
                     let _ = writeln!(text, "  {key}: {}", display(&result[key]));
                 }
             }
-            for key in ["diagnostic_errors", "cleanup_error"] {
+            for key in ["diagnostic_errors", "diagnostic_warnings", "cleanup_error"] {
                 if !result[key].is_null() && result[key] != json!([]) {
                     let _ = writeln!(text, "  {key}: {}", display(&result[key]));
                 }

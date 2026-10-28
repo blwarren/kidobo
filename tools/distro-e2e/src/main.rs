@@ -1481,6 +1481,8 @@ fn validate_vm_config(value: &serde_json::Value) -> Result<()> {
     Ok(())
 }
 #[cfg(test)]
+mod fedora_boot_tests;
+#[cfg(test)]
 mod guest_http_tests;
 #[cfg(test)]
 mod guest_preservation_tests;

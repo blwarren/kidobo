@@ -161,6 +161,7 @@ fn tcp_probe_distinguishes_timeout_refusal_and_response_failures() {
 import runpy, socket, sys
 fixture = runpy.run_path(sys.argv[1])
 probe = fixture['probe']
+class LegacySocketTimeout(OSError): pass
 class Client:
  def __init__(self, failure, response): self.failure=failure; self.response=list(response)
  def __enter__(self): return self
@@ -169,12 +170,21 @@ class Client:
  def bind(self, address): pass
  def connect(self, address):
   if self.failure: raise self.failure
- def recv(self, count): return self.response.pop(0)
+ def recv(self, count):
+  value = self.response.pop(0)
+  if isinstance(value, BaseException): raise value
+  return value
 original = socket.socket
+original_timeout = socket.timeout
+# Python 3.9 uses a distinct OSError subclass for socket timeouts.
+socket.timeout = LegacySocketTimeout
 for error, response, expected, outcome in [
  (TimeoutError('drop'), [], 10, 'connect-timeout'),
+ (LegacySocketTimeout('timed out'), [], 10, 'connect-timeout'),
  (ConnectionRefusedError('refused'), [], 20, 'infrastructure-error'),
  (OSError('route missing'), [], 20, 'infrastructure-error'),
+ (None, [TimeoutError('response timeout')], 20, 'infrastructure-error'),
+ (None, [LegacySocketTimeout('timed out')], 20, 'infrastructure-error'),
  (None, [b'kid', b'obo-e2e\n', b''], 0, 'allowed'),
  (None, [b'wrong', b''], 20, 'infrastructure-error'),
  (None, [b'kid', b''], 20, 'infrastructure-error'),
@@ -189,6 +199,7 @@ socket.socket = unavailable
 status, observation = probe('::1', 1234)
 assert status == 20 and observation['outcome'] == 'infrastructure-error', observation
 socket.socket = original
+socket.timeout = original_timeout
 ",
         ])
         .arg(concat!(

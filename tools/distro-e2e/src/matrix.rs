@@ -369,7 +369,7 @@ fn execute_inner(
         runner.report.document["results"] = json!(results);
         runner.report.save()?;
     }
-    let warnings = results
+    let mut warnings = results
         .iter()
         .filter(|result| result["required"] == false && result_failed(result))
         .map(|result| {
@@ -379,6 +379,11 @@ fn execute_inner(
             )
         })
         .collect::<Vec<_>>();
+    for result in &results {
+        if let Some(messages) = result["diagnostic_warnings"].as_array() {
+            warnings.extend(messages.iter().filter_map(Value::as_str).map(str::to_owned));
+        }
+    }
     let all_passed =
         results.len() == targets.len() && results.iter().all(|result| !result_failed(result));
     let required_passed = results
@@ -460,6 +465,7 @@ fn finish(runner: &mut Runner, trial: &Trial<'_>, keep_failed: bool, _unused: ()
     let target_dir = runner.evidence().join(&target.id);
     runner.stage(&format!("{} | diagnostics", target.id))?;
     let mut diagnostic_errors = vec![];
+    let mut diagnostic_warnings = vec![];
     let mut image_fingerprint: Option<String> = None;
     let mut vm_exists = None;
     let vm_snapshot = runner
@@ -477,7 +483,9 @@ fn finish(runner: &mut Runner, trial: &Trial<'_>, keep_failed: bool, _unused: ()
                 target_dir.join("vm.json"),
                 serde_json::to_vec_pretty(instance)?,
             )?;
-            diagnostic_errors.extend(diagnostics::collect(runner, vm, &target_dir));
+            let host = diagnostics::collect(runner, vm, &target_dir);
+            diagnostic_errors.extend(host.errors);
+            diagnostic_warnings.extend(host.warnings);
             if instance["status"] == "Stopped" {
                 if runner.cancelled.load(Ordering::Relaxed) {
                     return Err("stopped guest was not restarted during interrupted cleanup".into());
@@ -606,6 +614,7 @@ printf '%s\n' '=== kidobo service journal ==='; journalctl -u kidobo-sync.servic
         "active_seconds":trial.active_seconds+finalized.elapsed().as_secs_f64(), "parked_seconds":trial.parked_seconds,
         "preparation":trial.preparation, "validation_contract":crate::contract::VERSION,
         "image_fingerprint": image_fingerprint, "diagnostic_errors": diagnostic_errors,
+        "diagnostic_warnings": diagnostic_warnings,
     });
     runner.report.finish_stage(if cleanup_error.is_some() {
         "failed"

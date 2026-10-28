@@ -110,8 +110,10 @@ fn rpm_boot_default_must_match_the_selected_kernel() {
         let root = temp.path();
         fs::create_dir(root.join("boot")).expect("boot");
         fs::write(root.join("boot/initramfs-6.12.0-new.img"), "initramfs").expect("initramfs");
+        fs::write(root.join("os-release"), "ID=almalinux\n").expect("guest distribution");
         let function = helper("select_boot_kernel", "prepare_selinux")
-            .replace("/boot/", "${FIXTURE_ROOT}/boot/");
+            .replace("/boot/", "${FIXTURE_ROOT}/boot/")
+            .replace("/etc/os-release", "${FIXTURE_ROOT}/os-release");
         let default = if agrees { "new" } else { "old" };
         let body = format!(
             r#"

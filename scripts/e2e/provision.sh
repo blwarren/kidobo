@@ -143,8 +143,191 @@ verify_kernel_artifacts() {
   done
 }
 
+capture_boot_configuration() {
+  local label=$1 file
+  {
+    printf '%s\n' '=== mounted filesystems ==='; findmnt -o TARGET,SOURCE,FSTYPE,UUID
+    printf '%s\n' '=== boot identities ==='
+    grub2-probe --target=fs_uuid /boot/grub2
+    grub2-mkrelpath /boot/grub2
+    for file in /proc/cmdline /etc/kernel/cmdline /etc/default/grub \
+        /etc/grub2.cfg /etc/grub2-efi.cfg /boot/grub2/grub.cfg /boot/loader/entries/*.conf; do
+      printf '\n=== %s ===\n' "$file"
+      ls -ld "$file"
+      [[ ! -L "$file" ]] || readlink -f "$file"
+      head -c 1048576 "$file"
+    done
+    while IFS= read -r file; do
+      printf '\n=== %s ===\n' "$file"
+      case "$file" in
+        */grubenv) grub2-editenv "$file" list ;;
+        *) head -c 1048576 "$file" ;;
+      esac
+    done < <(find /boot/grub2 /boot/efi/EFI -maxdepth 4 -type f \( -name grub.cfg -o -name grubenv \))
+  } > "$PREPARED/boot-config-$label.txt" 2>&1 || true
+}
+
+fedora_boot_configuration() {
+  python3 - "$@" <<'PY'
+import re
+import shlex
+import sys
+from pathlib import Path
+
+mode, root_uuid, boot_uuid, grub_path, kernel, prepared = sys.argv[1:]
+prepared = Path(prepared)
+efi = Path('/boot/efi/EFI/fedora/grub.cfg')
+canonical = Path('/boot/grub2/grub.cfg')
+root_arg = 'root=UUID=' + root_uuid
+
+def require(condition, message):
+    if not condition:
+        raise SystemExit('e2e Fedora boot: ' + message)
+
+def root_options(text, add_root=True):
+    # Keep other arguments, including quoted values, byte-for-byte. Only root and
+    # the running kernel's informational BOOT_IMAGE token need replacement.
+    shlex.split(text)  # Reject unbalanced quoting before writing boot files.
+    tokens = re.findall(r'''(?:[^\s"']+|"[^"]*"|'[^']*')+''', text)
+    roots = [token for token in tokens if token.startswith('root=')]
+    require(all('"' not in value and "'" not in value for value in roots),
+            'unrecognized quoted root argument')
+    if not roots and not add_root:
+        return text
+    return ' '.join([token for token in tokens if not token.startswith(('root=', 'BOOT_IMAGE='))]
+                    + [root_arg])
+
+def default_arguments(match):
+    prefix, value = match[0].split('=', 1)
+    if value.startswith(('"', "'")):
+        quoted = re.fullmatch(r'''(["'])(.*)\1([ \t]*(?:#.*)?)''', value)
+        require(quoted is not None, 'unrecognized quoted GRUB command line')
+        quote, arguments, comment = quoted.groups()
+        return prefix + '=' + quote + root_options(arguments, add_root=False) + quote + comment
+    require(not re.search(r'\s', value), 'unrecognized unquoted GRUB command line')
+    return prefix + '=' + root_options(value, add_root=False)
+
+def entries():
+    paths = sorted(Path('/boot/loader/entries').glob('*.conf'))
+    require(bool(paths), 'no BLS entries')
+    return paths
+
+def selected_entry():
+    matches = [path for path in entries()
+               if re.search(r'^linux\s+/vmlinuz-' + re.escape(kernel) + r'\s*$',
+                            path.read_text(), re.M)]
+    require(len(matches) == 1, 'intended kernel must have exactly one BLS entry')
+    return matches[0]
+
+stub = ('search --no-floppy --fs-uuid --set=dev ' + boot_uuid + '\n'
+        'set prefix=($dev)' + grub_path + '\n'
+        'export prefix\nconfigfile $prefix/grub.cfg\n')
+
+def valid_stub(text):
+    lines = [line.strip() for line in text.splitlines()
+             if line.strip() and not line.lstrip().startswith('#')]
+    # Fedora's packaged stub exports $prefix; our generated stub exports its name.
+    expected = stub.splitlines()
+    return lines == expected or lines == [*expected[:2], 'export $prefix', expected[3]]
+
+def recognized_layout():
+    require(efi.is_file() and not efi.is_symlink(), 'missing or indirect Fedora EFI configuration')
+    configs = sorted(Path('/boot/efi/EFI').rglob('grub.cfg'))
+    require(configs == [efi], 'ambiguous EFI configuration layout')
+    text = efi.read_text()
+    if valid_stub(text):
+        return
+    require('grub2-mkconfig' in text or 'grub-mkconfig' in text,
+            'unrecognized EFI forwarding configuration')
+    require(re.search(r'^\s*(blscfg|menuentry\s)', text, re.M),
+            'unrecognized full EFI configuration')
+
+def verify_canonical():
+    text = canonical.read_text()
+    defaults = re.findall(r'^\s*set\s+default=(.*?)\s*$', text, re.M)
+    require(re.search(r'^\s*load_env(?:\s|$)', text, re.M)
+            and defaults in (["\"${saved_entry}\""], ["\"${next_entry}\"", "\"${saved_entry}\""])
+            and re.search(r'^\s*blscfg\s*$', text, re.M),
+            'canonical configuration lacks environment-based BLS selection')
+    require(not re.search(r'^\s*(set\s+prefix=|configfile\s)', text, re.M),
+            'canonical configuration redirects boot selection')
+
+require(re.fullmatch(r'[0-9A-Fa-f]+(?:-[0-9A-Fa-f]+)*', root_uuid or ''), 'missing or ambiguous root UUID')
+require(re.fullmatch(r'[0-9A-Fa-f]+(?:-[0-9A-Fa-f]+)*', boot_uuid or ''), 'missing or ambiguous boot UUID')
+require(grub_path in ('/boot/grub2', '/grub2'), 'unrecognized GRUB filesystem path')
+
+if mode == 'prepare':
+    recognized_layout()
+    selected = selected_entry()
+    running = root_options(Path('/proc/cmdline').read_text().strip())
+    cmdline = Path('/etc/kernel/cmdline')
+    persistent = root_options(cmdline.read_text().strip() if cmdline.exists() else running)
+    rewritten = []
+    for path in entries():
+        text = path.read_text()
+        options = re.findall(r'^options[ \t]+(.*)$', text, re.M)
+        require(len(options) == 1, 'BLS entry must have exactly one options line: ' + str(path))
+        resolved = options[0].replace('${kernelopts}', running).replace('$kernelopts', running)
+        resolved = root_options(resolved)
+        rewritten.append((path, re.sub(r'^options[ \t]+.*$', lambda _: 'options ' + resolved,
+                                       text, flags=re.M)))
+    defaults = Path('/etc/default/grub')
+    text = defaults.read_text()
+    # Repair explicit roots inside quoted GRUB_CMDLINE_LINUX assignments as well.
+    text = re.sub(r'^(GRUB_CMDLINE_LINUX(?:_DEFAULT)?=.*)$', default_arguments, text, flags=re.M)
+    for key, value in [('GRUB_DEFAULT', 'saved'), ('GRUB_SAVEDEFAULT', 'false'),
+                       ('GRUB_ENABLE_BLSCFG', 'true')]:
+        text = re.sub(r'^' + key + r'=.*\n?', '', text, flags=re.M)
+        text = text.rstrip() + '\n' + key + '=' + value + '\n'
+    cmdline.parent.mkdir(parents=True, exist_ok=True)
+    cmdline.write_text(persistent + '\n')
+    for path, content in rewritten:
+        path.write_text(content)
+    defaults.write_text(text)
+    (prepared / 'selected-bls-entry').write_text(selected.stem + '\n')
+elif mode == 'forward':
+    verify_canonical()
+    if not valid_stub(efi.read_text()):
+        efi.write_text(stub)
+elif mode == 'verify':
+    verify_canonical()
+    require(valid_stub(efi.read_text()), 'EFI does not forward to the measured GRUB filesystem')
+    selected = selected_entry()
+    environment = (prepared / 'canonical-grubenv.txt').read_text().splitlines()
+    require(environment.count('saved_entry=' + selected.stem) == 1,
+            'canonical GRUB environment does not select the intended BLS entry')
+    require(not any(line.startswith(('next_entry=', 'prev_saved_entry=')) for line in environment),
+            'canonical GRUB environment still overrides the next boot')
+    for path in entries():
+        options = re.findall(r'^options[ \t]+(.*)$', path.read_text(), re.M)
+        require(len(options) == 1 and re.findall(r'(?<!\S)root=\S+', options[0]) == [root_arg]
+                and '$kernelopts' not in options[0] and '${kernelopts}' not in options[0],
+                'BLS root identity is not explicit and correct: ' + str(path))
+else:
+    raise SystemExit('unknown Fedora boot configuration operation')
+PY
+}
+
+prepare_fedora_boot() (
+  local kernel=$1 root_uuid boot_uuid grub_path
+  capture_boot_configuration before
+  trap 'capture_boot_configuration after' EXIT
+  root_uuid=$(findmnt --noheadings --output UUID --target /)
+  boot_uuid=$(grub2-probe --target=fs_uuid /boot/grub2)
+  grub_path=$(grub2-mkrelpath /boot/grub2)
+  fedora_boot_configuration prepare "$root_uuid" "$boot_uuid" "$grub_path" "$kernel" "$PREPARED"
+  grub2-mkconfig -o /boot/grub2/grub.cfg
+  fedora_boot_configuration forward "$root_uuid" "$boot_uuid" "$grub_path" "$kernel" "$PREPARED"
+  grubby --set-default "/boot/vmlinuz-$kernel"
+  [[ "$(grubby --default-kernel)" == "/boot/vmlinuz-$kernel" ]] || fail 'grubby did not select the intended kernel'
+  grub2-editenv /boot/grub2/grubenv set "saved_entry=$(<"$PREPARED/selected-bls-entry")"
+  grub2-editenv /boot/grub2/grubenv unset next_entry prev_saved_entry
+  grub2-editenv /boot/grub2/grubenv list > "$PREPARED/canonical-grubenv.txt"
+  fedora_boot_configuration verify "$root_uuid" "$boot_uuid" "$grub_path" "$kernel" "$PREPARED"
+)
+
 select_boot_kernel() {
-  local family=$1 kernel=$2 initramfs first_linux
+  local family=$1 kernel=$2 initramfs first_linux ID=
   case "$family" in
     apt)
       initramfs="/boot/initrd.img-$kernel"
@@ -158,8 +341,14 @@ select_boot_kernel() {
     dnf|dnf-epel)
       initramfs="/boot/initramfs-$kernel.img"
       [[ -s "$initramfs" ]] || dracut --force "$initramfs" "$kernel"
-      grubby --set-default "/boot/vmlinuz-$kernel"
-      [[ "$(grubby --default-kernel)" == "/boot/vmlinuz-$kernel" ]] || fail 'grubby did not select the intended kernel'
+      # shellcheck disable=SC1091
+      . /etc/os-release
+      if [[ "$ID" == fedora ]]; then
+        prepare_fedora_boot "$kernel"
+      else
+        grubby --set-default "/boot/vmlinuz-$kernel"
+        [[ "$(grubby --default-kernel)" == "/boot/vmlinuz-$kernel" ]] || fail 'grubby did not select the intended kernel'
+      fi
       ;;
     zypper)
       initramfs="/boot/initrd-$kernel"
@@ -225,6 +414,7 @@ UNIT
 }
 
 capture_boot_diagnostics() {
+  capture_boot_configuration current
   {
     printf '%s\n' '=== observed kernel ==='; uname -a
     printf '%s\n' '=== kernel command line ==='; cat /proc/cmdline

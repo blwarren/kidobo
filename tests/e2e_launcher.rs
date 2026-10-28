@@ -145,6 +145,34 @@ fn finished_launches_release_session_and_preserve_output_and_status() {
 }
 
 #[test]
+fn handled_child_signals_release_session_and_keep_final_output() {
+    for (signal, exit) in [("INT", 130), ("TERM", 143), ("HUP", 129)] {
+        let fixture = Fixture::new("absent", 0);
+        executable(
+            &fixture.root.path().join("bin/just"),
+            &format!(
+                "#!/bin/bash\ntrap 'echo handled-{signal}; exit {exit}' {signal}\nkill -{signal} \"$$\"\nexit 99\n"
+            ),
+        );
+        let output = fixture.launch();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            read_fixture(fixture.root.path().join("state")).unwrap(),
+            "absent\n"
+        );
+        let log = fixture.directory("launcher-");
+        assert_eq!(
+            read_fixture(log.join("exit-status")).unwrap(),
+            format!("{exit}\n")
+        );
+        let text = read_fixture(log.join("output.log")).unwrap();
+        assert!(text.contains(&format!("handled-{signal}")));
+        assert!(text.contains(&format!("finished with exit status {exit}")));
+        assert!(fixture.launch().status.success(), "rerun after {signal}");
+    }
+}
+
+#[test]
 fn dead_legacy_session_is_archived_and_replaced() {
     let fixture = Fixture::new("dead", 0);
     let output = fixture.launch();
