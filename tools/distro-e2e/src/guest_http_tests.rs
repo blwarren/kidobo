@@ -127,14 +127,11 @@ fn fixture_http_probe_bounds_a_server_that_accepts_without_responding() {
             }
         }
     });
-    let script = include_str!("../../../scripts/e2e/lifecycle.sh");
-    let start = script.find("fixture_curl() {").expect("HTTP probe helper");
-    let end = script.find("\nserve_dir() {").expect("end of HTTP probe");
+    let script = include_str!("../../../scripts/e2e/lib/fixtures.sh");
     let output = Command::new("timeout")
         .args(["3", "bash", "-c"])
         .arg(format!(
-            "{}\nfixture_curl -fsS 'http://127.0.0.1:{port}/'",
-            &script[start..end]
+            "{script}\nfixture_curl -fsS 'http://127.0.0.1:{port}/'"
         ))
         .env("http_proxy", "http://127.0.0.1:1")
         .env("HTTP_PROXY", "http://127.0.0.1:1")

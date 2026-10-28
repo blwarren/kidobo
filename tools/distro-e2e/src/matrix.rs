@@ -9,6 +9,8 @@ use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
+mod outcome;
+
 struct Trial<'a> {
     target: &'a Distro,
     vm: String,
@@ -224,56 +226,20 @@ fn execute_inner(
         .as_array()
         .ok_or("missing results")?
         .clone();
-    let mut warnings = results
-        .iter()
-        .filter(|r| r["required"] == false && result_failed(r))
-        .map(|r| {
-            format!(
-                "advisory target {} failed; see retained evidence",
-                r["distro"]
-            )
-        })
-        .collect::<Vec<_>>();
-    for result in &results {
-        warnings.extend(
-            result["diagnostic_warnings"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(Value::as_str)
-                .map(str::to_owned),
-        );
-    }
-    let all_passed = results.len() == targets.len() && results.iter().all(|r| !result_failed(r));
-    let required_passed = targets.iter().filter(|t| t.required).all(|t| {
-        results
-            .iter()
-            .any(|r| r["distro"] == t.id && !result_failed(r))
-    });
-    let cleanup_passed = results.iter().all(|r| r["cleanup_error"].is_null());
-    runner.report.document["warnings"] = json!(warnings);
-    runner.report.document["all_selected_targets_passed"] = json!(all_passed);
-    runner.report.document["release_gate_passed"] = json!(
-        configured_release_passed(config, &results)
-            && cleanup_passed
-            && !runner.cancelled.load(Ordering::Relaxed)
+    let summary = outcome::summarize(
+        config,
+        targets,
+        &results,
+        runner.cancelled.load(Ordering::Relaxed),
     );
-    runner.report.document["platforms"] = json!(
-        results
-            .iter()
-            .map(|r| json!({"target":r["distro"],
-        "iptables_backend":r["preparation"]["preparation"]["iptables_backend"],
-        "ip6tables_backend":r["preparation"]["preparation"]["ip6tables_backend"],
-        "selinux":r["preparation"]["preparation"]["selinux"]}))
-            .collect::<Vec<_>>()
-    );
+    runner.report.document["warnings"] = json!(summary.warnings);
+    runner.report.document["all_selected_targets_passed"] =
+        json!(summary.all_selected_targets_passed);
+    runner.report.document["release_gate_passed"] = json!(summary.release_gate_passed);
+    runner.report.document["platforms"] = json!(summary.platforms);
     runner.report.document["active_targets"] = json!([]);
     runner.report.save()?;
-    if runner.cancelled.load(Ordering::Relaxed)
-        || results.len() != targets.len()
-        || !required_passed
-        || !cleanup_passed
-    {
+    if runner.cancelled.load(Ordering::Relaxed) || !summary.matrix_succeeded {
         return Err(format!("matrix failed; results: {}", runner.dir.display()).into());
     }
     Ok(())
@@ -285,19 +251,6 @@ fn save_owned(runner: &Runner, owned: &Owned) -> Result<()> {
     fs::rename(temporary, runner.dir.join("ownership.json"))?;
     Ok(())
 }
-fn result_failed(result: &Value) -> bool {
-    !result["error"].is_null()
-        || !result["cleanup_error"].is_null()
-        || result["diagnostic_errors"] != json!([])
-}
-fn configured_release_passed(config: &Config, results: &[Value]) -> bool {
-    config.distros.iter().filter(|t| t.required).all(|t| {
-        results
-            .iter()
-            .any(|r| r["distro"] == t.id && !result_failed(r))
-    })
-}
-
 #[expect(
     clippy::too_many_lines,
     reason = "Per-target diagnostics and cleanup remain one finalization boundary"
@@ -481,7 +434,7 @@ printf '%s\n' '=== kidobo service journal ==='; journalctl -u kidobo-sync.servic
         "passed"
     })?;
     runner.report.document["results"] = json!([result]);
-    runner.report.document["status"] = json!(if result_failed(&result) {
+    runner.report.document["status"] = json!(if outcome::result_failed(&result) {
         "failed"
     } else {
         "passed"

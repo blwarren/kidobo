@@ -386,6 +386,33 @@ that individual unused image with `incus --project kidobo-e2e image delete FINGE
 Do not delete all images, the project, or the storage pool. No new cleanup command or automatic
 image-management policy is introduced.
 
+## Harness organization
+
+The private `kidobo-e2e` crate keeps process mechanics separate from qualification policy:
+
+- `process` owns file-backed command capture, bounded output draining, deadlines, cancellation,
+  and child cleanup. Its fallible event callback carries output, heartbeats, and byte counts to
+  the runner; the runner owns command records and guest-check validation.
+- `matrix` owns worker scheduling and target finalization, including diagnostics and cleanup.
+  `matrix::outcome` computes coverage, warnings, platform summaries, and release-gate decisions
+  without performing I/O.
+- `evidence` owns the guest-input inventory, frozen snapshots, harness identity, and verified
+  archive publication. The harness digest includes sorted Rust source paths and contents,
+  including test sources, plus the lockfile and toolchain file.
+
+`scripts/e2e/lifecycle.sh` retains guest guards, state, tracing, traps, and phase dispatch.
+Function-only helpers under `scripts/e2e/lib/` separate reporting, fixture processes,
+network probes, runtime assertions, and upgrade checks. Sourcing a helper performs no guest
+operations; local tests load these same definitions with explicit fixture state and fake commands.
+FD 9 carries tracing and check markers separately from captured stdout and diagnostics;
+background fixtures close it so they cannot keep the execution connection open.
+
+Every helper must appear in the evidence module's guest-input inventory. Snapshotting copies
+and hashes these files beneath `inputs/lib/`; lifecycle uploads use those frozen copies at
+`/opt/kidobo-e2e/lib/`, never the live checkout. Preparation scripts remain independent of these
+helpers. Inventory and fake-Incus tests verify that the complete bundle reaches each guest
+before lifecycle execution.
+
 ## Validate a harness change
 
 Read the scope contract first. Use local fake-Incus and isolated script fixtures through

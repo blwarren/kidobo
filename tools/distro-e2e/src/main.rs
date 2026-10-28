@@ -5,10 +5,8 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
 use std::fs::{self, File};
-use std::io::{Read, Seek, SeekFrom};
-use std::os::unix::process::CommandExt;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -19,8 +17,13 @@ const OWNER: &str = "kidobo-e2e-v1";
 mod contract;
 mod coordination;
 mod diagnostics;
+mod evidence;
+#[cfg(test)]
+use evidence::archive_evidence_using;
+use evidence::{archive_evidence, freeze_archive, snapshot_inputs};
 mod matrix;
 mod prepared;
+mod process;
 mod report;
 mod vendor_images;
 use report::Report;
@@ -122,119 +125,6 @@ struct Runner {
     command_poll_interval: Duration,
     ignore_cancellation: bool,
 }
-/// Each command owns only one pair of temporary files, removed even on failure.
-struct Capture {
-    dir: PathBuf,
-    stdout: File,
-    stderr: File,
-}
-struct ManagedChild {
-    child: Child,
-    completed: bool,
-}
-impl std::ops::Deref for ManagedChild {
-    type Target = Child;
-    fn deref(&self) -> &Child {
-        &self.child
-    }
-}
-impl std::ops::DerefMut for ManagedChild {
-    fn deref_mut(&mut self) -> &mut Child {
-        &mut self.child
-    }
-}
-impl Drop for ManagedChild {
-    fn drop(&mut self) {
-        if !self.completed {
-            if let Ok(pid) = i32::try_from(self.child.id()) {
-                let _ = nix::sys::signal::killpg(
-                    nix::unistd::Pid::from_raw(pid),
-                    nix::sys::signal::Signal::SIGKILL,
-                );
-            }
-            let _ = self.child.wait();
-        }
-    }
-}
-impl Capture {
-    fn new(root: &Path) -> Result<Self> {
-        static NEXT_CAPTURE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let dir = root.join(format!(
-            ".capture-{}-{}",
-            std::process::id(),
-            NEXT_CAPTURE.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir(&dir)?;
-        let result = (|| -> Result<Self> {
-            Ok(Self {
-                stdout: File::create(dir.join("stdout"))?,
-                stderr: File::create(dir.join("stderr"))?,
-                dir: dir.clone(),
-            })
-        })();
-        if result.is_err() {
-            let _ = fs::remove_dir_all(&dir);
-        }
-        result
-    }
-}
-impl Drop for Capture {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.dir);
-    }
-}
-#[derive(Default)]
-struct Heartbeat {
-    last_notice: Duration,
-}
-impl Heartbeat {
-    fn due(&mut self, elapsed: Duration) -> bool {
-        if elapsed.saturating_sub(self.last_notice) >= Duration::from_secs(15) {
-            self.last_notice = elapsed;
-            true
-        } else {
-            false
-        }
-    }
-}
-fn archive_evidence(runner: &mut Runner) -> Result<()> {
-    archive_evidence_using(runner, "tar")
-}
-fn archive_evidence_using(runner: &mut Runner, program: &str) -> Result<()> {
-    runner.stage("finalizing evidence archive")?;
-    fs::create_dir_all(runner.evidence())?;
-    fs::write(
-        runner.evidence().join("README.txt"),
-        "Frozen inputs and SHA256 manifest: inputs/\nGuest diagnostics and snapshots: <distro>/\nCommand output and check references: ../targets/<distro>/transcript.log and results.json\n",
-    )?;
-    let temporary = runner.dir.join(".evidence.tar.gz.tmp");
-    let archive = runner.dir.join("evidence.tar.gz");
-    let temporary_text = temporary
-        .to_str()
-        .ok_or("non-UTF-8 evidence archive path")?;
-    let evidence = runner.evidence();
-    runner.command(
-        program,
-        &strings(&[
-            "-czf",
-            temporary_text,
-            "-C",
-            evidence.to_str().ok_or("non-UTF-8 evidence directory")?,
-            ".",
-        ]),
-        300,
-    )?;
-    runner.command(program, &strings(&["-tzf", temporary_text]), 300)?;
-    let sha256 = hash(&temporary)?;
-    fs::rename(&temporary, &archive)?;
-    runner.report.document["evidence"] = json!({"path": "evidence.tar.gz", "sha256": sha256});
-    runner.report.emit(&format!(
-        "Evidence archive: {} SHA-256={sha256}",
-        archive.display()
-    ))?;
-    fs::remove_dir_all(evidence)?;
-    Ok(())
-}
 fn safe_name(value: &str) -> bool {
     !value.is_empty()
         && value.len() < 64
@@ -283,12 +173,16 @@ impl Runner {
             }));
         self.report.save()?;
         let result = if !self.ignore_cancellation && self.cancelled.load(Ordering::Relaxed) {
-            Ok((None, String::new(), Some("interrupted".into())))
+            Ok(process::Outcome {
+                code: None,
+                output: String::new(),
+                error: Some("interrupted".into()),
+            })
         } else {
             self.capture_command(id, program, args, seconds)
         };
         let (code, output, mut error) = match result {
-            Ok((code, output, reason)) => (code, output, reason),
+            Ok(outcome) => (outcome.code, outcome.output, outcome.error),
             Err(error) => (None, String::new(), Some(error.to_string())),
         };
         let record = self.report.command_mut(id)?;
@@ -366,118 +260,34 @@ impl Runner {
         program: &str,
         args: &[String],
         seconds: u64,
-    ) -> Result<(Option<i32>, String, Option<String>)> {
-        const OUTPUT_LIMIT: u64 = 16 * 1024 * 1024;
-        let capture = Capture::new(&self.dir)?;
-        let mut out = File::open(capture.dir.join("stdout"))?;
-        let mut err = File::open(capture.dir.join("stderr"))?;
-        let child = Command::new(program)
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(capture.stdout.try_clone()?)
-            .stderr(capture.stderr.try_clone()?)
-            .process_group(0)
-            .spawn()
-            .map_err(|e| format!("spawn failed: {e}"))?;
-        let mut child = ManagedChild {
-            child,
-            completed: false,
+    ) -> Result<process::Outcome> {
+        let request = process::Request {
+            directory: &self.dir,
+            program,
+            args,
+            seconds,
+            cancelled: &self.cancelled,
+            ignore_cancellation: self.ignore_cancellation,
+            poll_interval: self.command_poll_interval,
         };
-        let started = Instant::now();
-        let mut heartbeat = Heartbeat::default();
-        // Regular-file readers cannot block on inherited pipes. Bound each drain so
-        // continuous output never prevents cancellation or timeout checks.
-        let result = (|| -> Result<(Option<i32>, Option<String>)> {
-            loop {
-                let activity =
-                    self.drain(id, "stdout", &mut out)? | self.drain(id, "stderr", &mut err)?;
-                let elapsed = started.elapsed();
-                if heartbeat.due(elapsed) {
+        process::capture(&request, |event| {
+            match event {
+                process::Event::Output { stream, bytes } => {
+                    self.report.output(id, stream, bytes)?;
+                }
+                process::Event::Heartbeat(elapsed) => {
                     self.report.progress(&format!(
                         "[{} | command {id}] still running; elapsed={:.0}s",
                         self.report.context,
                         elapsed.as_secs_f64()
                     ))?;
                 }
-                if let Some(status) = child.try_wait()? {
-                    child.completed = true;
-                    // The direct child is done; drain the bytes already captured without
-                    // waiting for EOF from background descendants.
-                    let out_len = out.metadata()?.len();
-                    let err_len = err.metadata()?.len();
-                    while out.stream_position()? < out_len {
-                        self.drain(id, "stdout", &mut out)?;
-                    }
-                    while err.stream_position()? < err_len {
-                        self.drain(id, "stderr", &mut err)?;
-                    }
-                    return Ok((
-                        status.code(),
-                        (!status.success()).then(|| format!("{program} exited {status}")),
-                    ));
-                }
-                if !self.ignore_cancellation && self.cancelled.load(Ordering::Relaxed) {
-                    return Ok((None, Some("interrupted".into())));
-                }
-                if elapsed > Duration::from_secs(seconds) {
-                    return Ok((None, Some("timed out".into())));
-                }
-                if !activity {
-                    std::thread::sleep(self.command_poll_interval);
+                process::Event::ByteCount { stream, bytes } => {
+                    self.report.command_mut(id)?[format!("{stream}_bytes")] = json!(bytes);
                 }
             }
-        })();
-        if !child.completed {
-            if let Ok(pid) = i32::try_from(child.id()) {
-                let _ = nix::sys::signal::killpg(
-                    nix::unistd::Pid::from_raw(pid),
-                    nix::sys::signal::Signal::SIGKILL,
-                );
-            }
-            let _ = child.wait();
-            child.completed = true;
-            // Best effort on failure; preserve the original reporting/command error.
-            for (stream, source) in [("stdout", &mut out), ("stderr", &mut err)] {
-                let end = source.metadata()?.len();
-                while source.stream_position()? < end {
-                    if self.drain(id, stream, source).is_err() {
-                        break;
-                    }
-                }
-            }
-        }
-        self.report.command_mut(id)?["stdout_bytes"] = json!(out.metadata()?.len());
-        self.report.command_mut(id)?["stderr_bytes"] = json!(err.metadata()?.len());
-        let (code, reason) = result?;
-        if let Some(reason) = reason {
-            return Ok((code, String::new(), Some(reason)));
-        }
-        if out.metadata()?.len() > OUTPUT_LIMIT {
-            return Ok((
-                code,
-                String::new(),
-                Some(format!(
-                    "{program} stdout exceeds the {OUTPUT_LIMIT}-byte capture limit"
-                )),
-            ));
-        }
-        out.seek(SeekFrom::Start(0))?;
-        let mut output = String::new();
-        out.take(OUTPUT_LIMIT).read_to_string(&mut output)?;
-        Ok((code, output, None))
-    }
-    fn drain(&mut self, id: usize, stream: &str, source: &mut File) -> Result<bool> {
-        let mut buffer = [0; 8192];
-        let mut activity = false;
-        for _ in 0..32 {
-            let count = source.read(&mut buffer)?;
-            if count == 0 {
-                break;
-            }
-            activity = true;
-            self.report.output(id, stream, &buffer[..count])?;
-        }
-        Ok(activity)
+            Ok(())
+        })
     }
     fn incus(&mut self, args: &[String], seconds: u64) -> Result<String> {
         // Raw API queries carry project scope in their URL and reject --project.
@@ -882,10 +692,15 @@ fn prerequisites(
 ) -> Result<()> {
     runner.guest(
         vm,
-        &strings(&["mkdir", "-p", "/opt/kidobo-e2e/release"]),
+        &strings(&[
+            "mkdir",
+            "-p",
+            "/opt/kidobo-e2e/release",
+            "/opt/kidobo-e2e/lib",
+        ]),
         30,
     )?;
-    for script in ["provision.sh", "lifecycle.sh", "traffic.py", "checks.json"] {
+    for script in evidence::lifecycle_inputs() {
         runner.push(
             vm,
             &runner.evidence().join("inputs").join(script),
@@ -1410,75 +1225,6 @@ fn read_text(path: &Path) -> Result<String> {
         return Err("file exceeds 1 MiB".into());
     }
     Ok(text)
-}
-fn freeze_archive(source: &Path, dir: &Path) -> Result<PathBuf> {
-    let release = dir.join("inputs/release");
-    fs::create_dir(&release)?;
-    let destination = release.join(source.file_name().ok_or("archive has no filename")?);
-    fs::copy(source, &destination)?;
-    fs::copy(
-        source.with_file_name("SHA256SUMS"),
-        release.join("SHA256SUMS"),
-    )?;
-    Ok(destination)
-}
-fn snapshot_inputs(dir: &Path, config: &Path) -> Result<()> {
-    let inputs = dir.join("inputs");
-    fs::create_dir(&inputs)?;
-    let mut hashes = serde_json::Map::new();
-    let mut harness = Sha256::new();
-    for module in [
-        "main.rs",
-        "matrix.rs",
-        "report.rs",
-        "diagnostics.rs",
-        "prepared.rs",
-        "coordination.rs",
-        "contract.rs",
-        "vendor_images.rs",
-        "vendor_images/discovery.rs",
-    ] {
-        harness.update(hash(&Path::new("tools/distro-e2e/src").join(module))?.as_bytes());
-    }
-    for input in ["Cargo.lock", "rust-toolchain.toml"] {
-        harness.update(hash(Path::new(input))?.as_bytes());
-    }
-    let mut identity = String::with_capacity(64);
-    for byte in harness.finalize() {
-        write!(&mut identity, "{byte:02x}")?;
-    }
-    hashes.insert("harness".into(), json!(identity));
-    for (source, name) in [
-        (Path::new("scripts/install.sh"), "installer.sh"),
-        (Path::new("scripts/e2e/provision.sh"), "provision.sh"),
-        (Path::new("scripts/e2e/bootstrap.sh"), "bootstrap.sh"),
-        (Path::new("scripts/e2e/lifecycle.sh"), "lifecycle.sh"),
-        (Path::new("scripts/e2e/traffic.py"), "traffic.py"),
-        (Path::new("scripts/e2e/checks.json"), "checks.json"),
-        (config, "e2e.toml"),
-    ] {
-        let destination = inputs.join(name);
-        fs::copy(source, &destination)?;
-        hashes.insert(name.into(), hash(&destination)?.into());
-    }
-    vendor_images::snapshot(&inputs, config)?;
-    hashes.insert(
-        "e2e-images.toml".into(),
-        hash(&inputs.join("e2e-images.toml"))?.into(),
-    );
-    for key in fs::read_dir(inputs.join("image-keys"))? {
-        let path = key?.path();
-        let name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or("invalid image key filename")?;
-        hashes.insert(format!("image-keys/{name}"), hash(&path)?.into());
-    }
-    fs::write(
-        inputs.join("SHA256.json"),
-        serde_json::to_vec_pretty(&hashes)?,
-    )?;
-    Ok(())
 }
 fn version_numbers(tag: &str) -> Option<(u64, u64, u64)> {
     let mut parts = tag.strip_prefix('v')?.split('-').next()?.split('.');

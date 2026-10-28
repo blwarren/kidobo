@@ -2,24 +2,11 @@ use super::{read_text, tests::TestDir};
 use std::fs;
 use std::process::Command;
 
-fn lifecycle_function(start: &str, end: &str) -> String {
-    let script = include_str!("../../../scripts/e2e/lifecycle.sh");
-    let offset = script
-        .find(&format!("\n{start}"))
-        .expect("lifecycle function")
-        + 1;
-    let length = script[offset..].find(end).expect("next function");
-    script[offset..offset + length]
-        .replace("/usr/local/bin/kidobo", "${TARGET}")
-        .replace("/var/lib/kidobo/temporary-bans.toml", "${TEMPORARY}")
-}
-
 #[test]
 fn failed_uninstall_observes_enforcement_before_any_repair() {
-    let function = lifecycle_function(
-        "test_uninstall_failure_preserves_runtime() {",
-        "\nfinish_phase() {",
-    );
+    let function = include_str!("../../../scripts/e2e/lib/runtime.sh")
+        .replace("/usr/local/bin/kidobo", "${TARGET}")
+        .replace("/var/lib/kidobo/temporary-bans.toml", "${TEMPORARY}");
     for damages_enforcement in [false, true] {
         let temp = TestDir::new();
         let root = temp.path();
@@ -40,6 +27,7 @@ set -euo pipefail
 exec 9>&2
 STATE=$ROOT CONFIG=$ROOT/config BLOCKLIST=$ROOT/blocklist TARGET=$ROOT/kidobo
 installer=$ROOT/installer V4_HOST=198.18.77.1 V6_HOST=fd42::1 SET4=set4 SET6=set6
+{function}
 e2e_check_start() {{ :; }}
 e2e_check_pass() {{ :; }}
 fail() {{ printf '%s\n' "$*" >&2; exit 1; }}
@@ -54,7 +42,6 @@ probe_pair() {{
   printf 'probe IPv4\nprobe IPv6\n' >> "$EVENTS"
 }}
 sync_and_assert() {{ printf 'repair\n' >> "$EVENTS"; printf retained > "$FIREWALL"; }}
-{function}
 test_uninstall_failure_preserves_runtime
 "#
                 ),
@@ -82,10 +69,8 @@ test_uninstall_failure_preserves_runtime
 
 #[test]
 fn candidate_reinstall_checks_nonempty_temporary_state_lookup_and_enforcement() {
-    let function = lifecycle_function(
-        "test_candidate_temporary_reinstall() {",
-        "\nupgrade_phase() {",
-    );
+    let function = include_str!("../../../scripts/e2e/lib/upgrade.sh")
+        .replace("/var/lib/kidobo/temporary-bans.toml", "${TEMPORARY}");
     for scenario in ["preserved", "lost-file", "lost-lookup", "lost-enforcement"] {
         let temp = TestDir::new();
         let root = temp.path();
@@ -94,6 +79,7 @@ fn candidate_reinstall_checks_nonempty_temporary_state_lookup_and_enforcement() 
 set -euo pipefail
 exec 9>&2
 STATE=$ROOT TEMPORARY=$ROOT/temporary SET4=set4
+{function}
 e2e_check_start() {{ :; }}
 e2e_check_pass() {{ :; }}
 fail() {{ printf '%s\n' "$*" >&2; exit 1; }}
@@ -109,7 +95,6 @@ kidobo() {{
 install_target() {{ if [[ "$SCENARIO" == lost-file ]]; then printf 'version = 1\n' > "$TEMPORARY"; fi; }}
 sync_and_assert() {{ if [[ "$SCENARIO" != lost-enforcement ]]; then printf enforced > "$ROOT/membership"; fi; }}
 ipset() {{ [[ "$1" == test && "$2" == set4 && "$3" == 203.0.113.79 && -f "$ROOT/membership" ]]; }}
-{function}
 test_candidate_temporary_reinstall
 "#)])
             .env("ROOT", root)
@@ -145,7 +130,9 @@ test_candidate_temporary_reinstall
     reason = "One inert lifecycle fixture verifies snapshot ordering and each preserved artifact"
 )]
 fn upgrade_preservation_compares_post_sync_state_and_rejects_installer_changes() {
-    let function = lifecycle_function("upgrade_phase() {", "\nassert_enforcement_absent() {")
+    let function = include_str!("../../../scripts/e2e/lib/upgrade.sh")
+        .replace("/usr/local/bin/kidobo", "${TARGET}")
+        .replace("/var/lib/kidobo/temporary-bans.toml", "${TEMPORARY}")
         .replace("/var/cache/kidobo/remote", "\"$ROOT/cache/remote\"");
     for scenario in [
         "preserved",
@@ -178,6 +165,7 @@ STATE=$ROOT CONFIG=$ROOT/config BLOCKLIST=$ROOT/blocklist TARGET=$ROOT/kidobo TE
 BASELINE=$ROOT/baseline RELEASE=$ROOT/release HTTP_PORT=12345 SOURCE_PORT=12346
 installer=$BASELINE/installer.sh mode=candidate tag=v0.14.3
 V4_PEER=198.18.77.2 V6_PEER=fd42::2 SET4=set4 SET6=set6
+{function}
 tar -czf "$BASELINE/kidobo-v0.14.2-linux-x86_64.tar.gz" -C "$BASELINE" kidobo-v0.14.2-linux-x86_64
 (cd "$BASELINE"; sha256sum kidobo-v0.14.2-linux-x86_64.tar.gz > SHA256SUMS)
 e2e_check_start() {{ :; }}
@@ -230,8 +218,7 @@ install_target() {{
     temporary) echo changed >> "$TEMPORARY" ;;
   esac
 }}
-{function}
-upgrade_phase
+run_upgrade_phase
 "#)])
             .env("ROOT", root)
             .env("SCENARIO", scenario)

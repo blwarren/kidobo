@@ -1,5 +1,6 @@
 use super::*;
 use std::os::unix::fs::PermissionsExt;
+use std::process::Command;
 use std::sync::{Mutex, MutexGuard};
 
 // Keep executable fixture writes isolated from concurrent process creation:
@@ -64,91 +65,51 @@ fn command_output(dir: &Path, id: usize, stream: &str) -> Result<String> {
         })
         .collect())
 }
-fn lifecycle_reporting_helpers() -> &'static str {
-    let lifecycle = include_str!("../../../scripts/e2e/lifecycle.sh");
-    let end = lifecycle
-        .find("readonly ROOT=")
-        .expect("end of reporting preamble");
-    &lifecycle[..end]
+fn lifecycle_reporting_helpers() -> String {
+    format!(
+        "set -euo pipefail\nexec 9>&2\nBASH_XTRACEFD=9\nPS4='+ TRACE ${{BASH_SOURCE:-main}}:${{LINENO}}:${{FUNCNAME[0]:-main}}: '\nset -x\ne2e_checks=()\ne2e_failure_reason='command failed or guest interrupted before assertion completion'\n{}\ntrap 'e2e_report_exit \"$?\"' EXIT\n",
+        include_str!("../../../scripts/e2e/lib/reporting.sh")
+    )
 }
 
 fn lifecycle_traffic_server_function() -> String {
-    let lifecycle = include_str!("../../../scripts/e2e/lifecycle.sh");
-    let start = lifecycle
-        .find("start_traffic_servers() {")
-        .expect("find traffic server function in guest lifecycle script");
-    let end = lifecycle[start..]
-        .find("\nprobe() {")
-        .map(|offset| start + offset)
-        .expect("find probe function after traffic server function");
     format!(
         "{}\n{}",
         lifecycle_reporting_helpers(),
-        &lifecycle[start..end]
+        include_str!("../../../scripts/e2e/lib/fixtures.sh")
     )
 }
 
 fn lifecycle_setup_namespace_function() -> String {
-    let lifecycle = include_str!("../../../scripts/e2e/lifecycle.sh");
-    let start = lifecycle
-        .find("setup_namespace() {")
-        .expect("find namespace setup function in guest lifecycle script");
-    let end = lifecycle[start..]
-        .find("\nstart_traffic_servers() {")
-        .map(|offset| start + offset)
-        .expect("find traffic server function after namespace setup");
     format!(
         "{}\n{}",
         lifecycle_reporting_helpers(),
-        &lifecycle[start..end]
+        include_str!("../../../scripts/e2e/lib/network.sh")
     )
 }
 
 fn lifecycle_baseline_recovery_functions() -> String {
-    let lifecycle = include_str!("../../../scripts/e2e/lifecycle.sh");
-    let start = lifecycle
-        .find("debian12_baseline_recovery_allowed() {")
-        .expect("find baseline recovery helpers in guest lifecycle script");
-    let end = lifecycle[start..]
-        .find("\ntest_uninstall_failure_preserves_runtime() {")
-        .map(|offset| start + offset)
-        .expect("find end of baseline recovery helpers");
     format!(
         "{}\n{}",
         lifecycle_reporting_helpers(),
-        &lifecycle[start..end]
+        include_str!("../../../scripts/e2e/lib/upgrade.sh")
     )
 }
 
 fn lifecycle_upgrade_test_helpers() -> String {
-    let lifecycle = include_str!("../../../scripts/e2e/lifecycle.sh");
-    let start = lifecycle
-        .find("ensure_unrelated_sentinels() {")
-        .expect("find firewall helpers in guest lifecycle script");
-    let end = lifecycle[start..]
-        .find("\ntest_uninstall_failure_preserves_runtime() {")
-        .map(|offset| start + offset)
-        .expect("find end of upgrade test helpers");
     format!(
-        "{}\n{}",
+        "{}\n{}\n{}",
         lifecycle_reporting_helpers(),
-        &lifecycle[start..end]
+        include_str!("../../../scripts/e2e/lib/runtime.sh"),
+        include_str!("../../../scripts/e2e/lib/upgrade.sh")
     )
 }
 
 fn lifecycle_probe_function() -> String {
-    let lifecycle = include_str!("../../../scripts/e2e/lifecycle.sh");
-    let start = lifecycle
-        .find("managed_drop_packets() {")
-        .expect("find traffic probe helper in guest lifecycle script");
-    let end = lifecycle[start..]
-        .find("\nstart_irr_fixture() {")
-        .map(|offset| start + offset)
-        .expect("find end of traffic probe helper");
     format!(
         "{}\n{}",
         lifecycle_reporting_helpers(),
-        &lifecycle[start..end]
+        include_str!("../../../scripts/e2e/lib/network.sh")
     )
 }
 
@@ -766,17 +727,7 @@ fn guest_traffic_server_startup_failure_is_reported_and_cleaned_up() {
 
 #[test]
 fn guest_background_fixtures_release_exec_streams_while_still_running() {
-    let lifecycle = include_str!("../../../scripts/e2e/lifecycle.sh");
-    let start = lifecycle.find("fixture_curl() {").expect("HTTP helpers");
-    let end = lifecycle
-        .find("defer_timer_until_configuration_is_ready() {")
-        .expect("end of HTTP helpers");
-    let traffic_start = lifecycle
-        .find("start_traffic_servers() {")
-        .expect("traffic startup helper");
-    let traffic_end = lifecycle
-        .find("\nprobe() {")
-        .expect("end of traffic startup");
+    let fixtures = include_str!("../../../scripts/e2e/lib/fixtures.sh");
     for invocation in [
         "serve_dir \"$ROOT/release\" 39472 release",
         "start_source_fixture",
@@ -819,13 +770,12 @@ port=${port%%/*}
                  SOURCE_PORT=39474 TRAFFIC_PORT=39471\n\
                  V4_HOST=198.18.77.1 V6_HOST=fd42:6b69:646f:626f::1\n\
                  fail() {{ printf '%s\\n' \"$*\" >&2; exit 1; }}\n\
-                 {}\n{}\n{invocation}\n",
+                 {}\n{invocation}\n",
                 lifecycle_reporting_helpers(),
                 temp.path().display(),
                 state.display(),
                 bin.display(),
-                &lifecycle[start..end],
-                &lifecycle[traffic_start..traffic_end],
+                fixtures,
             ),
         );
         let mut runner = runner(temp.path());
@@ -1682,7 +1632,7 @@ fn runner_streams_both_outputs_before_command_completes() {
 
 #[test]
 fn progress_heartbeat_repeats_even_when_full_output_is_hidden() {
-    let mut heartbeat = Heartbeat::default();
+    let mut heartbeat = crate::process::Heartbeat::default();
     for elapsed in 0..=60 {
         assert_eq!(
             heartbeat.due(Duration::from_secs(elapsed)),

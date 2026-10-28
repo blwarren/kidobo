@@ -2,16 +2,6 @@ use super::{read_text, tests::TestDir};
 use std::fs;
 use std::process::Command;
 
-fn lifecycle_function(start: &str, end: &str) -> String {
-    let script = include_str!("../../../scripts/e2e/lifecycle.sh");
-    let offset = script
-        .find(&format!("\n{start}"))
-        .expect("lifecycle helper")
-        + 1;
-    let length = script[offset..].find(end).expect("following helper");
-    script[offset..offset + length].to_owned()
-}
-
 #[test]
 fn frozen_baseline_transport_rejects_other_assets_and_arguments() {
     let temp = TestDir::new();
@@ -51,10 +41,7 @@ assert target.read_bytes() == b'captured manifest\n'
 
 #[test]
 fn baseline_fixture_edits_preserve_old_generated_configuration() {
-    let function = lifecycle_function(
-        "configure_baseline_sources() {",
-        "\nassert_remote_lookup() {",
-    );
+    let function = include_str!("../../../scripts/e2e/lib/upgrade.sh");
     let temp = TestDir::new();
     let config = temp.path().join("old-config.toml");
     fs::write(
@@ -83,7 +70,7 @@ fn baseline_fixture_edits_preserve_old_generated_configuration() {
 
 #[test]
 fn offline_upgrade_lookup_requires_exact_source_and_prefix() {
-    let function = lifecycle_function("assert_remote_lookup() {", "\ninstall_frozen_baseline() {");
+    let function = include_str!("../../../scripts/e2e/lib/upgrade.sh");
     for (record, succeeds) in [
         (
             "198.51.100.44\thttp://127.0.0.1:39474/feed.txt\t198.51.100.44/32\n",
@@ -165,15 +152,12 @@ else: raise AssertionError('unknown program was accepted')
 
 #[test]
 fn recovered_baseline_cache_routes_sudo_only_to_private_firewall_fakes() {
-    let function = lifecycle_function(
-        "create_recovered_baseline_cache() {",
-        "\ntest_candidate_temporary_reinstall() {",
-    )
-    .replace("/usr/local/bin/kidobo", "\"$ROOT/old-kidobo\"")
-    .replace(
-        "/var/cache/kidobo/remote",
-        "\"$ROOT/published-cache/remote\"",
-    );
+    let function = include_str!("../../../scripts/e2e/lib/upgrade.sh")
+        .replace("/usr/local/bin/kidobo", "\"$ROOT/old-kidobo\"")
+        .replace(
+            "/var/cache/kidobo/remote",
+            "\"$ROOT/published-cache/remote\"",
+        );
     for scenario in ["success", "failure"] {
         let temp = TestDir::new();
         let root = temp.path();
@@ -255,7 +239,7 @@ printf 'old binary cache bytes\n' > "$KIDOBO_ROOT/cache/remote/generated"
 
 #[test]
 fn application_reboot_requires_security_state_without_kernel_identity() {
-    let function = lifecycle_function("assert_reboot_preparation() {", "\nafter_reboot_phase() {")
+    let function = include_str!("../../../scripts/e2e/lib/runtime.sh")
         .replace("! -e /.autorelabel", "! -e \"$ROOT/autorelabel\"");
     for (mode, relabel, provenance, succeeds) in [
         ("Enforcing", false, true, true),
@@ -293,9 +277,8 @@ fn application_reboot_requires_security_state_without_kernel_identity() {
 
 #[test]
 fn changed_reboot_kernel_still_requires_timer_and_enforcement_success() {
-    let functions =
-        lifecycle_function("wait_for_timer_run() {", "\nconfigure_baseline_sources() {")
-            .replace("! -e /.autorelabel", "! -e \"$ROOT/autorelabel\"");
+    let functions = include_str!("../../../scripts/e2e/lib/runtime.sh")
+        .replace("! -e /.autorelabel", "! -e \"$ROOT/autorelabel\"");
     for (scenario, error) in [
         ("success", ""),
         ("timer-failed", "kidobo-sync.service failed after reboot"),
@@ -324,6 +307,7 @@ fn changed_reboot_kernel_still_requires_timer_and_enforcement_success() {
             r#"
 set -euo pipefail
 ROOT=$FIXTURE_ROOT STATE=$FIXTURE_ROOT
+{functions}
 SET4=fixture4 SET6=fixture6 SOURCE_PORT=39474 tag=v0.14.3 mode=published
 fail() {{ printf '%s\n' "$*" >&2; exit 1; }}
 uname() {{ printf 'different-kernel\n'; }}
@@ -360,8 +344,7 @@ probe_pair() {{
 }}
 ensure_unrelated_sentinels() {{ :; }}
 sync_and_assert() {{ :; }}
-{functions}
-after_reboot_phase
+run_after_reboot_phase
 "#
         );
         let output = Command::new("bash")
@@ -395,10 +378,7 @@ after_reboot_phase
 
 #[test]
 fn legacy_generated_defaults_gain_explicit_ipv6_fixture_settings_without_replacement() {
-    let function = lifecycle_function(
-        "configure_baseline_sources() {",
-        "\nassert_remote_lookup() {",
-    );
+    let function = include_str!("../../../scripts/e2e/lib/upgrade.sh");
     let temp = TestDir::new();
     let config = temp.path().join("config.toml");
     fs::write(

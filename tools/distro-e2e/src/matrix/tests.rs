@@ -164,7 +164,12 @@ elif operation == "config":
     pass
 elif operation == "file":
     if args[1] == "push":
-        assert Path(args[-2]).is_file(), args
+        source = Path(args[-2])
+        assert source.is_file(), args
+        vm, destination = args[-1].split("/", 1)
+        uploaded = state / vm / "files" / destination
+        uploaded.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, uploaded)
     elif args[1] == "pull":
         Path(args[-1]).mkdir(parents=True, exist_ok=True)
     else:
@@ -260,6 +265,11 @@ elif operation == "exec":
                         time.sleep(0.005)
             markers("preparation", phase)
         elif guest[1] == "/opt/kidobo-e2e/lifecycle.sh":
+            frozen = state.parent / vm.rsplit("-", 1)[0] / ".evidence/inputs"
+            for helper in ("reporting", "fixtures", "network", "runtime", "upgrade"):
+                relative = f"lib/{helper}.sh"
+                uploaded = state / vm / "files/opt/kidobo-e2e" / relative
+                assert uploaded.read_bytes() == (frozen / relative).read_bytes(), relative
             phase = guest[2]
             event(phase, vm)
             if phase == "start" and scenario == "report-write-failure" and vm.endswith("-primary"):
@@ -311,6 +321,18 @@ else:
         ] {
             fs::write(dir.join(".evidence/inputs").join(name), contents)
                 .expect("write frozen guest input");
+        }
+        for name in crate::evidence::lifecycle_inputs().filter(|name| name.starts_with("lib/")) {
+            let destination = dir.join(".evidence/inputs").join(name);
+            fs::create_dir_all(destination.parent().expect("helper parent"))
+                .expect("frozen helper directory");
+            fs::copy(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../scripts/e2e")
+                    .join(name),
+                destination,
+            )
+            .expect("freeze guest helper");
         }
         fs::write(
             dir.join(".evidence/inputs/SHA256.json"),
@@ -611,14 +633,23 @@ fn filtered_success_does_not_claim_the_configured_release_gate_passed() {
         json!({"distro":"primary","error":null,"cleanup_error":null,"diagnostic_errors":[]});
     let secondary =
         json!({"distro":"secondary","error":null,"cleanup_error":null,"diagnostic_errors":[]});
-    assert!(!configured_release_passed(
+    let selected = outcome::summarize(
         &fixture.config,
-        std::slice::from_ref(&primary)
-    ));
-    assert!(configured_release_passed(
+        &[&fixture.config.distros[0]],
+        std::slice::from_ref(&primary),
+        false,
+    );
+    assert!(selected.matrix_succeeded);
+    assert!(selected.all_selected_targets_passed);
+    assert!(!selected.release_gate_passed);
+
+    let full = outcome::summarize(
         &fixture.config,
-        &[primary, secondary]
-    ));
+        &[&fixture.config.distros[0], &fixture.config.distros[1]],
+        &[primary, secondary],
+        false,
+    );
+    assert!(full.release_gate_passed);
 }
 
 #[test]
