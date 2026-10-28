@@ -7,26 +7,30 @@ use std::path::Path;
 const LOG_LIMIT: u64 = 1024 * 1024;
 const VM_CONSOLE_UNSUPPORTED: &str = "Error: Instance is not container type\n";
 
-const PRE_REBOOT_SNAPSHOT: &str = r#"set -euo pipefail
+const PRE_REBOOT_SNAPSHOT: &str = r#"set -uo pipefail
+capture_failed=0
+attempt() {
+    "$@" || { status=$?; printf 'WARNING: snapshot command failed (%s): %s\n' "$status" "$*" >&2; capture_failed=1; }
+}
 printf '%s\n' '=== pre-reboot snapshot ===' '=== running kernel ==='
-uname -a
+attempt uname -a
 printf '%s\n' '=== boot ID ==='
-cat /proc/sys/kernel/random/boot_id
+attempt cat /proc/sys/kernel/random/boot_id
 printf '%s\n' '=== kernel command line ==='
-cat /proc/cmdline
+attempt cat /proc/cmdline
 printf '%s\n' '=== intended kernel ==='
-cat /opt/kidobo-e2e/prepared/expected-kernel
+attempt cat /opt/kidobo-e2e/prepared/expected-kernel
 printf '%s\n' '=== relabel scheduled ==='
-cat /opt/kidobo-e2e/prepared/relabel-scheduled
+attempt cat /opt/kidobo-e2e/prepared/relabel-scheduled
 optional() {
-    if command -v "$1" >/dev/null 2>&1; then "$@"
-    else printf 'unavailable tool: %s\n' "$1"; fi
+    if command -v "$1" >/dev/null 2>&1; then attempt "$@"
+    else printf 'WARNING: unavailable tool: %s\n' "$1"; fi
 }
 read_file() {
     if [[ -e "$1" || -L "$1" ]]; then
         printf '\n=== %s ===\n' "$1"
-        cat "$1"
-    else printf 'absent file: %s\n' "$1"; fi
+        attempt cat "$1"
+    else printf 'WARNING: absent file: %s\n' "$1"; fi
 }
 shopt -s nullglob
 for file in /etc/os-release /etc/kernel/cmdline /etc/default/grub /etc/default/grub.d/* \
@@ -39,13 +43,16 @@ for file in /etc/os-release /etc/kernel/cmdline /etc/default/grub /etc/default/g
 done
 for directory in /boot/grub /boot/grub2 /boot/efi/EFI; do
     if [[ -d "$directory" ]]; then
-        listing=$(find "$directory" -maxdepth 4 -type f \( -name grub.cfg -o -name grubenv \))
+        if ! listing=$(find "$directory" -maxdepth 4 -type f \( -name grub.cfg -o -name grubenv \)); then
+            printf 'WARNING: cannot list boot diagnostics: %s\n' "$directory" >&2
+            capture_failed=1
+        fi
         while IFS= read -r file; do
             [[ -n "$file" ]] || continue
             read_file "$file"
             if [[ "$file" == */grubenv ]]; then
-                if command -v grub2-editenv >/dev/null 2>&1; then grub2-editenv "$file" list
-                elif command -v grub-editenv >/dev/null 2>&1; then grub-editenv "$file" list; fi
+                if command -v grub2-editenv >/dev/null 2>&1; then attempt grub2-editenv "$file" list
+                elif command -v grub-editenv >/dev/null 2>&1; then attempt grub-editenv "$file" list; fi
             fi
         done <<< "$listing"
     fi
@@ -64,44 +71,55 @@ if command -v systemctl >/dev/null 2>&1; then
         else load_status=$?; fi
         printf '%s LoadState=%s\n' "$unit" "$load"
         [[ "$load" != not-found ]] || continue
-        (( load_status == 0 )) || exit "$load_status"
-        systemctl cat "$unit"
-        systemctl show "$unit" --property=ActiveState,SubState,FragmentPath,DropInPaths,ExecStart,ExecStartPre
+        if (( load_status != 0 )); then
+            printf 'WARNING: systemd diagnostic query failed (%s): %s\n' "$load_status" "$unit" >&2
+            capture_failed=1
+            continue
+        fi
+        attempt systemctl cat "$unit"
+        attempt systemctl show "$unit" --property=ActiveState,SubState,FragmentPath,DropInPaths,ExecStart,ExecStartPre
     done
-else printf '%s\n' 'unavailable tool: systemctl'; fi
+else printf '%s\n' 'WARNING: unavailable tool: systemctl'; fi
 printf '\n%s\n' '=== agent executable and configuration labels ==='
 for directory in /run/incus_agent /run/lxd_agent /var/lib/incus-agent /var/lib/lxd-agent; do
     if [[ -d "$directory" ]]; then
-        ls -ldZ "$directory"
-        find "$directory" -maxdepth 2 -type f -exec ls -lZ -- '{}' +
+        attempt ls -ldZ "$directory"
+        attempt find "$directory" -maxdepth 2 -type f -exec ls -lZ -- '{}' +
     fi
 done
 for file in /usr/bin/incus-agent /usr/sbin/incus-agent /usr/bin/lxd-agent; do
-    if [[ -e "$file" || -L "$file" ]]; then ls -lZ -- "$file"; fi
+    if [[ -e "$file" || -L "$file" ]]; then attempt ls -lZ -- "$file"; fi
 done
 printf '\n%s\n' '=== recent agent and relabel journal ==='
 optional journalctl -b --no-pager -n 250 -u incus-agent.service -u incus-agent-setup.service -u lxd-agent.service -u selinux-autorelabel.service
+exit "$capture_failed"
 "#;
 
-pub(super) fn pre_reboot(runner: &mut Runner, vm: &str, target: &Path) -> Result<()> {
+pub(super) fn pre_reboot(runner: &mut Runner, vm: &str, target: &Path) -> Result<Option<String>> {
     runner.verify(vm)?;
     let directory = target.join("pre-reboot");
-    fs::create_dir_all(&directory)?;
-    capture(
-        runner,
-        &strings(&[
-            "--project",
-            &runner.project,
-            "exec",
-            vm,
-            "--mode=non-interactive",
-            "--",
-            "bash",
-            "-c",
-            PRE_REBOOT_SNAPSHOT,
-        ]),
-        &directory.join("snapshot.log"),
-    )
+    let outcome = (|| -> Result<()> {
+        fs::create_dir_all(&directory)?;
+        capture(
+            runner,
+            &strings(&[
+                "--project",
+                &runner.project,
+                "exec",
+                vm,
+                "--mode=non-interactive",
+                "--",
+                "bash",
+                "-c",
+                PRE_REBOOT_SNAPSHOT,
+            ]),
+            &directory.join("snapshot.log"),
+        )
+    })();
+    runner.report.ensure_healthy()?;
+    Ok(outcome
+        .err()
+        .map(|error| format!("pre-reboot snapshot: {error}")))
 }
 
 #[derive(Default, serde::Serialize)]
@@ -121,7 +139,7 @@ pub(super) fn collect(runner: &mut Runner, vm: &str, target: &Path) -> Diagnosti
     let directory = target.join("host-diagnostics");
     if let Err(error) = fs::create_dir_all(&directory) {
         diagnostics
-            .errors
+            .warnings
             .push(format!("host diagnostics directory: {error}"));
         return diagnostics;
     }
@@ -131,7 +149,7 @@ pub(super) fn collect(runner: &mut Runner, vm: &str, target: &Path) -> Diagnosti
         match record_unsupported_console(&console_log) {
             Ok(true) => {
                 let warning = format!(
-                    "{vm}: Incus does not support saved serial-console logs for VMs; qemu.log remains required"
+                    "{vm}: Incus does not support saved serial-console logs for VMs; QEMU logs are collected separately"
                 );
                 if let Err(error) = runner.report.emit(&format!("WARNING: {warning}")) {
                     diagnostics
@@ -140,8 +158,10 @@ pub(super) fn collect(runner: &mut Runner, vm: &str, target: &Path) -> Diagnosti
                 }
                 diagnostics.warnings.push(warning);
             }
-            Ok(false) => diagnostics.errors.push(format!("serial console: {error}")),
-            Err(classification) => diagnostics.errors.push(format!(
+            Ok(false) => diagnostics
+                .warnings
+                .push(format!("serial console: {error}")),
+            Err(classification) => diagnostics.warnings.push(format!(
                 "serial console: {error}; classify capture: {classification}"
             )),
         }
@@ -160,7 +180,7 @@ pub(super) fn collect(runner: &mut Runner, vm: &str, target: &Path) -> Diagnosti
         Ok(value) => value.get("metadata").cloned().unwrap_or(value),
         Err(error) => {
             diagnostics
-                .errors
+                .warnings
                 .push(format!("runtime log listing: {error}"));
             // qemu.log is the standard VM log; still attempt it if listing failed.
             json!([format!("{prefix}/qemu.log")])
@@ -172,8 +192,8 @@ pub(super) fn collect(runner: &mut Runner, vm: &str, target: &Path) -> Diagnosti
             .any(|entry| entry == &format!("{prefix}/qemu.log"))
         {
             diagnostics
-                .errors
-                .push("required runtime qemu.log is not advertised by Incus".into());
+                .warnings
+                .push("runtime qemu.log is not advertised by Incus".into());
         }
         // Do not follow arbitrary server-provided URLs or retrieve exec output.
         for name in ["qemu.log", "qemu.early.log"] {
@@ -185,14 +205,21 @@ pub(super) fn collect(runner: &mut Runner, vm: &str, target: &Path) -> Diagnosti
                     &format!("{path}?project={}", runner.project),
                 ]);
                 if let Err(error) = capture(runner, &args, &directory.join(name)) {
-                    diagnostics.errors.push(format!("runtime {name}: {error}"));
+                    diagnostics
+                        .warnings
+                        .push(format!("runtime {name}: {error}"));
                 }
             }
         }
     } else {
         diagnostics
-            .errors
+            .warnings
             .push("runtime log listing is not an array".into());
+    }
+    if runner.report.failed() {
+        diagnostics
+            .errors
+            .push("could not retain authoritative diagnostic command report".into());
     }
     diagnostics
 }
@@ -261,8 +288,10 @@ printf '%s %s\n' "${statuses[0]}" "${statuses[1]}"
             .collect::<std::result::Result<Vec<_>, _>>()?;
         command_status = Some(statuses.clone());
         match statuses.as_slice() {
+            [0 | 141, 0] if truncated => {
+                Err(format!("diagnostic capture truncated at {LOG_LIMIT} bytes").into())
+            }
             [0, 0] => Ok(()),
-            [141, 0] if truncated => Ok(()),
             [child, sink] => Err(format!("log command exit={child}, capture exit={sink}").into()),
             _ => Err("invalid diagnostic capture status".into()),
         }
@@ -312,7 +341,7 @@ fi
     }
 
     #[test]
-    fn pre_reboot_guest_reads_tolerate_absent_optional_tools_but_propagate_errors() {
+    fn pre_reboot_guest_reads_continue_after_missing_files_and_failed_tools() {
         let temp = TestDir::new();
         let bin = temp.path().join("bin");
         fs::create_dir(&bin).expect("fake guest tools");
@@ -384,7 +413,7 @@ fi
             "#!/bin/bash\nprintf 'systemd query failed\\n' >&2\nexit 19\n",
         );
         let output = run();
-        assert_eq!(output.status.code(), Some(19));
+        assert_eq!(output.status.code(), Some(1));
         assert!(String::from_utf8_lossy(&output.stderr).contains("systemd query failed"));
         fs::remove_file(bin.join("systemctl")).expect("remove optional systemctl");
         executable(
@@ -392,9 +421,21 @@ fi
             "#!/bin/bash\necho 'SELinux read failed' >&2\nexit 17\n",
         );
         let output = run();
-        assert_eq!(output.status.code(), Some(17));
+        assert_eq!(output.status.code(), Some(1));
         assert!(String::from_utf8_lossy(&output.stderr).contains("SELinux read failed"));
         fs::remove_file(bin.join("getenforce")).expect("remove optional tool");
+        fs::create_dir_all(temp.path().join("etc")).expect("guest etc");
+        std::os::unix::fs::symlink("missing-grub", temp.path().join("etc/grub2.cfg"))
+            .expect("dangling diagnostic symlink");
+        let output = run();
+        assert_eq!(output.status.code(), Some(1));
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("WARNING: snapshot command failed")
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .contains("=== recent agent and relabel journal ===")
+        );
         fs::remove_file(temp.path().join("opt/kidobo-e2e/prepared/expected-kernel"))
             .expect("remove required identity");
         assert_eq!(run().status.code(), Some(1));
@@ -497,7 +538,12 @@ fi
         );
         let mut runner = runner_with_incus(temp.path(), &program);
         let target = temp.path().join("target with spaces");
-        pre_reboot(&mut runner, "vm-owned", &target).expect("bounded snapshot");
+        assert!(
+            pre_reboot(&mut runner, "vm-owned", &target)
+                .expect("capture result")
+                .expect("truncation warning")
+                .contains("truncated")
+        );
         let log = target.join("pre-reboot/snapshot.log");
         assert_eq!(fs::metadata(&log).expect("log metadata").len(), LOG_LIMIT);
         let mut bytes = [0; 4];
@@ -511,7 +557,12 @@ fi
         )
         .expect("JSON");
         assert_eq!(metadata["truncated"], true);
-        assert_eq!(metadata["error"], Value::Null);
+        assert!(
+            metadata["error"]
+                .as_str()
+                .expect("truncation warning")
+                .contains("truncated")
+        );
     }
 
     #[test]
@@ -575,7 +626,7 @@ esac
     }
 
     #[test]
-    fn supported_console_and_required_runtime_logs_are_captured() {
+    fn supported_console_and_runtime_logs_are_captured() {
         let temp = TestDir::new();
         let mut runner = compatible_runner(&temp, "serial evidence\n", 0, "available");
         let diagnostics = collect(&mut runner, "vm-owned", temp.path());
@@ -642,14 +693,14 @@ esac
             let temp = TestDir::new();
             let mut runner = compatible_runner(&temp, response, status, "available");
             let diagnostics = collect(&mut runner, "vm-owned", temp.path());
-            assert_eq!(diagnostics.errors.len(), 1);
-            assert!(diagnostics.errors[0].starts_with("serial console:"));
-            assert_eq!(diagnostics.warnings, Vec::<String>::new());
+            assert_eq!(diagnostics.errors, Vec::<String>::new());
+            assert_eq!(diagnostics.warnings.len(), 1);
+            assert!(diagnostics.warnings[0].starts_with("serial console:"));
         }
     }
 
     #[test]
-    fn unsupported_console_does_not_excuse_missing_or_failed_runtime_logs() {
+    fn missing_or_failed_runtime_logs_are_warnings_with_other_captures_preserved() {
         for (mode, expected) in [
             ("missing", "not advertised"),
             ("failure", "runtime qemu.log"),
@@ -657,9 +708,9 @@ esac
             let temp = TestDir::new();
             let mut runner = compatible_runner(&temp, VM_CONSOLE_UNSUPPORTED, 1, mode);
             let diagnostics = collect(&mut runner, "vm-owned", temp.path());
-            assert_eq!(diagnostics.warnings.len(), 1);
-            assert_eq!(diagnostics.errors.len(), 1);
-            assert!(diagnostics.errors[0].contains(expected));
+            assert_eq!(diagnostics.warnings.len(), 2);
+            assert_eq!(diagnostics.errors, Vec::<String>::new());
+            assert!(diagnostics.warnings[1].contains(expected));
         }
     }
 

@@ -42,15 +42,17 @@ adapter and CLI process tests. Installer, repository tooling, and local E2E-tool
 `just test` or `just check`. Hook checks use the working tree, so review partial staging before
 committing. Formatting checks never rewrite files.
 The publisher suppresses Git hooks only for its own final commit and push after explicit candidate
-validation or verified resume; ordinary pushes still run `just ci`.
+validation; ordinary pushes still run `just ci`.
 Coverage, strict rustdoc, the isolated release-binary exercise, static compatibility checks,
 and required coverage in the [Incus distro lifecycle matrix](e2e.md)
 are publication gates; they are not part of `just ci`. Fedora and AlmaLinux coverage is advisory
 and runs separately through `just e2e`, outside publication, with enforcing SELinux on those
 targets. Full seven-platform qualification requires every selected target to pass; reports expose
-that outcome separately from the four-target release gate. Prepared-image reuse and bounded
-two-VM concurrency reduce repeated work without omitting application checks. The matrix can be omitted
-with the explicit publisher option `--skip-e2e`.
+that outcome separately from the four-target release gate. Each target completes fresh provisioning
+and application checks with bounded two-VM concurrency. Read the
+[E2E scope contract](e2e.md#scope-and-non-goals) before changing its runner, fixtures, provisioning,
+reporting, or release integration. The matrix can be omitted with the explicit publisher option
+`--skip-e2e`.
 
 CI/CD remains local. Dependabot version updates are the sole GitHub-hosted automation exception;
 do not add GitHub Actions workflows without explicit approval. Dependency changes must also follow
@@ -152,18 +154,17 @@ then runs the publication-only gates listed above. The binary exercises use a te
 loopback feed, fake privileged commands, and Debian/Alpine containers. The publisher packages the
 tested static Linux x86_64 binary and, by default, selects the four required Debian and Ubuntu
 Incus VM targets against that archive. Separate `just e2e` runs also cover advisory Fedora and AlmaLinux.
-Guest prerequisite checks run before application lifecycles so required environment failures
-stop the batch early. The publisher then uses GitHub CLI to upload, verify, and publish the archive.
+Each target validates its environment and then runs its application lifecycle; one target's
+failure does not suppress the others. The publisher then uses GitHub CLI to upload, verify,
+and publish the archive only after required coverage succeeds.
 `just publish-release X.Y.Z --skip-e2e` skips only the matrix and its Incus/agent-ISO
 prerequisites, keeping all other gates. See the [command reference](../scripts/README.md)
-for skip reporting. A failed matrix retains the exact packaged candidate and its validation
-identity for `just publish-release X.Y.Z --resume-e2e RUN_ID`. Resume verifies the unchanged
-source and candidate before reusing completed local gates and compatible successful distro
-results within the preparation freshness limit; it does not rebuild or repackage the candidate.
-Add `--refresh-e2e-images` to force new prepared images and rerun required E2E coverage while
-retaining compatible local gates and the archive. This option cannot combine with `--skip-e2e`.
-See [candidate resume](e2e.md#resume-a-candidate)
-for eligibility and historical-run limits. The VM suite operates real guest
-firewalls and systemd only inside disposable VMs. Read [setup and diagnosis](e2e.md) for VM
+for skip reporting. Every attempt runs the gates, builds and packages a new candidate, and
+checks its source and artifact identity before publication. Prior local or E2E successes are
+not reused. A failure before refs are pushed removes newly created release artifacts, while
+E2E logs and frozen evidence remain in the original checkout. Existing artifacts are never
+overwritten; post-push failures retain the artifacts needed for publication recovery.
+The VM suite operates real guest firewalls and systemd only inside disposable VMs.
+Read [setup and diagnosis](e2e.md) for VM
 requirements and retained run evidence, and [commands and recovery](../scripts/README.md)
 for publication prerequisites and recovery steps.

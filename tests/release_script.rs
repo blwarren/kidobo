@@ -259,6 +259,8 @@ printf 'just %s\n' "$*" >> "${KIDOBO_TEST_EVENT_LOG}"
 if [[ "$1" == "${KIDOBO_TEST_FAIL_GATE:-}" ]]; then exit 44; fi
 if [[ "$1" == "e2e-artifact" ]]; then
   [[ "${KIDOBO_E2E_RESULTS_DIR}" == "${KIDOBO_TEST_REPO_ROOT}/target/e2e" ]] || exit 46
+  mkdir -p "${KIDOBO_E2E_RESULTS_DIR}"
+  cp "$2" "${KIDOBO_E2E_RESULTS_DIR}/frozen-candidate.tar.gz"
   if [[ "${KIDOBO_TEST_FAIL_E2E:-0}" == "1" ]]; then exit 45; fi
   if [[ "${KIDOBO_TEST_MUTATE_ARCHIVE:-0}" == "1" ]]; then printf corrupt >> "$2"; fi
 fi
@@ -272,17 +274,6 @@ if [[ "$*" == "exercise-release" ]]; then
   cp "$binary" "${KIDOBO_TEST_GH_RELEASE_DIR}/validated-candidate"
 fi
 exit 0
-"#,
-        );
-        write_executable(
-            &fake_bin.join("date"),
-            r#"#!/usr/bin/env bash
-set -euo pipefail
-if [[ -n "${KIDOBO_TEST_RELEASE_DATE:-}" && "$*" == "-u +%F" ]]; then
-  printf '%s\n' "${KIDOBO_TEST_RELEASE_DATE}"
-else
-  exec /usr/bin/date "$@"
-fi
 "#,
         );
         for command in ["docker", "genisoimage", "incus", "musl-gcc", "readelf"] {
@@ -1113,6 +1104,13 @@ fn distro_gate_failure_or_artifact_changes_prevent_publication() {
             "{variable} must block publication"
         );
         assert!(!fixture.tag_exists());
+        assert!(!fixture.artifact_root(RELEASE_TAG).exists());
+        assert!(
+            fixture
+                .repo
+                .join("target/e2e/frozen-candidate.tar.gz")
+                .is_file()
+        );
         let events = read_to_string_with_limit(&fixture.event_log, FIXTURE_LOG_READ_LIMIT);
         assert!(events.contains("just e2e-artifact "));
         assert!(!events.contains("git -c core.hooksPath=/dev/null push --atomic "));
@@ -1121,47 +1119,26 @@ fn distro_gate_failure_or_artifact_changes_prevent_publication() {
 }
 
 #[test]
-fn publisher_resumes_the_same_candidate_without_rebuilding_or_repeating_gates() {
+fn publisher_reruns_all_gates_after_a_failed_matrix() {
     let fixture = ReleaseFixture::new();
     let original_head = fixture.head();
     let first = fixture
         .publisher_command()
         .env("KIDOBO_TEST_FAIL_E2E", "1")
-        .env("KIDOBO_TEST_RELEASE_DATE", "2026-10-27")
         .output()
-        .expect("retain candidate after matrix failure");
+        .expect("fail the first matrix");
     assert_eq!(first.status.code(), Some(45));
-    let artifact_root = fixture.artifact_root(RELEASE_TAG);
-    let original_manifest =
-        read_to_string_with_limit(&artifact_root.join("candidate.txt"), FIXTURE_LOG_READ_LIMIT);
-    assert!(original_manifest.contains("release_date=2026-10-27\n"));
+    assert!(!fixture.artifact_root(RELEASE_TAG).exists());
+    assert!(
+        fixture
+            .repo
+            .join("target/e2e/frozen-candidate.tar.gz")
+            .is_file()
+    );
     assert_eq!(fixture.head(), original_head);
     assert!(!fixture.tag_exists());
-    assert!(String::from_utf8_lossy(&first.stderr).contains("Validated candidate retained"));
 
-    let resumed = run_with_confirmation(
-        fixture
-            .publisher_command()
-            .args(["--resume-e2e", "run-123-456"])
-            .env("KIDOBO_TEST_RELEASE_DATE", "2026-10-28")
-            .env("KIDOBO_TEST_FAIL_GATE", "ci"),
-        "y\n",
-    );
-    assert_success(&resumed, "resume retained candidate on the following day");
-    assert_eq!(
-        read_to_string_with_limit(&artifact_root.join("candidate.txt"), FIXTURE_LOG_READ_LIMIT),
-        original_manifest
-    );
-    assert!(
-        String::from_utf8_lossy(&resumed.stdout)
-            .contains("Reused local CI, release-note, coverage")
-    );
-    let dates = read_to_string_with_limit(
-        &fixture.repo.join("release-notes/dates.tsv"),
-        FIXTURE_LOG_READ_LIMIT,
-    );
-    assert!(dates.contains("2026-10-27"));
-    assert!(!dates.contains("2026-10-28"));
+    assert_success(&fixture.run_publisher("y\n"), "publish a fresh candidate");
     let events = read_to_string_with_limit(&fixture.event_log, FIXTURE_LOG_READ_LIMIT);
     for gate in [
         "ci",
@@ -1171,195 +1148,65 @@ fn publisher_resumes_the_same_candidate_without_rebuilding_or_repeating_gates() 
         "exercise-release",
         "release-compat",
     ] {
-        assert_eq!(events.matches(&format!("just {gate}\n")).count(), 1);
+        assert_eq!(
+            events.matches(&format!("just {gate}\n")).count(),
+            2,
+            "{gate}"
+        );
     }
-    let matrix_events = events
-        .lines()
-        .filter(|line| line.starts_with("just e2e-artifact "))
-        .collect::<Vec<_>>();
-    assert_eq!(matrix_events.len(), 2);
-    assert!(matrix_events[1].ends_with("--resume run-123-456"));
+    assert_eq!(
+        events
+            .lines()
+            .filter(|line| line.starts_with("just e2e-artifact "))
+            .count(),
+        2
+    );
+    assert!(
+        !fixture
+            .artifact_root(RELEASE_TAG)
+            .join("candidate.txt")
+            .exists()
+    );
     assert!(fixture.gh_release_dir.join("published").is_file());
 }
 
 #[test]
-fn publisher_resume_rejects_changed_source_and_retained_artifacts() {
-    for changed_file in [
-        "README.md",
-        "candidate.txt",
-        "SHA256SUMS",
-        "release-notes.md",
-        "kidobo-v0.12.0-linux-x86_64.tar.gz",
-    ] {
-        let fixture = ReleaseFixture::new();
-        let first = fixture
-            .publisher_command()
-            .env("KIDOBO_TEST_FAIL_E2E", "1")
-            .output()
-            .expect("retain failed candidate");
-        assert_eq!(first.status.code(), Some(45));
-        if changed_file == "README.md" {
-            let path = fixture.repo.join(changed_file);
-            let original = read_to_string_with_limit(&path, FIXTURE_LOG_READ_LIMIT);
-            fs::write(path, format!("{original}Changed source.\n")).expect("change source");
-            fixture.git_success(&["add", "README.md"], "stage changed source");
-            fixture.git_success(&["commit", "-m", "Change source"], "commit changed source");
-        } else {
-            let path = fixture.artifact_root(RELEASE_TAG).join(changed_file);
-            fs::OpenOptions::new()
-                .append(true)
-                .open(path)
-                .expect("open retained artifact")
-                .write_all(b"corrupt\n")
-                .expect("change retained artifact");
-        }
-        let output = fixture
-            .publisher_command()
-            .args(["--resume-e2e", "run-123-456"])
-            .output()
-            .expect("reject changed candidate");
-        assert_eq!(output.status.code(), Some(1), "{changed_file}");
-        assert!(
-            String::from_utf8_lossy(&output.stderr).contains("cannot resume"),
-            "{changed_file}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(String::from_utf8_lossy(&output.stderr).contains("mv -- "));
-        assert!(String::from_utf8_lossy(&output.stderr).contains(".saved-"));
-        assert!(fixture.artifact_root(RELEASE_TAG).is_dir());
-        assert!(!fixture.tag_exists());
-        let events = read_to_string_with_limit(&fixture.event_log, FIXTURE_LOG_READ_LIMIT);
-        assert_eq!(events.matches("just e2e-artifact ").count(), 1);
-        assert!(!events.contains("git -c core.hooksPath=/dev/null push --atomic "));
-    }
-}
-
-#[test]
-fn publisher_resume_requires_complete_metadata_and_retains_inputs_on_failure() {
+fn publisher_preserves_preexisting_artifact_directories() {
     let fixture = ReleaseFixture::new();
-    let missing = fixture
+    let artifact_root = fixture.artifact_root(RELEASE_TAG);
+    fs::create_dir_all(&artifact_root).expect("create prior artifacts");
+    let prior = artifact_root.join("prior-candidate");
+    fs::write(&prior, "retained evidence").expect("write prior artifact");
+    let output = fixture
         .publisher_command()
-        .args(["--resume-e2e", "run-123-456"])
         .output()
-        .expect("reject nonexistent candidate");
-    assert_eq!(missing.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&missing.stderr).contains("missing candidate metadata"));
-    assert!(
-        !fixture.event_log.exists()
-            || !read_to_string_with_limit(&fixture.event_log, FIXTURE_LOG_READ_LIMIT)
-                .contains("just ci\n")
+        .expect("reject existing artifacts");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("preserve it elsewhere"));
+    assert_eq!(
+        read_to_string_with_limit(&prior, FIXTURE_LOG_READ_LIMIT),
+        "retained evidence"
     );
-
-    let failed = fixture
-        .publisher_command()
-        .env("KIDOBO_TEST_FAIL_E2E", "1")
-        .output()
-        .expect("retain failed candidate");
-    assert_eq!(failed.status.code(), Some(45));
-    let repeated = fixture
-        .publisher_command()
-        .args(["--resume-e2e", "run-123-456"])
-        .env("KIDOBO_TEST_FAIL_E2E", "1")
-        .output()
-        .expect("retain candidate through repeated matrix failure");
-    assert_eq!(repeated.status.code(), Some(45));
-    let manifest = fixture.artifact_root(RELEASE_TAG).join("candidate.txt");
-    assert!(manifest.is_file());
-    fs::remove_file(&manifest).expect("remove metadata to emulate legacy candidate");
-    let legacy = fixture
-        .publisher_command()
-        .args(["--resume-e2e", "run-123-456"])
-        .output()
-        .expect("reject candidate without validated identity");
-    assert_eq!(legacy.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&legacy.stderr).contains("missing candidate metadata"));
-    assert!(fixture.artifact_root(RELEASE_TAG).is_dir());
+    assert!(!fixture.tag_exists());
 }
 
 #[test]
-fn publisher_rejects_conflicting_or_malformed_resume_options_before_tools() {
+fn publisher_rejects_removed_options_before_tools() {
     for options in [
-        vec!["--resume-e2e"],
-        vec!["--resume-e2e", "../run-123-456"],
-        vec!["--resume-e2e", "run-123-456", "--skip-e2e"],
+        vec!["--resume-e2e", "run-123-456"],
+        vec!["--refresh-e2e-images"],
         vec!["--skip-e2e", "--resume-e2e", "run-123-456"],
-        vec!["--resume-e2e", "run-123-456", "--resume-e2e", "run-123-789"],
         vec!["--skip-e2e", "--skip-e2e"],
-        vec!["--skip-e2e", "--refresh-e2e-images"],
-        vec!["--refresh-e2e-images", "--skip-e2e"],
-        vec!["--refresh-e2e-images", "--refresh-e2e-images"],
     ] {
         let fixture = CommandFixture::new();
         let output = fixture
             .publisher_command()
             .args(&options)
             .output()
-            .expect("reject malformed release options");
+            .expect("reject removed options");
         assert_eq!(output.status.code(), Some(2), "{options:?}");
         assert!(!fixture.event_log.exists());
     }
-}
-
-#[test]
-fn publisher_forwards_prepared_image_refresh_to_the_required_matrix() {
-    let fixture = ReleaseFixture::new();
-    let output = fixture
-        .publisher_command()
-        .arg("--refresh-e2e-images")
-        .env("KIDOBO_TEST_FAIL_E2E", "1")
-        .output()
-        .expect("request fresh prepared images at the fake matrix gate");
-    assert_eq!(output.status.code(), Some(45));
-    let events = read_to_string_with_limit(&fixture.event_log, FIXTURE_LOG_READ_LIMIT);
-    let matrix = events
-        .lines()
-        .find(|line| line.starts_with("just e2e-artifact "))
-        .expect("required matrix invocation");
-    assert!(matrix.ends_with("--refresh-images"));
-    assert!(!matrix.contains("--resume"));
-    assert!(
-        String::from_utf8_lossy(&output.stdout)
-            .contains("refreshing prepared images and rerunning every selected distro target")
-    );
-    assert!(!fixture.tag_exists());
-    assert!(!fixture.gh_release_dir.join("published").exists());
-}
-
-#[test]
-fn publisher_refreshes_images_on_resume_without_repeating_local_validation() {
-    let fixture = ReleaseFixture::new();
-    let first = fixture
-        .publisher_command()
-        .env("KIDOBO_TEST_FAIL_E2E", "1")
-        .output()
-        .expect("retain the candidate after a fake matrix failure");
-    assert_eq!(first.status.code(), Some(45));
-    let resumed = run_with_confirmation(
-        fixture
-            .publisher_command()
-            .args(["--resume-e2e", "run-123-456", "--refresh-e2e-images"])
-            .env("KIDOBO_TEST_FAIL_GATE", "ci"),
-        "y\n",
-    );
-    assert_success(&resumed, "refresh image coverage for a retained candidate");
-    let events = read_to_string_with_limit(&fixture.event_log, FIXTURE_LOG_READ_LIMIT);
-    for gate in [
-        "ci",
-        "coverage",
-        "release-notes-check",
-        "rustdoc",
-        "exercise-release",
-        "release-compat",
-    ] {
-        assert_eq!(events.matches(&format!("just {gate}\n")).count(), 1);
-    }
-    let matrix_events = events
-        .lines()
-        .filter(|line| line.starts_with("just e2e-artifact "))
-        .collect::<Vec<_>>();
-    assert_eq!(matrix_events.len(), 2);
-    assert!(matrix_events[1].ends_with("--resume run-123-456 --refresh-images"));
-    assert!(fixture.gh_release_dir.join("published").is_file());
 }
 
 #[test]
@@ -1520,6 +1367,34 @@ fn publisher_rejects_candidate_changes_after_validation() {
 }
 
 #[test]
+fn publisher_rejects_artifact_changes_while_awaiting_confirmation() {
+    for name in [
+        format!("kidobo-{RELEASE_TAG}-linux-x86_64.tar.gz"),
+        "SHA256SUMS".to_owned(),
+        "release-notes.md".to_owned(),
+    ] {
+        let fixture = ReleaseFixture::new();
+        let output = fixture.run_after_validation(|| {
+            let path = fixture.artifact_root(RELEASE_TAG).join(&name);
+            fs::OpenOptions::new()
+                .append(true)
+                .open(path)
+                .expect("open validated artifact")
+                .write_all(b"changed after validation\n")
+                .expect("change validated artifact");
+        });
+        assert_eq!(output.status.code(), Some(1), "{name}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("validated candidate changed"),
+            "{name}"
+        );
+        assert!(!fixture.tag_exists());
+        assert!(!fixture.remote_tag_exists(RELEASE_TAG));
+        assert!(!fixture.artifact_root(RELEASE_TAG).exists());
+    }
+}
+
+#[test]
 fn skipping_e2e_still_blocks_publication_on_other_gate_failures() {
     for gate in ["ci", "release-compat"] {
         let fixture = ReleaseFixture::new();
@@ -1565,7 +1440,6 @@ fn candidate_recipe_runs_an_existing_archive_without_building_or_packaging() {
         vec![
             "--archive=/tmp/existing candidate.tar.gz".to_owned(),
             format!("--tag={RELEASE_TAG}"),
-            "--refresh-images".to_owned(),
         ],
     ] {
         let output = Command::new("just")
@@ -1684,7 +1558,7 @@ fn publication_recipe_forwards_the_skip_option_as_an_argument() {
 }
 
 #[test]
-fn artifact_recipe_allows_resume_and_refresh_and_preserves_argument_boundaries() {
+fn artifact_recipe_preserves_arguments_and_rejects_extra_options() {
     let fixture = CommandFixture::new();
     let justfile = fixture.repo.join("Justfile");
     fs::copy(
@@ -1696,8 +1570,7 @@ fn artifact_recipe_allows_resume_and_refresh_and_preserves_argument_boundaries()
         &fixture.fake_bin.join("cargo"),
         "#!/bin/bash\nprintf '%s\\n' \"$@\"\n",
     );
-    let mut command = Command::new("just");
-    command
+    let output = Command::new("just")
         .arg("--justfile")
         .arg(&justfile)
         .env("PATH", path_with_prefix(&fixture.fake_bin))
@@ -1705,51 +1578,20 @@ fn artifact_recipe_allows_resume_and_refresh_and_preserves_argument_boundaries()
             "e2e-artifact",
             "/tmp/candidate with spaces.tar.gz",
             RELEASE_TAG,
-            "--resume",
-            "run-123-456",
-        ]);
-    let output = command.output().expect("forward artifact resume arguments");
-    assert_success(&output, "forward artifact resume");
+        ])
+        .output()
+        .expect("forward exact archive and tag");
+    assert_success(&output, "forward artifact arguments");
     assert_eq!(
-        String::from_utf8(output.stdout).expect("UTF-8 forwarded arguments"),
+        String::from_utf8(output.stdout).expect("UTF-8 arguments"),
         format!(
-            "run\n--locked\n-p\nkidobo-e2e\n--\nrun\n--required-only\n--archive\n/tmp/candidate with spaces.tar.gz\n--tag\n{RELEASE_TAG}\n--resume\nrun-123-456\n"
+            "run\n--locked\n-p\nkidobo-e2e\n--\nrun\n--required-only\n--archive\n/tmp/candidate with spaces.tar.gz\n--tag\n{RELEASE_TAG}\n"
         )
     );
     for options in [
-        vec!["--refresh-images"],
-        vec!["--resume", "run-123-456", "--refresh-images"],
-        vec!["--refresh-images", "--resume", "run-123-456"],
-    ] {
-        let output = Command::new("just")
-            .arg("--justfile")
-            .arg(&justfile)
-            .env("PATH", path_with_prefix(&fixture.fake_bin))
-            .args([
-                "e2e-artifact",
-                "/tmp/candidate with spaces.tar.gz",
-                RELEASE_TAG,
-            ])
-            .args(&options)
-            .output()
-            .expect("forward artifact refresh arguments");
-        assert_success(&output, "forward artifact image refresh");
-        assert_eq!(
-            String::from_utf8(output.stdout).expect("UTF-8 forwarded arguments"),
-            format!(
-                "run\n--locked\n-p\nkidobo-e2e\n--\nrun\n--required-only\n--archive\n/tmp/candidate with spaces.tar.gz\n--tag\n{RELEASE_TAG}\n{}\n",
-                options.join("\n")
-            )
-        );
-    }
-    for options in [
         vec!["--distro", "debian-12"],
-        vec!["--resume"],
-        vec!["--resume", "../run-123-456"],
-        vec!["--resume", "run-123-456", "--distro", "debian-12"],
-        vec!["--resume", "run-123-456", "--resume", "run-123-789"],
-        vec!["--refresh-images", "--refresh-images"],
-        vec!["--refresh-image"],
+        vec!["--resume", "run-123-456"],
+        vec!["--refresh-images"],
     ] {
         let output = Command::new("just")
             .arg("--justfile")
@@ -1758,71 +1600,16 @@ fn artifact_recipe_allows_resume_and_refresh_and_preserves_argument_boundaries()
             .args(["e2e-artifact", "/tmp/candidate.tar.gz", RELEASE_TAG])
             .args(&options)
             .output()
-            .expect("reject artifact filtering or malformed resume");
+            .expect("reject extra artifact arguments");
         assert!(!output.status.success(), "{options:?}");
-        assert!(String::from_utf8_lossy(&output.stderr).contains("Usage:"));
         assert_eq!(output.stdout, [] as [u8; 0]);
     }
-}
-
-#[test]
-fn resume_recipe_forwards_required_only_and_refresh_without_filtering_targets() {
-    let fixture = CommandFixture::new();
-    let justfile = fixture.repo.join("Justfile");
-    fs::copy(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("Justfile"),
-        &justfile,
-    )
-    .expect("copy recipes into isolated repository");
-    write_executable(
-        &fixture.fake_bin.join("cargo"),
-        "#!/bin/bash\nprintf '%s\\n' \"$@\"\n",
-    );
-    for options in [
-        vec![],
-        vec!["--required-only"],
-        vec!["--refresh-images"],
-        vec!["--required-only", "--refresh-images"],
-        vec!["--refresh-images", "--required-only"],
-    ] {
-        let output = Command::new("just")
-            .arg("--justfile")
-            .arg(&justfile)
-            .env("PATH", path_with_prefix(&fixture.fake_bin))
-            .args(["e2e-resume", "run-123-456"])
-            .args(&options)
-            .output()
-            .expect("forward resume target selection");
-        assert_success(&output, "forward resume target selection");
-        let expected_suffix = if options.is_empty() {
-            String::new()
-        } else {
-            format!("{}\n", options.join("\n"))
-        };
-        assert_eq!(
-            String::from_utf8(output.stdout).expect("UTF-8 forwarded arguments"),
-            format!(
-                "run\n--locked\n-p\nkidobo-e2e\n--\nrun\n--resume\nrun-123-456\n{expected_suffix}"
-            )
-        );
-    }
-    for options in [
-        vec!["--distro", "debian-12"],
-        vec!["--required-only", "--distro", "debian-12"],
-        vec!["--required-only", "--required-only"],
-        vec!["--refresh-images", "--refresh-images"],
-        vec!["--refresh-image"],
-    ] {
-        let output = Command::new("just")
-            .arg("--justfile")
-            .arg(&justfile)
-            .env("PATH", path_with_prefix(&fixture.fake_bin))
-            .args(["e2e-resume", "run-123-456"])
-            .args(&options)
-            .output()
-            .expect("reject unsupported resume target selection");
-        assert!(!output.status.success(), "{options:?}");
-        assert!(String::from_utf8_lossy(&output.stderr).contains("Usage:"));
-        assert_eq!(output.stdout, [] as [u8; 0]);
-    }
+    let output = Command::new("just")
+        .arg("--justfile")
+        .arg(&justfile)
+        .args(["e2e-resume", "run-123-456"])
+        .output()
+        .expect("reject removed recipe");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("does not contain recipe"));
 }

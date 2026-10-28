@@ -205,11 +205,9 @@ elif operation == "exec":
             print((state / vm / "boot").read_text(), end="")
         elif path.endswith("/relabel-scheduled"):
             print("0")
-        elif path.endswith("/manifest.json"):
-            print(json.dumps({"prepared_at_unix": int(time.time()), "kernel": "fixture-kernel",
-                              "selinux": "image-default"}))
-        elif path.endswith("/admission.json"):
-            print(json.dumps({"machine_id": vm, "kernel": "fixture-kernel", "selinux": "Disabled"}))
+        elif path.endswith("/environment.json"):
+            print(json.dumps({"kernel": "fixture-kernel", "selinux": "Disabled",
+                              "iptables_backend": "fixture-nft", "ip6tables_backend": "fixture-nft"}))
         else:
             raise AssertionError(guest)
     elif guest[0] == "bash":
@@ -241,8 +239,8 @@ elif operation == "exec":
                 event("kernel", vm)
                 if scenario == "prerequisite-failure" and vm.endswith("-secondary"):
                     raise SystemExit(70)
-            elif phase == "--admit":
-                event("admit", vm)
+            elif phase == "--validate":
+                event("validate", vm)
                 if ((scenario == "interrupt-first" and vm.endswith("-primary")) or
                         (scenario == "interrupt-second" and vm.endswith("-secondary"))):
                     (state / "interruption-ready").touch()
@@ -254,6 +252,12 @@ elif operation == "exec":
         elif guest[1] == "/opt/kidobo-e2e/lifecycle.sh":
             phase = guest[2]
             event(phase, vm)
+            if phase == "start" and scenario == "report-write-failure" and vm.endswith("-primary"):
+                report = state.parent / vm.rsplit("-", 1)[0] / "targets/primary/results.json"
+                report.unlink()
+                report.mkdir()
+            if phase == "finish" and scenario == "stopped-after-tests":
+                (state / vm / "running").unlink()
             if phase == "start" and scenario == "host-diagnostics-failure" and vm.endswith("-secondary"):
                 (state / vm / "agent-down").touch()
                 raise SystemExit(255)
@@ -330,10 +334,6 @@ else:
             memory: "4GiB".into(),
             disk: "30GiB".into(),
             max_parallel_vms: 1,
-            prepared_images: crate::prepared::Settings {
-                enabled: false,
-                ..Default::default()
-            },
             distros: ["primary", "secondary"]
                 .into_iter()
                 .map(|id| Distro {
@@ -374,7 +374,6 @@ else:
             false,
             None,
             keep_failed,
-            None,
         )
     }
 
@@ -428,76 +427,80 @@ else:
 }
 
 #[test]
-fn prerequisites_precede_applications_and_the_final_prepared_guest_stays_running() {
+fn each_target_completes_its_lifecycle_before_the_next_target_is_created() {
     let mut fixture = Fixture::new("success", true);
     fixture.execute().expect("complete the fixture matrix");
     let events = fixture.events();
-    let first_application = events
-        .iter()
-        .position(|event| event.starts_with("start "))
-        .expect("first application lifecycle");
     for id in ["primary", "secondary"] {
-        let admitted = events
-            .iter()
-            .position(|event| event == &format!("admit {RUN_ID}-{id}"))
-            .expect("prerequisite pass admits the guest");
-        assert!(admitted < first_application, "{id} prerequisites ran late");
+        let position = |operation| {
+            events
+                .iter()
+                .position(|event| event == &format!("{operation} {RUN_ID}-{id}"))
+                .expect("lifecycle event")
+        };
+        assert!(position("validate") < position("start"));
+        assert!(position("finish") < position("delete"));
         assert_eq!(
             events
                 .iter()
                 .filter(|event| *event == &format!("power-start {RUN_ID}-{id}"))
                 .count(),
-            if id == "primary" { 2 } else { 1 },
-            "only the earlier guest parks and restarts; the final guest stays running"
+            1
         );
         assert_eq!(fixture.result(id)["phase"], "application");
         assert_eq!(fixture.result(id)["error"], Value::Null);
         assert_eq!(fixture.result(id)["cleanup_error"], Value::Null);
         assert_eq!(fixture.result(id)["diagnostic_errors"], json!([]));
+        assert!(
+            !fixture
+                .temp
+                .path()
+                .join(format!("state/{RUN_ID}-{id}"))
+                .exists()
+        );
     }
+    assert!(
+        events
+            .iter()
+            .position(|event| event == &format!("delete {RUN_ID}-primary"))
+            .expect("first cleanup")
+            < events
+                .iter()
+                .position(|event| event == &format!("create {RUN_ID}-secondary"))
+                .expect("second creation")
+    );
+    assert!(!events.iter().any(|event| event.starts_with("park ")));
     assert!(
         !events
             .iter()
             .any(|event| event.starts_with("overlapping-start "))
     );
-    assert!(
-        !fixture
-            .temp
-            .path()
-            .join("state")
-            .read_dir()
-            .expect("fake state")
-            .any(|entry| entry
-                .expect("fake state entry")
-                .path()
-                .join("running")
-                .exists())
-    );
 }
 
 #[test]
-fn required_prerequisite_failure_suppresses_applications_and_cleans_all_created_vms() {
+fn required_prerequisite_failure_does_not_suppress_other_target_lifecycles() {
     let mut fixture = Fixture::new("prerequisite-failure", true);
+    fixture.config.distros.swap(0, 1);
     fixture
         .execute()
-        .expect_err("required prerequisites must block the matrix");
+        .expect_err("required prerequisites must fail qualification");
     let events = fixture.events();
-    assert!(!events.iter().any(|event| event.starts_with("start ")));
+    assert!(events.contains(&format!("start {RUN_ID}-primary")));
+    assert!(!events.contains(&format!("start {RUN_ID}-secondary")));
     for id in ["primary", "secondary"] {
         assert!(events.contains(&format!("delete {RUN_ID}-{id}")));
         assert_eq!(fixture.result(id)["cleanup_error"], Value::Null);
-        assert_eq!(fixture.result(id)["diagnostic_errors"], json!([]));
-        assert!(fixture.result(id)["error"].is_string());
         assert!(
             !fixture
                 .temp
                 .path()
-                .join("state")
-                .join(format!("{RUN_ID}-{id}"))
+                .join(format!("state/{RUN_ID}-{id}"))
                 .exists()
         );
     }
-    assert_eq!(fixture.result("primary")["phase"], "provisioning");
+    assert_eq!(fixture.result("primary")["error"], Value::Null);
+    assert_eq!(fixture.result("primary")["phase"], "application");
+    assert!(fixture.result("secondary")["error"].is_string());
     assert_eq!(fixture.result("secondary")["phase"], "provisioning");
 }
 
@@ -529,13 +532,12 @@ fn advisory_prerequisite_and_application_failures_warn_without_blocking_required
         let warnings = fixture.runner.report.document["warnings"]
             .as_array()
             .expect("advisory warnings");
-        assert_eq!(warnings.len(), 1);
-        assert!(
-            warnings[0]
+        assert!(warnings.iter().any(|warning| {
+            warning
                 .as_str()
                 .expect("warning text")
-                .contains("secondary")
-        );
+                .contains("advisory target \"secondary\" failed")
+        }));
         assert_eq!(fixture.result("secondary")["required"], false);
         assert_eq!(fixture.result("secondary")["cleanup_error"], Value::Null);
         let events = fixture.events();
@@ -588,7 +590,7 @@ fn filtered_success_does_not_claim_the_configured_release_gate_passed() {
 }
 
 #[test]
-fn interruption_cleans_parked_targets_and_cannot_pass_incomplete_coverage() {
+fn interruption_cleans_created_targets_and_cannot_pass_incomplete_coverage() {
     for (scenario, result_count) in [("interrupt-first", 1), ("interrupt-second", 2)] {
         let mut fixture = Fixture::new(scenario, true);
         fixture
@@ -597,51 +599,42 @@ fn interruption_cleans_parked_targets_and_cannot_pass_incomplete_coverage() {
         assert!(fixture.runner.cancelled.load(Ordering::Relaxed));
         let results = fixture.runner.report.document["results"]
             .as_array()
-            .expect("interrupted target results");
+            .expect("target results");
         assert_eq!(results.len(), result_count);
         let events = fixture.events();
-        assert!(!events.iter().any(|event| event.starts_with("start ")));
+        assert!(!events.contains(&format!("start {RUN_ID}-secondary")));
+        if scenario == "interrupt-first" {
+            assert!(!events.contains(&format!("create {RUN_ID}-secondary")));
+            assert!(!events.contains(&format!("start {RUN_ID}-primary")));
+        } else {
+            assert_eq!(fixture.result("primary")["error"], Value::Null);
+        }
         for result in results {
             let id = result["distro"].as_str().expect("target ID");
-            assert!(events.contains(&format!("admit {RUN_ID}-{id}")));
+            assert!(events.contains(&format!("validate {RUN_ID}-{id}")));
             assert!(events.contains(&format!("delete {RUN_ID}-{id}")));
             assert_eq!(result["cleanup_error"], Value::Null);
-            if scenario == "interrupt-second" && id == "primary" {
-                assert_eq!(
-                    result["diagnostic_errors"],
-                    json!([
-                        "VM metadata: stopped guest was not restarted during interrupted cleanup"
-                    ])
-                );
-                assert_eq!(
-                    events
-                        .iter()
-                        .filter(|event| **event == format!("power-start {RUN_ID}-{id}"))
-                        .count(),
-                    1
-                );
-            } else {
-                assert_eq!(result["diagnostic_errors"], json!([]));
-            }
-        }
-        assert!(
-            !fixture
-                .temp
-                .path()
-                .join("state")
-                .read_dir()
-                .expect("fake state")
-                .any(|entry| entry
-                    .expect("fake state entry")
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| **event == format!("power-start {RUN_ID}-{id}"))
+                    .count(),
+                1
+            );
+            assert!(
+                !fixture
+                    .temp
                     .path()
-                    .join("running")
-                    .exists())
-        );
+                    .join(format!("state/{RUN_ID}-{id}"))
+                    .exists()
+            );
+        }
+        assert_eq!(fixture.runner.report.document["release_gate_passed"], false);
     }
 }
 
 #[test]
-fn two_workers_overlap_without_a_third_running_vm_and_preserve_the_prerequisite_barrier() {
+fn two_workers_overlap_without_a_third_vm_or_global_preparation_barrier() {
     let mut fixture = Fixture::new("concurrent", true);
     fixture.parallelism(2);
     let mut tertiary = fixture.config.distros[0].clone();
@@ -653,20 +646,32 @@ fn two_workers_overlap_without_a_third_running_vm_and_preserve_the_prerequisite_
         .expect("complete three targets with two workers");
 
     let events = fixture.events();
-    let first_application = events
-        .iter()
-        .position(|event| event.starts_with("start "))
-        .expect("application lifecycle");
     for id in ["primary", "secondary", "tertiary"] {
-        let admitted = events
+        let validated = events
             .iter()
-            .position(|event| event == &format!("admit {RUN_ID}-{id}"))
-            .expect("target admitted before applications");
-        assert!(admitted < first_application, "{id} admission ran late");
+            .position(|event| event == &format!("validate {RUN_ID}-{id}"))
+            .expect("target validation");
+        let application = events
+            .iter()
+            .position(|event| event == &format!("start {RUN_ID}-{id}"))
+            .expect("target application");
+        assert!(validated < application);
         assert_eq!(fixture.result(id)["error"], Value::Null);
         assert_eq!(fixture.result(id)["cleanup_error"], Value::Null);
         assert_eq!(fixture.result(id)["diagnostic_errors"], json!([]));
     }
+    let third_created = events
+        .iter()
+        .position(|event| event == &format!("create {RUN_ID}-tertiary"))
+        .expect("third target");
+    assert!(
+        events
+            .iter()
+            .position(|event| event == &format!("delete {RUN_ID}-primary"))
+            .expect("first target cleanup")
+            < third_created
+    );
+    assert!(!events.iter().any(|event| event.starts_with("park ")));
     let running = events
         .iter()
         .filter_map(|event| event.strip_prefix("running-count "))
@@ -710,25 +715,25 @@ fn a_successful_guest_without_check_markers_cannot_qualify_the_matrix() {
 }
 
 #[test]
-fn advisory_diagnostic_failure_is_visible_and_does_not_qualify_all_targets() {
-    let mut fixture = Fixture::new("diagnostics-failure", false);
+fn supplemental_diagnostic_failure_warns_without_failing_valid_coverage() {
+    let mut fixture = Fixture::new("diagnostics-failure", true);
     fixture.execute().expect("required coverage still passes");
 
     assert_eq!(fixture.result("secondary")["error"], Value::Null);
     assert_eq!(
-        fixture.result("secondary")["diagnostic_errors"]
+        fixture.result("secondary")["diagnostic_warnings"]
             .as_array()
-            .expect("diagnostic failures")
+            .expect("diagnostic warnings")
             .len(),
         1
     );
     assert_eq!(fixture.runner.report.document["release_gate_passed"], true);
     assert_eq!(
         fixture.runner.report.document["all_selected_targets_passed"],
-        false
+        true
     );
     let summary = read_text(&fixture.runner.dir.join("summary.txt")).expect("summary");
-    assert!(!summary.contains("secondary: PASS"));
+    assert!(summary.contains("secondary: PASS"));
     let host = fixture.runner.evidence().join("secondary/host-diagnostics");
     assert_eq!(
         read_text(&host.join("console.log")).expect("serial log"),
@@ -814,9 +819,9 @@ fn host_diagnostic_failure_preserves_partial_evidence_and_still_cleans_guests() 
     );
     assert_eq!(result["cleanup_error"], Value::Null);
     assert!(
-        result["diagnostic_errors"]
+        result["diagnostic_warnings"]
             .as_array()
-            .expect("diagnostic errors")
+            .expect("diagnostic warnings")
             .iter()
             .any(|error| error
                 .as_str()
@@ -881,8 +886,8 @@ fn pre_reboot_snapshot_survives_agent_loss_and_normal_cleanup() {
 }
 
 #[test]
-fn failed_pre_reboot_snapshot_retains_partial_evidence_and_prevents_restart() {
-    let mut fixture = Fixture::new("pre-reboot-failure", false);
+fn failed_pre_reboot_snapshot_retains_partial_evidence_and_allows_testing() {
+    let mut fixture = Fixture::new("pre-reboot-failure", true);
     fixture.execute().expect("required target passed");
     let snapshot = fixture.runner.evidence().join("secondary/pre-reboot");
     let output = read_text(&snapshot.join("snapshot.log")).expect("partial pre-reboot evidence");
@@ -901,11 +906,31 @@ fn failed_pre_reboot_snapshot_retains_partial_evidence_and_prevents_restart() {
             .contains("74")
     );
     assert!(
-        !fixture
+        fixture
             .events()
             .contains(&format!("reboot {RUN_ID}-secondary"))
     );
     assert_eq!(fixture.result("secondary")["cleanup_error"], Value::Null);
+    assert_eq!(fixture.result("secondary")["error"], Value::Null);
+    assert!(
+        fixture
+            .events()
+            .contains(&format!("start {RUN_ID}-secondary"))
+    );
+    assert!(
+        fixture.result("secondary")["diagnostic_warnings"]
+            .as_array()
+            .expect("snapshot warnings")
+            .iter()
+            .any(|warning| warning
+                .as_str()
+                .expect("warning text")
+                .contains("pre-reboot snapshot"))
+    );
+    assert_eq!(
+        fixture.runner.report.document["all_selected_targets_passed"],
+        true
+    );
     assert!(
         !fixture
             .temp
@@ -984,36 +1009,23 @@ fn retained_failed_guests_are_stopped_before_releasing_worker_slots() {
 }
 
 #[test]
-fn deletion_and_stop_failure_cancel_before_any_parked_guest_restarts() {
+fn deletion_and_stop_failure_cancel_before_another_target_is_created() {
     let mut fixture = Fixture::new("cleanup-and-stop-failure", false);
+    fixture.config.distros.swap(0, 1);
     fixture
         .execute()
-        .expect_err("an owned guest that cannot be removed or stopped must block the run");
-
+        .expect_err("occupied VM slot must block admission");
     assert!(fixture.runner.cancelled.load(Ordering::Relaxed));
     let events = fixture.events();
     assert!(events.contains(&format!("stop-failure {RUN_ID}-secondary")));
     assert!(events.contains(&format!("start {RUN_ID}-secondary")));
-    assert!(
-        !events.contains(&format!("start {RUN_ID}-primary")),
-        "the parked required target must not begin application checks"
-    );
-    assert_eq!(
-        events
-            .iter()
-            .filter(|event| *event == &format!("power-start {RUN_ID}-primary"))
-            .count(),
-        1,
-        "cancellation must not restart a parked guest for diagnostics"
-    );
+    assert!(!events.contains(&format!("create {RUN_ID}-primary")));
     assert!(
         !events
             .iter()
-            .any(|event| event.starts_with("overlapping-start ")),
-        "failed cleanup must not release an occupied running-VM slot"
+            .any(|event| event.starts_with("overlapping-start "))
     );
     assert!(fixture.result("secondary")["cleanup_error"].is_string());
-    assert!(fixture.result("primary")["error"].is_string());
     assert_eq!(
         fixture.runner.report.document["all_selected_targets_passed"],
         false
@@ -1043,4 +1055,51 @@ fn concurrent_interruption_stays_sticky_through_both_workers_cleanup() {
                 .exists()
         );
     }
+}
+
+#[test]
+fn supplemental_diagnostics_do_not_restart_a_stopped_guest() {
+    let mut fixture = Fixture::new("stopped-after-tests", true);
+    fixture
+        .execute()
+        .expect("completed application checks pass");
+    let events = fixture.events();
+    for id in ["primary", "secondary"] {
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| **event == format!("power-start {RUN_ID}-{id}"))
+                .count(),
+            1,
+            "diagnostics must not restart {id}"
+        );
+        assert_eq!(fixture.result(id)["error"], Value::Null);
+        assert_eq!(fixture.result(id)["cleanup_error"], Value::Null);
+        assert!(events.contains(&format!("delete {RUN_ID}-{id}")));
+    }
+}
+
+#[test]
+fn worker_report_write_failure_cancels_admission_and_cleans_owned_guests() {
+    let mut fixture = Fixture::new("report-write-failure", true);
+    fixture
+        .execute()
+        .expect_err("mandatory target results cannot be saved");
+    assert!(fixture.runner.cancelled.load(Ordering::Relaxed));
+    let events = fixture.events();
+    assert!(events.contains(&format!("start {RUN_ID}-primary")));
+    assert!(events.contains(&format!("delete {RUN_ID}-primary")));
+    assert!(!events.contains(&format!("create {RUN_ID}-secondary")));
+    assert_eq!(
+        fixture.runner.report.document["emergency_cleanup"]["completed"],
+        true
+    );
+    assert_ne!(fixture.runner.report.document["release_gate_passed"], true);
+    assert!(
+        !fixture
+            .temp
+            .path()
+            .join(format!("state/{RUN_ID}-primary"))
+            .exists()
+    );
 }

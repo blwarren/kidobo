@@ -3,15 +3,13 @@ set -euo pipefail
 
 usage() {
     cat <<'EOF'
-Usage: just publish-release [v]X.Y.Z [--skip-e2e | --resume-e2e RUN_ID] [--refresh-e2e-images]
+Usage: just publish-release [v]X.Y.Z [--skip-e2e]
 
 Prepares and validates a release in a temporary worktree, asks for confirmation,
 then atomically pushes the release commit and tag, uploads locally built assets
 with GitHub CLI, verifies the uploaded archive, and publishes the GitHub release.
 
   --skip-e2e           Skip the Incus VM matrix; all other release checks still run.
-  --resume-e2e RUN_ID   Reuse the verified candidate and successful distro results.
-  --refresh-e2e-images Rebuild prepared images and rerun every selected distro target.
 EOF
 }
 
@@ -23,36 +21,15 @@ fi
 requested_version="$1"
 shift
 skip_e2e=false
-resume_e2e=""
-refresh_e2e_images=false
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --skip-e2e)
-            if [[ "${skip_e2e}" == true || -n "${resume_e2e}" || "${refresh_e2e_images}" == true ]]; then
-                echo "--skip-e2e cannot repeat or combine with --resume-e2e or --refresh-e2e-images" >&2
+            if [[ "${skip_e2e}" == true ]]; then
+                echo "--skip-e2e cannot repeat" >&2
                 usage >&2
                 exit 2
             fi
             skip_e2e=true
-            shift
-            ;;
-        --resume-e2e)
-            if [[ "${skip_e2e}" == true || -n "${resume_e2e}" || $# -lt 2 \
-                || ! "$2" =~ ^run-[0-9]+-[0-9]+$ ]]; then
-                echo "--resume-e2e requires one RUN_ID and cannot combine with --skip-e2e" >&2
-                usage >&2
-                exit 2
-            fi
-            resume_e2e="$2"
-            shift 2
-            ;;
-        --refresh-e2e-images)
-            if [[ "${skip_e2e}" == true || "${refresh_e2e_images}" == true ]]; then
-                echo "--refresh-e2e-images cannot repeat or combine with --skip-e2e" >&2
-                usage >&2
-                exit 2
-            fi
-            refresh_e2e_images=true
             shift
             ;;
         *)
@@ -134,9 +111,7 @@ archive_name="${archive_root}.tar.gz"
 archive_path="${artifact_root}/${archive_name}"
 checksums_path="${artifact_root}/SHA256SUMS"
 release_notes_copy="${artifact_root}/release-notes.md"
-candidate_manifest="${artifact_root}/candidate.txt"
 artifacts_created=false
-artifacts_resumable=false
 tag_created=false
 refs_pushed=false
 release_published=false
@@ -193,7 +168,7 @@ cleanup() {
     if [[ -n "${temporary_root}" ]]; then
         rm -rf "${temporary_root}"
     fi
-    if [[ "${artifacts_created}" == true && "${artifacts_resumable}" == false && "${refs_pushed}" == false ]]; then
+    if [[ "${artifacts_created}" == true && "${refs_pushed}" == false ]]; then
         rm -rf "${artifact_root}"
     fi
     if [[ "${switched_to_main}" == true && "${refs_pushed}" == false ]]; then
@@ -202,10 +177,6 @@ cleanup() {
         else
             git -C "${repo_root}" switch --quiet --detach "${original_head}" >/dev/null 2>&1 || true
         fi
-    fi
-    if [[ "${artifacts_resumable}" == true && "${refs_pushed}" == false ]]; then
-        echo "Validated candidate retained for E2E resume at: ${artifact_root}" >&2
-        echo "Resume with: just publish-release ${release_version} --resume-e2e RUN_ID" >&2
     fi
     if [[ "${refs_pushed}" == true && "${release_published}" == false ]]; then
         print_recovery
@@ -244,24 +215,11 @@ if gh release view "${release_tag}" --repo "${github_repo}" >/dev/null 2>&1; the
     echo "GitHub release already exists: ${release_tag}" >&2
     exit 1
 fi
-if [[ -n "${resume_e2e}" ]]; then
-    for candidate_file in "${candidate_manifest}" "${archive_path}" "${checksums_path}" "${release_notes_copy}"; do
-        if [[ ! -s "${candidate_file}" ]]; then
-            echo "cannot resume: missing candidate metadata or artifact: ${candidate_file}" >&2
-            exit 1
-        fi
-    done
-    release_date="$(sed -n 's/^release_date=//p' "${candidate_manifest}")"
-    if [[ ! "${release_date}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
-        echo "cannot resume: invalid candidate release date" >&2
-        exit 1
-    fi
-elif [[ -e "${artifact_root}" ]]; then
-    echo "release artifact directory already exists: ${artifact_root}; use --resume-e2e RUN_ID to resume its candidate" >&2
+if [[ -e "${artifact_root}" ]]; then
+    echo "release artifact directory already exists: ${artifact_root}; preserve it elsewhere before starting a fresh release" >&2
     exit 1
-else
-    release_date="$(date -u +%F)"
 fi
+release_date="$(date -u +%F)"
 
 current_version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
 if [[ -z "${current_version}" ]]; then
@@ -277,10 +235,8 @@ if [[ ! -s release-notes/unreleased.md ]]; then
     exit 1
 fi
 
-if [[ -z "${resume_e2e}" ]]; then
-    echo "[release] installing pinned validation tools"
-    just _install-deny _install-audit _install-coverage
-fi
+echo "[release] installing pinned validation tools"
+just _install-deny _install-audit _install-coverage
 
 temporary_root="$(mktemp -d)"
 release_worktree="${temporary_root}/worktree"
@@ -324,35 +280,14 @@ just _release-notes-format _release-notes-generate
 git add Cargo.toml Cargo.lock README.md CHANGELOG.md release-notes
 validated_tree="$(git write-tree)"
 
-write_candidate_manifest() {
-    local candidate_tree="${1:-$(git write-tree)}"
-    printf 'format=1\nbase_commit=%s\ncandidate_tree=%s\nrelease_date=%s\n' \
-        "${base_commit}" "${candidate_tree}" "${release_date}"
-    printf 'archive=%s\nchecksums=%s\nrelease_notes=%s\n' \
-        "$(sha256sum "${archive_path}")" "$(sha256sum "${checksums_path}")" \
-        "$(sha256sum "${release_notes_copy}")"
-}
-
-if [[ -n "${resume_e2e}" ]]; then
-    write_candidate_manifest > "${temporary_root}/candidate.txt"
-    if ! cmp -s "${candidate_manifest}" "${temporary_root}/candidate.txt"; then
-        echo "cannot resume: source tree or retained candidate artifacts changed; start a fresh candidate" >&2
-        printf 'Preserve the retained candidate before retrying a fresh release:\n  mv -- %q %q\n' \
-            "${artifact_root}" "${artifact_root}.saved-$(date -u +%Y%m%dT%H%M%SZ)" >&2
-        exit 1
-    fi
-    cmp "${release_notes_path}" "${release_notes_copy}"
-    echo "[release] reusing verified candidate archive and passed local/release checks (identical source tree and artifact hashes)"
-else
-    echo "[release] running local CI on the prepared candidate"
-    just ci
-    echo "[release] running release-only validation"
-    just release-notes-check
-    just coverage
-    just rustdoc
-    just exercise-release
-    just release-compat
-fi
+echo "[release] running local CI on the prepared candidate"
+just ci
+echo "[release] running release-only validation"
+just release-notes-check
+just coverage
+just rustdoc
+just exercise-release
+just release-compat
 git diff --check --cached
 if [[ "$(git write-tree)" != "${validated_tree}" ]] || ! git diff --quiet || [[ -n "$(git ls-files --others --exclude-standard)" ]]; then
     echo "validation produced uncommitted changes outside the staged release update" >&2
@@ -360,37 +295,23 @@ if [[ "$(git write-tree)" != "${validated_tree}" ]] || ! git diff --quiet || [[ 
     exit 1
 fi
 
-if [[ -z "${resume_e2e}" ]]; then
-    echo "[release] packaging locally built artifacts"
-    mkdir -p "${artifact_root}"
-    artifacts_created=true
-    ./scripts/package-release.sh "${candidate_binary}" "${release_tag}" "${artifact_root}"
-    install -m 0644 "${release_notes_path}" "${release_notes_copy}"
-    write_candidate_manifest "${validated_tree}" > "${candidate_manifest}"
-fi
+echo "[release] packaging locally built artifacts"
+mkdir -p "${artifact_root}"
+artifacts_created=true
+./scripts/package-release.sh "${candidate_binary}" "${release_tag}" "${artifact_root}"
+install -m 0644 "${release_notes_path}" "${release_notes_copy}"
 
 # Keep the packaged archive and checksum manifest unchanged through validation.
 archive_digest="$(sha256sum "${archive_path}")"
 checksums_digest="$(sha256sum "${checksums_path}")"
+release_notes_digest="$(sha256sum "${release_notes_copy}")"
 if [[ "${skip_e2e}" == false ]]; then
-    matrix_args=("${archive_path}" "${release_tag}")
-    if [[ -n "${resume_e2e}" ]]; then
-        echo "[release] resuming required distro lifecycle matrix from ${resume_e2e}"
-        matrix_args+=(--resume "${resume_e2e}")
-    else
-        echo "[release] running required distro lifecycle matrix"
-    fi
-    if [[ "${refresh_e2e_images}" == true ]]; then
-        echo "[release] refreshing prepared images and rerunning every selected distro target"
-        matrix_args+=(--refresh-images)
-    fi
-    artifacts_resumable=true
-    KIDOBO_E2E_RESULTS_DIR="${repo_root}/target/e2e" just e2e-artifact "${matrix_args[@]}"
+    echo "[release] running required distro lifecycle matrix"
+    KIDOBO_E2E_RESULTS_DIR="${repo_root}/target/e2e" just e2e-artifact "${archive_path}" "${release_tag}"
     matrix_result="PASSED (required targets; advisory coverage separate)"
 fi
 if [[ "$(sha256sum "${archive_path}")" != "${archive_digest}" \
     || "$(sha256sum "${checksums_path}")" != "${checksums_digest}" ]]; then
-    artifacts_resumable=false
     echo "release artifacts changed during distro validation" >&2
     exit 1
 fi
@@ -398,9 +319,6 @@ fi
 echo
 echo "Release ${release_tag} is ready to publish:"
 echo "Distro lifecycle matrix: ${matrix_result}"
-if [[ -n "${resume_e2e}" ]]; then
-    echo "Reused local CI, release-note, coverage, rustdoc, binary exercise, and compatibility checks for the identical candidate."
-fi
 git --no-pager diff --cached --stat
 echo
 git --no-pager diff --cached
@@ -412,19 +330,20 @@ cat "${checksums_path}"
 echo
 read -r -p "Commit, tag, push, verify, and publish ${release_tag}? [y/N] " confirmation
 if [[ ! "${confirmation}" =~ ^[Yy]$ ]]; then
-    artifacts_resumable=false
     echo "release publication cancelled; the main worktree was not changed"
     exit 0
 fi
 
-write_candidate_manifest > "${temporary_root}/confirmed-candidate.txt"
-if ! cmp -s "${candidate_manifest}" "${temporary_root}/confirmed-candidate.txt" \
+if [[ "$(git write-tree)" != "${validated_tree}" \
+    || "$(sha256sum "${archive_path}")" != "${archive_digest}" \
+    || "$(sha256sum "${checksums_path}")" != "${checksums_digest}" \
+    || "$(sha256sum "${release_notes_copy}")" != "${release_notes_digest}" ]] \
     || ! git diff --quiet || [[ -n "$(git ls-files --others --exclude-standard)" ]]; then
     echo "validated candidate changed before publication; start a fresh candidate" >&2
     exit 1
 fi
 
-# The exact candidate already passed the explicit gates above (or verified resume).
+# The exact candidate already passed the explicit gates above.
 git -c core.hooksPath=/dev/null commit -m "Prepare ${release_tag} release"
 release_commit="$(git rev-parse HEAD)"
 git tag -a "${release_tag}" -m "Release ${release_tag}"

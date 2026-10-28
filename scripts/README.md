@@ -51,13 +51,8 @@ that include those retired scaled cases.
   `kidobo-e2e`; attach with `tmux attach -t kidobo-e2e` to watch progress; the session closes
   automatically and saves output and exit status under `target/e2e/launcher-*/`)
 - `just e2e --required-only` (build and test only required targets in the detached session)
-- `just e2e --archive ARCHIVE --tag TAG` (rerun all configured targets against the same archive without rebuilding; supports cold/warm comparisons)
-- `just e2e --refresh-images` (rebuild prepared images and rerun every selected target)
+- `just e2e --archive ARCHIVE --tag TAG` (run fresh VMs against an existing archive without rebuilding it)
 - `just e2e-artifact ARCHIVE TAG` (select every required target against an existing archive)
-- `just e2e-artifact ARCHIVE TAG --resume RUN_ID` (reuse compatible successful required targets for the exact archive)
-- `just e2e-artifact ARCHIVE TAG --resume RUN_ID --refresh-images` (retain the archive while rebuilding images and rerunning required coverage)
-- `just e2e-resume RUN_ID` (resume a candidate in the foreground using its frozen archive and tag)
-- `just e2e-resume RUN_ID --required-only` (resume only required coverage for the captured candidate)
 - `just e2e-published [tag]` (test a published release; default latest)
 - `just e2e-clean RUN_ID` (clean recorded VMs for one run)
 - `just rustdoc` (workspace documentation with warnings denied)
@@ -66,8 +61,6 @@ that include those retired scaled cases.
 - `just release-notes-check` (required after repository changes and during release validation)
 - `just publish-release X.Y.Z` (complete local preparation, validation, required Incus coverage, upload, verification, and publication)
 - `just publish-release X.Y.Z --skip-e2e` (skip only the matrix and its Incus/agent-ISO prerequisites; other validation and upload verification remain enabled)
-- `just publish-release X.Y.Z --resume-e2e RUN_ID` (resume the retained exact candidate after checking its source, validation identity, and artifacts)
-- `just publish-release X.Y.Z --refresh-e2e-images` (rebuild required prepared images and rerun the matrix; can combine with `--resume-e2e RUN_ID`)
 - `just mutants`
 - `just mutants --shard 1/4`
 
@@ -92,15 +85,12 @@ configured targets, including advisory Fedora 44 and AlmaLinux 9 and 10 with enf
 Advisory prerequisite and application failures do not fail that broader run; reports separately
 identify required-gate success and all-selected-target success. Full seven-platform qualification
 requires every target to pass. Cleanup, shared infrastructure, and evidence archive failures still
-fail the run. Guest prerequisites are checked across pending targets before application lifecycles.
-At most two VMs run by default, each with 2 vCPUs and 4 GiB RAM, with a memory preflight and
-1 GiB host headroom. Running guests in the suite project prevent a new matrix until stopped or cleaned.
-The runner admits fresh clones of private suite-owned prepared images, refreshing after seven days without extending freshness on
-hits. Preparation changes invalidate images immediately; upstream changes are picked up at expiry
-or forced refresh. Up to two unused completed generations per target are retained; generations
-referenced by retained guests are protected. Unused generations are pruned after fourteen days.
-Every clone verifies its kernel/modules, network, security state, and absence of Kidobo state; full application checks still run. See
-[prepared-image reuse](../docs/e2e.md#prepared-image-reuse).
+fail the run. At most two VMs run by default, each with 2 vCPUs and 4 GiB RAM, with a memory
+preflight and 1 GiB host headroom. Each worker completes fresh provisioning, environment validation,
+application checks, diagnostics, and cleanup for one target before taking another. Individual target
+failures do not suppress other targets. Ownership-checked startup recovery removes abandoned suite
+VMs and preserves retained/foreign guests. No prepared-image or prior-result reuse remains.
+Read the [E2E scope contract](../docs/e2e.md#scope-and-non-goals) before changing this workflow.
 
 An explicit `--skip-e2e` argument skips only that matrix and its Incus/agent-ISO prerequisites;
 CI, release-note validation, coverage, strict rustdoc, the release-binary exercise,
@@ -109,23 +99,25 @@ skip before validation and repeats it before the final confirmation. This overri
 or imply evidence from an earlier matrix run. E2E command
 transcript and results remain under the original checkout's `target/e2e/<run-id>/`,
 including when the publisher removes its temporary worktree. Start with `summary.txt` and
-its line references into `transcript.log`; frozen inputs and guest snapshots are retained in
-`evidence.tar.gz`. See [live progress and retained evidence](../docs/e2e.md#diagnose-and-clean-up).
+the paths and local line references into `targets/<distro>/transcript.log`. Each target owns
+its full transcript and structured results; the terminal and root transcript show progress and
+outcomes. Frozen inputs and available supplemental diagnostics are retained in `evidence.tar.gz`.
+Supplemental diagnostic failures are warnings; required assertions, authoritative reporting,
+artifact integrity, evidence archival, and cleanup remain mandatory. See
+[live progress and retained evidence](../docs/e2e.md#diagnose-and-clean-up).
 Packaging reads the validated candidate binary from `CARGO_TARGET_DIR` when
 set, or `target` otherwise. Relative target directories resolve inside the
 candidate worktree; recovery artifacts retain the location below.
 
-After a matrix failure, `just publish-release X.Y.Z --resume-e2e RUN_ID` verifies the retained
-source commit, reconstructed candidate tree and saved release date, and artifact hashes. It reuses
-the completed local validation gates and exact archive without rebuilding or repackaging, then
-resumes compatible distro successes and reruns pending targets. Source or artifact changes reject
-publisher resume. `--resume-e2e` cannot be combined with `--skip-e2e`. Add
-`--refresh-e2e-images` to rebuild preparation and rerun all required targets while retaining
-compatible local validation and the exact archive. It cannot combine with `--skip-e2e`.
-See [candidate resume](../docs/e2e.md#resume-a-candidate) for result compatibility and historical-run
-limits; old attempts without retained publisher metadata cannot resume publication. That guide
-also shows how to move a retained candidate aside before starting fresh after source changes;
-fresh publication refuses to overwrite an existing candidate directory.
+Every publication attempt reruns its validation gates and builds/packages the candidate. The
+publisher checks the validated source tree and artifact hashes again before publishing; it does
+not reuse prior gates or E2E results. A failure or cancellation before refs are pushed removes
+newly created release artifacts but preserves E2E logs and frozen evidence. Retry with the normal
+publication command after addressing the failure.
+
+A pre-existing `target/release-artifacts/<tag>/` directory is not deleted or overwritten. If it
+belongs to an older pre-push attempt, preserve it by moving it aside before starting again. If
+refs were already pushed, use the recovery workflow below instead of retrying publication.
 
 ## GitHub Automation
 
@@ -135,9 +127,8 @@ PRs remain enabled as the sole GitHub-hosted automation exception.
 
 ## Release Recovery
 
-The publisher retains the archive, checksum, release notes, and candidate validation metadata
-under `target/release-artifacts/<tag>/` after a matrix failure so the exact candidate can be resumed.
-It also retains release artifacts whenever Git refs have been pushed but the GitHub release was
+The publisher retains the archive, checksum, and release notes under
+`target/release-artifacts/<tag>/` whenever Git refs have been pushed but the GitHub release was
 not confirmed published. In that case it prints commands specialized for that release. The
 equivalent manual recovery flow after refs have been pushed is:
 

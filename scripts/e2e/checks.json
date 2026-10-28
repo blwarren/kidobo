@@ -90,11 +90,8 @@
         "post-upgrade kernel and firewall backends": 1,
         "prepared SELinux enforcement": 1
       },
-      "--sanitize": {
-        "prepared image is pristine and sanitized": 1
-      },
-      "--admit": {
-        "prepared clone admission": 1
+      "--validate": {
+        "fresh guest environment": 1
       }
     }
   }

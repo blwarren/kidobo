@@ -237,8 +237,9 @@ tests; run it when changing those areas. Publication additionally
 requires coverage, strict rustdoc, the isolated release-binary exercise, static Debian/Alpine
 compatibility, and by default required Debian/Ubuntu coverage in the [Incus distro lifecycle
 matrix](docs/e2e.md). Separate `just e2e` runs cover all seven configured targets, including
-advisory Fedora and AlmaLinux with enforcing SELinux. The suite reuses verified seven-day
-prepared images and permits two running VMs while retaining full application checks.
+advisory Fedora and AlmaLinux with enforcing SELinux. Each target gets fresh provisioning and
+full application checks, with at most two VMs running concurrently. Read the
+[E2E scope contract](docs/e2e.md#scope-and-non-goals) before changing that infrastructure.
 The isolated exercises use a temporary `KIDOBO_ROOT`, a loopback HTTP feed, and fake privileged
 commands; they never
 touch the development host's firewall or systemd. The Incus matrix runs real privileged
@@ -253,11 +254,9 @@ verifies the draft's downloaded assets, and only then publishes it. See the
 [development-command reference](scripts/README.md) for the complete workflow
 and failure recovery. Use `just publish-release X.Y.Z --skip-e2e` to omit the VM
 matrix while retaining all other release checks and uploaded-asset verification.
-After a failed matrix, `just publish-release X.Y.Z --resume-e2e RUN_ID` resumes the retained
-exact candidate and reuses compatible successful target results after verifying its validation
-identity. Add `--refresh-e2e-images` to rebuild preparation images and rerun required coverage,
-including when resuming the retained candidate. See [candidate resume](docs/e2e.md#resume-a-candidate)
-for requirements.
+Every publication attempt reruns validation and builds its candidate; prior E2E results are not
+reused. E2E logs and frozen evidence survive a failed attempt. The command reference distinguishes
+retrying before publication from recovery after Git refs have been pushed.
 
 Use `just --list` to see all available local and CI recipes.
 

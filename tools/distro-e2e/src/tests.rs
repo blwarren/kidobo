@@ -1066,7 +1066,6 @@ fn setup_config() -> Config {
         memory: "4GiB".into(),
         disk: "20GiB".into(),
         max_parallel_vms: 1,
-        prepared_images: crate::prepared::Settings::default(),
         distros: vec![],
     }
 }
@@ -1233,6 +1232,17 @@ fn freeze_archive_preserves_private_archive_and_checksum_snapshot() {
         hash(&frozen_manifest).expect("hash frozen manifest"),
         hash(&manifest).expect("hash mutated caller manifest")
     );
+}
+
+#[test]
+fn removed_reuse_options_and_configuration_are_rejected() {
+    for option in ["--resume", "--refresh-images", "--resume=run-1-2"] {
+        assert!(Cli::try_parse_from(["kidobo-e2e", "run", option]).is_err());
+    }
+    let config = include_str!("../../../config/e2e.toml");
+    toml_edit::de::from_str::<Config>(config).expect("current fresh-run configuration");
+    let legacy = format!("{config}\n[prepared_images]\nenabled = true\n");
+    assert!(toml_edit::de::from_str::<Config>(&legacy).is_err());
 }
 
 #[test]
@@ -1671,15 +1681,14 @@ fn runner_streams_both_outputs_before_command_completes() {
 }
 
 #[test]
-fn heartbeat_uses_silence_and_repeat_intervals_without_sleeping() {
+fn progress_heartbeat_repeats_even_when_full_output_is_hidden() {
     let mut heartbeat = Heartbeat::default();
-    assert!(!heartbeat.due(Duration::from_secs(14), false));
-    assert!(heartbeat.due(Duration::from_secs(15), false));
-    assert!(!heartbeat.due(Duration::from_secs(29), false));
-    assert!(heartbeat.due(Duration::from_secs(30), false));
-    assert!(!heartbeat.due(Duration::from_secs(44), true));
-    assert!(!heartbeat.due(Duration::from_secs(58), false));
-    assert!(heartbeat.due(Duration::from_secs(59), false));
+    for elapsed in 0..=60 {
+        assert_eq!(
+            heartbeat.due(Duration::from_secs(elapsed)),
+            elapsed > 0 && elapsed % 15 == 0
+        );
+    }
 }
 
 #[test]
@@ -1702,13 +1711,17 @@ fn runner_rejects_successful_exit_with_an_aborted_check() {
 }
 
 #[test]
-fn runner_archives_raw_evidence_and_leaves_five_files() {
+fn runner_archives_raw_evidence_and_preserves_target_reports() {
     let temp = TestDir::new();
     let mut runner = runner(temp.path());
     fs::create_dir_all(runner.evidence().join("inputs")).expect("create frozen inputs");
     let snapshot = runner.evidence().join("inputs/SHA256.json");
     fs::write(&snapshot, "{\"fixture\":\"hash\"}\n").expect("write frozen evidence");
     fs::write(runner.dir.join("ownership.json"), "{}").expect("ownership fixture");
+    let target = runner.dir.join("targets/debian-12");
+    fs::create_dir_all(&target).expect("target report directory");
+    fs::write(target.join("transcript.log"), "target command evidence\n").expect("target log");
+    fs::write(target.join("results.json"), "{}\n").expect("target report");
     runner.command("true", &[], 5).expect("silent fake command");
     archive_evidence(&mut runner).expect("archive local fixture only");
     runner.report.save().expect("save report");
@@ -1724,9 +1737,18 @@ fn runner_archives_raw_evidence_and_leaves_five_files() {
             "ownership.json",
             "results.json",
             "summary.txt",
+            "targets",
             "transcript.log"
         ]
         .map(std::ffi::OsString::from)
+    );
+    assert_eq!(
+        read_text(&target.join("transcript.log")).expect("retained target log"),
+        "target command evidence\n"
+    );
+    assert_eq!(
+        read_text(&target.join("results.json")).expect("retained target report"),
+        "{}\n"
     );
     let extracted = Command::new("tar")
         .args(["-xOf"])

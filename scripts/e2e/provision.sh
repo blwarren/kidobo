@@ -167,281 +167,8 @@ capture_boot_configuration() {
   } > "$PREPARED/boot-config-$label.txt" 2>&1 || true
 }
 
-fedora_boot_configuration() {
-  python3 - "$@" <<'PY'
-import re
-import shlex
-import sys
-from pathlib import Path
-
-mode, root_uuid, boot_uuid, grub_path, kernel_path, initramfs_path, prepared = sys.argv[1:]
-prepared = Path(prepared)
-efi = Path('/boot/efi/EFI/fedora/grub.cfg')
-canonical = Path('/boot/grub2/grub.cfg')
-root_arg = 'root=UUID=' + root_uuid
-
-def require(condition, message):
-    if not condition:
-        raise SystemExit('e2e Fedora boot: ' + message)
-
-def root_options(text, add_root=True):
-    # Keep other arguments, including quoted values, byte-for-byte. Only root and
-    # the running kernel's informational BOOT_IMAGE token need replacement.
-    shlex.split(text)  # Reject unbalanced quoting before writing boot files.
-    tokens = re.findall(r'''(?:[^\s"']+|"[^"]*"|'[^']*')+''', text)
-    roots = [token for token in tokens if token.startswith('root=')]
-    require(all('"' not in value and "'" not in value for value in roots),
-            'unrecognized quoted root argument')
-    if not roots and not add_root:
-        return text
-    return ' '.join([token for token in tokens if not token.startswith(('root=', 'BOOT_IMAGE='))]
-                    + [root_arg])
-
-def default_arguments(match):
-    prefix, value = match[0].split('=', 1)
-    if value.startswith(('"', "'")):
-        quoted = re.fullmatch(r'''(["'])(.*)\1([ \t]*(?:#.*)?)''', value)
-        require(quoted is not None, 'unrecognized quoted GRUB command line')
-        quote, arguments, comment = quoted.groups()
-        return prefix + '=' + quote + root_options(arguments, add_root=False) + quote + comment
-    require(not re.search(r'\s', value), 'unrecognized unquoted GRUB command line')
-    return prefix + '=' + root_options(value, add_root=False)
-
-def entries():
-    paths = sorted(Path('/boot/loader/entries').glob('*.conf'))
-    require(bool(paths), 'no BLS entries')
-    return paths
-
-def selected_entry() -> Path:
-    matches = []
-    observed = []
-    for path in entries():
-        text = path.read_text()
-        linux = re.findall(r'^\s*linux[ \t]+([^\n]*)$', text, re.M)
-        observed.append(path.name + ': ' + repr(linux))
-        require(len(linux) == 1 and len(linux[0].split()) == 1,
-                'BLS entry must have exactly one kernel path: ' + str(path))
-        if linux[0].strip() == kernel_path:
-            initrds = re.findall(r'^\s*initrd[ \t]+([^\n]*)$', text, re.M)
-            require(sum(line.split().count(initramfs_path) for line in initrds) == 1,
-                    'BLS entry does not reference intended initramfs ' + initramfs_path + ': ' + str(path))
-            matches.append(path)
-    require(len(matches) == 1,
-            'intended kernel ' + kernel_path + ' must have exactly one BLS entry; matched '
-            + str(len(matches)) + '; entries: ' + '; '.join(observed))
-    return matches[0]
-
-stub = ('search --no-floppy --fs-uuid --set=dev ' + boot_uuid + '\n'
-        'set prefix=($dev)' + grub_path + '\n'
-        'export prefix\nconfigfile $prefix/grub.cfg\n')
-
-def valid_stub(text):
-    lines = [line.strip() for line in text.splitlines()
-             if line.strip() and not line.lstrip().startswith('#')]
-    # Fedora's packaged stub exports $prefix; our generated stub exports its name.
-    expected = stub.splitlines()
-    return lines == expected or lines == [*expected[:2], 'export $prefix', expected[3]]
-
-def recognized_layout():
-    require(efi.is_file() and not efi.is_symlink(), 'missing or indirect Fedora EFI configuration')
-    configs = sorted(Path('/boot/efi/EFI').rglob('grub.cfg'))
-    require(configs == [efi], 'ambiguous EFI configuration layout')
-    text = efi.read_text()
-    if valid_stub(text):
-        return
-    require('grub2-mkconfig' in text or 'grub-mkconfig' in text,
-            'unrecognized EFI forwarding configuration')
-    require(re.search(r'^\s*(blscfg|menuentry\s)', text, re.M),
-            'unrecognized full EFI configuration')
-
-def grub_tokens(text: str) -> list[str]:
-    lexer = shlex.shlex(text, posix=False, punctuation_chars=';')
-    lexer.whitespace_split = True
-    return list(lexer)
-
-def grub_section(text: str, name: str) -> str:
-    sections = re.findall(r'^### BEGIN /etc/grub.d/' + re.escape(name)
-                          + r' ###\n(.*?)^### END /etc/grub.d/' + re.escape(name)
-                          + r' ###$', text, re.M | re.S)
-    require(len(sections) == 1,
-            'canonical configuration lacks environment-based BLS selection: expected one ' + name)
-    return sections[0]
-
-def consume_grub(text: str, fragment: str, reason: str) -> str:
-    # Match known generated control flow, ignoring only comments and whitespace.
-    expected = ' ' + ' '.join(grub_tokens(fragment)) + ' '
-    require(text.count(expected) == 1, reason)
-    return text.replace(expected, ' ', 1)
-
-def verify_canonical() -> None:
-    text = canonical.read_text()
-    header = ' ' + ' '.join(grub_tokens(grub_section(text, '00_header'))) + ' '
-    selection = '''
-if [ "${next_entry}" ] ; then
-  set default="${next_entry}"
-  set next_entry=
-  if [ "${env_block}" ] ; then
-    save_env -f "${env_block}" next_entry
-  else
-    save_env next_entry
-  fi
-  set boot_once=true
-else
-  set default="${saved_entry}"
-fi
-'''
-    environment = '''
-if [ -f ${config_directory}/grubenv ]; then
-  load_env -f ${config_directory}/grubenv
-elif [ -s $prefix/grubenv ]; then
-  load_env
-fi
-'''
-    alternate_environment = '''
-if [ "${env_block}" ] ; then
-  if [ "${dev}" ]; then
-    set env_block="(${dev})${env_block}"
-  else
-    set env_block="(${root})${env_block}"
-  fi
-  export env_block
-  load_env -f "${env_block}"
-fi
-'''
-    reason = 'canonical configuration lacks environment-based BLS selection'
-    consume_grub(header, environment, reason)
-    consume_grub(header, selection, reason)
-    remaining = ' ' + ' '.join(grub_tokens(text)) + ' '
-    for block in (environment, alternate_environment, selection):
-        remaining = consume_grub(remaining, block, reason)
-    fallback = grub_section(text, '08_fallback_counting')
-    expected_fallback = '''
-insmod increment
-if [ -n "${boot_counter}" -a "${boot_success}" = "0" ]; then
-  if [ "${boot_counter}" = "0" -o "${boot_counter}" = "-1" ]; then
-    set default=1
-    set boot_counter=-1
-  else
-    decrement boot_counter
-  fi
-  if [ "${env_block}" ]; then
-    save_env -f "${env_block}" boot_counter
-  else
-    save_env boot_counter
-  fi
-fi
-'''
-    require(grub_tokens(fallback) == grub_tokens(expected_fallback),
-            'canonical configuration has an unrecognized fallback guard')
-    remaining = consume_grub(remaining, fallback, 'ambiguous fallback configuration')
-    tokens = grub_tokens(remaining)
-    require('blscfg' in tokens, reason)
-    for index, token in enumerate(tokens):
-        require(token not in ('load_env', 'configfile'),
-                'canonical configuration redirects boot selection')
-        if token == 'set' and index + 1 < len(tokens):
-            name = tokens[index + 1].split('=', 1)[0]
-            require(name not in ('default', 'prefix', 'boot_counter'),
-                    'canonical configuration has an unexpected boot override: ' + name)
-
-require(re.fullmatch(r'[0-9A-Fa-f]+(?:-[0-9A-Fa-f]+)*', root_uuid or ''), 'missing or ambiguous root UUID')
-require(re.fullmatch(r'[0-9A-Fa-f]+(?:-[0-9A-Fa-f]+)*', boot_uuid or ''), 'missing or ambiguous boot UUID')
-require(grub_path in ('/boot/grub2', '/grub2'), 'unrecognized GRUB filesystem path')
-for artifact in (kernel_path, initramfs_path):
-    require(artifact.startswith('/') and not re.search(r'\s', artifact)
-            and not any(part in ('.', '..') for part in artifact.split('/')),
-            'unrecognized boot artifact path: ' + artifact)
-
-if mode == 'prepare':
-    recognized_layout()
-    selected = selected_entry()
-    running = root_options(Path('/proc/cmdline').read_text().strip())
-    cmdline = Path('/etc/kernel/cmdline')
-    persistent = root_options(cmdline.read_text().strip() if cmdline.exists() else running)
-    rewritten = []
-    for path in entries():
-        text = path.read_text()
-        options = re.findall(r'^options[ \t]+(.*)$', text, re.M)
-        require(len(options) == 1, 'BLS entry must have exactly one options line: ' + str(path))
-        resolved = options[0].replace('${kernelopts}', running).replace('$kernelopts', running)
-        resolved = root_options(resolved)
-        rewritten.append((path, re.sub(r'^options[ \t]+.*$', lambda _: 'options ' + resolved,
-                                       text, flags=re.M)))
-    defaults = Path('/etc/default/grub')
-    text = defaults.read_text()
-    # Repair explicit roots inside quoted GRUB_CMDLINE_LINUX assignments as well.
-    text = re.sub(r'^(GRUB_CMDLINE_LINUX(?:_DEFAULT)?=.*)$', default_arguments, text, flags=re.M)
-    for key, value in [('GRUB_DEFAULT', 'saved'), ('GRUB_SAVEDEFAULT', 'false'),
-                       ('GRUB_ENABLE_BLSCFG', 'true')]:
-        text = re.sub(r'^' + key + r'=.*\n?', '', text, flags=re.M)
-        text = text.rstrip() + '\n' + key + '=' + value + '\n'
-    cmdline.parent.mkdir(parents=True, exist_ok=True)
-    cmdline.write_text(persistent + '\n')
-    for path, content in rewritten:
-        path.write_text(content)
-    defaults.write_text(text)
-    (prepared / 'selected-bls-entry').write_text(selected.stem + '\n')
-elif mode == 'forward':
-    verify_canonical()
-    if not valid_stub(efi.read_text()):
-        efi.write_text(stub)
-elif mode == 'verify':
-    verify_canonical()
-    require(valid_stub(efi.read_text()), 'EFI does not forward to the measured GRUB filesystem')
-    selected = selected_entry()
-    environment = (prepared / 'canonical-grubenv.txt').read_text().splitlines()
-    require(environment.count('saved_entry=' + selected.stem) == 1,
-            'canonical GRUB environment does not select the intended BLS entry')
-    require(not any(line.startswith(('next_entry=', 'prev_saved_entry=', 'boot_counter=', 'env_block='))
-                    for line in environment),
-            'canonical GRUB environment still overrides the next boot')
-    for path in entries():
-        options = re.findall(r'^options[ \t]+(.*)$', path.read_text(), re.M)
-        require(len(options) == 1 and re.findall(r'(?<!\S)root=\S+', options[0]) == [root_arg]
-                and '$kernelopts' not in options[0] and '${kernelopts}' not in options[0],
-                'BLS root identity is not explicit and correct: ' + str(path))
-else:
-    raise SystemExit('unknown Fedora boot configuration operation')
-PY
-}
-
-fedora_boot_identity() {
-  local kernel=$1 artifact
-  root_uuid=$(findmnt --noheadings --output UUID --target /)
-  boot_uuid=$(grub2-probe --target=fs_uuid /boot/grub2)
-  grub_path=$(grub2-mkrelpath /boot/grub2)
-  kernel_path=$(grub2-mkrelpath "/boot/vmlinuz-$kernel")
-  initramfs_path=$(grub2-mkrelpath "/boot/initramfs-$kernel.img")
-  for artifact in "/boot/vmlinuz-$kernel" "/boot/initramfs-$kernel.img"; do
-    [[ "$(grub2-probe --target=fs_uuid "$artifact")" == "$boot_uuid" ]] || fail "boot artifact is on a different GRUB filesystem: $artifact"
-  done
-}
-
-verify_fedora_boot() (
-  local kernel=$1 root_uuid boot_uuid grub_path kernel_path initramfs_path
-  trap 'capture_boot_configuration final' EXIT
-  fedora_boot_identity "$kernel"
-  grub2-editenv /boot/grub2/grubenv list > "$PREPARED/canonical-grubenv.txt"
-  fedora_boot_configuration verify "$root_uuid" "$boot_uuid" "$grub_path" "$kernel_path" "$initramfs_path" "$PREPARED"
-)
-
-prepare_fedora_boot() (
-  local kernel=$1 root_uuid boot_uuid grub_path kernel_path initramfs_path
-  capture_boot_configuration before
-  trap 'capture_boot_configuration after' EXIT
-  fedora_boot_identity "$kernel"
-  fedora_boot_configuration prepare "$root_uuid" "$boot_uuid" "$grub_path" "$kernel_path" "$initramfs_path" "$PREPARED"
-  grub2-mkconfig -o /boot/grub2/grub.cfg
-  fedora_boot_configuration forward "$root_uuid" "$boot_uuid" "$grub_path" "$kernel_path" "$initramfs_path" "$PREPARED"
-  grubby --set-default "/boot/vmlinuz-$kernel"
-  [[ "$(grubby --default-kernel)" == "/boot/vmlinuz-$kernel" ]] || fail 'grubby did not select the intended kernel'
-  grub2-editenv /boot/grub2/grubenv set "saved_entry=$(<"$PREPARED/selected-bls-entry")"
-  grub2-editenv /boot/grub2/grubenv unset next_entry prev_saved_entry boot_counter
-  verify_fedora_boot "$kernel"
-)
-
 select_boot_kernel() {
-  local family=$1 kernel=$2 initramfs first_linux ID=
+  local family=$1 kernel=$2 initramfs first_linux
   case "$family" in
     apt)
       initramfs="/boot/initrd.img-$kernel"
@@ -455,14 +182,8 @@ select_boot_kernel() {
     dnf|dnf-epel)
       initramfs="/boot/initramfs-$kernel.img"
       [[ -s "$initramfs" ]] || dracut --force "$initramfs" "$kernel"
-      # shellcheck disable=SC1091
-      . /etc/os-release
-      if [[ "$ID" == fedora ]]; then
-        prepare_fedora_boot "$kernel"
-      else
-        grubby --set-default "/boot/vmlinuz-$kernel"
-        [[ "$(grubby --default-kernel)" == "/boot/vmlinuz-$kernel" ]] || fail 'grubby did not select the intended kernel'
-      fi
+      grubby --set-default "/boot/vmlinuz-$kernel"
+      [[ "$(grubby --default-kernel)" == "/boot/vmlinuz-$kernel" ]] || fail 'grubby did not select the intended kernel'
       ;;
     zypper)
       initramfs="/boot/initrd-$kernel"
@@ -603,122 +324,41 @@ assert_pristine() {
   local path
   for path in /usr/local/bin/kidobo /usr/bin/kidobo /etc/kidobo /var/lib/kidobo /var/cache/kidobo \
     /etc/systemd/system/kidobo-sync.service /etc/systemd/system/kidobo-sync.timer; do
-    [[ ! -e "$path" && ! -L "$path" ]] || fail "prepared image contains Kidobo state: $path"
+    [[ ! -e "$path" && ! -L "$path" ]] || fail "fresh guest contains Kidobo state: $path"
   done
 }
 
-write_manifest() {
-  python3 - "$PREPARED" <<'PY'
-import hashlib
+write_environment() {
+  python3 - "$PREPARED" <<'PYTHON'
 import json
 import os
-import re
 import shutil
 import subprocess
 import sys
-import time
 from pathlib import Path
 
 prepared = Path(sys.argv[1])
 values = dict(line.split('=', 1) for line in (prepared / 'provision.txt').read_text().splitlines() if '=' in line)
-selinux = subprocess.check_output(['getenforce'], text=True).strip() if shutil.which('getenforce') else 'unavailable'
-machine_id = Path('/etc/machine-id').read_text().strip()
-if not re.fullmatch('[0-9a-f]{32}', machine_id):
-    raise SystemExit('source VM has no valid machine ID before publishing')
-manifest = {
-    'format': 1,
-    'prepared_at_unix': int(time.time()),
+environment = {
     'family': values['family'],
     'architecture': os.uname().machine,
-    'expected_kernel': (prepared / 'expected-kernel').read_text().strip(),
-    'selinux_requested': (prepared / 'selinux-requested').read_text().strip(),
-    'selinux_actual': selinux,
-    'packages_sha256': hashlib.sha256((prepared / 'packages.txt').read_bytes()).hexdigest(),
-    'provision_sha256': hashlib.sha256(Path('/opt/kidobo-e2e/provision.sh').read_bytes()).hexdigest(),
-    'source_machine_id': machine_id,
-    'source_boot_id': Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
+    'kernel': os.uname().release,
+    'selinux': subprocess.check_output(['getenforce'], text=True).strip() if shutil.which('getenforce') else 'unavailable',
     'iptables_backend': subprocess.check_output(['iptables', '--version'], text=True).strip(),
     'ip6tables_backend': subprocess.check_output(['ip6tables', '--version'], text=True).strip(),
 }
-temporary = prepared / 'manifest.json.tmp'
-temporary.write_text(json.dumps(manifest, indent=2) + '\n')
-temporary.replace(prepared / 'manifest.json')
-PY
+(prepared / 'environment.json').write_text(json.dumps(environment, indent=2) + '\n')
+PYTHON
 }
 
-sanitize_image() {
-  [[ -s "$PREPARED/manifest.json" ]] || fail 'sanitizing requires successful post-reboot verification'
-  assert_pristine
-  if command -v cloud-init >/dev/null 2>&1; then cloud-init clean --logs; fi
-  rm -f /etc/ssh/ssh_host_*
-  rm -f /var/lib/dbus/machine-id
-  : > /etc/machine-id
-  find /var/lib/dhcp /var/lib/NetworkManager -maxdepth 1 -type f \( -name '*.lease' -o -name '*.leases' \) -delete 2>/dev/null || true
-  find "$BASE" -mindepth 1 -maxdepth 1 ! -name prepared ! -name provision.sh -exec rm -rf -- {} +
-}
-
-admit_clone() {
-  local fresh=${1:-false}
-  [[ -s "$PREPARED/manifest.json" ]] || fail 'clone lacks preparation provenance'
+validate_environment() {
   assert_pristine
   verify_running_kernel
-  local family requested
+  finish_selinux
+  local family
   family=$(sed -n 's/^family=//p' "$PREPARED/provision.txt")
   wait_for_network "$family"
-  requested=$(<"$PREPARED/selinux-requested")
-  if [[ "$requested" == enforcing ]]; then
-    [[ "$(getenforce)" == Enforcing ]] || fail 'prepared clone is not SELinux enforcing'
-    [[ ! -e /.autorelabel ]] || fail 'prepared clone has incomplete SELinux relabeling'
-  fi
-  record_packages "$family" "$PREPARED/admission-packages.txt"
-  python3 - "$PREPARED" "$fresh" <<'PY'
-import hashlib
-import json
-import os
-import re
-import shutil
-import subprocess
-import sys
-import time
-from pathlib import Path
-
-prepared = Path(sys.argv[1])
-manifest = json.loads((prepared / 'manifest.json').read_text())
-machine_id = Path('/etc/machine-id').read_text().strip()
-if not re.fullmatch('[0-9a-f]{32}', machine_id) or (sys.argv[2] != 'true' and machine_id == manifest['source_machine_id']):
-    raise SystemExit('prepared clone did not receive a new valid machine ID')
-if hashlib.sha256((prepared / 'packages.txt').read_bytes()).hexdigest() != manifest['packages_sha256']:
-    raise SystemExit('prepared package inventory does not match provenance')
-if hashlib.sha256((prepared / 'admission-packages.txt').read_bytes()).hexdigest() != manifest['packages_sha256']:
-    raise SystemExit('installed clone packages changed after preparation')
-if hashlib.sha256(Path('/opt/kidobo-e2e/provision.sh').read_bytes()).hexdigest() != manifest['provision_sha256']:
-    raise SystemExit('prepared provision script does not match provenance')
-if os.uname().release != manifest['expected_kernel']:
-    raise SystemExit('running kernel does not match preparation provenance')
-iptables = subprocess.check_output(['iptables', '--version'], text=True).strip()
-ip6tables = subprocess.check_output(['ip6tables', '--version'], text=True).strip()
-if iptables != manifest['iptables_backend'] or ip6tables != manifest['ip6tables_backend']:
-    raise SystemExit('clone firewall backends changed after preparation')
-selinux = subprocess.check_output(['getenforce'], text=True).strip() if shutil.which('getenforce') else 'unavailable'
-if selinux != manifest['selinux_actual']:
-    raise SystemExit('clone SELinux state changed after preparation')
-admission = {
-    'format': 1,
-    'admitted_at_unix': int(time.time()),
-    'machine_id': machine_id,
-    'boot_id': Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
-    'manifest_sha256': hashlib.sha256((prepared / 'manifest.json').read_bytes()).hexdigest(),
-    'kernel': os.uname().release,
-    'selinux': selinux,
-    'iptables_backend': iptables,
-    'ip6tables_backend': ip6tables,
-    'fresh_same_instance': sys.argv[2] == 'true',
-}
-(prepared / 'admission.json').write_text(json.dumps(admission, indent=2) + '\n')
-PY
-  install -d -m 0755 "$BASE/state"
-  cp "$PREPARED/provision.txt" "$BASE/state/provision.txt"
-  cp "$PREPARED/packages.txt" "$BASE/state/packages.txt"
+  write_environment
 }
 
 provision_main() {
@@ -728,7 +368,7 @@ provision_main() {
   set -x
   trap 'e2e_report_exit "$?"' EXIT
   require_guest
-  local mode=${1:-} family selinux=image-default kernel ID=
+  local mode=${1:-} family selinux=image-default kernel
   case "$mode" in
     --boot-status)
       [[ $# == 1 ]] || fail '--boot-status accepts no additional arguments'
@@ -775,23 +415,16 @@ provision_main() {
       finish_selinux
       rm -f /etc/systemd/system/selinux-autorelabel.service.d/kidobo-e2e.conf
       systemctl daemon-reload
-      write_manifest
       install -d -m 0755 "$BASE/state"
       cp "$PREPARED/provision.txt" "$BASE/state/provision.txt"
       cp "$PREPARED/packages.txt" "$BASE/state/packages.txt"
-      e2e_check_pass "requested=$(<"$PREPARED/selinux-requested"); actual=$(getenforce 2>/dev/null || printf unavailable); preparation manifest recorded"
+      e2e_check_pass "requested=$(<"$PREPARED/selinux-requested"); actual=$(getenforce 2>/dev/null || printf unavailable)"
       ;;
-    --sanitize)
-      [[ $# == 1 ]] || fail '--sanitize accepts no additional arguments'
-      e2e_check_start 'prepared image is pristine and sanitized' 'no Kidobo installation/state; instance IDs, SSH host keys and cloud-init instance state removed'
-      sanitize_image
-      e2e_check_pass 'pristine preparation retained; instance identities removed before publishing'
-      ;;
-    --admit)
-      [[ $# == 1 || ( $# == 2 && $2 == --fresh ) ]] || fail 'usage: provision.sh --admit [--fresh]'
-      e2e_check_start 'prepared clone admission' 'pristine clone has new identity, intended kernel/modules/backends, networking and requested security state'
-      if [[ ${2:-} == --fresh ]]; then admit_clone true; else admit_clone false; fi
-      e2e_check_pass 'new clone identity and preparation hashes verified; kernel, modules, network and security checks passed'
+    --validate)
+      [[ $# == 1 ]] || fail '--validate accepts no additional arguments'
+      e2e_check_start 'fresh guest environment' 'no pre-existing Kidobo state; kernel, firewall backends, network and requested security state are usable'
+      validate_environment
+      e2e_check_pass 'fresh guest environment verified'
       ;;
     --prepare|apt|dnf|dnf-epel|zypper)
       if [[ "$mode" == --prepare ]]; then
@@ -828,17 +461,13 @@ provision_main() {
         [[ -n "$kernel" ]] || fail 'no installed kernel package was found'
         select_boot_kernel "$family" "$kernel"
         prepare_selinux "$family" "$selinux"
-        # SELinux preparation edits the selected entries through grubby.
-        # shellcheck disable=SC1091
-        . /etc/os-release
-        if [[ "$ID" == fedora ]]; then verify_fedora_boot "$kernel"; fi
         e2e_check_pass "intended_kernel=$kernel; requested_selinux=$selinux; relabel_scheduled=$(<"$PREPARED/relabel-scheduled")"
       fi
       install -d -m 0755 "$BASE/state"
       cp "$PREPARED/provision.txt" "$BASE/state/provision.txt"
       cp "$PREPARED/packages.txt" "$BASE/state/packages.txt"
       ;;
-    *) fail 'usage: provision.sh --prepare FAMILY SELINUX PACKAGE... | --check-kernel | --sanitize | --admit' ;;
+    *) fail 'usage: provision.sh --prepare FAMILY SELINUX PACKAGE... | --check-kernel | --validate' ;;
   esac
 }
 

@@ -22,7 +22,6 @@ mod diagnostics;
 mod matrix;
 mod prepared;
 mod report;
-mod resume;
 use report::Report;
 
 #[derive(Parser)]
@@ -49,12 +48,6 @@ enum Action {
         required_only: bool,
         #[arg(long)]
         keep_failed: bool,
-        /// Reuse completed target results for the same candidate and test inputs.
-        #[arg(long, conflicts_with_all = ["published", "distro"])]
-        resume: Option<String>,
-        /// Rebuild selected preparation images and rerun selected lifecycle results.
-        #[arg(long)]
-        refresh_images: bool,
     },
     Clean {
         run_id: String,
@@ -73,8 +66,6 @@ struct Config {
     distros: Vec<Distro>,
     #[serde(default = "default_parallelism")]
     max_parallel_vms: usize,
-    #[serde(default)]
-    prepared_images: prepared::Settings,
 }
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -186,17 +177,11 @@ impl Drop for Capture {
 }
 #[derive(Default)]
 struct Heartbeat {
-    last_activity: Duration,
     last_notice: Duration,
 }
 impl Heartbeat {
-    fn due(&mut self, elapsed: Duration, activity: bool) -> bool {
-        if activity {
-            self.last_activity = elapsed;
-        }
-        if elapsed.saturating_sub(self.last_activity.max(self.last_notice))
-            >= Duration::from_secs(15)
-        {
+    fn due(&mut self, elapsed: Duration) -> bool {
+        if elapsed.saturating_sub(self.last_notice) >= Duration::from_secs(15) {
             self.last_notice = elapsed;
             true
         } else {
@@ -212,7 +197,7 @@ fn archive_evidence_using(runner: &mut Runner, program: &str) -> Result<()> {
     fs::create_dir_all(runner.evidence())?;
     fs::write(
         runner.evidence().join("README.txt"),
-        "Frozen inputs and SHA256 manifest: inputs/\nGuest diagnostics and snapshots: <distro>/\nCommand output and check references: ../transcript.log and ../results.json\n",
+        "Frozen inputs and SHA256 manifest: inputs/\nGuest diagnostics and snapshots: <distro>/\nCommand output and check references: ../targets/<distro>/transcript.log and results.json\n",
     )?;
     let temporary = runner.dir.join(".evidence.tar.gz.tmp");
     let archive = runner.dir.join("evidence.tar.gz");
@@ -250,13 +235,17 @@ fn safe_name(value: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
 }
 impl Runner {
-    fn worker(&self, sink: std::sync::mpsc::SyncSender<report::Event>) -> Result<Self> {
+    fn worker(
+        &self,
+        target: &str,
+        sink: std::sync::mpsc::SyncSender<report::Event>,
+    ) -> Result<Self> {
         Ok(Self {
             project: self.project.clone(),
             dir: self.dir.clone(),
             incus_program: self.incus_program.clone(),
             cancelled: Arc::clone(&self.cancelled),
-            report: self.report.worker(sink)?,
+            report: self.report.worker(target, sink)?,
             command_poll_interval: self.command_poll_interval,
             ignore_cancellation: false,
         })
@@ -357,7 +346,7 @@ impl Runner {
             };
             return Err(format!(
                 "{error}; transcript: {} (command {id}, line {line})",
-                self.dir.join("transcript.log").display()
+                self.report.transcript_path().display()
             )
             .into());
         }
@@ -395,8 +384,8 @@ impl Runner {
                 let activity =
                     self.drain(id, "stdout", &mut out)? | self.drain(id, "stderr", &mut err)?;
                 let elapsed = started.elapsed();
-                if heartbeat.due(elapsed, activity) {
-                    self.report.emit(&format!(
+                if heartbeat.due(elapsed) {
+                    self.report.progress(&format!(
                         "[{} | command {id}] still running; elapsed={:.0}s",
                         self.report.context,
                         elapsed.as_secs_f64()
@@ -1075,33 +1064,9 @@ fn run(cli: Cli) -> Result<()> {
         runner.report.document["tag"] = json!(tag);
         runner.report.document["archive"] = json!(archive);
         runner.report.document["targets"] = json!(targets);
-        let published = matches!(
-            &cli.action,
-            Action::Run {
-                published: true,
-                ..
-            }
-        );
-        let mut stages = vec![];
-        for target in &targets {
-            for &name in resume::LIFECYCLE_STAGES {
-                if published
-                    && matches!(
-                        name,
-                        "upgrade baseline preparation"
-                            | "application reboot and timer recovery"
-                            | "upgrade and preservation"
-                    )
-                {
-                    continue;
-                }
-                stages.push(json!({"name": format!("{target} | {name}"), "status": "not-run"}));
-            }
-        }
-        runner.report.document["stages"] = json!(stages);
         runner.report.document["status"] = json!("running");
         runner.report.save()?;
-        runner.report.emit(&format!(
+        runner.report.progress(&format!(
             "E2E run {run_id}: release={tag} archive={archive:?} targets={targets:?}; results: {}",
             runner.dir.display()
         ))?;
@@ -1109,10 +1074,6 @@ fn run(cli: Cli) -> Result<()> {
     let started = Instant::now();
     let outcome = execute(cli, &config, &run_id, &mut runner);
     runner.report.document["run_wall_seconds"] = json!(started.elapsed().as_secs_f64());
-    let restored = runner.dir.join(".resume-candidate");
-    if restored.exists() {
-        fs::remove_dir_all(restored)?;
-    }
     if is_clean {
         runner
             .report
@@ -1154,6 +1115,13 @@ fn run(cli: Cli) -> Result<()> {
         runner.report.document["release_gate_passed"] = json!(false);
     }
     runner.report.save()?;
+    runner.report.progress(&format!(
+        "[e2e] finished: status={} required_gate={} all_selected={}; summary: {}",
+        runner.report.document["status"],
+        runner.report.document["release_gate_passed"],
+        runner.report.document["all_selected_targets_passed"],
+        runner.dir.join("summary.txt").display()
+    ))?;
     outcome?;
     archive?;
     Ok(())
@@ -1200,28 +1168,7 @@ fn execute(cli: Cli, config: &Config, run_id: &str, runner: &mut Runner) -> Resu
             distro,
             required_only,
             keep_failed,
-            resume,
-            refresh_images,
         } => {
-            runner.report.document["refresh_images"] = json!(refresh_images);
-            let previous = resume
-                .as_deref()
-                .map(|id| resume::Resume::load(runner, id))
-                .transpose()?;
-            let archive = if let Some(previous) = &previous {
-                if tag == "latest" {
-                    tag = previous.document["tag"]
-                        .as_str()
-                        .ok_or("missing resume tag")?
-                        .into();
-                }
-                Some(match archive {
-                    Some(archive) => archive,
-                    None => previous.restore_candidate(runner)?,
-                })
-            } else {
-                archive
-            };
             runner.report.document["coverage"] = json!(if published {
                 "Published smoke lane; candidate post-install reboot, upgrade, and candidate-only checks are not run"
             } else {
@@ -1267,14 +1214,7 @@ fn execute(cli: Cli, config: &Config, run_id: &str, runner: &mut Runner) -> Resu
             if test_archive.as_deref().map(hash).transpose()? != artifact_hash {
                 return Err("candidate changed while taking its input snapshot".into());
             }
-            if let Some(previous) = &previous {
-                previous.verify_inputs(
-                    runner,
-                    &tag,
-                    archive.as_deref().ok_or("resume needs candidate")?,
-                )?;
-                previous.restore_baseline(runner)?;
-            } else if !published {
+            if !published {
                 let release_list = runner.command(
                     "curl",
                     &strings(&[
@@ -1342,9 +1282,6 @@ fn execute(cli: Cli, config: &Config, run_id: &str, runner: &mut Runner) -> Resu
             let _operation_lock = coordination::lock(runner)?;
             let parallelism = coordination::preflight(runner, config)?;
             runner.report.document["effective_parallelism"] = json!(parallelism);
-            if config.prepared_images.enabled {
-                prepared::prune(runner, config)?;
-            }
             let targets = selected_targets(config, distro.as_deref(), required_only);
             if targets.is_empty() {
                 return Err("no matching distros".into());
@@ -1362,11 +1299,7 @@ fn execute(cli: Cli, config: &Config, run_id: &str, runner: &mut Runner) -> Resu
                 published,
                 test_archive.as_deref(),
                 keep_failed,
-                previous.as_ref(),
             )?;
-            if config.prepared_images.enabled {
-                prepared::prune(runner, config)?;
-            }
             if archive.as_deref().map(hash).transpose()? != artifact_hash {
                 return Err("candidate archive changed during testing".into());
             }
@@ -1423,7 +1356,7 @@ fn snapshot_inputs(dir: &Path, config: &Path) -> Result<()> {
         "main.rs",
         "matrix.rs",
         "report.rs",
-        "resume.rs",
+        "diagnostics.rs",
         "prepared.rs",
         "coordination.rs",
         "contract.rs",
@@ -1480,8 +1413,6 @@ fn validate_vm_config(value: &serde_json::Value) -> Result<()> {
     }
     Ok(())
 }
-#[cfg(test)]
-mod fedora_boot_tests;
 #[cfg(test)]
 mod guest_http_tests;
 #[cfg(test)]

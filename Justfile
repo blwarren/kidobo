@@ -95,63 +95,10 @@ _e2e *args:
     ./scripts/package-release.sh "${binary}" "${tag}" "${output}"
     cargo run --locked -p kidobo-e2e -- run --archive "${output}/kidobo-${tag}-linux-x86_64.tar.gz" --tag "${tag}" "$@"
 
-# Test required targets against the publication archive; optionally resume or refresh images.
+# Test required targets against the exact publication archive.
 [positional-arguments]
-e2e-artifact archive tag *args:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    archive="$1"
-    tag="$2"
-    shift 2
-    matrix_args=("$@")
-    resume_seen=false
-    refresh_seen=false
-    usage() { echo 'Usage: just e2e-artifact ARCHIVE TAG [--resume RUN_ID] [--refresh-images]' >&2; exit 2; }
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --resume)
-                if [[ "$resume_seen" == true || $# -lt 2 || ! "$2" =~ ^run-[0-9]+-[0-9]+$ ]]; then usage; fi
-                resume_seen=true
-                shift 2
-                ;;
-            --refresh-images)
-                if [[ "$refresh_seen" == true ]]; then usage; fi
-                refresh_seen=true
-                shift
-                ;;
-            *) usage ;;
-        esac
-    done
-    cargo run --locked -p kidobo-e2e -- run --required-only --archive "${archive}" --tag "${tag}" "${matrix_args[@]}"
-
-# Resume an unchanged candidate using its frozen archive and retained results.
-[positional-arguments]
-e2e-resume run_id *args:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    run_id="$1"
-    shift
-    matrix_args=("$@")
-    required_seen=false
-    refresh_seen=false
-    usage() { echo 'Usage: just e2e-resume RUN_ID [--required-only] [--refresh-images]' >&2; exit 2; }
-    if [[ ! "$run_id" =~ ^run-[0-9]+-[0-9]+$ ]]; then usage; fi
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --required-only)
-                if [[ "$required_seen" == true ]]; then usage; fi
-                required_seen=true
-                shift
-                ;;
-            --refresh-images)
-                if [[ "$refresh_seen" == true ]]; then usage; fi
-                refresh_seen=true
-                shift
-                ;;
-            *) usage ;;
-        esac
-    done
-    cargo run --locked -p kidobo-e2e -- run --resume "${run_id}" "${matrix_args[@]}"
+e2e-artifact archive tag:
+    @cargo run --locked -p kidobo-e2e -- run --required-only --archive "$1" --tag "$2"
 
 # Exercise genuine GitHub installation of a published release.
 e2e-published tag="latest" *args:

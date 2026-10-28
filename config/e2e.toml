@@ -7,12 +7,6 @@ cpus = 2
 memory = "4GiB"
 disk = "30GiB"
 
-[prepared_images]
-enabled = true
-max_age_hours = 168
-max_generations = 2
-prune_after_hours = 336
-
 [[distros]]
 id = "debian-12"
 image = "debian/bookworm"
