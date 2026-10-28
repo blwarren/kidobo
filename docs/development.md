@@ -25,15 +25,22 @@ Select checks according to the change:
 | Documentation only | Check affected links, anchors, and fenced-code languages; no Rust gate unless executable examples, generated artifacts, or build/release behavior are affected. Use the applicable row above for those impacts. |
 | Every repository change | `just release-notes-check`, in addition to the applicable checks above. |
 
-`just check` formats, tests, and lints. `just ci` checks formatting, lints, dependency policy,
-advisories, and tests; it satisfies the Rust gate without requiring a separate `just check` run.
+`just check` formats, runs the complete workspace test suite, and lints. `just ci` checks
+formatting, lints, dependency policy, advisories, and application correctness through `just test-app`;
+it satisfies the Rust gate without requiring a separate `just check` run. Application tests cover
+the core, application, adapter, and CLI libraries plus the explicitly listed CLI integration targets
+in `test-app`. Add new application integration targets to that recipe. CI excludes tests of the
+installer/uninstaller, release and performance scripts, architecture/package rules, Git hooks,
+and E2E infrastructure. For changes affecting those areas, also run `just test` to exercise the
+complete workspace suite, including documentation tests and local infrastructure fixtures.
 Regardless of the editing checks above, `just ci` must pass locally before a push or merge.
 The pre-commit hook runs `just commit-check`: staged and working-tree whitespace checks,
 then `just format-check` and `just test-fast` when staged Rust sources, Cargo manifests/lockfile,
 toolchain/Cargo configuration, or the Justfile change. Documentation-only commits avoid Cargo.
-The fast tests cover core, application, and CLI library units; adapter, process, installer,
-release-script, and local E2E-tool tests remain in the full suite at pre-push. Hook checks use
-the working tree, so review partial staging before committing. Formatting checks never rewrite files.
+The fast tests cover core, application, and CLI library units; pre-push runs `just ci`, adding
+adapter and CLI process tests. Installer, repository tooling, and local E2E-tool tests run through
+`just test` or `just check`. Hook checks use the working tree, so review partial staging before
+committing. Formatting checks never rewrite files.
 The publisher suppresses Git hooks only for its own final commit and push after explicit candidate
 validation or verified resume; ordinary pushes still run `just ci`.
 Coverage, strict rustdoc, the isolated release-binary exercise, static compatibility checks,

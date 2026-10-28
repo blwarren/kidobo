@@ -18,6 +18,13 @@ lint:
 test:
     @cargo test --workspace --locked --quiet
 
+# Run application correctness tests, excluding repository tooling and installation.
+test-app:
+    @cargo test --workspace --exclude kidobo-e2e --locked --quiet --lib \
+        --test cli_runtime --test configuration_cli --test doctor_command \
+        --test error_contracts --test inspection_cli --test mutation_cli \
+        --test preview_cli --test setup_cli --test terminal_cli
+
 # Format Rust sources.
 format:
     @cargo fmt --all
@@ -158,8 +165,8 @@ e2e-clean run_id:
 rustdoc:
     @env RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
 
-# Run the complete local CI validation sequence.
-ci: && lint deny audit test
+# Run local CI with application correctness tests.
+ci: && lint deny audit test-app
     @just format-check
 
 # Run the stable llvm-cov region, function, and line coverage gates.

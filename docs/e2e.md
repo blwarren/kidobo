@@ -6,7 +6,7 @@ Debian/Alpine static compatibility checks. Publication requires successful candi
 every required target before any release push or upload; published-release smoke testing is separate.
 `just publish-release X.Y.Z --skip-e2e` omits the matrix and its Incus/agent-ISO prerequisites;
 all other release checks remain enabled. See the [command reference](../scripts/README.md).
-`just ci` keeps its existing local checks and does not launch VMs.
+`just ci` runs local application correctness tests and does not launch VMs or test E2E infrastructure.
 
 The default release gate has four required targets: Debian 12 and 13, and Ubuntu 24.04 and 26.04.
 Publication and `just e2e-artifact` select only required targets, avoiding the runtime cost of
@@ -458,8 +458,9 @@ run identity match recorded resources. Do not remove the shared project, bridge,
 ## Validate a harness change
 
 Agents must not launch the VM matrix unless explicitly and expressly asked. Local harness
-regressions use fake commands, temporary roots, and loopback fixtures. `just ci` does not establish
-VM acceptance. The earlier historical runs below also do not qualify a changed validation contract.
+regressions use fake commands, temporary roots, and loopback fixtures; run them with `just test`.
+`just ci` excludes these infrastructure tests and does not establish VM acceptance. The earlier
+historical runs below also do not qualify a changed validation contract.
 
 Use the same captured archive and tag for cold/warm comparison. The following cold command
 rebuilds preparation images and runs every configured target in the detached session:

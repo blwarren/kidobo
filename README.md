@@ -230,8 +230,10 @@ just release-notes-check
 uses `just commit-check` for whitespace checks and, when staged files affect Rust,
 formatting verification and these fast tests. It does not modify source files.
 `just check` remains the complete development format/test/lint loop. Run `just ci`
-before every push; GitHub does not run project CI for pushes or tags. The complete local gate
-checks formatting, lints, dependency policy, audits, and tests. Publication additionally
+before every push; GitHub does not run project CI for pushes or tags. The local CI gate
+checks formatting, lints, dependency policy, audits, and application correctness via `just test-app`.
+`just test` runs all workspace tests, including installer, repository tooling, and E2E infrastructure
+tests; run it when changing those areas. Publication additionally
 requires coverage, strict rustdoc, the isolated release-binary exercise, static Debian/Alpine
 compatibility, and by default required Debian/Ubuntu coverage in the [Incus distro lifecycle
 matrix](docs/e2e.md). Separate `just e2e` runs cover all seven configured targets, including

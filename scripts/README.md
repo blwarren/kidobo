@@ -39,8 +39,10 @@ that include those retired scaled cases.
 
 - `just commit-check` (nonmutating pre-commit whitespace and staged-change-selected fast Rust checks)
 - `just test-fast` (core, application, and CLI unit tests)
+- `just test-app` (core, application, adapter, and CLI correctness tests; excludes installation and repository tooling)
+- `just test` (complete workspace tests, including documentation, installer, and local infrastructure tests)
 - `just check` (format, complete workspace tests, and lint)
-- `just ci` (local formatting, lint, dependency-policy, audit, and test gate)
+- `just ci` (local formatting, lint, dependency-policy, audit, and application correctness test gate)
 - `just coverage` (release-only 90% minimum for stable region, function, and line metrics)
 - `just exercise-release` (release-only build and isolated binary exercise)
 - `just release-compat` (release-only static ELF, Debian 11, and Alpine 3.22 gate)
