@@ -344,6 +344,11 @@ fn finish(runner: &mut Runner, trial: &Trial<'_>, keep_failed: bool) -> Result<V
     if let Err(error) = vm_snapshot {
         diagnostic_warnings.push(format!("VM metadata: {error}"));
     } else if vm_running {
+        if target.vendor_image.is_some()
+            && let Some(warning) = diagnostics::vendor_guest(runner, vm, &target_dir)?
+        {
+            diagnostic_warnings.push(warning);
+        }
         let diagnostic_script = r"
 printf '%s\n' '=== uname ==='; uname -a || true
 printf '%s\n' '=== boot selection ==='; cat /proc/cmdline || true; find /boot -maxdepth 3 -type f -printf '%p %s bytes\n' || true
@@ -463,6 +468,7 @@ printf '%s\n' '=== kidobo service journal ==='; journalctl -u kidobo-sync.servic
         "report": format!("targets/{}/results.json", target.id),
         "phase": trial.phase, "error": trial.error, "cleanup_error": cleanup_error,
         "seconds": trial.started.elapsed().as_secs_f64(), "image": target.image,
+        "vendor_image": target.vendor_image,
         "preparation":trial.preparation, "validation_contract":crate::contract::VERSION,
         "image_fingerprint": image_fingerprint, "diagnostic_errors": diagnostic_errors,
         "diagnostic_warnings": diagnostic_warnings,

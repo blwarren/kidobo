@@ -22,6 +22,7 @@ mod diagnostics;
 mod matrix;
 mod prepared;
 mod report;
+mod vendor_images;
 use report::Report;
 
 #[derive(Parser)]
@@ -34,6 +35,10 @@ struct Cli {
 #[derive(Subcommand)]
 enum Action {
     Setup,
+    Images {
+        #[command(subcommand)]
+        action: vendor_images::ImageAction,
+    },
     Run {
         #[arg(long)]
         archive: Option<PathBuf>,
@@ -71,7 +76,10 @@ struct Config {
 #[serde(deny_unknown_fields)]
 struct Distro {
     id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     image: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    vendor_image: Option<String>,
     family: String,
     packages: Vec<String>,
     #[serde(default = "required_by_default")]
@@ -492,7 +500,13 @@ impl Runner {
         validate_vm_config(value)?;
         Ok(())
     }
-    fn create_vm(&mut self, image: &str, vm: &str, profile: &str) -> Result<()> {
+    fn create_vm(
+        &mut self,
+        image: &str,
+        vm: &str,
+        profile: &str,
+        user_data: Option<&str>,
+    ) -> Result<()> {
         self.incus(
             &strings(&[
                 "init",
@@ -525,6 +539,29 @@ impl Runner {
             ]),
             30,
         )?;
+        if let Some(user_data) = user_data {
+            self.incus(
+                &strings(&[
+                    "config",
+                    "device",
+                    "add",
+                    vm,
+                    "cloud-init",
+                    "disk",
+                    "source=cloud-init:config",
+                ]),
+                30,
+            )?;
+            self.incus(
+                &strings(&[
+                    "config",
+                    "set",
+                    vm,
+                    &format!("cloud-init.user-data={user_data}"),
+                ]),
+                30,
+            )?;
+        }
         self.incus(&strings(&["start", vm]), 900)?;
         Ok(())
     }
@@ -1004,6 +1041,7 @@ fn run(cli: Cli) -> Result<()> {
         return Err("unsafe resource identifier".into());
     }
     prepared::validate_settings(&config)?;
+    vendor_images::validate_sources(&config)?;
     let mut ids = std::collections::BTreeSet::new();
     if config.distros.iter().any(|d| !ids.insert(&d.id))
         || !config.distros.iter().any(|d| d.required)
@@ -1039,6 +1077,7 @@ fn run(cli: Cli) -> Result<()> {
         ignore_cancellation: false,
     };
     let is_clean = matches!(&cli.action, Action::Clean { .. });
+    let is_images = matches!(&cli.action, Action::Images { .. });
     if is_clean {
         runner.stage("cleanup requested after run")?;
     } else {
@@ -1066,13 +1105,26 @@ fn run(cli: Cli) -> Result<()> {
         runner.report.document["targets"] = json!(targets);
         runner.report.document["status"] = json!("running");
         runner.report.save()?;
-        runner.report.progress(&format!(
-            "E2E run {run_id}: release={tag} archive={archive:?} targets={targets:?}; results: {}",
-            runner.dir.display()
-        ))?;
+        if is_images {
+            runner.report.progress(&format!(
+                "[images] Source maintenance; no VM or application qualification. Evidence: {}",
+                runner.dir.display()
+            ))?;
+        } else {
+            runner.report.progress(&format!(
+                "E2E run {run_id}: release={tag} archive={archive:?} targets={targets:?}; results: {}",
+                runner.dir.display()
+            ))?;
+        }
     }
     let started = Instant::now();
-    let outcome = execute(cli, &config, &run_id, &mut runner);
+    let mut refresh = None;
+    let outcome = if let Action::Images { action } = &cli.action {
+        vendor_images::execute(&mut runner, &config, &cli.config, action)
+            .map(|pending| refresh = pending)
+    } else {
+        execute(cli, &config, &run_id, &mut runner)
+    };
     runner.report.document["run_wall_seconds"] = json!(started.elapsed().as_secs_f64());
     if is_clean {
         runner
@@ -1115,15 +1167,36 @@ fn run(cli: Cli) -> Result<()> {
         runner.report.document["release_gate_passed"] = json!(false);
     }
     runner.report.save()?;
-    runner.report.progress(&format!(
-        "[e2e] finished: status={} required_gate={} all_selected={}; summary: {}",
-        runner.report.document["status"],
-        runner.report.document["release_gate_passed"],
-        runner.report.document["all_selected_targets_passed"],
-        runner.dir.join("summary.txt").display()
-    ))?;
+    if is_images {
+        runner.report.progress(&format!(
+            "[images] Processing finished: status={}; summary: {}",
+            runner.report.document["status"],
+            runner.dir.join("summary.txt").display()
+        ))?;
+    } else {
+        runner.report.progress(&format!(
+            "[e2e] finished: status={} required_gate={} all_selected={}; summary: {}",
+            runner.report.document["status"],
+            runner.report.document["release_gate_passed"],
+            runner.report.document["all_selected_targets_passed"],
+            runner.dir.join("summary.txt").display()
+        ))?;
+    }
     outcome?;
     archive?;
+    if let Some(refresh) = refresh {
+        if runner.cancelled.load(Ordering::Relaxed) {
+            runner.report.document["status"] = json!("interrupted");
+            runner.report.save()?;
+            return Err("image refresh interrupted before pin adoption".into());
+        }
+        if let Err(error) = refresh.commit() {
+            runner.report.document["status"] = json!("failed");
+            runner.report.document["error"] = json!(error.to_string());
+            runner.report.save()?;
+            return Err(error);
+        }
+    }
     Ok(())
 }
 
@@ -1152,6 +1225,7 @@ fn execute(cli: Cli, config: &Config, run_id: &str, runner: &mut Runner) -> Resu
             })?;
     }
     match cli.action {
+        Action::Images { .. } => unreachable!("image commands handled without VM prerequisites"),
         Action::Setup => {
             let _operation_lock = coordination::lock(runner)?;
             setup(runner, config)
@@ -1205,6 +1279,7 @@ fn execute(cli: Cli, config: &Config, run_id: &str, runner: &mut Runner) -> Resu
                 return Err("invalid version tag".into());
             }
             snapshot_inputs(&runner.evidence(), &cli.config)?;
+            vendor_images::startup_check(runner, config)?;
             let archive = archive.map(fs::canonicalize).transpose()?;
             let artifact_hash = archive.as_deref().map(hash).transpose()?;
             let test_archive = archive
@@ -1360,6 +1435,8 @@ fn snapshot_inputs(dir: &Path, config: &Path) -> Result<()> {
         "prepared.rs",
         "coordination.rs",
         "contract.rs",
+        "vendor_images.rs",
+        "vendor_images/discovery.rs",
     ] {
         harness.update(hash(&Path::new("tools/distro-e2e/src").join(module))?.as_bytes());
     }
@@ -1374,6 +1451,7 @@ fn snapshot_inputs(dir: &Path, config: &Path) -> Result<()> {
     for (source, name) in [
         (Path::new("scripts/install.sh"), "installer.sh"),
         (Path::new("scripts/e2e/provision.sh"), "provision.sh"),
+        (Path::new("scripts/e2e/bootstrap.sh"), "bootstrap.sh"),
         (Path::new("scripts/e2e/lifecycle.sh"), "lifecycle.sh"),
         (Path::new("scripts/e2e/traffic.py"), "traffic.py"),
         (Path::new("scripts/e2e/checks.json"), "checks.json"),
@@ -1382,6 +1460,19 @@ fn snapshot_inputs(dir: &Path, config: &Path) -> Result<()> {
         let destination = inputs.join(name);
         fs::copy(source, &destination)?;
         hashes.insert(name.into(), hash(&destination)?.into());
+    }
+    vendor_images::snapshot(&inputs, config)?;
+    hashes.insert(
+        "e2e-images.toml".into(),
+        hash(&inputs.join("e2e-images.toml"))?.into(),
+    );
+    for key in fs::read_dir(inputs.join("image-keys"))? {
+        let path = key?.path();
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or("invalid image key filename")?;
+        hashes.insert(format!("image-keys/{name}"), hash(&path)?.into());
     }
     fs::write(
         inputs.join("SHA256.json"),

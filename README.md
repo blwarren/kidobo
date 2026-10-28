@@ -240,6 +240,11 @@ matrix](docs/e2e.md). Separate `just e2e` runs cover all seven configured target
 advisory Fedora and AlmaLinux with enforcing SELinux. Each target gets fresh provisioning and
 full application checks, with at most two VMs running concurrently. Read the
 [E2E scope contract](docs/e2e.md#scope-and-non-goals) before changing that infrastructure.
+Fedora and AlmaLinux use reviewed vendor-image pins. E2E startup reports available image and
+stable distro updates without adopting them. Use `just e2e-images-check` for discovery and
+`just e2e-images-refresh [DISTRO]` to verify/import sources and propose pin changes; neither
+command starts VMs. Follow the [image update workflow](docs/e2e.md#image-sources-and-reviewed-updates)
+for review and separately authorized lifecycle acceptance.
 The isolated exercises use a temporary `KIDOBO_ROOT`, a loopback HTTP feed, and fake privileged
 commands; they never
 touch the development host's firewall or systemd. The Incus matrix runs real privileged

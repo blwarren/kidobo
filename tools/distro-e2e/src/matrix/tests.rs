@@ -349,6 +349,7 @@ else:
                 .map(|id| Distro {
                     id: id.into(),
                     image: "fixture/image".into(),
+                    vendor_image: None,
                     family: "apt".into(),
                     packages: vec!["fixture-package".into()],
                     required: id == "primary" || secondary_required,

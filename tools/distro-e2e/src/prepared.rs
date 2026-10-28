@@ -1,8 +1,105 @@
 //! Fresh guest preparation through ordinary distro tools and bounded readiness checks.
-use super::{Config, Distro, OWNER, Result, Runner, strings};
+use super::{Config, Distro, OWNER, Result, Runner, read_text, strings};
 use serde_json::{Value, json};
 use std::fs;
 use std::time::Instant;
+
+pub(super) fn cloud_init_user_data(bootstrap: &str) -> Result<String> {
+    Ok(format!(
+        "#cloud-config\n{}\n",
+        serde_json::to_string(&json!({"runcmd": [["bash", "-c", bootstrap]]}))?
+    ))
+}
+
+fn cloud_init_warnings(output: &str, fedora: bool, vm: &str) -> Result<(Value, Vec<String>)> {
+    let (document, exit) = output
+        .rsplit_once("\nKIDOBO_CLOUD_INIT_EXIT=")
+        .ok_or("cloud-init completion exit status missing")?;
+    let status: Value = serde_json::from_str(document.trim())?;
+    if status["status"] != "done"
+        || !status["errors"]
+            .as_array()
+            .is_some_and(std::vec::Vec::is_empty)
+    {
+        return Err("cloud-init did not complete successfully".into());
+    }
+    let expected = format!("Failed to set the hostname to {vm} ({vm})");
+    validate_cloud_errors(&status, fedora, &expected)?;
+    let warnings = status["recoverable_errors"]
+        .as_object()
+        .ok_or("cloud-init recoverable error inventory missing")?
+        .values()
+        .flat_map(|messages| messages.as_array().into_iter().flatten())
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if !matches!(
+        (exit.trim(), warnings.is_empty()),
+        ("0,0", true) | ("2,2", false)
+    ) {
+        return Err("cloud-init exit status does not match accepted completion state".into());
+    }
+    Ok((status, warnings))
+}
+
+fn validate_cloud_errors(value: &Value, fedora: bool, expected: &str) -> Result<()> {
+    let Some(object) = value.as_object() else {
+        return Ok(());
+    };
+    for (key, value) in object {
+        match key.as_str() {
+            "errors" => {
+                if !value.as_array().is_some_and(std::vec::Vec::is_empty) {
+                    return Err("cloud-init reported critical errors".into());
+                }
+            }
+            "recoverable_errors" => {
+                let errors = value
+                    .as_object()
+                    .ok_or("unrecognized cloud-init recoverable errors")?;
+                for messages in errors.values() {
+                    let messages = messages
+                        .as_array()
+                        .ok_or("unrecognized cloud-init warning inventory")?;
+                    for message in messages {
+                        if !fedora || message.as_str() != Some(expected) {
+                            return Err(format!("unexpected cloud-init warning: {message}").into());
+                        }
+                    }
+                }
+            }
+            _ => validate_cloud_errors(value, fedora, expected)?,
+        }
+    }
+    Ok(())
+}
+
+fn wait_for_cloud_init(runner: &mut Runner, target: &Distro, vm: &str) -> Result<Vec<String>> {
+    runner.stage(&format!("{} | vendor image bootstrap", target.id))?;
+    let output = runner.guest(
+        vm,
+        &strings(&[
+            "bash",
+            "-c",
+            "set +e; cloud-init status --wait >/dev/null; waited=$?; cloud-init status --format=json; reported=$?; printf '\\nKIDOBO_CLOUD_INIT_EXIT=%s,%s\\n' \"$waited\" \"$reported\"",
+        ]),
+        300,
+    )?;
+    let directory = runner.evidence().join(&target.id);
+    fs::create_dir_all(&directory)?;
+    fs::write(directory.join("cloud-init-status.txt"), &output)?;
+    let (status, warnings) = cloud_init_warnings(&output, target.id.starts_with("fedora-"), vm)?;
+    fs::write(
+        directory.join("cloud-init.json"),
+        serde_json::to_vec_pretty(&status)?,
+    )?;
+    for warning in &warnings {
+        runner
+            .report
+            .emit(&format!("WARNING: cloud-init: {warning}"))?;
+    }
+    Ok(warnings)
+}
 
 pub(super) fn validate_settings(config: &Config) -> Result<()> {
     if !(1..=2).contains(&config.max_parallel_vms)
@@ -123,7 +220,7 @@ fn reboot_prepared(
                 }
                 other => {
                     return Err(format!(
-                        "detached SELinux enforcement failed: {other}; see prepared/enforcement.log"
+                        "detached SELinux enforcement failed: {other}; see kidobo-e2e-enforce.service journal"
                     )
                     .into());
                 }
@@ -180,21 +277,31 @@ fn validate_profile(runner: &mut Runner, config: &Config) -> Result<()> {
     Ok(())
 }
 
-fn prepare_guest(runner: &mut Runner, config: &Config, target: &Distro, vm: &str) -> Result<Value> {
+fn create_fresh_vm(
+    runner: &mut Runner,
+    config: &Config,
+    target: &Distro,
+    vm: &str,
+) -> Result<(String, Vec<String>)> {
     runner.stage(&format!("{} | VM creation", target.id))?;
-    // Resolve the upstream alias once for this fresh guest.
-    let source = runner.incus(
-        &strings(&["image", "info", &format!("images:{}", target.image), "--vm"]),
-        60,
-    )?;
-    let source_fp = source
-        .lines()
-        .find_map(|line| line.strip_prefix("Fingerprint: "))
-        .map(str::trim)
-        .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
-        .ok_or("upstream VM image fingerprint missing")?;
-    runner.create_vm(&format!("images:{source_fp}"), vm, &config.profile)?;
+    let (source_fp, image) = crate::vendor_images::resolve(runner, target)?;
+    let user_data = if target.vendor_image.is_some() {
+        let bootstrap = read_text(&runner.evidence().join("inputs/bootstrap.sh"))?;
+        let user_data = cloud_init_user_data(&bootstrap)?;
+        let directory = runner.evidence().join(&target.id);
+        fs::create_dir_all(&directory)?;
+        fs::write(directory.join("cloud-init-user-data.txt"), &user_data)?;
+        Some(user_data)
+    } else {
+        None
+    };
+    runner.create_vm(&image, vm, &config.profile, user_data.as_deref())?;
     runner.ready(vm)?;
+    let warnings = if target.vendor_image.is_some() {
+        wait_for_cloud_init(runner, target, vm)?
+    } else {
+        Vec::new()
+    };
     runner.guest(
         vm,
         &strings(&[
@@ -212,6 +319,18 @@ fn prepare_guest(runner: &mut Runner, config: &Config, target: &Distro, vm: &str
             false,
         )?;
     }
+    if target.vendor_image.is_some() {
+        runner.guest(
+            vm,
+            &strings(&["bash", "/opt/kidobo-e2e/provision.sh", "--check-bootstrap"]),
+            30,
+        )?;
+    }
+    Ok((source_fp, warnings))
+}
+
+fn prepare_guest(runner: &mut Runner, config: &Config, target: &Distro, vm: &str) -> Result<Value> {
+    let (source_fp, mut warnings) = create_fresh_vm(runner, config, target, vm)?;
     runner.stage(&format!("{} | provisioning", target.id))?;
     let mut args = strings(&[
         "bash",
@@ -223,7 +342,6 @@ fn prepare_guest(runner: &mut Runner, config: &Config, target: &Distro, vm: &str
     args.extend(target.packages.clone());
     runner.guest(vm, &args, 4800)?;
     runner.stage(&format!("{} | pre-reboot evidence", target.id))?;
-    let mut warnings = Vec::new();
     if let Some(warning) =
         crate::diagnostics::pre_reboot(runner, vm, &runner.evidence().join(&target.id))?
     {
@@ -262,7 +380,17 @@ fn prepare_guest(runner: &mut Runner, config: &Config, target: &Distro, vm: &str
         &strings(&["cat", "/opt/kidobo-e2e/prepared/environment.json"]),
         30,
     )?)?;
-    let metadata = json!({"image_fingerprint":source_fp,"preparation":preparation,"diagnostic_warnings":warnings});
+    let source = if target.vendor_image.is_some() {
+        serde_json::from_str::<Value>(&read_text(
+            &runner
+                .evidence()
+                .join(&target.id)
+                .join("vendor-image/source.json"),
+        )?)?
+    } else {
+        Value::Null
+    };
+    let metadata = json!({"image_fingerprint":source_fp,"source":source,"preparation":preparation,"diagnostic_warnings":warnings});
     let directory = runner.evidence().join(&target.id);
     fs::create_dir_all(&directory)?;
     fs::write(

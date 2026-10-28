@@ -266,6 +266,14 @@ provision_main() {
   require_guest
   local mode=${1:-} family selinux=image-default
   case "$mode" in
+    --check-bootstrap)
+      [[ $# == 1 ]] || fail '--check-bootstrap accepts no additional arguments'
+      e2e_check_start 'vendor image agent bootstrap' 'cloud-init-installed agent completed successfully under enforcing SELinux'
+      [[ -s /var/log/kidobo-image-bootstrap.status && "$(</var/log/kidobo-image-bootstrap.status)" == 0 ]] || fail 'vendor image bootstrap did not complete successfully'
+      systemctl is-active --quiet incus-agent.service || fail 'bootstrapped Incus agent is not active'
+      [[ "$(getenforce)" == Enforcing ]] || fail 'vendor image bootstrap lost enforcing SELinux'
+      e2e_check_pass 'durable bootstrap success, active Incus agent and enforcing SELinux verified'
+      ;;
     --boot-status)
       [[ $# == 1 ]] || fail '--boot-status accepts no additional arguments'
       prepared_boot_status
@@ -277,9 +285,8 @@ provision_main() {
       [[ "$(<"$PREPARED/selinux-requested")" == enforcing ]] || fail 'enforcement job requires enforcing preparation'
       rm -f "$PREPARED/enforcement.status" "$PREPARED/enforcement.status.tmp"
       systemd-run --unit=kidobo-e2e-enforce --no-block --property=Type=oneshot \
-        --property=RuntimeMaxSec=120 --property=TimeoutStartSec=120 \
-        --property="StandardOutput=append:$PREPARED/enforcement.log" \
-        --property="StandardError=append:$PREPARED/enforcement.log" \
+        --property=TimeoutStartSec=120 \
+        --property=StandardOutput=journal --property=StandardError=journal \
         /bin/bash "$BASE/provision.sh" --enforce-selinux
       e2e_check_start 'prepared enforcement job scheduled' 'systemd accepted the detached enforcement job'
       e2e_check_pass 'job accepted; durable completion is checked separately'
@@ -294,7 +301,16 @@ provision_main() {
       if [[ -s "$PREPARED/enforcement.status" ]]; then
         printf '%s %s\n' "$(<"$PREPARED/enforcement.status")" "$(getenforce)"
       else
-        printf 'pending\n'
+        local active result exit_status
+        active=$(systemctl show kidobo-e2e-enforce.service --property=ActiveState --value)
+        case "$active" in
+          activating|active|deactivating) printf 'pending\n' ;;
+          *)
+            result=$(systemctl show kidobo-e2e-enforce.service --property=Result --value)
+            exit_status=$(systemctl show kidobo-e2e-enforce.service --property=ExecMainStatus --value)
+            printf 'failed unit=%s result=%s status=%s; completion marker missing\n' "$active" "$result" "$exit_status"
+            ;;
+        esac
       fi
       e2e_check_start 'prepared enforcement status observed' 'detached job status inspected without assuming success'
       e2e_check_pass 'status returned for host enforcement admission'

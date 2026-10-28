@@ -34,7 +34,7 @@ packages = ["bash", "ca-certificates", "curl", "tar", "coreutils", "grep", "kmod
 [[distros]]
 required = false
 id = "fedora-44"
-image = "fedora/44"
+vendor_image = "fedora-44"
 family = "dnf"
 selinux = "enforcing"
 packages = ["bash", "ca-certificates", "curl", "tar", "coreutils", "grep", "kmod", "sudo", "iproute", "python3", "ipset", "iptables", "bgpq4", "kernel-modules-extra"]
@@ -42,7 +42,7 @@ packages = ["bash", "ca-certificates", "curl", "tar", "coreutils", "grep", "kmod
 [[distros]]
 required = false
 id = "almalinux-9"
-image = "almalinux/9"
+vendor_image = "almalinux-9"
 family = "dnf-epel"
 selinux = "enforcing"
 packages = ["bash", "ca-certificates", "curl", "tar", "coreutils", "grep", "kmod", "sudo", "iproute", "python3", "ipset", "iptables", "bgpq4", "epel-release", "dnf-plugins-core", "kernel-modules-extra"]
@@ -50,7 +50,7 @@ packages = ["bash", "ca-certificates", "curl", "tar", "coreutils", "grep", "kmod
 [[distros]]
 required = false
 id = "almalinux-10"
-image = "almalinux/10"
+vendor_image = "almalinux-10"
 family = "dnf-epel"
 selinux = "enforcing"
 packages = ["bash", "ca-certificates", "curl", "tar", "coreutils", "grep", "kmod", "sudo", "iproute", "python3", "ipset", "iptables", "bgpq4", "epel-release", "dnf-plugins-core", "kernel-modules-extra"]

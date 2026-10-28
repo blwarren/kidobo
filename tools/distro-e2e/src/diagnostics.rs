@@ -62,7 +62,7 @@ optional getenforce
 optional sestatus
 printf '\n%s\n' '=== agent and relabel units and configuration ==='
 if command -v systemctl >/dev/null 2>&1; then
-    for unit in incus-agent.service incus-agent-setup.service lxd-agent.service selinux-autorelabel.service; do
+    for unit in incus-agent.service incus-agent-setup.service lxd-agent.service selinux-autorelabel.service kidobo-e2e-enforce.service; do
         if load=$(systemctl show "$unit" --property=LoadState --value); then
             load_status=0
         else load_status=$?; fi
@@ -88,7 +88,7 @@ for file in /usr/bin/incus-agent /usr/sbin/incus-agent /usr/bin/lxd-agent; do
     if [[ -e "$file" || -L "$file" ]]; then attempt ls -lZ -- "$file"; fi
 done
 printf '\n%s\n' '=== recent agent and relabel journal ==='
-optional journalctl -b --no-pager -n 250 -u incus-agent.service -u incus-agent-setup.service -u lxd-agent.service -u selinux-autorelabel.service
+optional journalctl -b --no-pager -n 250 -u incus-agent.service -u incus-agent-setup.service -u lxd-agent.service -u selinux-autorelabel.service -u kidobo-e2e-enforce.service
 exit "$capture_failed"
 "#;
 
@@ -117,6 +117,52 @@ pub(super) fn pre_reboot(runner: &mut Runner, vm: &str, target: &Path) -> Result
     Ok(outcome
         .err()
         .map(|error| format!("pre-reboot snapshot: {error}")))
+}
+
+pub(super) fn vendor_guest(runner: &mut Runner, vm: &str, target: &Path) -> Result<Option<String>> {
+    runner.verify(vm)?;
+    let script = r#"set -uo pipefail
+failed=0
+attempt() {
+    "$@" || { status=$?; printf 'WARNING: vendor diagnostic capture failed (%s): %s\n' "$status" "$*" >&2; failed=1; }
+}
+for file in /var/log/kidobo-image-bootstrap.log /var/log/kidobo-image-bootstrap.status; do
+    printf '\n=== %s ===\n' "$file"
+    attempt cat "$file"
+done
+printf '\n%s\n' '=== cloud-init completion ==='
+cloud-init status --long
+status=$?
+if [[ "$status" != 0 && "$status" != 2 ]]; then
+    printf 'WARNING: cloud-init diagnostic command failed (%s)\n' "$status" >&2
+    failed=1
+fi
+printf '\n%s\n' '=== bootstrap and enforcement journals ==='
+attempt journalctl -b --no-pager -n 250 -u cloud-final.service -u incus-agent.service -u kidobo-e2e-enforce.service
+exit "$failed"
+"#;
+    let outcome = (|| -> Result<()> {
+        fs::create_dir_all(target)?;
+        capture(
+            runner,
+            &strings(&[
+                "--project",
+                &runner.project,
+                "exec",
+                vm,
+                "--mode=non-interactive",
+                "--",
+                "bash",
+                "-c",
+                script,
+            ]),
+            &target.join("vendor-guest-diagnostics.log"),
+        )
+    })();
+    runner.report.ensure_healthy()?;
+    Ok(outcome
+        .err()
+        .map(|error| format!("vendor guest diagnostics: {error}")))
 }
 
 #[derive(Default, serde::Serialize)]

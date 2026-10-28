@@ -552,6 +552,7 @@ fn summary(document: &Value) -> String {
                 "active_seconds",
                 "preparation",
                 "image",
+                "vendor_image",
                 "image_fingerprint",
                 "transcript_line",
                 "transcript",

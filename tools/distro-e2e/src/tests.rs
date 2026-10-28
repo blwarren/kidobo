@@ -1601,7 +1601,7 @@ fn create_vm_verifies_ownership_before_agent_disk_and_start() {
     let mut runner = runner_with_incus(temp.path(), &program);
 
     runner
-        .create_vm("debian/13", "vm-owned", "test-profile")
+        .create_vm("debian/13", "vm-owned", "test-profile", None)
         .expect("owned VM receives agent disk and starts");
 
     let calls = read_text(&log).expect("read fake Incus log");
@@ -1629,7 +1629,7 @@ fn create_vm_refuses_agent_disk_and_start_when_ownership_check_fails() {
     let mut runner = runner_with_incus(temp.path(), &program);
 
     let error = runner
-        .create_vm("alma/10", "vm-unowned", "test-profile")
+        .create_vm("alma/10", "vm-unowned", "test-profile", None)
         .expect_err("unowned VM must not be mutated");
 
     assert!(

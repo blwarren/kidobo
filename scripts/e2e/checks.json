@@ -71,6 +71,9 @@
       }
     },
     "preparation": {
+      "--check-bootstrap": {
+        "vendor image agent bootstrap": 1
+      },
       "--boot-status": {
         "prepared boot status observed": 1
       },

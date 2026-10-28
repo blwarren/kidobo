@@ -96,14 +96,17 @@ if operation == 'query':
 elif operation == 'console':
     print('fixture serial console')
 elif operation == 'image':
-    assert args[1] == 'info', args
-    print('Fingerprint: ' + 'a' * 64)
+    if args[1] == 'list':
+        print(json.dumps([{'fingerprint':state['cached_fp'], 'type':'virtual-machine', 'architecture':'x86_64'}]))
+    else:
+        assert args[1] == 'info', args
+        print('Fingerprint: ' + 'a' * 64)
 elif operation == 'init':
     source, name = args[1:3]
     assert name not in state['instances'], name
     state['serial'] += 1
-    assert source.startswith('images:'), source
-    state['instances'][name] = {'base':source.split(':', 1)[1], 'status':'Stopped', 'environment':None, 'boot':0}
+    assert source.startswith('images:') or source == state.get('cached_fp'), source
+    state['instances'][name] = {'base':source.removeprefix('images:'), 'status':'Stopped', 'environment':None, 'boot':0}
 elif operation == 'list':
     names = list(state['instances']) if args[1] == '--format=json' else [args[1]]
     print(json.dumps([describe(name) for name in names if name in state['instances']]))
@@ -150,6 +153,17 @@ elif operation == 'exec':
         if scenario == 'snapshot-failure':
             print('cat: /etc/grub2.cfg: No such file or directory', file=sys.stderr)
             fail(1)
+    elif command[:2] == ['bash', '-c'] and 'cloud-init status --wait' in command[2]:
+        status = {'status':'done', 'errors':[], 'recoverable_errors':{}}
+        code = '0,0'
+        if scenario == 'hostname-warning':
+            status['recoverable_errors'] = {'WARNING':[f'Failed to set the hostname to {name} ({name})']}
+            code = '2,2'
+        elif scenario == 'bootstrap-failure':
+            status['errors'] = ['agent installation failed']
+            code = '1,1'
+        print(json.dumps(status))
+        print('KIDOBO_CLOUD_INIT_EXIT=' + code)
     elif command[0] in {'true','sh','test'}:
         pass
     elif command[:2] == ['bash','/opt/kidobo-e2e/provision.sh']:
@@ -214,6 +228,7 @@ save()
             distros: vec![Distro {
                 id: "primary".into(),
                 image: "fixture/image".into(),
+                vendor_image: None,
                 family: "apt".into(),
                 packages: vec!["bash".into()],
                 required: true,
@@ -244,6 +259,18 @@ save()
         let dir = self.temporary.path().join(format!("run-100-{run}"));
         let report = Report::open(&dir).expect("preparation report");
         fs::create_dir_all(dir.join(".evidence/inputs")).expect("frozen inputs");
+        if self.config.distros[0].vendor_image.is_some() {
+            crate::vendor_images::snapshot(
+                &dir.join(".evidence/inputs"),
+                &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/e2e.toml"),
+            )
+            .unwrap();
+            fs::write(
+                dir.join(".evidence/inputs/bootstrap.sh"),
+                include_str!("../../../../scripts/e2e/bootstrap.sh"),
+            )
+            .unwrap();
+        }
         for (name, contents) in [
             (
                 "provision.sh",
@@ -308,13 +335,79 @@ save()
 }
 
 #[test]
+fn vendor_source_bootstraps_before_provisioning_and_keeps_fresh_guest_lifecycles() {
+    let mut fixture = Fixture::new();
+    let production: Config =
+        toml_edit::de::from_str(include_str!("../../../../config/e2e.toml")).unwrap();
+    fixture.config.distros[0] = production
+        .distros
+        .into_iter()
+        .find(|d| d.id == "fedora-44")
+        .unwrap();
+    let pins: Value =
+        toml_edit::de::from_str(include_str!("../../../../config/e2e-images.toml")).unwrap();
+    let fingerprint = pins["images"]["fedora-44"]["incus_fingerprint"].clone();
+    fixture.change(|state| state["cached_fp"] = fingerprint.clone());
+    let (_, result) = fixture.prepare(1);
+    let prepared = result.unwrap();
+    assert_eq!(prepared["source"]["incus_fingerprint"], fingerprint);
+    assert_eq!(
+        prepared["source"]["sha256"],
+        pins["images"]["fedora-44"]["sha256"]
+    );
+    let state = fixture.state();
+    let events = state["events"].as_array().unwrap();
+    let started = events.iter().position(|event| event[0] == "start").unwrap();
+    for device in ["agent", "cloud-init"] {
+        assert!(
+            events[..started]
+                .iter()
+                .any(|event| event[0] == "config" && event[1] == "device" && event[4] == device)
+        );
+    }
+    assert!(events[..started].iter().any(|event| {
+        event[0] == "config"
+            && event[1] == "set"
+            && event[3]
+                .as_str()
+                .unwrap_or("")
+                .starts_with("cloud-init.user-data=#cloud-config")
+    }));
+    let bootstrap = events
+        .iter()
+        .position(|event| {
+            event
+                .as_array()
+                .unwrap()
+                .contains(&json!("--check-bootstrap"))
+        })
+        .unwrap();
+    let provision = events
+        .iter()
+        .position(|event| event.as_array().unwrap().contains(&json!("--prepare")))
+        .unwrap();
+    assert!(bootstrap < provision);
+    fixture.change(|state| state["scenario"] = json!("bootstrap-failure"));
+    let (_, failed) = fixture.prepare(2);
+    assert!(
+        failed
+            .unwrap_err()
+            .to_string()
+            .contains("cloud-init did not complete")
+    );
+    assert_eq!(fixture.count("init", None), 2);
+    assert_eq!(fixture.count("image", Some("import")), 0);
+    assert_eq!(fixture.guest_count("--prepare"), 1);
+}
+
+#[test]
 fn preparation_waits_through_relabel_reboot_and_enforcement_transport_loss() {
     let fixture = Fixture::new();
     fixture.change(|state| state["scenario"] = json!("relabel-reboot"));
     let mut runner = fixture.runner(1);
     let vm = "run-100-1-primary";
     runner
-        .create_vm("images:fixture-image", vm, "test-profile")
+        .create_vm("images:fixture-image", vm, "test-profile", None)
         .expect("fixture VM");
     reboot_prepared(
         &mut runner,
@@ -338,6 +431,94 @@ fn preparation_waits_through_relabel_reboot_and_enforcement_transport_loss() {
 }
 
 #[test]
+fn cloud_init_completion_is_recorded_and_only_known_fedora_warnings_are_accepted() {
+    for scenario in ["", "hostname-warning", "bootstrap-failure"] {
+        let mut fixture = Fixture::new();
+        fixture.config.distros[0].id = "fedora-44".into();
+        fixture.change(|state| state["scenario"] = json!(scenario));
+        let mut runner = fixture.runner(1);
+        let vm = "run-100-1-primary";
+        runner
+            .create_vm("images:fixture-image", vm, "test-profile", None)
+            .expect("fixture VM");
+        let result = wait_for_cloud_init(&mut runner, &fixture.config.distros[0], vm);
+        let evidence = runner.evidence().join("fedora-44");
+        assert!(evidence.join("cloud-init-status.txt").is_file());
+        if scenario == "bootstrap-failure" {
+            assert!(
+                result
+                    .expect_err("failed cloud-init cannot admit provisioning")
+                    .to_string()
+                    .contains("did not complete successfully")
+            );
+            assert!(!evidence.join("cloud-init.json").exists());
+        } else {
+            let warnings = result.expect("completed cloud-init");
+            assert_eq!(warnings.len(), usize::from(scenario == "hostname-warning"));
+            assert!(evidence.join("cloud-init.json").is_file());
+            if !warnings.is_empty() {
+                assert!(
+                    read_text(&runner.dir.join("transcript.log"))
+                        .expect("transcript")
+                        .contains("WARNING: cloud-init: Failed to set the hostname")
+                );
+            }
+        }
+        assert_eq!(fixture.guest_count("--prepare"), 0);
+    }
+}
+
+#[test]
+fn cloud_init_rejects_unfinished_errors_unknown_warnings_and_inconsistent_exit_status() {
+    let good = json!({"status":"done", "errors":[], "recoverable_errors":{}});
+    for (status, exit) in [
+        (
+            json!({"status":"running", "errors":[], "recoverable_errors":{}}),
+            "0,0",
+        ),
+        (json!({"status":"done", "recoverable_errors":{}}), "0,0"),
+        (
+            json!({"status":"done", "errors":["failed"], "recoverable_errors":{}}),
+            "0,0",
+        ),
+        (
+            json!({"status":"done", "errors":[], "recoverable_errors":{"WARNING":["unknown warning"]}}),
+            "2,2",
+        ),
+        (
+            json!({"status":"done", "errors":[], "recoverable_errors":{}, "modules-final":{"errors":["failed"]}}),
+            "0,0",
+        ),
+        (good.clone(), "2,2"),
+        (good.clone(), "1,0"),
+        (good.clone(), "0,1"),
+    ] {
+        let output = format!("{status}\nKIDOBO_CLOUD_INIT_EXIT={exit}\n");
+        cloud_init_warnings(&output, true, "guest").expect_err("must reject invalid completion");
+    }
+    cloud_init_warnings(&good.to_string(), true, "guest").expect_err("exit status must be present");
+    let warning = json!({"status":"done", "errors":[], "recoverable_errors":{"WARNING":["Failed to set the hostname to guest (guest)"]}});
+    let output = format!("{warning}\nKIDOBO_CLOUD_INIT_EXIT=2,2\n");
+    cloud_init_warnings(&output, false, "guest").expect_err("AlmaLinux warnings are not exempt");
+    cloud_init_warnings(&output, true, "different-guest")
+        .expect_err("warning must identify the current guest exactly");
+    cloud_init_warnings(&output, true, "guest").expect("identified Fedora hostname warning");
+}
+
+#[test]
+fn bootstrap_cloud_config_preserves_the_frozen_script_without_shell_interpolation() {
+    let script = "printf '%s\\n' \"$guest\" `literal`\n";
+    let user_data = cloud_init_user_data(script).expect("cloud-config");
+    let document: Value = serde_json::from_str(
+        user_data
+            .strip_prefix("#cloud-config\n")
+            .expect("cloud-init header"),
+    )
+    .expect("cloud-config JSON");
+    assert_eq!(document, json!({"runcmd":[["bash", "-c", script]]}));
+}
+
+#[test]
 fn preparation_readiness_bounds_failure_timeout_and_cancellation() {
     for scenario in [
         "enforcement-failure",
@@ -350,7 +531,7 @@ fn preparation_readiness_bounds_failure_timeout_and_cancellation() {
         let mut runner = fixture.runner(1);
         let vm = "run-100-1-primary";
         runner
-            .create_vm("images:fixture-image", vm, "test-profile")
+            .create_vm("images:fixture-image", vm, "test-profile", None)
             .expect("fixture VM");
         if scenario == "cancelled" {
             runner
@@ -384,7 +565,7 @@ fn successful_restart_then_agent_loss_keeps_snapshot_and_expires_before_admissio
     let mut runner = fixture.runner(1);
     let vm = "run-100-1-primary";
     runner
-        .create_vm("images:fixture-image", vm, "test-profile")
+        .create_vm("images:fixture-image", vm, "test-profile", None)
         .expect("fixture VM");
     let target = runner.evidence().join("primary");
     assert_eq!(

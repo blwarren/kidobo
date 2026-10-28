@@ -9,13 +9,19 @@ target before pushing refs or uploading assets, unless the user explicitly selec
 ## Scope and non-goals
 
 This section is the authoritative scope contract for E2E work. Read it before changing the
-runner, guest scripts, launcher, fixtures, matrix configuration, or release integration.
+runner, guest scripts, launcher, fixtures, image acquisition/monitoring, matrix configuration,
+or release integration.
 
 E2E proves that Kidobo installs, accepts configuration, enforces IPv4/IPv6 policy, runs through
 systemd and reboot, preserves state through upgrade and expected failures, flushes its own
 rules, and uninstalls on the configured distributions. Supporting work is limited to ordinary
 guest provisioning, deterministic fixtures, bounded execution, trustworthy results, useful
 diagnostics, and cleanup of suite-owned resources.
+
+Supporting image work is limited to acquiring verified, unmodified vendor disks, wrapping them
+in Incus metadata, bootstrapping the Incus agent, and reporting available image/distro updates.
+Image pins are reviewed changes. Discovery must not automatically adopt images, add or retire
+targets, or change required/advisory policy. No background monitoring service is permitted.
 
 The harness is not a general VM/image manager, distro-image or bootloader repair tool,
 historical-result reuse system, or duplicate of the exhaustive application unit tests. Do not
@@ -37,7 +43,8 @@ failure paths over introducing another mechanism around them.
 
 Every selected target gets a fresh VM and repeats OS preparation and application testing on
 every run. Repeated work is an accepted cost of a smaller harness. Incus may cache upstream
-images normally; the harness does not publish prepared images or reuse prior test results.
+images normally, including the verified raw vendor images imported into its suite project;
+the harness does not publish prepared images or reuse prior test results.
 Keep the current matrix and required/advisory policy unless a change is explicitly requested.
 
 Two existing exceptions are bounded rather than precedents for expansion:
@@ -86,6 +93,8 @@ initialize unrelated resources. Release builds need the pinned Rust target, `mus
 and `just`. Install host `tar`, plus `genisoimage` or `mkisofs` for the
 [agent configuration disk](https://linuxcontainers.org/incus/docs/main/reference/devices_disk/#types-of-disk-devices).
 Diagnostic capture uses GNU coreutils `head` and `stdbuf`. Candidate launcher use requires `tmux`.
+Image discovery uses `curl`; vendor-image processing also requires `gpg` and `qemu-img`.
+The suite never installs these host tools automatically.
 
 After joining `incus-admin`, start a fresh login session. In an existing terminal, a command can
 use the new group membership with:
@@ -114,6 +123,54 @@ Before a run, ownership-checked recovery removes abandoned suite-owned VMs with 
 and absent owner PIDs. Foreign guests, malformed names, and existing owner PIDs block recovery
 with a named diagnostic. Explicitly retained guests remain protected and are stopped if necessary.
 
+## Image sources and reviewed updates
+
+Debian and Ubuntu retain their configured Incus aliases. Fedora and AlmaLinux use the exact
+vendor cloud images pinned in [the image manifest](../config/e2e-images.toml). Each target in
+the matrix has either `image` or `vendor_image`, never both. Vendor pins record the download URL,
+SHA-256, architecture, publication date, signing identity, and deterministic Incus fingerprint.
+
+On a missing local fingerprint, the runner downloads the pinned disk, verifies its hash and
+qcow2 format, and imports it with deterministic metadata. The vendor disk is not mounted,
+converted, provisioned, or repaired during import. A missing or invalid artifact fails that
+target; the runner does not substitute another image. Completed imports remain in Incus for
+reuse as source images. Every target still creates a fresh VM and repeats all provisioning.
+
+```bash
+just e2e-images-check
+just e2e-images-refresh
+just e2e-images-refresh almalinux-10
+```
+
+`e2e-images-check` reports newer vendor builds and stable distro releases without downloading
+disks, importing images, editing pins, or starting VMs. It exits successfully when discovery
+completes, even if updates are available; incomplete discovery returns nonzero. Every E2E run
+also performs this check for all four distro families, including filtered and required-only
+runs. Startup discovery has a 30-second total budget. Unavailable or unrecognized metadata
+produces an “update status unknown” warning, not a qualification failure. Results are visible
+in progress output and retained evidence. No checks happen while E2E is idle.
+
+`e2e-images-refresh` processes one configured vendor target, or all three when omitted. It
+verifies vendor-signed checksums with explicitly trusted signing fingerprints in an isolated
+keyring, verifies disk hashes and format, generates metadata, and imports the source images.
+New pins must satisfy the seven-day publication-age rule; unknown age blocks adoption. Age
+uses the later of the official disk's Last-Modified time and the checksum signature timestamp.
+Signing-key changes require review. Unsupported architectures and qcow2 backing files are
+rejected. The manifest changes atomically only after all requested processing succeeds;
+failed processing leaves existing pins and pre-existing images intact. No VM is started.
+
+Review the resulting diff, obtain explicitly authorized fresh lifecycle acceptance for the
+affected targets, and then commit the reviewed pins. Source verification or a successful
+environment probe is not application acceptance. Run evidence records the exact source hash
+and Incus fingerprint independently of bootstrap and application outcomes.
+
+Discovery uses Fedora's release catalogue and official Cloud checksum listings, AlmaLinux's
+official release directories and GenericCloud checksums, Debian's stable Release metadata,
+and Ubuntu's LTS release feed. Development releases, betas, release candidates, and alternate
+architectures are excluded. New major versions are coverage proposals only: adding or retiring
+targets, changing Ubuntu's LTS policy, or changing required/advisory status requires explicit
+approval. Debian and Ubuntu continue resolving their existing Incus sources normally.
+
 ## Guest preparation
 
 Each worker completes one target through creation, provisioning, environment validation,
@@ -127,6 +184,12 @@ the requested SELinux mode, and absence of pre-existing Kidobo state. Running ke
 before and after preparation and application reboot, plus package inventories, identify what
 was tested without imposing version requirements.
 
+Vendor guests receive the agent and cloud-init configuration disks before first boot. Cloud-init
+installs the Incus-provided agent and the bounded SELinux label accommodation. Preparation waits
+for cloud-init completion and a successful bootstrap status. The identified Fedora hostname-setting
+warnings remain visible but do not fail a completed bootstrap; unexpected cloud-init errors,
+missing completion, or failed bootstrap prevent application admission.
+
 After the application reboot, the existing timer, service, restored-set, and IPv4/IPv6 traffic
 assertions prove that Kidobo restored enforcement. The harness does not preload modules to help
 that boot behavior pass; the requested SELinux state must also persist.
@@ -134,7 +197,9 @@ that boot behavior pass; the requested SELinux state must also persist.
 AlmaLinux enables EPEL/CRB. SELinux setup retains a bounded readiness deadline, observes completion
 of relabeling across boot identities, and requires a saved successful enforcement result plus an
 observed enforcing state. The existing Incus-agent label accommodation is described in the scope
-contract above. Missing packages, failed boot, unusable modules, unsupported agent layouts, or
+contract above. The detached enforcement helper writes output to the system journal and retains
+its mandatory completion status and deadline; a failed unit is not treated as pending success.
+Missing packages, failed boot, unusable modules, unsupported agent layouts, or
 incorrect security state fail the target. The harness does not build replacement dependencies,
 rewrite Fedora GRUB/BLS/EFI configuration, or select an automatic fallback environment.
 
@@ -238,7 +303,8 @@ a stopped guest solely to obtain diagnostics. Required environment/application a
 fail normally; a warning never hides a failed assertion. Failure to save authoritative logs/results,
 finalize the evidence archive, or clean resources remains fatal.
 
-Frozen installer, guest scripts, configuration, and hashes are stored under `inputs/` in the archive;
+Frozen installer, guest scripts, configuration, image manifest, bootstrap input, metadata,
+verification evidence, and hashes are retained in the archive;
 candidate bytes and checksums are under `inputs/release/`. Upgrade checks capture the baseline
 archive, installer, and checksum manifest, create state with the baseline binary, and verify
 preservation and offline operation after candidate installation. The narrow historical baseline
@@ -266,6 +332,25 @@ just e2e-clean RUN_ID
 Use the same results root and active Incus group membership. Cleanup validates suite ownership and
 run identity; never remove the shared project, bridge, or pool to clean one run.
 
+### Retained vendor source images
+
+Completed vendor imports are intentionally retained. There are no prepared-image generations,
+automatic pruning, or historical-result reuse. To reclaim an unused source image, inspect its
+exact fingerprint and all suite instances:
+
+```bash
+incus --project kidobo-e2e image list
+incus --project kidobo-e2e image show "${IMAGE_FINGERPRINT:?set IMAGE_FINGERPRINT}"
+incus --project kidobo-e2e list --format=json
+```
+
+Require the `user.kidobo-e2e-source: kidobo-e2e-v1` property and verify that no running, stopped,
+or deliberately retained guest references the fingerprint as `volatile.base_image`. Preserve
+foreign, ambiguous, and referenced images. Only then remove that individual image with
+`incus --project kidobo-e2e image delete FINGERPRINT`. Deleting a still-pinned, unused source
+causes its next run to download and verify it again. Never delete the project or storage pool
+to reclaim one image.
+
 ### Legacy prepared-image storage
 
 Old prepared images are unused after this simplification and are not automatically migrated or
@@ -291,7 +376,8 @@ Read the scope contract first. Use local fake-Incus and isolated script fixtures
 `just test`, then the required local gates in the [development guide](development.md#toolchain-and-validation).
 `just ci` excludes infrastructure tests and does not establish VM acceptance. Local fixtures use
 fake privileged commands, temporary roots, and loopback services; they require Bash, curl,
-Python 3, and coreutils. Do not replace missing real-VM acceptance with a claim based on fixtures.
+Python 3, GNU tar/coreutils, and GPG for isolated signature verification. Do not replace missing
+real-VM acceptance with a claim based on fixtures.
 
 Real VM acceptance requires a separate, explicit user request. It should cover fresh execution
 of the selected targets, configured SELinux modes and observed backends, application assertions,

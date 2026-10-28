@@ -431,6 +431,10 @@ if [[ '{mode}' == launch ]]; then provision_main --start-enforcement; else provi
             let job = read_text(&root.join("job")).expect("job invocation");
             assert!(job.contains("--no-block --property=Type=oneshot"));
             assert!(job.contains("--property=TimeoutStartSec=120"));
+            assert!(job.contains("--property=StandardOutput=journal"));
+            assert!(job.contains("--property=StandardError=journal"));
+            assert!(!job.contains("append:"));
+            assert!(!job.contains("RuntimeMaxSec"));
             assert!(job.ends_with("provision.sh --enforce-selinux\n"));
             assert!(!root.join("prepared/enforcement.status").exists());
         } else {
@@ -440,6 +444,155 @@ if [[ '{mode}' == launch ]]; then provision_main --start-enforcement; else provi
                 read_text(&root.join("prepared/enforcement.status")).expect("durable status"),
                 format!("{expected}\n")
             );
+        }
+    }
+}
+
+#[test]
+fn enforcement_probe_reports_terminal_unit_failure_without_waiting_for_a_marker() {
+    for (active, expected) in [
+        ("activating", "pending\n"),
+        ("active", "pending\n"),
+        (
+            "failed",
+            "failed unit=failed result=exit-code status=209; completion marker missing\n",
+        ),
+        (
+            "inactive",
+            "failed unit=inactive result=exit-code status=209; completion marker missing\n",
+        ),
+    ] {
+        let temp = TestDir::new();
+        fs::create_dir(temp.path().join("prepared")).expect("prepared");
+        let script = include_str!("../../../scripts/e2e/provision.sh").replace(
+            "readonly BASE=/opt/kidobo-e2e PREPARED=/opt/kidobo-e2e/prepared",
+            "readonly BASE=\"$FIXTURE_ROOT\" PREPARED=\"$FIXTURE_ROOT/prepared\"",
+        );
+        fs::write(temp.path().join("provision.sh"), script).expect("script");
+        let output = run(
+            temp.path(),
+            &format!(
+                r#"
+set -euo pipefail
+source "$FIXTURE_ROOT/provision.sh"
+require_guest() {{ :; }}
+systemctl() {{
+  case "$*" in
+    *--property=ActiveState*) printf '%s\n' '{active}' ;;
+    *--property=Result*) printf 'exit-code\n' ;;
+    *--property=ExecMainStatus*) printf '209\n' ;;
+    *) exit 99 ;;
+  esac
+}}
+provision_main --enforcement-status
+"#
+            ),
+        );
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), expected);
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("E2E_CHECK\tprepared enforcement status observed\tPASS")
+        );
+    }
+}
+
+#[test]
+fn vendor_bootstrap_assertion_requires_durable_success_active_agent_and_selinux() {
+    for (status, active, selinux, success) in [
+        ("0", true, "Enforcing", true),
+        ("", true, "Enforcing", false),
+        ("1", true, "Enforcing", false),
+        ("0", false, "Enforcing", false),
+        ("0", true, "Permissive", false),
+    ] {
+        let temp = TestDir::new();
+        fs::write(temp.path().join("bootstrap.status"), status).expect("status");
+        let script = include_str!("../../../scripts/e2e/provision.sh").replace(
+            "/var/log/kidobo-image-bootstrap.status",
+            "${FIXTURE_ROOT}/bootstrap.status",
+        );
+        fs::write(temp.path().join("provision.sh"), script).expect("script");
+        let output = run(
+            temp.path(),
+            &format!(
+                r#"
+set -euo pipefail
+source "$FIXTURE_ROOT/provision.sh"
+require_guest() {{ :; }}
+systemctl() {{ [[ '{active}' == true ]]; }}
+getenforce() {{ printf '%s\n' '{selinux}'; }}
+provision_main --check-bootstrap
+"#
+            ),
+        );
+        assert_eq!(output.status.success(), success, "{output:?}");
+        let expected = if success { "PASS" } else { "FAIL" };
+        assert!(String::from_utf8_lossy(&output.stderr).contains(&format!(
+            "E2E_CHECK\tvendor image agent bootstrap\t{expected}"
+        )));
+    }
+}
+
+#[test]
+fn vendor_bootstrap_installs_agent_and_cleans_the_mount_on_failure() {
+    for (scenario, expected_status) in [("success", 0), ("installer", 17), ("layout", 1)] {
+        let temp = TestDir::new();
+        let root = temp.path();
+        fs::create_dir(root.join("agent")).expect("agent config disk mount");
+        fs::write(
+            root.join("agent/install.sh"),
+            if scenario == "installer" {
+                "exit 17\n"
+            } else {
+                "exit 0\n"
+            },
+        )
+        .expect("inert installer");
+        let script = include_str!("../../../scripts/e2e/bootstrap.sh")
+            .replace("/mnt/incus-agent", "${FIXTURE_ROOT}/agent")
+            .replace(
+                "/var/log/kidobo-image-bootstrap",
+                "${FIXTURE_ROOT}/bootstrap",
+            )
+            .replace("/etc/systemd/system", "${FIXTURE_ROOT}/units");
+        fs::write(root.join("bootstrap.sh"), script).expect("isolated script");
+        let output = run(
+            root,
+            &format!(
+                r#"
+set -euo pipefail
+systemd-detect-virt() {{ [[ "$*" == --vm ]]; }}
+mount() {{ printf 'mount %s\n' "$*" >> "$FIXTURE_ROOT/events"; }}
+umount() {{ printf 'umount\n' >> "$FIXTURE_ROOT/events"; }}
+systemctl() {{
+  printf 'systemctl %s\n' "$*" >> "$FIXTURE_ROOT/events"
+  if [[ "$1" == show ]]; then
+    if [[ '{scenario}' == layout ]]; then printf '{{ path=/unknown ; }}\n'; else printf '{{ path=/run/incus_agent/incus-agent ; }}\n'; fi
+  fi
+}}
+getenforce() {{ printf 'Enforcing\n'; }}
+source "$FIXTURE_ROOT/bootstrap.sh"
+"#
+            ),
+        );
+        assert_eq!(output.status.code(), Some(expected_status), "{output:?}");
+        assert_eq!(
+            read_text(&root.join("bootstrap.status")).expect("durable bootstrap status"),
+            format!("{expected_status}\n")
+        );
+        let events = read_text(&root.join("events")).expect("bootstrap events");
+        assert!(events.starts_with("mount -o ro /dev/disk/by-label/incus-agent "));
+        assert_eq!(events.lines().filter(|line| *line == "umount").count(), 1);
+        if scenario == "success" {
+            assert!(events.contains("systemctl start incus-agent.service"));
+            assert_eq!(
+                read_text(&root.join("units/incus-agent.service.d/kidobo-e2e-selinux.conf"))
+                    .expect("bounded agent accommodation"),
+                "[Service]\nExecStartPre=/usr/bin/chcon -t bin_t /run/incus_agent/incus-agent\n"
+            );
+        } else {
+            assert!(!events.contains("systemctl start"));
         }
     }
 }

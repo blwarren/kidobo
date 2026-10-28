@@ -51,7 +51,12 @@ targets. Full seven-platform qualification requires every selected target to pas
 that outcome separately from the four-target release gate. Each target completes fresh provisioning
 and application checks with bounded two-VM concurrency. Read the
 [E2E scope contract](e2e.md#scope-and-non-goals) before changing its runner, fixtures, provisioning,
-reporting, or release integration. The matrix can be omitted with the explicit publisher option
+image acquisition/monitoring, reporting, or release integration. Fedora and AlmaLinux use reviewed
+vendor-image pins; `just e2e-images-check` reports updates, while `just e2e-images-refresh [DISTRO]`
+verifies/imports sources and changes pins for review without starting VMs. Startup discovery is
+advisory, has a 30-second budget, and never changes the matrix. See the
+[image update workflow](e2e.md#image-sources-and-reviewed-updates) for verification and acceptance.
+The matrix can be omitted with the explicit publisher option
 `--skip-e2e`.
 
 CI/CD remains local. Dependabot version updates are the sole GitHub-hosted automation exception;

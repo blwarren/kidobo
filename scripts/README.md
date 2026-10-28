@@ -47,6 +47,8 @@ that include those retired scaled cases.
 - `just exercise-release` (release-only build and isolated binary exercise)
 - `just release-compat` (release-only static ELF, Debian 11, and Alpine 3.22 gate)
 - `just e2e-setup` (configure suite-owned Incus infrastructure; see [distro testing](../docs/e2e.md))
+- `just e2e-images-check` (report vendor-image updates and new stable distro releases; no image imports or VMs)
+- `just e2e-images-refresh [DISTRO]` (verify/import one or all configured vendor sources and update pins for review; no VMs)
 - `just e2e` (start the candidate build and complete distro matrix in detached tmux session
   `kidobo-e2e`; attach with `tmux attach -t kidobo-e2e` to watch progress; the session closes
   automatically and saves output and exit status under `target/e2e/launcher-*/`)
@@ -90,6 +92,13 @@ preflight and 1 GiB host headroom. Each worker completes fresh provisioning, env
 application checks, diagnostics, and cleanup for one target before taking another. Individual target
 failures do not suppress other targets. Ownership-checked startup recovery removes abandoned suite
 VMs and preserves retained/foreign guests. No prepared-image or prior-result reuse remains.
+Fedora and AlmaLinux use reviewed vendor-image pins; verified, unmodified source images remain
+in Incus. Startup checks report image updates and new stable Debian, Ubuntu LTS, Fedora, and
+AlmaLinux releases within a 30-second budget. Discovery failures warn without changing
+qualification, pins, or matrix coverage. The refresh command verifies signatures, hashes,
+format, and seven-day publication age before atomically updating requested pins. Review the
+diff and obtain explicitly authorized fresh lifecycle acceptance before committing it. See
+[image updates and storage](../docs/e2e.md#image-sources-and-reviewed-updates).
 Read the [E2E scope contract](../docs/e2e.md#scope-and-non-goals) before changing this workflow.
 
 An explicit `--skip-e2e` argument skips only that matrix and its Incus/agent-ISO prerequisites;

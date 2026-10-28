@@ -21,11 +21,15 @@ deterministic computation, operator compatibility, and reliable installation and
   asks them to run it. Requests to change, document, or review the E2E workflow do not authorize
   execution. This applies to all candidate, artifact, published-release, and publication paths
   that launch the matrix, including filtered runs.
-- Before changing E2E runner, guest scripts, launcher, fixtures, configuration, or release integration,
+- Before changing E2E runner, guest scripts, launcher, fixtures, image acquisition/monitoring,
+  configuration, or release integration,
   read and follow [E2E scope and non-goals](docs/e2e.md#scope-and-non-goals). Keep work within
   the configured Kidobo lifecycle checks; new platforms, scenarios, persistent state, reuse,
   repair/fallback mechanisms, or release-policy changes require explicit user scope. Environment
   failures do not authorize new repair systems or weaker assertions.
+- E2E vendor-image updates use reviewed pins. Discovery is advisory; never automatically change
+  the distro matrix or release policy. Retaining unmodified source images in Incus does not
+  authorize prepared-image publication, reused test outcomes, or guest repair.
 - E2E must clean up its own VMs and completed tmux sessions after success, failure, or handled
   interruption. Preserve logs and evidence, honor explicit `--keep-failed` retention, and recover
   abandoned suite-owned resources safely on the next run. Do not make routine reruns depend on
@@ -43,7 +47,7 @@ Read the relevant sections before the corresponding work; other guides need not 
 | Work | Guidance |
 | --- | --- |
 | Crate boundaries, domain computation, command/source workflows, firewall or cache logic | [Architecture](docs/architecture.md), including its sync sequence and failure policy. |
-| E2E runner, guest scripts, launcher, fixtures, matrix configuration, or release integration | [E2E scope and non-goals](docs/e2e.md#scope-and-non-goals), then the relevant execution and evidence sections in that guide. |
+| E2E runner, guest scripts, launcher, fixtures, image acquisition/monitoring, matrix configuration, or release integration | [E2E scope and non-goals](docs/e2e.md#scope-and-non-goals), then the relevant execution and evidence sections in that guide. |
 | Rust, tests, executable scripts, or validation | [Toolchain and validation](docs/development.md#toolchain-and-validation). |
 | Core or safety-critical behavior, including fixes and refactors | [Safety-critical regressions](docs/development.md#safety-critical-regressions). |
 | CLI, output, paths, installation, or systemd compatibility | [Compatibility contract](docs/compatibility.md) and the relevant [operator workflow](docs/operations.md). |

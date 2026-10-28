@@ -4,7 +4,7 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::Path;
 
-pub(super) const VERSION: u64 = 4;
+pub(super) const VERSION: u64 = 5;
 
 pub(super) fn validate(
     document: &Value,

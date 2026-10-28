@@ -70,6 +70,15 @@ release-compat: build-release
 e2e-setup:
     @cargo run --locked -p kidobo-e2e -- setup
 
+# Report vendor-image updates and new stable distro releases without starting VMs.
+e2e-images-check:
+    @cargo run --locked -p kidobo-e2e -- images check
+
+# Verify/import vendor images and update their pins for review; optionally select one distro.
+[positional-arguments]
+e2e-images-refresh *args:
+    @cargo run --locked -p kidobo-e2e -- images refresh "$@"
+
 # Start candidate testing in a persistent, detached tmux session.
 [positional-arguments]
 e2e *args:
