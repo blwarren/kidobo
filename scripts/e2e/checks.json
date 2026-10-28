@@ -71,6 +71,15 @@
       }
     },
     "preparation": {
+      "--boot-status": {
+        "prepared boot status observed": 1
+      },
+      "--start-enforcement": {
+        "prepared enforcement job scheduled": 1
+      },
+      "--enforcement-status": {
+        "prepared enforcement status observed": 1
+      },
       "--prepare": {
         "guest route and DNS readiness": 1,
         "guest dependency provisioning": 1,

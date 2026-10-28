@@ -779,9 +779,20 @@ create_recovered_baseline_cache() {
     printf '#!/usr/bin/env bash\nexec python3 %q baseline-firewall %q "${0##*/}" "$@"\n' "$ROOT/traffic.py" "$isolated" > "$fake/$name"
     chmod 0755 "$fake/$name"
   done
+  # The baseline invokes sudo even as root; its secure_path would escape the fakes.
+  {
+    printf '#!/usr/bin/env bash\nset -euo pipefail\n'
+    printf '[[ $# -ge 2 && "$1" == -n ]] || exit 90\nshift\n'
+    printf 'case "$1" in ipset|iptables|ip6tables) ;; *) exit 91 ;; esac\n'
+    printf 'program=$1\nshift\nexec %q/"$program" "$@"\n' "$fake"
+  } > "$fake/sudo"
+  chmod 0755 "$fake/sudo"
   # Only the old binary's cache writer uses these fakes, inside a separate root.
   # The candidate and the guest's live firewall never see this PATH.
-  KIDOBO_ROOT="$isolated" PATH="$fake:$PATH" /usr/local/bin/kidobo sync > "$STATE/baseline-cache-generation.stdout" 2> "$STATE/baseline-cache-generation.stderr"
+  if ! KIDOBO_ROOT="$isolated" PATH="$fake:$PATH" /usr/local/bin/kidobo sync > "$STATE/baseline-cache-generation.stdout" 2> "$STATE/baseline-cache-generation.stderr"; then
+    cat "$STATE/baseline-cache-generation.stdout" "$STATE/baseline-cache-generation.stderr" >&9
+    fail 'isolated baseline cache generation failed; see baseline-cache-generation.stderr'
+  fi
   [[ -n "$(find "$isolated/cache/remote" -type f -print -quit)" ]] || fail 'recovered baseline did not generate a cache'
   rm -rf /var/cache/kidobo/remote
   cp -a "$isolated/cache/remote" /var/cache/kidobo/remote
@@ -832,12 +843,12 @@ upgrade_phase() {
   kidobo ban "$V4_PEER"
   kidobo ban "$V6_PEER"
   kidobo ban --help > "$STATE/baseline-ban-help.txt"
-  local preserved_config="$STATE/upgrade-config.toml" preserved_blocklist="$STATE/upgrade-blocklist.txt"
+  local preserved_config="$STATE/baseline-before-sync-config.toml" preserved_blocklist="$STATE/baseline-before-sync-blocklist.txt"
   local preserved_temporary=- temporary_supported=false
   if grep -Eq -- '(^|[[:space:]])--for([[:space:]]|$)' "$STATE/baseline-ban-help.txt"; then
     temporary_supported=true
     kidobo ban 203.0.113.79 --for 1d
-    preserved_temporary="$STATE/upgrade-temporary-bans.toml"
+    preserved_temporary="$STATE/baseline-before-sync-temporary-bans.toml"
     cp -p /var/lib/kidobo/temporary-bans.toml "$preserved_temporary"
   else
     [[ ! -e /var/lib/kidobo/temporary-bans.toml ]] || fail 'legacy baseline unexpectedly created temporary state'
@@ -854,6 +865,15 @@ upgrade_phase() {
   assert_remote_lookup baseline-remote-v6 2001:db8::44 2001:db8::44/128
   find /var/cache/kidobo/remote -type f -print0 | sort -z | xargs -0 -r sha256sum > "$STATE/upgrade-cache-before.sha256"
   stop_fixture "$STATE/http-source.pid" "$ROOT/traffic.py source $ROOT/fixtures/feed.txt $SOURCE_PORT"
+  # Baseline sync may canonicalize source files; measure only the installer's changes.
+  preserved_config="$STATE/upgrade-config.toml"
+  preserved_blocklist="$STATE/upgrade-blocklist.txt"
+  cp -p "$CONFIG" "$preserved_config"
+  cp -p "$BLOCKLIST" "$preserved_blocklist"
+  if [[ "$temporary_supported" == true ]]; then
+    preserved_temporary="$STATE/upgrade-temporary-bans.toml"
+    cp -p /var/lib/kidobo/temporary-bans.toml "$preserved_temporary"
+  fi
   install_target
   assert_target_version
   assert_installed_binary upgraded

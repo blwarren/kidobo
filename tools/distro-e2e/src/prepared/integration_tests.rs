@@ -48,7 +48,7 @@ state_path = root / 'state.json'
 state = json.loads(state_path.read_text())
 args = sys.argv[1:]
 if args[0] == 'query':
-    assert args == ['query', '/1.0/profiles/test-profile?project=test-project'], args
+    assert args == ['query', '/1.0/profiles/test-profile?project=test-project'] or '/1.0/instances/' in args[1], args
 else:
     assert args[:2] == ['--project', 'test-project'], args
     args = args[2:]
@@ -82,7 +82,15 @@ def markers(phase):
 
 operation = args[0]
 if operation == 'query':
-    print(json.dumps({'metadata':state['profile']}))
+    if '/instances/' in args[1]:
+        if '/logs?' in args[1]:
+            print(json.dumps({'metadata':['/1.0/instances/fixture/logs/qemu.log']}))
+        else:
+            print('fixture QEMU log')
+    else:
+        print(json.dumps({'metadata':state['profile']}))
+elif operation == 'console':
+    print('fixture serial console')
 elif operation == 'image':
     action = args[1]
     if action == 'list':
@@ -153,19 +161,52 @@ elif operation == 'exec':
         elif path.endswith('/admission.json'):
             print(json.dumps({'format':1, 'machine_id':vm['machine_id'],
                               'boot_id':f"{name}-boot-{vm['boot']}",
-                              'kernel':'fixture-kernel', 'selinux':'Disabled'}))
+                              'kernel':'fixture-kernel', 'selinux':vm['manifest']['selinux_actual']}))
         else:
             raise AssertionError(command)
     elif command[0] in {'true','sh','test'}:
         pass
     elif command[:2] == ['bash','/opt/kidobo-e2e/provision.sh']:
         phase = command[2]
+        if phase == '--boot-status':
+            vm['probes'] = vm.get('probes', 0) + 1
+            if scenario == 'boot-timeout':
+                fail(255)
+            if scenario == 'relabel-reboot' and vm['probes'] in {1, 3, 6}:
+                if vm['probes'] == 3:
+                    vm['boot'] += 1
+                fail(255)
+            print(f"{name}-boot-{vm['boot']}")
+            if scenario != 'missing-probe-marker':
+                markers(phase)
+            save()
+            raise SystemExit(0)
+        if phase == '--start-enforcement':
+            vm['enforcement_started'] = True
+            if scenario == 'relabel-reboot':
+                fail(255)
+            markers(phase)
+            save()
+            raise SystemExit(0)
+        if phase == '--enforcement-status':
+            assert vm['enforcement_started']
+            vm['enforcement_probes'] = vm.get('enforcement_probes', 0) + 1
+            if scenario == 'relabel-reboot' and vm['enforcement_probes'] == 1:
+                fail(255)
+            print('17 Permissive' if scenario == 'enforcement-failure' else '0 Enforcing')
+            markers(phase)
+            save()
+            raise SystemExit(0)
         if phase == '--prepare' and scenario == 'prepare-failure':
             fail(70)
+        if phase == '--prepare':
+            vm['family'] = command[3]
+            vm['selinux_requested'] = command[4]
         if phase == '--check-kernel':
-            vm['manifest'] = {'format':1, 'prepared_at_unix':int(time.time()), 'family':'apt',
+            requested = vm.get('selinux_requested', 'image-default')
+            vm['manifest'] = {'format':1, 'prepared_at_unix':int(time.time()), 'family':vm.get('family', 'apt'),
                               'architecture':'x86_64', 'expected_kernel':'fixture-kernel',
-                              'selinux_requested':'image-default', 'selinux_actual':'Disabled',
+                              'selinux_requested':requested, 'selinux_actual':'Enforcing' if requested == 'enforcing' else 'Disabled',
                               'source_machine_id':vm['machine_id'],
                               'source_boot_id':f"{name}-boot-{vm['boot']}",
                               'packages_sha256':'b'*64, 'provision_sha256':'c'*64,
@@ -639,4 +680,108 @@ fn fresh_image_property_cannot_hide_an_expired_preparation_manifest() {
     assert_ne!(metadata["image_fingerprint"], fingerprint);
     assert_eq!(fixture.guest_count("--prepare"), 2);
     assert_eq!(fixture.guest_count("--admit"), 2);
+}
+
+#[test]
+fn preparation_waits_through_relabel_reboot_and_enforcement_transport_loss() {
+    let fixture = Fixture::new();
+    fixture.change(|state| state["scenario"] = json!("relabel-reboot"));
+    let mut runner = fixture.runner(1);
+    let vm = "run-100-1-primary";
+    runner
+        .create_vm("fixture/image", vm, "test-profile")
+        .expect("fixture VM");
+    reboot_prepared(
+        &mut runner,
+        vm,
+        true,
+        Duration::from_secs(5),
+        Duration::from_millis(1),
+    )
+    .unwrap_or_else(|error| {
+        panic!(
+            "{error}\n{}",
+            read_text(&runner.dir.join("transcript.log")).expect("transcript")
+        )
+    });
+    let state = fixture.state();
+    assert_eq!(state["instances"][vm]["boot"], 3);
+    assert_eq!(state["instances"][vm]["probes"], 7);
+    assert_eq!(state["instances"][vm]["enforcement_probes"], 3);
+    assert_eq!(fixture.guest_count("--start-enforcement"), 1);
+    assert_eq!(fixture.guest_count("--check-kernel"), 0);
+}
+
+#[test]
+fn preparation_readiness_bounds_failure_timeout_and_cancellation() {
+    for scenario in [
+        "enforcement-failure",
+        "boot-timeout",
+        "cancelled",
+        "missing-probe-marker",
+    ] {
+        let fixture = Fixture::new();
+        fixture.change(|state| state["scenario"] = json!(scenario));
+        let mut runner = fixture.runner(1);
+        let vm = "run-100-1-primary";
+        runner
+            .create_vm("fixture/image", vm, "test-profile")
+            .expect("fixture VM");
+        if scenario == "cancelled" {
+            runner
+                .cancelled
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        let timeout = if scenario == "boot-timeout" {
+            Duration::from_millis(100)
+        } else {
+            Duration::from_secs(5)
+        };
+        let error = reboot_prepared(&mut runner, vm, true, timeout, Duration::from_millis(1))
+            .expect_err("preparation cannot be admitted")
+            .to_string();
+        let expected = match scenario {
+            "enforcement-failure" => "detached SELinux enforcement failed: 17 Permissive",
+            "boot-timeout" => "deadline expired",
+            "missing-probe-marker" => "guest check inventory mismatch",
+            _ => "interrupted",
+        };
+        assert!(error.contains(expected), "{scenario}: {error}");
+        assert_eq!(fixture.guest_count("--check-kernel"), 0);
+        assert_eq!(fixture.count("publish", None), 0);
+    }
+}
+
+#[test]
+fn enforcing_preparation_publishes_only_after_durable_transition_success() {
+    for success in [false, true] {
+        let mut fixture = Fixture::new();
+        fixture.config.distros[0].selinux = "enforcing".into();
+        fixture.config.distros[0].family = "dnf".into();
+        fixture.change(|state| {
+            state["scenario"] = json!(if success { "" } else { "enforcement-failure" });
+        });
+        let (_, outcome) = fixture.prepare(1, false);
+        if success {
+            let metadata = outcome.expect("enforcing prepared clone admitted");
+            assert_eq!(metadata["preparation"]["selinux_actual"], "Enforcing");
+            assert_eq!(fixture.guest_count("--check-kernel"), 1);
+            assert_eq!(fixture.count("publish", None), 1);
+        } else {
+            assert!(
+                outcome
+                    .expect_err("enforcement failure must abort preparation")
+                    .to_string()
+                    .contains("detached SELinux enforcement failed")
+            );
+            assert_eq!(fixture.guest_count("--check-kernel"), 0);
+            assert_eq!(fixture.count("publish", None), 0);
+            assert!(
+                fixture.state()["images"]
+                    .as_object()
+                    .expect("images")
+                    .is_empty()
+            );
+        }
+    }
 }

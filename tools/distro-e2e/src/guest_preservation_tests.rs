@@ -138,3 +138,129 @@ test_candidate_temporary_reinstall
         }
     }
 }
+
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "One inert lifecycle fixture verifies snapshot ordering and each preserved artifact"
+)]
+fn upgrade_preservation_compares_post_sync_state_and_rejects_installer_changes() {
+    let function = lifecycle_function("upgrade_phase() {", "\nassert_enforcement_absent() {")
+        .replace("/var/cache/kidobo/remote", "\"$ROOT/cache/remote\"");
+    for scenario in [
+        "preserved",
+        "legacy",
+        "config",
+        "blocklist",
+        "cache",
+        "temporary",
+    ] {
+        let temp = TestDir::new();
+        let root = temp.path();
+        fs::create_dir_all(root.join("baseline/kidobo-v0.14.2-linux-x86_64"))
+            .expect("archive tree");
+        fs::create_dir_all(root.join("cache/remote")).expect("cache tree");
+        fs::write(root.join("kidobo"), "frozen old binary bytes").expect("binary");
+        fs::write(
+            root.join("baseline/kidobo-v0.14.2-linux-x86_64/kidobo"),
+            "frozen old binary bytes",
+        )
+        .expect("archive binary");
+        fs::write(root.join("baseline-tag"), "v0.14.2\n").expect("baseline tag");
+        fs::write(root.join("config"), "baseline configuration\n").expect("config");
+        fs::write(root.join("blocklist"), "# baseline header\n").expect("blocklist");
+        super::tests::executable(&root.join("baseline/installer.sh"), "#!/bin/sh\nexit 0\n");
+        let output = Command::new("bash")
+            .args(["-c", &format!(r#"
+set -euo pipefail
+exec 9>&2
+STATE=$ROOT CONFIG=$ROOT/config BLOCKLIST=$ROOT/blocklist TARGET=$ROOT/kidobo TEMPORARY=$ROOT/temporary
+BASELINE=$ROOT/baseline RELEASE=$ROOT/release HTTP_PORT=12345 SOURCE_PORT=12346
+installer=$BASELINE/installer.sh mode=candidate tag=v0.14.3
+V4_PEER=198.18.77.2 V6_PEER=fd42::2 SET4=set4 SET6=set6
+tar -czf "$BASELINE/kidobo-v0.14.2-linux-x86_64.tar.gz" -C "$BASELINE" kidobo-v0.14.2-linux-x86_64
+(cd "$BASELINE"; sha256sum kidobo-v0.14.2-linux-x86_64.tar.gz > SHA256SUMS)
+e2e_check_start() {{ :; }}
+e2e_check_pass() {{ :; }}
+fail() {{ echo "$*" >&2; exit 1; }}
+start_source_fixture() {{ :; }}
+serve_dir() {{ :; }}
+defer_timer_until_configuration_is_ready() {{ :; }}
+wait_for_sync_service_idle() {{ :; }}
+clear_timer_deferral() {{ :; }}
+install_frozen_baseline() {{ :; }}
+assert_installed_binary() {{ :; }}
+assert_systemd_units() {{ :; }}
+configure_baseline_sources() {{ :; }}
+setup_namespace() {{ :; }}
+capture_namespace_and_cleanup() {{ :; }}
+start_traffic_servers() {{ :; }}
+assert_remote_lookup() {{ :; }}
+stop_fixture() {{ :; }}
+assert_target_version() {{ :; }}
+sync_and_assert() {{ :; }}
+ipset() {{ :; }}
+probe_pair() {{ :; }}
+test_candidate_temporary_reinstall() {{ :; }}
+restore_boot_timer() {{ :; }}
+kidobo() {{
+  case "$1" in
+    --version) echo 'kidobo v0.14.2' | sed 's/kidobo v/kidobo /' ;;
+    ban)
+      if [[ "$2" == --help ]]; then [[ "$SCENARIO" == legacy ]] || echo '  --for DURATION'; return 0
+      elif [[ "${{3:-}}" == --for ]]; then echo 'old temporary state' > "$TEMPORARY"
+      else printf '%s\n' "$2" >> "$BLOCKLIST"; fi ;;
+    lookup) printf '203.0.113.79\ttemporary:blocklist\t203.0.113.79/32\n' ;;
+    init|doctor) : ;;
+    *) exit 90 ;;
+  esac
+}}
+run_baseline_enforcement_check() {{
+  cmp -s "$2" "$CONFIG"
+  cmp -s "$3" "$BLOCKLIST"
+  [[ "$4" == - ]] || cmp -s "$4" "$TEMPORARY"
+  printf '# baseline header\n\n198.18.77.2/32\nfd42::2/128\n' > "$BLOCKLIST"
+  echo 'cache written by old sync' > "$ROOT/cache/remote/data"
+}}
+install_target() {{
+  case "$SCENARIO" in
+    config) echo changed >> "$CONFIG" ;;
+    blocklist) echo changed >> "$BLOCKLIST" ;;
+    cache) echo changed >> "$ROOT/cache/remote/data" ;;
+    temporary) echo changed >> "$TEMPORARY" ;;
+  esac
+}}
+{function}
+upgrade_phase
+"#)])
+            .env("ROOT", root)
+            .env("SCENARIO", scenario)
+            .output()
+            .expect("exercise upgrade with inert lifecycle operations");
+        if matches!(scenario, "preserved" | "legacy") {
+            assert!(output.status.success(), "{scenario}: {output:?}");
+            assert_eq!(
+                read_text(&root.join("upgrade-blocklist.txt")).expect("installer snapshot"),
+                "# baseline header\n\n198.18.77.2/32\nfd42::2/128\n"
+            );
+            assert_eq!(
+                read_text(&root.join("baseline-before-sync-blocklist.txt"))
+                    .expect("baseline failure snapshot"),
+                "# baseline header\n198.18.77.2\nfd42::2\n"
+            );
+        } else {
+            assert_eq!(output.status.code(), Some(1), "{scenario}: {output:?}");
+            let expected = match scenario {
+                "config" => "binary upgrade changed baseline-generated config",
+                "blocklist" => "binary upgrade changed baseline-generated blocklist",
+                "cache" => "binary upgrade changed old remote-cache bytes",
+                "temporary" => "binary upgrade changed baseline temporary data",
+                _ => unreachable!(),
+            };
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains(expected),
+                "{scenario}: {output:?}"
+            );
+        }
+    }
+}

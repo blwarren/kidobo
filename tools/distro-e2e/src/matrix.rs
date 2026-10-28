@@ -1,7 +1,7 @@
 //! Bounded prerequisite/application scheduling with one coordinator-owned report.
 use super::{
-    Config, Distro, OWNER, Owned, Result, Runner, application, clean, prepared, prerequisites,
-    resume, strings, validate_vm_config,
+    Config, Distro, OWNER, Owned, Result, Runner, application, clean, diagnostics, prepared,
+    prerequisites, resume, strings, validate_vm_config,
 };
 use serde_json::{Value, json};
 use std::fs;
@@ -477,6 +477,7 @@ fn finish(runner: &mut Runner, trial: &Trial<'_>, keep_failed: bool, _unused: ()
                 target_dir.join("vm.json"),
                 serde_json::to_vec_pretty(instance)?,
             )?;
+            diagnostic_errors.extend(diagnostics::collect(runner, vm, &target_dir));
             if instance["status"] == "Stopped" {
                 if runner.cancelled.load(Ordering::Relaxed) {
                     return Err("stopped guest was not restarted during interrupted cleanup".into());

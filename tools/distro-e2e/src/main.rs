@@ -18,6 +18,7 @@ const OWNER: &str = "kidobo-e2e-v1";
 
 mod contract;
 mod coordination;
+mod diagnostics;
 mod matrix;
 mod prepared;
 mod report;

@@ -47,6 +47,122 @@ pub(super) fn validate_settings(config: &Config) -> Result<()> {
     Ok(())
 }
 
+fn readiness_seconds(runner: &Runner, deadline: Instant) -> Result<u64> {
+    if runner.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err("preparation readiness interrupted".into());
+    }
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err("preparation boot/enforcement readiness deadline expired".into());
+    }
+    Ok(remaining.as_secs().clamp(1, 15))
+}
+
+fn readiness_probe(
+    runner: &mut Runner,
+    vm: &str,
+    mode: &str,
+    deadline: Instant,
+) -> Result<Option<String>> {
+    let seconds = readiness_seconds(runner, deadline)?;
+    match runner.guest(
+        vm,
+        &strings(&["bash", "/opt/kidobo-e2e/provision.sh", mode]),
+        seconds,
+    ) {
+        Ok(value) => {
+            readiness_seconds(runner, deadline)?;
+            Ok(Some(value))
+        }
+        Err(error) => {
+            // A zero-exit command rejected by the host assertion contract is a
+            // harness failure, not an unavailable agent or pending guest probe.
+            if runner.report.document["commands"]
+                .as_array()
+                .and_then(|commands| commands.last())
+                .is_some_and(|command| command["code"] == 0)
+            {
+                return Err(error);
+            }
+            readiness_seconds(runner, deadline)?;
+            Ok(None)
+        }
+    }
+}
+
+fn reboot_prepared(
+    runner: &mut Runner,
+    vm: &str,
+    enforcing: bool,
+    timeout: std::time::Duration,
+    poll: std::time::Duration,
+) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    let before = runner.guest(
+        vm,
+        &strings(&["cat", "/proc/sys/kernel/random/boot_id"]),
+        readiness_seconds(runner, deadline)?,
+    )?;
+    readiness_seconds(runner, deadline)?;
+    runner.incus(
+        &strings(&["restart", vm, "--timeout=60"]),
+        deadline
+            .saturating_duration_since(Instant::now())
+            .as_secs()
+            .clamp(1, 120),
+    )?;
+    let mut observed = None;
+    let boot = loop {
+        match readiness_probe(runner, vm, "--boot-status", deadline)? {
+            Some(boot) if !boot.trim().is_empty() && boot != before => {
+                readiness_seconds(runner, deadline)?;
+                if observed.as_ref() == Some(&boot) {
+                    break boot;
+                }
+                runner
+                    .report
+                    .emit(&format!("Preparation observed boot {}", boot.trim()))?;
+                observed = Some(boot);
+            }
+            _ => observed = None,
+        }
+        std::thread::sleep(poll.min(deadline.saturating_duration_since(Instant::now())));
+    };
+    if !enforcing {
+        return Ok(());
+    }
+    if readiness_probe(runner, vm, "--start-enforcement", deadline)?.is_none() {
+        // The detached job may have restarted the transport before its launcher
+        // replied. Only its durable status plus a fresh enforcing probe can admit it.
+        runner
+            .report
+            .emit("Enforcement launch transport interrupted; checking durable job result")?;
+    }
+    loop {
+        if let Some(status) = readiness_probe(runner, vm, "--enforcement-status", deadline)? {
+            match status.trim() {
+                "pending" => {}
+                "0 Enforcing" => {
+                    if let Some(current) = readiness_probe(runner, vm, "--boot-status", deadline)? {
+                        if current != boot {
+                            return Err("guest rebooted during SELinux enforcement".into());
+                        }
+                        readiness_seconds(runner, deadline)?;
+                        return Ok(());
+                    }
+                }
+                other => {
+                    return Err(format!(
+                        "detached SELinux enforcement failed: {other}; see prepared/enforcement.log"
+                    )
+                    .into());
+                }
+            }
+        }
+        std::thread::sleep(poll.min(deadline.saturating_duration_since(Instant::now())));
+    }
+}
+
 fn key(runner: &Runner, config: &Config, target: &Distro, profile: &Value) -> Result<String> {
     let frozen: Value = serde_json::from_str(&super::read_text(
         &runner.evidence().join("inputs/SHA256.json"),
@@ -222,6 +338,12 @@ pub(super) fn prepare(
                     return Ok(metadata);
                 }
                 Err(error) => {
+                    let diagnostics = crate::diagnostics::collect(
+                        runner,
+                        vm,
+                        &runner.evidence().join(&target.id).join("rejected-cache"),
+                    );
+                    runner.report.document["cache_rejection_diagnostics"] = json!(diagnostics);
                     runner.report.emit(&format!(
                         "[{}] Cached image {fp} rejected; rebuilding once: {error}",
                         target.id
@@ -319,23 +441,17 @@ fn build(
         "{} | OS reboot and kernel verification",
         target.id
     ))?;
-    runner.reboot_with_timeout(vm, if relabel.trim() == "1" { 900 } else { 300 })?;
-    if relabel.trim() == "1" {
-        let deadline = Instant::now() + std::time::Duration::from_mins(15);
-        loop {
-            if runner.guest(vm,&strings(&["bash","-c","test ! -e /.autorelabel && ! systemctl is-active --quiet selinux-autorelabel.service"]),15).is_ok() {break;}
-            if runner.cancelled.load(std::sync::atomic::Ordering::Relaxed)
-                || Instant::now() >= deadline
-            {
-                return Err("SELinux relabeling did not complete within 900 seconds".into());
-            }
-            std::thread::sleep(std::time::Duration::from_secs(2));
-        }
-    }
+    reboot_prepared(
+        runner,
+        vm,
+        target.selinux == "enforcing",
+        std::time::Duration::from_secs(if relabel.trim() == "1" { 900 } else { 300 }),
+        std::time::Duration::from_secs(2),
+    )?;
     runner.guest(
         vm,
         &strings(&["bash", "/opt/kidobo-e2e/provision.sh", "--check-kernel"]),
-        if relabel.trim() == "1" { 900 } else { 60 },
+        60,
     )?;
     let manifest = runner.guest(
         vm,

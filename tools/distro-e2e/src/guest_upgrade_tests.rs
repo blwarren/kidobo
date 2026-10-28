@@ -164,6 +164,96 @@ else: raise AssertionError('unknown program was accepted')
 }
 
 #[test]
+fn recovered_baseline_cache_routes_sudo_only_to_private_firewall_fakes() {
+    let function = lifecycle_function(
+        "create_recovered_baseline_cache() {",
+        "\ntest_candidate_temporary_reinstall() {",
+    )
+    .replace("/usr/local/bin/kidobo", "\"$ROOT/old-kidobo\"")
+    .replace(
+        "/var/cache/kidobo/remote",
+        "\"$ROOT/published-cache/remote\"",
+    );
+    for scenario in ["success", "failure"] {
+        let temp = TestDir::new();
+        let root = temp.path();
+        fs::write(root.join("config"), "old config\n").expect("config");
+        fs::write(root.join("blocklist"), "198.51.100.1\n").expect("blocklist");
+        fs::create_dir_all(root.join("published-cache/remote")).expect("old cache");
+        fs::write(
+            root.join("published-cache/remote/old"),
+            "preserve on failure",
+        )
+        .expect("old cache file");
+        fs::write(
+            root.join("traffic.py"),
+            include_str!("../../../scripts/e2e/traffic.py").replace(
+                "Path(\"/etc/kidobo-e2e-owned\")",
+                "(Path(__file__).parent / 'owned')",
+            ),
+        )
+        .expect("real firewall fixture");
+        fs::write(root.join("owned"), "kidobo-e2e-v1\n").expect("fixture ownership marker");
+        fs::create_dir(root.join("fallback")).expect("sentinel directory");
+        super::tests::executable(
+            &root.join("fallback/sudo"),
+            "#!/bin/bash\necho 'escaped isolated sudo boundary' >&2\nexit 99\n",
+        );
+        super::tests::executable(
+            &root.join("old-kidobo"),
+            r#"#!/bin/bash
+set -euo pipefail
+[[ "$1" == sync ]]
+sudo -n iptables -w 5 -A INPUT -j fixture-v4
+sudo -n ip6tables -w 5 -A INPUT -j fixture-v6
+printf 'create fixture hash:net\n' | sudo -n ipset restore
+for invalid in 'ipset list fixture' '-n systemctl restart anything' '-n /usr/sbin/iptables -S INPUT' '-n'; do
+    read -r -a arguments <<< "$invalid"
+    if sudo "${arguments[@]}"; then echo 'unexpected sudo command accepted' >&2; exit 98; fi
+done
+if [[ "$SCENARIO" == failure ]]; then echo 'baseline cache writer failed' >&2; exit 7; fi
+mkdir -p "$KIDOBO_ROOT/cache/remote"
+printf 'old binary cache bytes\n' > "$KIDOBO_ROOT/cache/remote/generated"
+"#,
+        );
+        let output = Command::new("bash")
+            .args(["-c", &format!(
+                "set -euo pipefail\nexec 9>&2\nSTATE=$ROOT CONFIG=$ROOT/config BLOCKLIST=$ROOT/blocklist\nPATH=\"$ROOT/fallback:$PATH\"\nfail() {{ echo \"$*\" >&2; exit 1; }}\nkidobo() {{ echo 'kidobo baseline'; }}\n{function}\ncreate_recovered_baseline_cache\n"
+            )])
+            .env("ROOT", root)
+            .env("SCENARIO", scenario)
+            .output()
+            .expect("exercise cache helper without privileged executables");
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("escaped isolated sudo"));
+        assert!(
+            root.join("baseline-cache-root/iptables.json").exists(),
+            "{output:?}"
+        );
+        assert!(
+            root.join("baseline-cache-root/ip6tables.json").exists(),
+            "{output:?}"
+        );
+        if scenario == "success" {
+            assert!(output.status.success(), "{output:?}");
+            assert_eq!(
+                read_text(&root.join("published-cache/remote/generated")).expect("cache"),
+                "old binary cache bytes\n"
+            );
+            assert!(!root.join("published-cache/remote/old").exists());
+        } else {
+            assert_eq!(output.status.code(), Some(1), "{output:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("baseline cache writer failed")
+            );
+            assert_eq!(
+                read_text(&root.join("published-cache/remote/old")).expect("retained cache"),
+                "preserve on failure"
+            );
+        }
+    }
+}
+
+#[test]
 fn application_reboot_requires_the_prepared_kernel_and_enforcing_security_state() {
     let function = lifecycle_function("assert_reboot_preparation() {", "\nafter_reboot_phase() {")
         .replace("! -e /.autorelabel", "! -e \"$ROOT/autorelabel\"");

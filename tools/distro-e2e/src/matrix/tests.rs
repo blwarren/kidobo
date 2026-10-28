@@ -46,7 +46,8 @@ state = Path(__file__).parent / "state"
 scenario = (state / "scenario").read_text().strip()
 args = sys.argv[1:]
 if args[0] == "query":
-    assert args == ["query", "/1.0/profiles/test-profile?project=test-project"], args
+    assert "--project" not in args, args
+    assert args[-1].endswith("?project=test-project"), args
 else:
     assert args[:2] == ["--project", "test-project"], args
     args = args[2:]
@@ -121,10 +122,27 @@ def barrier(vm, interrupt=False):
 
 operation = args[0]
 if operation == "query":
-    print(json.dumps({"metadata": {
-        "config": {"user.kidobo-e2e": "kidobo-e2e-v1", "limits.cpu": "2", "limits.memory": "4GiB"},
-        "devices": {"root": {"type": "disk", "path": "/", "pool": "test-pool", "size": "30GiB"},
-                    "eth0": {"type": "nic", "network": "test-network", "name": "eth0"}}}}))
+    path = args[-1].split("?")[0]
+    if path == "/1.0/profiles/test-profile":
+        print(json.dumps({"metadata": {
+            "config": {"user.kidobo-e2e": "kidobo-e2e-v1", "limits.cpu": "2", "limits.memory": "4GiB"},
+            "devices": {"root": {"type": "disk", "path": "/", "pool": "test-pool", "size": "30GiB"},
+                        "eth0": {"type": "nic", "network": "test-network", "name": "eth0"}}}}))
+    elif path.endswith("/logs"):
+        print(json.dumps([path + "/qemu.log"]))
+    elif path.endswith("/logs/qemu.log"):
+        vm = path.split("/")[3]
+        event("runtime-log", vm)
+        if scenario == "host-diagnostics-failure" and vm.endswith("-secondary"):
+            print("runtime log unavailable", file=sys.stderr)
+            raise SystemExit(74)
+        print("QEMU boot evidence")
+    else:
+        raise AssertionError(args)
+elif operation == "console":
+    assert args[2] == "--show-log", args
+    event("serial-log", args[1])
+    print("serial boot evidence")
 elif operation == "image":
     assert args[1] == "info", args
     print("Fingerprint: " + "a" * 64)
@@ -169,6 +187,9 @@ elif operation == "exec":
     vm = args[1]
     guest = args[4:]
     assert (state / vm / "running").exists(), vm
+    if (state / vm / "agent-down").exists():
+        print("VM agent is unavailable", file=sys.stderr)
+        raise SystemExit(255)
     if guest[0] in {"true", "sh", "chmod", "mkdir", "test"}:
         pass
     elif guest[0] == "cat":
@@ -192,6 +213,10 @@ elif operation == "exec":
                 print("fake guest diagnostics")
         elif guest[1] == "/opt/kidobo-e2e/provision.sh":
             phase = guest[2]
+            if phase == "--boot-status":
+                print((state / vm / "boot").read_text(), end="")
+                markers("preparation", phase)
+                raise SystemExit(0)
             if phase == "--prepare":
                 event("dependencies", vm)
                 if scenario in {"concurrent", "interrupt-both"} and not vm.endswith("-tertiary"):
@@ -213,6 +238,9 @@ elif operation == "exec":
         elif guest[1] == "/opt/kidobo-e2e/lifecycle.sh":
             phase = guest[2]
             event(phase, vm)
+            if phase == "start" and scenario == "host-diagnostics-failure" and vm.endswith("-secondary"):
+                (state / vm / "agent-down").touch()
+                raise SystemExit(255)
             if phase == "start" and scenario == "application-failure" and vm.endswith("-secondary"):
                 raise SystemExit(71)
             if not (phase == "start" and scenario == "missing-checks"):
@@ -685,6 +713,67 @@ fn advisory_diagnostic_failure_is_visible_and_does_not_qualify_all_targets() {
     );
     let summary = read_text(&fixture.runner.dir.join("summary.txt")).expect("summary");
     assert!(!summary.contains("secondary: PASS"));
+    let host = fixture.runner.evidence().join("secondary/host-diagnostics");
+    assert_eq!(
+        read_text(&host.join("console.log")).expect("serial log"),
+        "serial boot evidence\n"
+    );
+    assert_eq!(
+        read_text(&host.join("qemu.log")).expect("runtime log"),
+        "QEMU boot evidence\n"
+    );
+    let events = fixture.events();
+    let deleted = events
+        .iter()
+        .position(|event| event == &format!("delete {RUN_ID}-secondary"))
+        .expect("guest deleted");
+    for event in ["serial-log", "runtime-log"] {
+        assert!(
+            events
+                .iter()
+                .position(|value| value == &format!("{event} {RUN_ID}-secondary"))
+                .expect("host evidence")
+                < deleted
+        );
+    }
+}
+
+#[test]
+fn host_diagnostic_failure_preserves_partial_evidence_and_still_cleans_guests() {
+    let mut fixture = Fixture::new("host-diagnostics-failure", false);
+    fixture.execute().expect("required target passed");
+    let result = fixture.result("secondary");
+    assert!(
+        result["error"]
+            .as_str()
+            .expect("agent failure")
+            .contains("255")
+    );
+    assert_eq!(result["cleanup_error"], Value::Null);
+    assert!(
+        result["diagnostic_errors"]
+            .as_array()
+            .expect("diagnostic errors")
+            .iter()
+            .any(|error| error
+                .as_str()
+                .expect("error text")
+                .contains("runtime qemu.log"))
+    );
+    let host = fixture.runner.evidence().join("secondary/host-diagnostics");
+    assert_eq!(
+        read_text(&host.join("qemu.log")).expect("partial runtime log"),
+        "runtime log unavailable\n"
+    );
+    crate::archive_evidence(&mut fixture.runner).expect("archive partial diagnostics");
+    let archived = std::process::Command::new("tar")
+        .args(["-xOzf"])
+        .arg(fixture.runner.dir.join("evidence.tar.gz"))
+        .arg("./secondary/host-diagnostics/console.log")
+        .output()
+        .expect("read archived serial log");
+    assert!(archived.status.success());
+    assert_eq!(archived.stdout, b"serial boot evidence\n");
 }
 
 #[test]

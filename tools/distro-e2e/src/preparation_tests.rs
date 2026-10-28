@@ -179,12 +179,15 @@ fn disabled_selinux_is_prepared_for_permissive_relabel_before_enforcement() {
     let config = root.join("selinux-config");
     fs::write(&config, "SELINUX=disabled\nSELINUXTYPE=targeted\n").expect("security config");
     let function = helper("prepare_selinux", "capture_boot_diagnostics")
-        .replace("/etc/selinux/config", "${FIXTURE_ROOT}/selinux-config");
+        .replace("/etc/selinux/config", "${FIXTURE_ROOT}/selinux-config")
+        .replace("/etc/systemd/system", "${FIXTURE_ROOT}/units");
     let body = format!(
         r#"
 set -euo pipefail
 PREPARED=$FIXTURE_ROOT
 fail() {{ printf '%s\n' "$*" >&2; exit 1; }}
+prepare_agent_selinux() {{ printf 'agent labels prepared\n' >> "$PREPARED/events"; }}
+systemctl() {{ printf 'systemctl %s\n' "$*" >> "$PREPARED/events"; }}
 getenforce() {{ printf 'Disabled\n'; }}
 grubby() {{ printf 'grubby %s\n' "$*" >> "$PREPARED/events"; }}
 fixfiles() {{ printf 'fixfiles %s\n' "$*" >> "$PREPARED/events"; }}
@@ -226,7 +229,7 @@ fn selinux_enforcement_waits_for_relabel_and_verifies_the_transition() {
         if scenario == "incomplete" {
             fs::write(root.join("autorelabel"), "-F\n").expect("unfinished relabel");
         }
-        let function = helper("finish_selinux", "assert_pristine")
+        let function = helper("enable_selinux", "prepared_boot_status")
             .replace("/.autorelabel", "${FIXTURE_ROOT}/autorelabel")
             .replace("/etc/selinux/config", "${FIXTURE_ROOT}/selinux-config");
         let body = format!(
@@ -234,7 +237,9 @@ fn selinux_enforcement_waits_for_relabel_and_verifies_the_transition() {
 set -euo pipefail
 PREPARED=$FIXTURE_ROOT
 fail() {{ printf '%s\n' "$*" >&2; exit 1; }}
-systemctl() {{ return 1; }}
+systemctl() {{ [[ "$*" != 'is-active --quiet selinux-autorelabel.service' ]]; }}
+ls() {{ :; }}
+stat() {{ printf 'system_u:object_r:bin_t:s0\n'; }}
 sleep() {{ SECONDS=$((SECONDS + 901)); }}
 getenforce() {{ cat "$PREPARED/mode"; }}
 setenforce() {{
@@ -243,7 +248,7 @@ setenforce() {{
 }}
 grubby() {{ printf 'grubby %s\n' "$*" >> "$PREPARED/events"; }}
 {function}
-finish_selinux
+enable_selinux
 "#
         );
         let output = run(root, &body);
@@ -260,7 +265,7 @@ finish_selinux
         } else {
             assert_eq!(output.status.code(), Some(1), "{scenario}: {output:?}");
             let expected = match scenario {
-                "incomplete" => "relabeling did not complete",
+                "incomplete" => "relabeling has not completed",
                 "disabled" => "policy did not load",
                 "denied" => "did not enter enforcing mode",
                 _ => unreachable!(),
@@ -342,6 +347,189 @@ sanitize_image
         read_text(&root.join("cloud-init-events")).expect("cloud-init sanitation"),
         "clean --logs\n"
     );
+}
+
+#[test]
+fn relabel_boot_probe_rejects_intermediate_boot_and_reports_both_identities() {
+    for scenario in [
+        "not-started",
+        "relabel-boot",
+        "marker",
+        "active",
+        "complete",
+    ] {
+        let temp = TestDir::new();
+        let root = temp.path();
+        fs::write(root.join("relabel-scheduled"), "1\n").expect("scheduled");
+        fs::write(root.join("boot-id"), "final-boot\n").expect("boot");
+        if scenario != "not-started" {
+            fs::write(
+                root.join("relabel-boot-id"),
+                if scenario == "relabel-boot" {
+                    "final-boot\n"
+                } else {
+                    "relabel-boot\n"
+                },
+            )
+            .expect("relabel boot");
+        }
+        if scenario == "marker" {
+            fs::write(root.join("autorelabel"), "-F").expect("marker");
+        }
+        let function = helper("prepared_boot_status", "assert_pristine")
+            .replace("/proc/sys/kernel/random/boot_id", "${FIXTURE_ROOT}/boot-id")
+            .replace("/.autorelabel", "${FIXTURE_ROOT}/autorelabel");
+        let output = run(
+            root,
+            &format!(
+                r"
+set -euo pipefail
+PREPARED=$FIXTURE_ROOT
+systemctl() {{ [[ '{scenario}' == active ]]; }}
+{function}
+prepared_boot_status
+"
+            ),
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(if scenario == "complete" { 0 } else { 75 }),
+            "{scenario}: {output:?}"
+        );
+        assert!(String::from_utf8_lossy(&output.stderr).contains("current=final-boot relabel="));
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            if scenario == "complete" {
+                "final-boot\n"
+            } else {
+                ""
+            }
+        );
+    }
+}
+
+#[test]
+fn agent_label_dropin_preserves_vendor_setup_and_rejects_unknown_layout() {
+    for known in [true, false] {
+        let temp = TestDir::new();
+        let root = temp.path();
+        let function = helper("prepare_agent_selinux", "prepare_selinux")
+            .replace("/etc/systemd/system", "${FIXTURE_ROOT}/units");
+        let output = run(
+            root,
+            &format!(
+                r#"
+set -euo pipefail
+PREPARED=$FIXTURE_ROOT
+fail() {{ printf '%s\n' "$*" >&2; exit 1; }}
+systemctl() {{
+  if [[ "$1" == show ]]; then
+    if [[ '{known}' == true ]]; then printf '{{ path=/run/incus_agent/incus-agent ; }}\n'; else printf '{{ path=/unknown ; }}\n'; fi
+  fi
+}}
+chcon() {{ :; }}
+ls() {{ :; }}
+ps() {{ :; }}
+{function}
+prepare_agent_selinux
+"#
+            ),
+        );
+        let dropin = root.join("units/incus-agent.service.d/kidobo-e2e-selinux.conf");
+        if known {
+            assert!(output.status.success(), "{output:?}");
+            assert_eq!(
+                read_text(&dropin).expect("drop-in"),
+                "[Service]\nExecStartPre=/usr/bin/chcon -t bin_t /run/incus_agent/incus-agent\n"
+            );
+        } else {
+            assert_eq!(output.status.code(), Some(1));
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .contains("unsupported Incus agent executable")
+            );
+            assert!(!dropin.exists());
+        }
+    }
+}
+
+#[test]
+fn enforcement_admission_requires_durable_success_and_enforcing_state() {
+    for (status, mode, success) in [
+        ("0", "Enforcing", true),
+        ("", "Enforcing", false),
+        ("17", "Enforcing", false),
+        ("0", "Permissive", false),
+    ] {
+        let temp = TestDir::new();
+        let root = temp.path();
+        fs::write(root.join("selinux-requested"), "enforcing").expect("requested");
+        fs::write(root.join("enforcement.status"), status).expect("status");
+        let function = helper("finish_selinux", "enable_selinux")
+            .replace("/.autorelabel", "${FIXTURE_ROOT}/autorelabel");
+        let output = run(
+            root,
+            &format!(
+                r#"
+set -euo pipefail
+PREPARED=$FIXTURE_ROOT
+fail() {{ printf '%s\n' "$*" >&2; exit 1; }}
+systemctl() {{ return 1; }}
+getenforce() {{ printf '%s\n' '{mode}'; }}
+{function}
+finish_selinux
+"#
+            ),
+        );
+        assert_eq!(
+            output.status.success(),
+            success,
+            "status={status} mode={mode}: {output:?}"
+        );
+    }
+}
+
+#[test]
+fn detached_enforcement_launch_and_worker_persist_outcome_without_agent_lifetime() {
+    for mode in ["launch", "success", "failure"] {
+        let temp = TestDir::new();
+        let root = temp.path();
+        fs::create_dir(root.join("prepared")).expect("prepared");
+        fs::write(root.join("prepared/selinux-requested"), "enforcing").expect("requested");
+        let script = include_str!("../../../scripts/e2e/provision.sh").replace(
+            "readonly BASE=/opt/kidobo-e2e PREPARED=/opt/kidobo-e2e/prepared",
+            "readonly BASE=\"$FIXTURE_ROOT\" PREPARED=\"$FIXTURE_ROOT/prepared\"",
+        );
+        fs::write(root.join("provision.sh"), script).expect("script");
+        let output = run(
+            root,
+            &format!(
+                r#"
+set -euo pipefail
+source "$FIXTURE_ROOT/provision.sh"
+require_guest() {{ :; }}
+systemd-run() {{ printf '%s\n' "$*" > "$FIXTURE_ROOT/job"; }}
+enable_selinux() {{ [[ '{mode}' != launch ]] || exit 99; if [[ '{mode}' == failure ]]; then return 17; fi; }}
+if [[ '{mode}' == launch ]]; then provision_main --start-enforcement; else provision_main --enforce-selinux; fi
+"#
+            ),
+        );
+        if mode == "launch" {
+            assert!(output.status.success(), "{output:?}");
+            let job = read_text(&root.join("job")).expect("job invocation");
+            assert!(job.contains("--no-block --property=Type=oneshot"));
+            assert!(job.contains("--property=TimeoutStartSec=120"));
+            assert!(job.ends_with("provision.sh --enforce-selinux\n"));
+            assert!(!root.join("prepared/enforcement.status").exists());
+        } else {
+            let expected = if mode == "success" { 0 } else { 17 };
+            assert_eq!(output.status.code(), Some(expected), "{output:?}");
+            assert_eq!(
+                read_text(&root.join("prepared/enforcement.status")).expect("durable status"),
+                format!("{expected}\n")
+            );
+        }
+    }
 }
 
 #[test]
