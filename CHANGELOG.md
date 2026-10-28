@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+
+## [0.15.0] - 2026-10-28
+
 ### Added
 
 - Add offline-by-default sync previews with an explicit in-memory network option, and generate Bash, Zsh, or Fish completions.
