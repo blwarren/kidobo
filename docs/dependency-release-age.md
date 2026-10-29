@@ -19,7 +19,8 @@ just update
 ```
 
 This installs the pinned `cargo-cooldown` tool, updates dependencies using
-[cooldown.toml](../cooldown.toml), and then runs the workspace tests. The
+[cooldown.toml](../cooldown.toml), and then runs the non-E2E workspace tests. Run
+`just test --include-e2e` as well when an update affects the E2E system. The
 configuration sets a seven-day minimum registry publish age, denies incompatible
 publish ages, and uses the existing lockfile as the version floor. Inspect the
 resulting manifest and lockfile diff before accepting an update.

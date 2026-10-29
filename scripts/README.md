@@ -19,6 +19,7 @@ gh auth login
 - `Justfile`: local validation, release-note, udeps, publication, and mutation-test recipes.
 - `cooldown.toml`: fail-closed seven-day minimum publish age for dependency updates.
 - `scripts/install.sh`: public install/uninstall flow used by operators.
+- `scripts/test.sh`: non-E2E test selection, with `--include-e2e` for the full workspace suite.
 - `scripts/publish-release.sh`: guarded, transactional release preparation and publication.
 - `scripts/release-validation.sh`: internal application-only CI, coverage, and rustdoc selection
   for the publisher's `--skip-e2e` path.
@@ -42,8 +43,9 @@ that include those retired scaled cases.
 - `just commit-check` (nonmutating pre-commit whitespace and staged-change-selected fast Rust checks)
 - `just test-fast` (core, application, and CLI unit tests)
 - `just test-app` (core, application, adapter, and CLI correctness tests; excludes installation and repository tooling)
-- `just test` (complete workspace tests, including documentation, installer, and local infrastructure tests)
-- `just check` (format, complete workspace tests, and lint)
+- `just test` (non-E2E workspace tests, including documentation, installer, and repository tooling tests)
+- `just test --include-e2e` (complete workspace tests, including E2E-system units and local fixtures; no VM matrix)
+- `just check` (format, non-E2E workspace tests, and lint)
 - `just ci` (local formatting, lint, dependency-policy, audit, and application correctness test gate)
 - `just coverage` (release-only 90% minimum for stable region, function, and line metrics)
 - `just exercise-release` (release-only build and isolated binary exercise)
@@ -115,7 +117,8 @@ verification, and recovery remain unchanged.
 
 The publisher reports `E2E validation skipped` before validation and at final confirmation,
 covering both infrastructure checks and VM execution. Default publication and standalone
-`just ci`, `just coverage`, `just rustdoc`, and `just test` retain their existing scope.
+`just ci`, `just coverage`, and `just rustdoc` retain their existing scope. Standalone `just test`
+requires `--include-e2e` to include E2E-system tests.
 Root E2E integration targets use the `e2e_*` prefix; the harness package is `kidobo-e2e`.
 Future E2E packages, targets, and dedicated helpers must stay outside the publisher's skip path.
 This override does not reuse or imply evidence from an earlier matrix run.

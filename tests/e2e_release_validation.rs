@@ -361,9 +361,15 @@ fn scoped_checks_propagate_each_gate_failure_without_later_work() {
 }
 
 #[test]
-fn ordinary_developer_validation_keeps_workspace_wide_coverage() {
+fn explicit_e2e_tests_and_other_developer_gates_cover_workspace() {
     let fixture = Fixture::new();
-    for recipe in ["test", "lint", "format-check", "coverage", "rustdoc"] {
+    let output = fixture
+        .command("just")
+        .args(["test", "--include-e2e"])
+        .output()
+        .expect("run full workspace tests with fake tools");
+    assert!(output.status.success(), "{output:?}");
+    for recipe in ["lint", "format-check", "coverage", "rustdoc"] {
         let output = fixture.recipe(recipe);
         assert!(output.status.success(), "{recipe}: {output:?}");
     }

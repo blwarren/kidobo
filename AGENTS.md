@@ -33,7 +33,8 @@ deterministic computation, operator compatibility, and reliable installation and
 - Keep E2E-specific packages and tests outside the publisher's `--skip-e2e` validation path.
   The harness belongs in `kidobo-e2e`; root E2E integration targets must use the `e2e_*` prefix.
   Non-E2E fixtures must not include dedicated E2E helpers. Preserve shared dependency checks
-  and full E2E infrastructure coverage in ordinary developer commands.
+  and full E2E infrastructure coverage through `just test --include-e2e`; plain `just test`
+  excludes E2E-system tests.
 - E2E must clean up its own VMs and completed tmux sessions after success, failure, or handled
   interruption. Preserve logs and evidence, honor explicit `--keep-failed` retention, and recover
   abandoned suite-owned resources safely on the next run. Do not make routine reruns depend on

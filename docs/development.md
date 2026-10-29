@@ -25,22 +25,25 @@ Select checks according to the change:
 | Documentation only | Check affected links, anchors, and fenced-code languages; no Rust gate unless executable examples, generated artifacts, or build/release behavior are affected. Use the applicable row above for those impacts. |
 | Every repository change | `just release-notes-check`, in addition to the applicable checks above. |
 
-`just check` formats, runs the complete workspace test suite, and lints. `just ci` checks
+`just check` formats, runs the non-E2E workspace test suite, and lints. `just ci` checks
 formatting, lints, dependency policy, advisories, and application correctness through `just test-app`;
 it satisfies the Rust gate without requiring a separate `just check` run. Application tests cover
 the core, application, adapter, and CLI libraries plus the explicitly listed CLI integration targets
 in `test-app`. Add new application integration targets to that recipe. CI excludes tests of the
 installer/uninstaller, release and performance scripts, architecture/package rules, Git hooks,
-and E2E infrastructure. For changes affecting those areas, also run `just test` to exercise the
-complete workspace suite, including documentation tests and local infrastructure fixtures.
+and E2E infrastructure. For installer or repository-tooling changes, also run `just test`, which
+includes documentation tests and all non-E2E local fixtures. For E2E-system changes, run
+`just test --include-e2e` to exercise the complete workspace suite, including the harness units
+and local E2E fixtures. This flag does not launch the VM matrix. Plain `just test` excludes the
+`kidobo-e2e` package and root `e2e_*` integration targets from compilation and execution.
 Regardless of the editing checks above, `just ci` must pass locally before a push or merge.
 The pre-commit hook runs `just commit-check`: staged and working-tree whitespace checks,
 then `just format-check` and `just test-fast` when staged Rust sources, Cargo manifests/lockfile,
 toolchain/Cargo configuration, or the Justfile change. Documentation-only commits avoid Cargo.
 The fast tests cover core, application, and CLI library units; pre-push runs `just ci`, adding
-adapter and CLI process tests. Installer, repository tooling, and local E2E-tool tests run through
-`just test` or `just check`. Hook checks use the working tree, so review partial staging before
-committing. Formatting checks never rewrite files.
+adapter and CLI process tests. Installer and repository-tooling tests run through `just test`
+or `just check`; local E2E-tool tests require `just test --include-e2e`. Hook checks use the working
+tree, so review partial staging before committing. Formatting checks never rewrite files.
 The publisher suppresses Git hooks only for its own final commit and push after explicit candidate
 validation; ordinary pushes still run `just ci`.
 Coverage, strict rustdoc, the isolated release-binary exercise, static compatibility checks,
@@ -57,9 +60,10 @@ verifies/imports sources and changes pins for review without starting VMs. Start
 advisory, has a 30-second budget, and never changes the matrix. See the
 [image update workflow](e2e.md#image-sources-and-reviewed-updates) for verification and acceptance.
 The explicit publisher option `--skip-e2e` omits all E2E-specific validation, including local
-infrastructure checks and image operations as well as the matrix. Ordinary developer commands
-keep their existing scope: formatting, lint, coverage, and rustdoc include the harness, and
-`just test` runs every local E2E regression.
+infrastructure checks and image operations as well as the matrix. Formatting, lint, coverage,
+and rustdoc include the harness. `just test` excludes E2E tests by default; `just test --include-e2e`
+runs every local E2E regression alongside the non-E2E suite. Recipes that depend on `test`,
+including `just check` and `just update`, use its non-E2E default.
 
 The skip path uses private `_release-ci-without-e2e`, `_release-coverage-without-e2e`, and
 `_release-rustdoc-without-e2e` recipes backed by `scripts/release-validation.sh`. Their shared

@@ -34,8 +34,9 @@ Keep future E2E-specific packages and targets outside that skip path. The harnes
 `kidobo-e2e`, and root-package E2E integration targets must be named `e2e_*`. Dedicated E2E
 helpers must not be included by non-E2E fixtures or traversed by their formatter inputs; only
 neutral fixture utilities may be shared. Package and target selection must exclude E2E from
-compilation, not merely filter test names or coverage reports. Default publishing and standalone
-developer commands retain their full scope; `just test` runs all local E2E infrastructure tests.
+compilation, not merely filter test names or coverage reports. Default publishing retains its
+full scope. `just test` excludes E2E-system tests unless explicitly requested with
+`just test --include-e2e`, which runs the full workspace suite without launching the VM matrix.
 
 The harness is not a general VM/image manager, distro-image or bootloader repair tool,
 historical-result reuse system, or duplicate of the exhaustive application unit tests. Do not
@@ -416,7 +417,7 @@ before lifecycle execution.
 ## Validate a harness change
 
 Read the scope contract first. Use local fake-Incus and isolated script fixtures through
-`just test`, then the required local gates in the [development guide](development.md#toolchain-and-validation).
+`just test --include-e2e`, then the required local gates in the [development guide](development.md#toolchain-and-validation).
 `just ci` excludes infrastructure tests and does not establish VM acceptance. Local fixtures use
 fake privileged commands, temporary roots, and loopback services; they require Bash, curl,
 Python 3, GNU tar/coreutils, and GPG for isolated signature verification. Do not replace missing

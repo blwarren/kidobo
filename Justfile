@@ -14,9 +14,10 @@ build-release:
 lint:
     @cargo clippy --workspace --all-targets --all-features -- -D warnings
 
-# Run the workspace test suite, including documentation tests.
-test:
-    @cargo test --workspace --locked --quiet
+# Run non-E2E tests and doctests; add --include-e2e for E2E-system tests.
+[positional-arguments]
+test *args:
+    @bash ./scripts/test.sh "$@"
 
 # Run application correctness tests, excluding repository tooling and installation.
 test-app:

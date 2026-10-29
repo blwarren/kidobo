@@ -229,11 +229,12 @@ just release-notes-check
 `just test-fast` runs the core, application, and CLI unit tests. The pre-commit hook
 uses `just commit-check` for whitespace checks and, when staged files affect Rust,
 formatting verification and these fast tests. It does not modify source files.
-`just check` remains the complete development format/test/lint loop. Run `just ci`
+`just check` runs the development format/test/lint loop with non-E2E tests. Run `just ci`
 before every push; GitHub does not run project CI for pushes or tags. The local CI gate
 checks formatting, lints, dependency policy, audits, and application correctness via `just test-app`.
-`just test` runs all workspace tests, including installer, repository tooling, and E2E infrastructure
-tests; run it when changing those areas. Publication additionally
+`just test` runs non-E2E workspace tests, including documentation, installer, and repository tooling
+tests. Use `just test --include-e2e` when changing the E2E system to also run its unit and local
+integration tests; this does not launch the VM matrix. Publication additionally
 requires coverage, strict rustdoc, the isolated release-binary exercise, static Debian/Alpine
 compatibility, and by default required Debian/Ubuntu coverage in the [Incus distro lifecycle
 matrix](docs/e2e.md). Separate `just e2e` runs cover all seven configured targets, including
