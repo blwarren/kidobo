@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use std::process;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use kidobo_core::config::IPSET_NAME_MAX_LEN;
 use log::warn;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -19,7 +20,6 @@ use crate::command_runner::{
 };
 use crate::hash::hex_lower;
 
-const IPSET_NAME_MAX_LEN: usize = 31;
 #[cfg(test)]
 const RESTORE_SCRIPT_READ_LIMIT: usize = 8_388_608;
 

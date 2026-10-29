@@ -12,7 +12,8 @@ static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 ///
 /// # Errors
 ///
-/// Returns an I/O error when the file cannot be read, exceeds `max_bytes`, or is not valid UTF-8.
+/// Returns an I/O error when the path does not resolve to a regular file, cannot be read,
+/// exceeds `max_bytes`, or is not valid UTF-8.
 pub fn read_to_string_with_limit(path: &Path, max_bytes: usize) -> io::Result<String> {
     let bytes = read_bytes_with_limit(path, max_bytes)?;
     String::from_utf8(bytes).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
@@ -22,9 +23,23 @@ pub fn read_to_string_with_limit(path: &Path, max_bytes: usize) -> io::Result<St
 ///
 /// # Errors
 ///
-/// Returns an I/O error when the file cannot be read or exceeds `max_bytes`.
+/// Returns an I/O error when the path does not resolve to a regular file, cannot be read,
+/// or exceeds `max_bytes`.
 pub fn read_bytes_with_limit(path: &Path, max_bytes: usize) -> io::Result<Vec<u8>> {
-    let file = File::open(path)?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(nix::libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "input must be a regular file",
+        ));
+    }
     let mut reader = BufReader::new(file);
     read_to_end_with_limit(&mut reader, max_bytes, |limit| {
         format!("file exceeds {limit} byte limit")
@@ -259,6 +274,38 @@ mod tests {
 
         let bytes = read_bytes_with_limit(&path, 3).expect("read");
         assert_eq!(bytes, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn bounded_file_reader_requires_a_regular_file() {
+        let temp = TempDir::new().expect("tempdir");
+        let error = read_bytes_with_limit(temp.path(), 16).expect_err("directory rejected");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(error.to_string(), "input must be a regular file");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_file_reader_follows_regular_symlinks_and_rejects_devices() {
+        let temp = TempDir::new().expect("tempdir");
+        let file = temp.path().join("file");
+        let link = temp.path().join("link");
+        fs::write(&file, b"abc").expect("write");
+        std::os::unix::fs::symlink(&file, &link).expect("symlink");
+        assert_eq!(read_bytes_with_limit(&link, 3).expect("read link"), b"abc");
+        let error = read_bytes_with_limit(std::path::Path::new("/dev/null"), 16)
+            .expect_err("device rejected");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn bounded_file_reader_preserves_invalid_utf8_error() {
+        let temp = TempDir::new().expect("tempdir");
+        let file = temp.path().join("invalid.txt");
+        fs::write(&file, [0xff]).expect("write");
+        let error = read_to_string_with_limit(&file, 1).expect_err("invalid UTF-8");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(read_bytes_with_limit(&file, 1).expect("raw bytes"), [0xff]);
     }
 
     #[test]

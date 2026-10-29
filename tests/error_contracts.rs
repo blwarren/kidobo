@@ -287,26 +287,49 @@ fn core_parse_errors_support_standard_error_propagation() {
 #[test]
 fn config_and_target_read_errors_keep_os_codes_and_path_context() {
     let temp = TempDir::new().expect("tempdir");
-    let config = load_config_from_file(temp.path()).expect_err("directory is not a config file");
-    assert!(matches!(&config, AppError::ConfigRead { path, .. } if path == temp.path()));
+    let blocker = temp.path().join("file");
+    fs::write(&blocker, b"not a directory").expect("block parent");
+    let unreadable = blocker.join("input");
+    let config = load_config_from_file(&unreadable).expect_err("parent is not a directory");
+    assert!(matches!(&config, AppError::ConfigRead { path, .. } if path == &unreadable));
     let source = io_cause(&config);
-    assert_eq!(source.kind(), io::ErrorKind::IsADirectory);
+    assert_eq!(source.kind(), io::ErrorKind::NotADirectory);
     assert!(source.raw_os_error().is_some());
     assert_eq!(
         config.to_string(),
         format!(
             "failed to read config file {}: {source}",
-            temp.path().display()
+            unreadable.display()
         )
     );
 
     let target = LookupTargetFileReader
-        .read_lines(temp.path())
-        .expect_err("directory is not a target file");
-    assert!(matches!(&target, AppError::LookupTargetFileRead { path, .. } if path == temp.path()));
+        .read_lines(&unreadable)
+        .expect_err("parent is not a directory");
+    assert!(matches!(&target, AppError::LookupTargetFileRead { path, .. } if path == &unreadable));
     let source = io_cause(&target);
-    assert_eq!(source.kind(), io::ErrorKind::IsADirectory);
+    assert_eq!(source.kind(), io::ErrorKind::NotADirectory);
     assert!(source.raw_os_error().is_some());
+}
+
+#[test]
+fn non_regular_file_errors_keep_path_and_validation_cause() {
+    let temp = TempDir::new().expect("tempdir");
+    let config = load_config_from_file(temp.path()).expect_err("directory rejected");
+    assert!(matches!(&config, AppError::ConfigRead { path, .. } if path == temp.path()));
+    let target = LookupTargetFileReader
+        .read_lines(temp.path())
+        .expect_err("directory rejected");
+    assert!(matches!(&target, AppError::LookupTargetFileRead { path, .. } if path == temp.path()));
+    for error in [config, target] {
+        assert_eq!(io_cause(&error).kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(io_cause(&error).to_string(), "input must be a regular file");
+        assert!(
+            error
+                .to_string()
+                .contains(&temp.path().display().to_string())
+        );
+    }
 }
 
 #[cfg(unix)]
@@ -368,8 +391,8 @@ fn offline_cache_errors_keep_io_causes_through_source_wrappers() {
     let asn_cache = temp.path().join("asn");
     fs::create_dir_all(asn_cache.join("as64512.iplist")).expect("create invalid cache directory");
     let error = load_cached_asn_prefixes(64512, &asn_cache).expect_err("ASN cache must be a file");
-    assert_eq!(io_cause(&error).kind(), io::ErrorKind::IsADirectory);
-    assert!(io_cause(&error).raw_os_error().is_some());
+    assert_eq!(io_cause(&error).kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(io_cause(&error).to_string(), "input must be a regular file");
 }
 
 #[cfg(unix)]

@@ -2,6 +2,8 @@
 
 use std::path::Path;
 
+use kidobo_core::config::IPSET_NAME_MAX_LEN;
+
 use crate::AppError;
 use crate::paths::{ConfigRequirement, PathResolutionInput};
 use crate::ports::{ConfigRepository, LockManager, PathResolver};
@@ -145,7 +147,10 @@ pub fn execute(
         format!("ipset `{}`", config.ipset.set_name),
         dependencies.backend.destroy_ipset(&config.ipset.set_name),
     );
-    if config.ipset.set_name_v6 != config.ipset.set_name {
+    // Disabled IPv6 permits an overlong derived name, which cannot exist in ipset.
+    if config.ipset.set_name_v6 != config.ipset.set_name
+        && (config.ipset.enable_ipv6 || config.ipset.set_name_v6.len() <= IPSET_NAME_MAX_LEN)
+    {
         attempt(
             &mut outcome,
             format!("ipset `{}`", config.ipset.set_name_v6),
@@ -301,6 +306,67 @@ mod tests {
         "ipset:kidobo-v6",
         "cache",
     ];
+
+    #[test]
+    fn ipv4_only_flush_destroys_only_possible_set_names() {
+        struct ParsedConfigs(Config);
+        impl ConfigRepository for ParsedConfigs {
+            fn load(&self, _: &Path) -> Result<Config, AppError> {
+                Ok(self.0.clone())
+            }
+        }
+
+        for (name_length, explicit_v6, expected_v6) in [
+            (28, None, Some(format!("{}-v6", "a".repeat(28)))),
+            (29, None, None),
+            (31, None, None),
+            (31, Some("custom-v6"), Some("custom-v6".to_string())),
+        ] {
+            let name = "a".repeat(name_length);
+            let extra =
+                explicit_v6.map_or_else(String::new, |name| format!("set_name_v6 = '{name}'\n"));
+            let configs = ParsedConfigs(
+                Config::from_toml_str(&format!(
+                    "[ipset]\nset_name = '{name}'\nenable_ipv6 = false\n{extra}"
+                ))
+                .expect("valid IPv4-only configuration"),
+            );
+            let backend = Backend {
+                events: Mutex::new(Vec::new()),
+                fail: false,
+            };
+            let outcome = execute(
+                &request(false),
+                &FlushDependencies {
+                    cancellation: &crate::ports::NoCancellation,
+                    paths: &Paths(ConfigRequirement::Required),
+                    configs: &configs,
+                    locks: &Locks,
+                    backend: &backend,
+                },
+            )
+            .expect("flush");
+            let mut events = vec![
+                "firewall:Ipv4".to_string(),
+                "firewall:Ipv6".to_string(),
+                format!("ipset:{name}"),
+            ];
+            let mut completed = vec![
+                "IPv4 firewall".to_string(),
+                "IPv6 firewall".to_string(),
+                format!("ipset `{name}`"),
+            ];
+            if let Some(name) = expected_v6 {
+                events.push(format!("ipset:{name}"));
+                completed.push(format!("ipset `{name}`"));
+            }
+            events.push("cache".to_string());
+            completed.push("remote cache".to_string());
+            assert_eq!(*backend.events.lock().expect("events"), events);
+            assert_eq!(outcome.completed, completed);
+            assert_eq!(outcome.failed, Vec::<super::CleanupFailure>::new());
+        }
+    }
 
     fn assert_failed_cleanup(outcome: &FlushOutcome, backend: &Backend) {
         assert_eq!(*backend.events.lock().expect("events"), CLEANUP_EVENTS);

@@ -5,6 +5,11 @@ ipset enforcement; `flush` removes managed enforcement. Run the commands below
 on the intended Linux host with the required privileges. For configuration keys
 and paths, see [Configuration](configuration.md).
 
+File inputs, including `--file` target lists, configuration, local sources, and
+caches, must resolve to regular files. Symlinks to regular files are supported;
+named pipes, sockets, directories, and devices are rejected. Save streamed
+input to a regular file before passing its path to Kidobo.
+
 ## First setup
 
 Install Kidobo using the [README instructions](../README.md#install), then run

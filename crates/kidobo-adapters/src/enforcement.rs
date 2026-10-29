@@ -4,7 +4,7 @@ use kidobo_app::AppError;
 use kidobo_app::source::Notice;
 use kidobo_app::sync::{EnforcementBackend, EnforcementPlan, ManagedSetSpec};
 use kidobo_core::AddressFamily;
-use kidobo_core::config::FirewallAction;
+use kidobo_core::config::{FirewallAction, IPSET_NAME_MAX_LEN};
 use kidobo_core::network::CanonicalCidr;
 
 use crate::command_runner::{SudoCommandRunner, SystemCommandExecutor};
@@ -81,6 +81,11 @@ where
             notices.push(Notice::warning(format!(
                 "disabled IPv6 firewall cleanup failed softly: {error}"
             )));
+        }
+
+        // Disabled IPv6 permits an overlong derived name, which cannot exist in ipset.
+        if plan.ipv6.set_name.len() > IPSET_NAME_MAX_LEN {
+            return notices;
         }
 
         if plan.ipv6.set_name == plan.ipv4.set_name {
@@ -368,5 +373,39 @@ mod tests {
                 .iter()
                 .all(|(command, _)| command != "ipset")
         );
+    }
+
+    #[test]
+    fn disabled_ipv6_cleanup_destroys_only_possible_set_names() {
+        for (name_length, explicit_v6, expected_v6) in [
+            (28, None, Some(format!("{}-v6", "a".repeat(28)))),
+            (29, None, None),
+            (31, None, None),
+            (31, Some("custom-v6"), Some("custom-v6".to_string())),
+        ] {
+            let name = "a".repeat(name_length);
+            let extra =
+                explicit_v6.map_or_else(String::new, |name| format!("set_name_v6 = '{name}'\n"));
+            let config = kidobo_core::config::Config::from_toml_str(&format!(
+                "[ipset]\nset_name = '{name}'\nenable_ipv6 = false\n{extra}"
+            ))
+            .expect("valid IPv4-only configuration");
+            let backend = CommandEnforcementBackend::new(Runner(RefCell::new(Vec::new())));
+            let notices = backend.cleanup_disabled_ipv6(&EnforcementPlan::from_config(&config));
+            assert_eq!(notices, Vec::<kidobo_app::source::Notice>::new());
+            let calls = backend.runner.0.borrow();
+            assert!(calls.iter().any(|(command, args)| {
+                command == "ip6tables" && args == &["-w", "5", "-F", "kidobo-input"]
+            }));
+            let ipset_calls = calls
+                .iter()
+                .filter(|(command, _)| command == "ipset")
+                .map(|(_, args)| args.clone())
+                .collect::<Vec<_>>();
+            let expected = expected_v6
+                .map(|name| vec![vec!["destroy".to_string(), name]])
+                .unwrap_or_default();
+            assert_eq!(ipset_calls, expected);
+        }
     }
 }

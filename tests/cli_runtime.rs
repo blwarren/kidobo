@@ -45,6 +45,42 @@ fn run_kidobo_with_root(root: &Path, args: &[&str]) -> Output {
         .expect("run kidobo with root")
 }
 
+fn wait_child_with_deadline(
+    mut child: std::process::Child,
+    timeout: Duration,
+) -> Result<Output, Output> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if child.try_wait().expect("poll kidobo").is_some() {
+            return Ok(child.wait_with_output().expect("collect kidobo output"));
+        }
+        if Instant::now() >= deadline {
+            child.kill().expect("kill stalled kidobo");
+            return Err(child.wait_with_output().expect("reap stalled kidobo"));
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(unix)]
+fn create_fifo(path: &Path) {
+    nix::unistd::mkfifo(
+        path,
+        nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+    )
+    .unwrap_or_else(|error| panic!("create FIFO {}: {error}", path.display()));
+}
+
+#[cfg(unix)]
+fn open_idle_fifo_writer(path: &Path) -> std::os::fd::OwnedFd {
+    nix::fcntl::open(
+        path,
+        nix::fcntl::OFlag::O_RDWR | nix::fcntl::OFlag::O_NONBLOCK | nix::fcntl::OFlag::O_CLOEXEC,
+        nix::sys::stat::Mode::empty(),
+    )
+    .unwrap_or_else(|error| panic!("open idle FIFO {}: {error}", path.display()))
+}
+
 fn run_interactive_kidobo<F>(
     root: &Path,
     args: &[&str],
@@ -929,6 +965,150 @@ fn lookup_file_mode_uses_local_sources_and_exits_zero() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn lookup_and_ban_file_inputs_reject_fifos_without_blocking() {
+    for idle_writer in [false, true] {
+        for command_name in ["lookup", "ban"] {
+            let initial = "198.51.100.0/24\n";
+            let root = create_root("[ipset]\nset_name='kidobo'\n", initial);
+            let fifo = root.path().join("targets.fifo");
+            create_fifo(&fifo);
+            let temporary_state = temporary_bans_path(root.path());
+            let temporary_contents = format!(
+                "version = 1\n\n[[ips]]\ncidr = '192.0.2.7/32'\nexpires_at = {}\n",
+                future_expiry(3600)
+            );
+            fs::write(&temporary_state, &temporary_contents).expect("write temporary state");
+            let target_path = fifo.to_str().expect("UTF-8 FIFO path");
+            let args = if command_name == "lookup" {
+                vec!["lookup", "--file", target_path, "--format", "tsv"]
+            } else {
+                vec!["ban", "--file", target_path, "--no-apply"]
+            };
+            let fake_sudo = write_fake_sudo_script(&root);
+            let sudo_log = root.path().join("sudo.log");
+            let mut command = kidobo_with_root_command(root.path(), &args);
+            command
+                .env(
+                    "PATH",
+                    path_with_bin_prefix(fake_sudo.parent().expect("fake sudo parent")),
+                )
+                .env("KIDOBO_TEST_SUDO_LOG", &sudo_log)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let child = command.spawn().expect("spawn file command");
+            let _idle_writer = idle_writer.then(|| open_idle_fifo_writer(&fifo));
+            let result = wait_child_with_deadline(child, Duration::from_secs(2));
+
+            let output = result.unwrap_or_else(|stalled| {
+                panic!(
+                    "{command_name} --file with {} FIFO writer blocked; child was killed/reaped; stdout={:?}, stderr={:?}",
+                    if idle_writer { "an idle" } else { "no" },
+                    String::from_utf8_lossy(&stalled.stdout),
+                    String::from_utf8_lossy(&stalled.stderr),
+                )
+            });
+            assert_eq!(
+                output.status.code(),
+                Some(1),
+                "{command_name} should reject a FIFO: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("input must be a regular file"),
+                "missing regular-file rejection diagnostic: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            if command_name == "ban" {
+                assert_eq!(
+                    read_to_string_with_limit(
+                        &root.path().join("data/blocklist.txt"),
+                        BLOCKLIST_READ_LIMIT
+                    )
+                    .expect("read unchanged blocklist"),
+                    initial,
+                    "a rejected FIFO must not change the saved blocklist"
+                );
+                assert_eq!(
+                    read_to_string_with_limit(&temporary_state, TEMPORARY_BANS_READ_LIMIT)
+                        .expect("read preserved temporary state"),
+                    temporary_contents,
+                    "a rejected FIFO must not change temporary source state"
+                );
+                let lock = hold_lock(&root.path().join("cache/sync.lock"));
+                drop(lock);
+                assert!(!sudo_log.exists(), "file rejection must precede sudo");
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn lookup_and_ban_file_inputs_reject_directories_and_accept_file_symlinks() {
+    for command_name in ["lookup", "ban"] {
+        let initial = if command_name == "lookup" {
+            "203.0.113.7\n"
+        } else {
+            ""
+        };
+        let root = create_root("[ipset]\nset_name='kidobo'\n", initial);
+        let directory = root.path().join("targets-directory");
+        fs::create_dir(&directory).expect("create target directory");
+        let directory_arg = directory.to_str().expect("UTF-8 directory path");
+        let args = if command_name == "lookup" {
+            vec!["lookup", "--file", directory_arg, "--format", "tsv"]
+        } else {
+            vec!["ban", "--file", directory_arg, "--no-apply"]
+        };
+        let directory_output = run_kidobo_with_root(root.path(), &args);
+        assert_eq!(
+            directory_output.status.code(),
+            Some(1),
+            "{command_name} must reject a directory target file"
+        );
+
+        let regular = root.path().join("targets.txt");
+        let link = root.path().join("targets-link.txt");
+        fs::write(&regular, "203.0.113.7\n").expect("write target file");
+        std::os::unix::fs::symlink(&regular, &link).expect("symlink target file");
+        let link_arg = link.to_str().expect("UTF-8 symlink path");
+        let args = if command_name == "lookup" {
+            vec!["lookup", "--file", link_arg, "--format", "tsv"]
+        } else {
+            vec!["ban", "--file", link_arg, "--no-apply"]
+        };
+        let linked_output = run_kidobo_with_root(root.path(), &args);
+        assert_eq!(
+            linked_output.status.code(),
+            Some(0),
+            "{command_name} should follow a symlink to a regular file: {}",
+            String::from_utf8_lossy(&linked_output.stderr)
+        );
+        if command_name == "lookup" {
+            assert_eq!(
+                String::from_utf8_lossy(&linked_output.stdout)
+                    .lines()
+                    .collect::<Vec<_>>(),
+                vec![
+                    "203.0.113.7\tinternal:blocklist\t203.0.113.7",
+                    "summary: total_ips=1 matched_ips=1 matched_pct=100%",
+                ]
+            );
+        } else {
+            assert_eq!(
+                read_to_string_with_limit(
+                    &root.path().join("data/blocklist.txt"),
+                    BLOCKLIST_READ_LIMIT
+                )
+                .expect("read ban result"),
+                "203.0.113.7/32\n"
+            );
+        }
+    }
+}
+
 #[test]
 fn lookup_file_mode_counts_safelist_and_asn_matches() {
     let root = create_root(
@@ -1276,6 +1456,65 @@ fn invalid_configuration_prevents_all_blocklist_mutations() {
                 read_to_string_with_limit(&asn_cache, 1024).expect("cache"),
                 initial
             );
+        }
+    }
+}
+
+#[test]
+fn ipset_set_names_reject_option_like_values_before_privileged_commands() {
+    for ipv6_enabled in [false, true] {
+        for (field, value) in [
+            ("ipset.set_name", "-q"),
+            ("ipset.set_name", "-exist"),
+            ("ipset.set_name", "--help"),
+            ("ipset.set_name_v6", "-q"),
+            ("ipset.set_name_v6", "-exist"),
+            ("ipset.set_name_v6", "--help"),
+        ] {
+            let (ipv4, ipv6) = if field == "ipset.set_name" {
+                (value, "kidobo-v6")
+            } else {
+                ("kidobo", value)
+            };
+            let root = create_root(
+                &format!(
+                    "[ipset]\nset_name='{ipv4}'\nset_name_v6='{ipv6}'\nenable_ipv6={ipv6_enabled}\n"
+                ),
+                "",
+            );
+            let fake_sudo = write_fake_sudo_script(&root);
+            let touched = root.path().join("sudo-touched");
+            let sudo_log = root.path().join("sudo.log");
+            let mut command = kidobo_with_root_command(root.path(), &["flush", "--yes"]);
+            command
+                .env(
+                    "PATH",
+                    path_with_bin_prefix(fake_sudo.parent().expect("fake sudo parent")),
+                )
+                .env("KIDOBO_TEST_SUDO_TOUCHED", &touched)
+                .env("KIDOBO_TEST_SUDO_LOG", &sudo_log);
+            let output = command.output().expect("run config validation command");
+
+            assert_eq!(
+                output.status.code(),
+                Some(1),
+                "{field}={value:?}, IPv6 enabled={ipv6_enabled} should fail: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains(field),
+                "missing field name {field}: {stderr}"
+            );
+            assert!(
+                stderr.contains("must not start with '-'"),
+                "missing option-like-name explanation: {stderr}"
+            );
+            assert!(
+                !touched.exists(),
+                "invalid config reached fake sudo: {field}={value}"
+            );
+            assert!(!sudo_log.exists(), "invalid config logged privileged calls");
         }
     }
 }

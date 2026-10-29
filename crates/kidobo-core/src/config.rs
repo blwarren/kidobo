@@ -14,6 +14,8 @@ use crate::network::CanonicalCidr;
 
 /// Default kernel ipset type used for managed sets.
 pub const DEFAULT_IPSET_TYPE: &str = "hash:net";
+/// Maximum byte length of a managed ipset name.
+pub const IPSET_NAME_MAX_LEN: usize = 31;
 /// Default firewall action for matched addresses.
 pub const DEFAULT_CHAIN_ACTION: FirewallAction = FirewallAction::Drop;
 /// Default ipset hash table size.
@@ -22,6 +24,8 @@ pub const DEFAULT_HASHSIZE: u32 = 65_536;
 pub const DEFAULT_MAXELEM: u32 = 500_000;
 /// Default ipset entry timeout; zero means entries do not expire.
 pub const DEFAULT_TIMEOUT: u32 = 0;
+/// Maximum entry timeout accepted by ipset, in seconds.
+pub const IPSET_TIMEOUT_SECS_MAX: u32 = 2_147_483;
 /// Default timeout for a remote source request.
 pub const DEFAULT_REMOTE_TIMEOUT_SECS: u32 = 30;
 /// Default age after which an ASN cache is eligible for refresh.
@@ -416,7 +420,7 @@ fn parse_ipset(raw: RawIpsetConfig) -> Result<IpsetConfig, ConfigError> {
         raw.timeout.unwrap_or(i64::from(DEFAULT_TIMEOUT)),
         "ipset.timeout",
         0,
-        u32::MAX,
+        IPSET_TIMEOUT_SECS_MAX,
     )?;
 
     Ok(IpsetConfig {
@@ -680,6 +684,66 @@ mod tests {
     }
 
     #[test]
+    fn set_names_reject_option_prefixes_for_both_families() {
+        for field in ["ipset.set_name", "ipset.set_name_v6"] {
+            for name in ["-", "-q", "-exist", "--help", " -q "] {
+                for enabled in [false, true] {
+                    let other = if field == "ipset.set_name" {
+                        "ipset.set_name_v6 = 'custom-v6'"
+                    } else {
+                        "ipset.set_name = 'kidobo'"
+                    };
+                    let error = Config::from_toml_str(&format!(
+                        "{field} = '{name}'\n{other}\nipset.enable_ipv6 = {enabled}\n"
+                    ))
+                    .expect_err("set names must not become command options");
+                    assert_eq!(
+                        error,
+                        ConfigError::InvalidField {
+                            field,
+                            reason: "must not start with '-'".to_string(),
+                        }
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn set_names_preserve_allowed_punctuation() {
+        let config = Config::from_toml_str(
+            "[ipset]\nset_name = '.kidobo_v4-set'\nset_name_v6 = '_kidobo.v6-set'\n",
+        )
+        .expect("leading dots and underscores and internal hyphens remain valid");
+        assert_eq!(config.ipset.set_name, ".kidobo_v4-set");
+        assert_eq!(config.ipset.set_name_v6, "_kidobo.v6-set");
+    }
+
+    #[test]
+    fn ipset_timeout_matches_kernel_limits() {
+        for seconds in [0, 2_147_483] {
+            let config = Config::from_toml_str(&format!(
+                "[ipset]\nset_name = 'kidobo'\ntimeout = {seconds}\n"
+            ))
+            .expect("supported timeout");
+            assert_eq!(config.ipset.timeout, seconds);
+        }
+        for seconds in [2_147_484_i64, 2_592_000, -1, 4_294_967_296] {
+            let error = Config::from_toml_str(&format!(
+                "[ipset]\nset_name = 'kidobo'\ntimeout = {seconds}\n"
+            ))
+            .expect_err("unsupported timeout");
+            assert_eq!(
+                error,
+                ConfigError::InvalidField {
+                    field: "ipset.timeout",
+                    reason: "must be between 0 and 2147483".to_string(),
+                }
+            );
+        }
+    }
+
+    #[test]
     fn set_name_v6_must_not_match_set_name_when_ipv6_disabled() {
         let err = Config::from_toml_str(
             "[ipset]\nset_name = 'kidobo'\nset_name_v6 = 'kidobo'\nenable_ipv6 = false\n",
@@ -901,7 +965,7 @@ mod tests {
             err,
             ConfigError::InvalidField {
                 field: "ipset.timeout",
-                reason: format!("must be between {} and {}", 0, u32::MAX),
+                reason: "must be between 0 and 2147483".to_string(),
             }
         );
     }

@@ -1,6 +1,6 @@
 use crate::network::{CanonicalCidr, parse_ip_cidr_token};
 
-use crate::config::{ConfigError, DEFAULT_CHAIN_ACTION, FirewallAction};
+use crate::config::{ConfigError, DEFAULT_CHAIN_ACTION, FirewallAction, IPSET_NAME_MAX_LEN};
 
 pub(super) fn required_non_empty(
     value: Option<String>,
@@ -77,10 +77,16 @@ pub(super) fn bounded_newtype<T>(
 }
 
 pub(super) fn validate_ipset_set_name(value: &str, field: &'static str) -> Result<(), ConfigError> {
-    if value.len() > 31 {
+    if value.len() > IPSET_NAME_MAX_LEN {
         return Err(ConfigError::InvalidField {
             field,
-            reason: "must be 31 characters or fewer".to_string(),
+            reason: format!("must be {IPSET_NAME_MAX_LEN} characters or fewer"),
+        });
+    }
+    if value.starts_with('-') {
+        return Err(ConfigError::InvalidField {
+            field,
+            reason: "must not start with '-'".to_string(),
         });
     }
     if !value

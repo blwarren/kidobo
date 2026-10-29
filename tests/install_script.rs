@@ -1023,6 +1023,99 @@ fn custom_root_init_rejects_explicit_empty_value_before_execution() {
 }
 
 #[test]
+fn uninstall_succeeds_with_disabled_ipv6_and_overlong_derived_set_name() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().join("root");
+    let install_dir = temp.path().join("bin");
+    let ipv4_set = "a".repeat(31);
+    fs::create_dir_all(&install_dir).expect("mkdir install");
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_kidobo"), install_dir.join("kidobo"))
+        .expect("link current binary");
+    fs::create_dir_all(root.join("config")).expect("mkdir config");
+    fs::create_dir_all(root.join("cache")).expect("mkdir cache");
+    fs::write(
+        root.join("config/config.toml"),
+        format!("[ipset]\nset_name='{ipv4_set}'\nenable_ipv6=false\n"),
+    )
+    .expect("write IPv4-only config");
+    fs::write(root.join("cache/sync.lock"), "").expect("create sync lock");
+    for directory in ["data", "systemd/system"] {
+        fs::create_dir_all(root.join(directory)).expect("mkdir artifact");
+    }
+    for unit in ["kidobo-sync.service", "kidobo-sync.timer", "other.service"] {
+        fs::write(root.join("systemd/system").join(unit), "unit fixture")
+            .expect("write unit fixture");
+    }
+
+    let cleanup_log = temp.path().join("cleanup.log");
+    let fake_bin = write_cleanup_fakes(&temp);
+    write_executable(
+        &fake_bin.join("ipset"),
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+printf 'ipset %s\n' "$*" >> "${KIDOBO_TEST_CLEANUP_LOG}"
+if [[ "${1:-}" == destroy && ${#2} -gt 31 ]]; then
+  echo "Syntax error: invalid setname '${2}'" >&2
+  exit 2
+fi
+"#,
+    );
+
+    let output = Command::new("bash")
+        .arg("-c")
+        .arg("source \"$INSTALLER\"; uninstall_artifacts")
+        .env("INSTALLER", installer_path())
+        .env("KIDOBO_ROOT", &root)
+        .env("KIDOBO_INSTALL_DIR", &install_dir)
+        .env("KIDOBO_TEST_CLEANUP_LOG", &cleanup_log)
+        .env("PATH", path_with_prefix(&fake_bin))
+        .output()
+        .expect("run isolated uninstall");
+
+    let log = read_to_string_with_limit(&cleanup_log, FIXTURE_FILE_READ_LIMIT);
+    let derived_ipv6_set = format!("{ipv4_set}-v6");
+    assert!(
+        output.status.success(),
+        "uninstall failed: stdout={} stderr={} cleanup log={log}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        log.lines()
+            .any(|line| line == format!("ipset destroy {ipv4_set}"))
+    );
+    assert!(
+        log.lines()
+            .any(|line| line == "ip6tables -w 5 -F kidobo-input"),
+        "IPv6 firewall cleanup missing: {log}"
+    );
+    assert!(
+        !log.lines()
+            .any(|line| line == format!("ipset destroy {derived_ipv6_set}"))
+    );
+    assert!(!install_dir.join("kidobo").exists());
+    for artifact in [
+        "config",
+        "data",
+        "cache",
+        "systemd/system/kidobo-sync.service",
+        "systemd/system/kidobo-sync.timer",
+    ] {
+        assert!(
+            !root.join(artifact).exists(),
+            "artifact remains: {artifact}"
+        );
+    }
+    assert_eq!(
+        read_to_string_with_limit(
+            &root.join("systemd/system/other.service"),
+            FIXTURE_FILE_READ_LIMIT
+        ),
+        "unit fixture"
+    );
+}
+
+#[test]
 fn uninstall_removes_scoped_artifacts_after_successful_flush() {
     let temp = TempDir::new().expect("tempdir");
     let root = temp.path().join("root");

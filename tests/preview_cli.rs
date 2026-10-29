@@ -393,6 +393,63 @@ fn completions_render_without_reading_config_or_invoking_tools() {
 }
 
 #[test]
+fn preview_rejects_oversized_ipset_timeouts_before_fetch_or_enforcement() {
+    for timeout in [2_147_484, 2_592_000] {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind fetch sentinel");
+        let address = listener.local_addr().expect("fetch sentinel address");
+        let url = format!("http://{address}/feed");
+        let config = fixture_config(Some(&url), &[], false).replace(
+            "maxelem = 100",
+            &format!("maxelem = 100\ntimeout = {timeout}"),
+        );
+        let fixture = Fixture::new(&config, "");
+        let mut child = fixture
+            .command(&["sync", "--dry-run", "--allow-network"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn timeout preview");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut timed_out = false;
+        loop {
+            if child.try_wait().expect("poll timeout preview").is_some() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                child.kill().expect("kill stalled timeout preview");
+                timed_out = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let output = child.wait_with_output().expect("reap timeout preview");
+        assert!(!timed_out, "ipset.timeout={timeout} preview hung");
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "ipset.timeout={timeout} should fail config validation: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("ipset.timeout"),
+            "missing timeout field diagnostic: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(fixture.log(), "", "validation must precede tool execution");
+        listener
+            .set_nonblocking(true)
+            .expect("make fetch sentinel nonblocking");
+        assert!(
+            matches!(
+                listener.accept(),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock
+            ),
+            "ipset.timeout={timeout} reached the source fetch"
+        );
+    }
+}
+
+#[test]
 fn allow_network_requires_a_dry_run_and_usage_errors_do_not_call_tools() {
     let fixture = Fixture::new("[ipset]\nset_name = 'kidobo'\n", "");
     let output = fixture.run(&["sync", "--allow-network"]);

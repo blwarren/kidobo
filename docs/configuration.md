@@ -27,14 +27,23 @@ keys are optional. The defaults below apply when a key is omitted.
 
 | Key | Default | Accepted value |
 | --- | --- | --- |
-| `ipset.set_name` | Required | Nonempty IPv4 set name, at most 31 characters, using only letters, digits, `_`, `-`, or `.`. |
+| `ipset.set_name` | Required | Nonempty IPv4 set name, at most 31 characters, using only letters, digits, `_`, `-`, or `.`; must not start with `-`. |
 | `ipset.set_name_v6` | `<set_name>-v6` | Explicit names follow the IPv4 name rules and must be distinct. The derived name must fit the 31-character limit when IPv6 is enabled; supply an explicit name if needed. With IPv6 disabled, an overlong derived name is accepted. |
 | `ipset.enable_ipv6` | `true` | Boolean. When false, sync does not enforce IPv6 and cleans up managed IPv6 artifacts. |
 | `ipset.chain_action` | `DROP` | `DROP` or `REJECT` (case insensitive). |
 | `ipset.set_type` | `hash:net` | Nonempty ipset type using only letters, digits, `:`, `,`, `_`, `-`, or `.`; `hash:net` is the supported managed type. |
 | `ipset.hashsize` | `65536` | Positive power of two fitting in a 32-bit unsigned integer. |
 | `ipset.maxelem` | `500000` | Integer from `1` through `500000`, per managed set. |
-| `ipset.timeout` | `0` | Integer from `0` through `4294967295`; `0` means entries do not expire. |
+| `ipset.timeout` | `0` | Integer seconds from `0` through `2147483`; `0` means entries do not expire. |
+
+With IPv6 disabled, sync and flush still remove managed IPv6 firewall wiring
+and any valid configured IPv6 set. If the derived IPv6 name exceeds 31
+characters, cleanup skips that impossible set name without reporting a failure.
+Explicit IPv6 names must always satisfy the name rules, even with IPv6 disabled.
+
+Invalid names and out-of-range timeouts are configuration errors. Correct the
+value before running commands that require valid configuration; Kidobo does
+not rename sets, clamp timeouts, or rewrite these settings automatically.
 
 IPv4 and IPv6 lists are computed and capacity checked separately. Sync checks
 both enabled families against `maxelem` before replacing either set. Each set
