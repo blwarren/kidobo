@@ -4,15 +4,8 @@
 [development workflow](../docs/development.md) for validation requirements, test strategy, and
 release-note handling.
 
-Install `just` and the pinned CI tools before running local CI, and authenticate
-GitHub CLI before publishing. The publisher installs the coverage tool when it
-is needed:
-
-```bash
-cargo install --locked just --version 1.55.1
-just _install-cooldown _install-deny _install-audit
-gh auth login
-```
+Start with [developer setup](../docs/development.md#toolchain-and-validation) for the toolchain
+and pinned validation tools. Use `just --list` to list recipes.
 
 ## Structure
 
@@ -30,15 +23,6 @@ gh auth login
 - `.cargo/mutants.toml`: cargo-mutants mutation-testing configuration.
 
 ## Common Commands
-
-Performance comparisons require Python 3 (standard library only) and current results for
-every saved baseline case. They respect `CARGO_TARGET_DIR`, remove previous `new` estimates
-before running Criterion, and fail on missing comparisons or unparsable estimates.
-Thresholds compare mean point estimates;
-they do not establish statistical significance. Keep datasets and machine load comparable.
-The duplicate scaled real-world cases at scale 1 were removed; fixed real-world cases retain
-their names. Regenerate baselines in a fresh target directory when migrating old estimates
-that include those retired scaled cases.
 
 - `just commit-check` (nonmutating pre-commit whitespace and staged-change-selected fast Rust checks)
 - `just test-fast` (core, application, and CLI unit tests)
@@ -78,38 +62,57 @@ documented reason or an explicit user override. Security urgency alone does
 not grant an automatic exception. See the [dependency release-age
 guide](../docs/dependency-release-age.md) for verification and exception handling.
 
+## Performance checks
+
+Run these scripts from the checkout root. Save a Criterion baseline before changing the code,
+then compare the changed checkout against it:
+
+```bash
+scripts/perf/run-benchmarks.sh main
+# After making the change:
+scripts/perf/check-regressions.sh --baseline main --max-slowdown-pct 8
+```
+
+The regression checker also runs the lookup RSS/time probe. To run that probe independently,
+or apply explicit limits during a comparison:
+
+```bash
+scripts/perf/measure-lookup-rss.sh
+scripts/perf/check-regressions.sh --baseline main --max-rss-kib 20000 --max-elapsed-s 0.10
+```
+
+Choose limits for the workload and host; the numbers above are examples. The lookup probe
+builds the release binary unless `KIDOBO_PERF_BINARY` selects an existing executable. It uses
+a temporary runtime root, performs offline human/TSV lookup, and reports elapsed seconds and
+maximum RSS in KiB for each format. `KIDOBO_PERF_BLOCKS` and `KIDOBO_PERF_TARGETS` select dataset
+sizes; optional `KIDOBO_PERF_CPU_CORE` pins the probe to a CPU, and `KIDOBO_PERF_MEM_LIMIT_KIB`
+sets its virtual-memory limit. The probe requires `/usr/bin/time`; CPU pinning also needs `taskset`.
+
+Performance comparisons require Python 3 (standard library only). The scripts respect
+`CARGO_TARGET_DIR`; the regression checker removes previous `new` estimates and requires fresh,
+parseable results for every saved baseline case. Regenerate baselines in a fresh target directory
+when benchmark case names change. Thresholds compare mean point estimates and do not establish
+statistical significance. Keep datasets and machine load comparable. Use
+`scripts/perf/check-regressions.sh --help` for available thresholds and `--skip-rss-probe`.
+
+## Publication
+
+Authenticate GitHub CLI with `gh auth login`, then run `just publish-release X.Y.Z` from a clean
+branch. The publisher installs the pinned deny, audit, and coverage tools before validation.
 Publication requires a Linux x86_64 host. Release builds require `musl-gcc` and the pinned
 `x86_64-unknown-linux-musl` Rust target. The compatibility gate additionally
 requires `readelf` and Docker access; it runs only offline Kidobo commands in
 the containers and never invokes firewall or systemd operations.
-Publication requires host `tar`. By default, it also requires configured Incus VM access, a
-`genisoimage` or `mkisofs` utility for agent configuration disks, and passing required distro
-lifecycle coverage against the exact packaged archive before pushing refs or uploading assets.
-The default required targets are Debian 12 and 13 and Ubuntu 24.04 and 26.04. Publication and
-`just e2e-artifact` select only those required targets. Use a separate `just e2e` run for all seven
-configured targets, including advisory Fedora 44 and AlmaLinux 9 and 10 with enforcing SELinux.
-Advisory prerequisite and application failures do not fail that broader run; reports separately
-identify required-gate success and all-selected-target success. Full seven-platform qualification
-requires every target to pass. Cleanup, shared infrastructure, and evidence archive failures still
-fail the run. At most two VMs run by default, each with 2 vCPUs and 4 GiB RAM, with a memory
-preflight and 1 GiB host headroom. Each worker completes fresh provisioning, environment validation,
-application checks, diagnostics, and cleanup for one target before taking another. Individual target
-failures do not suppress other targets. Ownership-checked startup recovery removes abandoned suite
-VMs and preserves retained/foreign guests. No prepared-image or prior-result reuse remains.
-Fedora and AlmaLinux use reviewed vendor-image pins; verified, unmodified source images remain
-in Incus. Startup checks report image updates and new stable Debian, Ubuntu LTS, Fedora, and
-AlmaLinux releases within a 30-second budget. Discovery failures warn without changing
-qualification, pins, or matrix coverage. The refresh command verifies signatures, hashes,
-format, and seven-day publication age before atomically updating requested pins. Review the
-diff and obtain explicitly authorized fresh lifecycle acceptance before committing it. See
-[image updates and storage](../docs/e2e.md#image-sources-and-reviewed-updates).
-Read the [E2E scope contract](../docs/e2e.md#scope-and-non-goals) before changing this workflow.
+Publication requires host `tar`. By default, it also requires configured Incus VM access and
+`genisoimage` or `mkisofs` for agent configuration disks. Required distro lifecycle coverage
+must pass against the exact packaged archive before refs are pushed or assets uploaded. See
+[host preparation](../docs/e2e.md#host-preparation) for all VM prerequisites and
+[coverage and outcomes](../docs/e2e.md#coverage-and-outcomes) for required versus advisory targets.
 
-An explicit `--skip-e2e` argument skips E2E compilation, formatting, linting, documentation,
-harness and launcher tests, E2E integration fixtures, image discovery/import, and VM execution.
-It requires no Incus, tmux, image-processing, or agent-ISO tools and invokes no E2E cleanup.
-Application CI, non-E2E coverage with the same 90% region/function/line thresholds, and strict
-application rustdoc still run through private recipes backed by `scripts/release-validation.sh`.
+`just publish-release X.Y.Z --skip-e2e` excludes the E2E validation and tools defined in the
+[E2E scope contract](../docs/e2e.md#scope-and-non-goals). Application CI, non-E2E coverage with
+the same 90% region/function/line thresholds, and strict application rustdoc still run through
+private recipes backed by `scripts/release-validation.sh`.
 Shared dependency audits and license/policy checks remain enabled; reading shared Cargo manifests
 and lockfile metadata is allowed. Release-note validation, static builds, the release-binary
 exercise, compatibility, packaging, confirmation, source/artifact mutation detection, upload
@@ -119,18 +122,14 @@ The publisher reports `E2E validation skipped` before validation and at final co
 covering both infrastructure checks and VM execution. Default publication and standalone
 `just ci`, `just coverage`, and `just rustdoc` retain their existing scope. Standalone `just test`
 requires `--include-e2e` to include E2E-system tests.
-Root E2E integration targets use the `e2e_*` prefix; the harness package is `kidobo-e2e`.
-Future E2E packages, targets, and dedicated helpers must stay outside the publisher's skip path.
 This override does not reuse or imply evidence from an earlier matrix run.
 
-E2E command transcripts and results remain under the original checkout's `target/e2e/<run-id>/`,
-including when the publisher removes its temporary worktree. Start with `summary.txt` and
-the paths and local line references into `targets/<distro>/transcript.log`. Each target owns
-its full transcript and structured results; the terminal and root transcript show progress and
-outcomes. Frozen inputs and available supplemental diagnostics are retained in `evidence.tar.gz`.
-Supplemental diagnostic failures are warnings; required assertions, authoritative reporting,
-artifact integrity, evidence archival, and cleanup remain mandatory. See
-[live progress and retained evidence](../docs/e2e.md#diagnose-and-clean-up).
+The private `_release-ci-without-e2e`, `_release-coverage-without-e2e`, and
+`_release-rustdoc-without-e2e` recipes share a selection covering the four application packages
+and root integration targets other than `e2e_*`. New packages and targets must be accounted for
+by that selection and its inventory regressions; maintain the exclusions in the
+[E2E scope contract](../docs/e2e.md#scope-and-non-goals).
+
 Packaging reads the validated candidate binary from `CARGO_TARGET_DIR` when
 set, or `target` otherwise. Relative target directories resolve inside the
 candidate worktree; recovery artifacts retain the location below.
@@ -144,12 +143,6 @@ publication command after addressing the failure.
 A pre-existing `target/release-artifacts/<tag>/` directory is not deleted or overwritten. If it
 belongs to an older pre-push attempt, preserve it by moving it aside before starting again. If
 refs were already pushed, use the recovery workflow below instead of retrying publication.
-
-## GitHub Automation
-
-Kidobo does not use checked-in GitHub Actions workflows. Run `just ci` before
-ordinary pushes and `just publish-release X.Y.Z` for releases. Dependabot update
-PRs remain enabled as the sole GitHub-hosted automation exception.
 
 ## Release Recovery
 

@@ -27,8 +27,8 @@ The publisher's explicit `--skip-e2e` flag excludes all E2E-specific validation:
 formatting, linting, documentation, harness and launcher tests, E2E integration fixtures, image
 operations, and VM execution. It requires no E2E-only tools and performs no E2E cleanup.
 Application checks and publication safeguards remain mandatory, including the existing coverage
-thresholds. Shared dependency audits and license/policy checks remain enabled; reading Cargo
-manifests and lockfile metadata does not execute E2E code.
+thresholds. See [publication validation](../scripts/README.md#publication) for retained application
+gates and the internal selection recipes.
 
 Keep future E2E-specific packages and targets outside that skip path. The harness lives in
 `kidobo-e2e`, and root-package E2E integration targets must be named `e2e_*`. Dedicated E2E
@@ -69,8 +69,10 @@ Two existing exceptions are bounded rather than precedents for expansion:
   Its bounded relabel/reboot and enforcement checks remain prerequisites; unsupported layouts
   fail that target rather than invoking a new repair path.
 - The upgrade fixture recognizes the exact documented Debian 12 failure of baseline versions
-  `v0.14.2`/`v0.14.3`, verifies preserved state, and exercises the candidate afterward. This
-  historical baseline recovery never exempts a candidate or published target from its assertions.
+  `v0.14.2`/`v0.14.3` with both iptables binaries reporting 1.8.9/nf_tables and the known
+  incompatible-chain diagnostic. It verifies preserved state and exercises the candidate
+  afterward. This baseline recovery never exempts a candidate or published target from its
+  assertions.
 
 Agents must not run the VM matrix without an explicit and express user request. Changes,
 reviews, documentation, and local fixture validation do not authorize it. Never exercise the
@@ -89,8 +91,6 @@ kernel available for that distribution.
 The [matrix configuration](../config/e2e.toml) records package prerequisites and target security
 requirements. `required` defaults to `true`; advisory targets explicitly set it to `false`.
 Fedora and AlmaLinux require enforcing SELinux; other targets retain their image defaults.
-openSUSE Leap 16.0 remains outside the matrix because packaged `bgpq4` was unavailable.
-Reintroducing it requires explicit scope and a passing lifecycle with packaged prerequisites.
 
 A target's environment or application failure does not suppress other selected targets.
 Cancellation, shared infrastructure/reporting failure, or inability to safely release a VM slot
@@ -370,8 +370,8 @@ to reclaim one image.
 
 ### Legacy prepared-image storage
 
-Old prepared images are unused after this simplification and are not automatically migrated or
-deleted. To reclaim their storage, first inspect images and all instances in the suite project:
+Legacy prepared images are unused and are not automatically deleted. To reclaim their storage,
+first inspect images and all instances in the suite project:
 
 ```bash
 incus --project kidobo-e2e image list
@@ -384,8 +384,7 @@ Only consider an exact fingerprint with `user.kidobo-e2e: kidobo-e2e-v1` and the
 or deliberately retained instance references that fingerprint as `volatile.base_image`.
 Preserve foreign, ambiguous, or referenced images. After those checks, the operator may remove
 that individual unused image with `incus --project kidobo-e2e image delete FINGERPRINT`.
-Do not delete all images, the project, or the storage pool. No new cleanup command or automatic
-image-management policy is introduced.
+Do not delete all images, the project, or the storage pool.
 
 ## Harness organization
 
@@ -427,110 +426,5 @@ Real VM acceptance requires a separate, explicit user request. It should cover f
 of the selected targets, configured SELinux modes and observed backends, application assertions,
 retained logs, interruption/cleanup, and independent required/all-selected outcomes. Record actual
 wall time without summing overlapping target durations; build/packaging time is outside runner time.
-No cold/warm or resume qualification remains. The separate Debian 11/Alpine gate checks static
+Prepared-image and result reuse are outside scope. The separate Debian 11/Alpine gate checks static
 binary startup and offline lookup, not full firewall/systemd behavior on those platforms.
-
-## Historical validation evidence
-
-The dated records below describe earlier harness versions and their captured inputs. They are
-retained for diagnosis and do not establish acceptance of the current implementation or artifact.
-
-## Initial validation: 22 October 2026
-
-Both eight-target runs completed for version `v0.14.3` after host Incus access, networking,
-and ISO tooling were configured. Both exited with status 1: candidate run
-`run-1792703914-558810` recorded five passes and three failures; published smoke run
-`run-1792703913-557732` recorded six passes and two failures. These historical eight-target
-results did not satisfy publication; the current seven-target matrix and subsequent fixes
-require fresh validation.
-
-| Target | Candidate lifecycle | Published smoke |
-| --- | --- | --- |
-| Debian 12 | Application failure, 45.4 s | Application failure, 41.7 s |
-| Debian 13 | PASS, 247.6 s | PASS, 74.3 s |
-| Ubuntu 24.04 | PASS, 251.7 s | PASS, 76.5 s |
-| Ubuntu 26.04 | PASS, 263.2 s | PASS, 84.3 s |
-| Fedora 44 | PASS, 306.1 s | PASS, 112.7 s |
-| AlmaLinux 9 | Fixture failure, 295.5 s | PASS, 109.0 s |
-| AlmaLinux 10 | PASS, 304.6 s | PASS, 109.1 s |
-| openSUSE Leap 16.0 | Provisioning failure, 32.6 s | Provisioning failure, 28.6 s |
-
-Debian 12 exposed an application compatibility issue: iptables 1.8.9 with the nftables
-backend reports an absent chain using an incompatible-chain diagnostic. The same message
-was reproduced with a fresh unrelated absent chain. The subsequent fix handles that exact
-requested-chain/filter-table diagnostic and exit status 1 by inspecting a bounded, read-only
-chain listing from the same address family. Only absence of the exact chain declaration
-establishes that the chain is missing; a listed chain preserves the original error, and a
-failed listing propagates its error. The application matches the diagnostic rather than
-hard-coding a distro or version.
-
-Upgrade baselines `v0.14.2` and `v0.14.3` require a narrowly guarded harness recovery for
-this historical defect on Debian 12 with both iptables binaries reporting 1.8.9/nf_tables
-and the exact known error. This recovery applies only to the older upgrade baseline; it does
-not mask candidate or published-target failures. Leap's missing packaged `bgpq4` remains a
-recorded provisioning failure, with reintroduction deferred as described above.
-
-AlmaLinux 9's full candidate attempt failed when its traffic fixture lost an interface
-address and could not bind (`EADDRNOTAVAIL`). The fixture now excludes only its test veth
-interface from NetworkManager management before assigning addresses, following the
-[scoped NetworkManager device guidance](https://docs.redhat.com/en/documentation/red_hat_enterprise_linux/9/html/configuring_and_managing_networking/configuring-networkmanager-to-ignore-certain-devices_configuring-and-managing-networking).
-It preserves the guest's main network interface and global NetworkManager configuration.
-The latest focused AlmaLinux 9 candidate run, `run-1792706036-603679`, passed in 300.5 s.
-Its diagnostics retained the test interface address/local route and recorded that the device
-was unmanaged. The VM was cleaned up. This focused pass validates the fixture correction;
-the original full-matrix failure remains recorded in the table.
-
-The full runs used their captured `inputs/` snapshots. Later custom-configuration repeat-init
-and failed-uninstall timer-ordering assertions passed in a focused Debian 13 candidate run,
-`run-1792704567-575487`, in 248.5 s. These focused changes do not retroactively alter the
-full-matrix results. The earlier full candidate attempt `run-1792700407-470030` exposed
-harness assertions that were corrected; it is not a successful matrix result.
-
-Per-target elapsed values include provisioning, application checks, diagnostics, and cleanup.
-Their sums are 1,746.8 s for the candidate run and 636.1 s for published smoke; these exclude
-host builds, setup, and initial release/baseline resolution. The lanes overlapped in time and
-the host image cache was populated, so these observations are not performance benchmarks or
-cold-download estimates. Retained evidence records exact image fingerprints, package updates,
-kernel versions, and iptables backends.
-
-The tested images included both legacy and nftables iptables backends. Fedora and both
-AlmaLinux images reported SELinux Disabled; the suite preserved their image settings.
-Enforcing SELinux was not validated. These observations describe the Incus images used,
-rather than installations from each distribution's standard ISO.
-
-`just ci` and `just coverage` passed locally. Coverage was 92.53% of regions, 93.65% of
-functions, and 93.02% of lines with the existing thresholds. These checks do not establish
-VM matrix acceptance.
-
-## Repair validation: 22 October 2026
-
-Two fresh focused candidate runs passed after the Debian chain-detection fix and final
-fixture corrections:
-
-| Target | Run | Result | Elapsed |
-| --- | --- | --- | --- |
-| Debian 12 | `run-1792709120-639527` | PASS; no diagnostic collection failures | 239.6 s |
-| AlmaLinux 9 | `run-1792709366-657973` | PASS; no diagnostic collection failures | 297.3 s |
-
-Debian 12 reproduced the known `v0.14.2` baseline synchronization failure with exit status 1
-and its exact incompatible-chain diagnostic before the guarded historical recovery. The
-corrected candidate then passed its lifecycle. AlmaLinux 9's final network diagnostics
-recorded the test veth as unmanaged and retained both assigned address families. Both VMs
-were deleted after diagnostic collection.
-
-The Debian candidate archive SHA-256 was
-`8f78dbe8fc7eeffcaf44354a6f2f19b498e36654864af1131bf7533f68b7fbfc`;
-the AlmaLinux candidate archive SHA-256 was
-`8f84346d9c117fcd03da559879d18462e21afe3b6a8a358c378ec031948eddae`.
-The differing archives belong to separate captured runs; neither focused result establishes
-a complete mandatory-matrix pass.
-
-Local `just ci`, `just coverage`, `just exercise-release`, `just release-compat`, and
-`just rustdoc` passed. Coverage was 92.61% of regions, 93.69% of functions, and 93.10% of
-lines with the existing thresholds. Release-note generation added the compatibility entry
-to `CHANGELOG.md`; the normal check initially reported the intentional unstaged note and
-changelog differences. Verification against an isolated temporary index passed without
-changing the real staging area, and the final check rewrote no files.
-
-At the time of this record, the seven-target candidate run `run-1792709674-661101` was still
-in progress. This record does not establish its completion or corrected-release published smoke.

@@ -1,8 +1,10 @@
 # Architecture
 
-Kidobo is a resolver-v3 Cargo workspace with one released package and three private implementation
-crates. The root `kidobo` package remains the version and release source of truth; every internal crate
-is fixed at `0.0.0` with `publish = false`.
+Kidobo is a resolver-v3 Cargo workspace. The root `kidobo` package is the released application and
+the version and release source of truth. Its three private implementation crates are fixed at
+`0.0.0` with `publish = false`. The workspace also contains the private `kidobo-e2e` tool in
+`tools/distro-e2e`, which has its own version and verifies disposable VM lifecycles; it is not an
+application dependency. The dependency diagram below describes the application crates.
 
 ## Dependency direction
 
@@ -198,10 +200,11 @@ source semantics and both enabled-family capacities pass, and before either set 
 
 Readers validate the manifest, generation identifiers, bounded members, configured URL, checksums, and
 GitHub category scope before accepting data. They try current, then previous, then the legacy flat-file
-layout. New writes use only v2, while legacy files remain readable and unchanged for compatibility. After a
-successful promotion, only the current and previous generations are retained; incomplete or unselected
-staging directories are never selected and are removed opportunistically by online cache work. Normal cache
-flush removes the containing remote-cache directory and therefore both layouts.
+layout. New writes use only v2, while legacy files remain readable and unchanged for compatibility.
+Promotion selects the current and optional previous generations; removing other generations is best effort,
+so extra unselected directories can remain after success. Incomplete or unselected staging directories are
+never selected and are removed opportunistically by online cache work. Normal cache flush removes the
+containing remote-cache directory and therefore both layouts.
 
 An unchanged current generation retains its previous manifest entry and skips redundant promotion.
 Existing same-ID content is verified before reuse. Corrupt or missing members are repaired from retained

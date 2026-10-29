@@ -8,13 +8,29 @@ other tasks to their relevant guides. Runtime design and ordering belong in
 
 ## Toolchain and validation
 
-Use the pinned stable toolchain in [rust-toolchain.toml](../rust-toolchain.toml) for development.
-Preserve `package.rust-version` as the minimum supported Rust version; the development pin may be
-newer. The [README](../README.md#development) records the current versions and MSRV check.
+Development uses Rust 1.99.1, pinned in [rust-toolchain.toml](../rust-toolchain.toml) with
+Clippy, rustfmt, rust-analyzer, and the `x86_64-unknown-linux-musl` target. The minimum supported
+Rust version is 1.97.1 in the Cargo manifests. Keep code compatible with that minimum and verify
+it with `RUSTUP_TOOLCHAIN=1.97.1 just test` when changing toolchain compatibility.
 
 [Justfile](../Justfile) is the canonical command interface. Do not duplicate its Cargo commands in
 new scripts or documentation. See the [command reference](../scripts/README.md) for prerequisites,
 available recipes, and release recovery.
+
+From the checkout root, install the pinned task runner and validation tools, then check the
+checkout. These tool versions follow the repository's [release-age policy](dependency-release-age.md).
+
+```bash
+cargo install --locked just --version 1.55.1
+just _install-cooldown _install-deny _install-audit
+just check
+just ci
+just release-notes-check
+```
+
+The tests use injected runners, fake privileged commands, temporary roots, and loopback services.
+Use the separate [E2E guide](e2e.md) for disposable-VM setup; ordinary local checks do not require
+running the VM matrix.
 
 Select checks according to the change:
 
@@ -46,32 +62,15 @@ or `just check`; local E2E-tool tests require `just test --include-e2e`. Hook ch
 tree, so review partial staging before committing. Formatting checks never rewrite files.
 The publisher suppresses Git hooks only for its own final commit and push after explicit candidate
 validation; ordinary pushes still run `just ci`.
+
 Coverage, strict rustdoc, the isolated release-binary exercise, static compatibility checks,
 and required coverage in the [Incus distro lifecycle matrix](e2e.md)
-are publication gates; they are not part of `just ci`. Fedora and AlmaLinux coverage is advisory
-and runs separately through `just e2e`, outside publication, with enforcing SELinux on those
-targets. Full seven-platform qualification requires every selected target to pass; reports expose
-that outcome separately from the four-target release gate. Each target completes fresh provisioning
-and application checks with bounded two-VM concurrency. Read the
-[E2E scope contract](e2e.md#scope-and-non-goals) before changing its runner, fixtures, provisioning,
-image acquisition/monitoring, reporting, or release integration. Fedora and AlmaLinux use reviewed
-vendor-image pins; `just e2e-images-check` reports updates, while `just e2e-images-refresh [DISTRO]`
-verifies/imports sources and changes pins for review without starting VMs. Startup discovery is
-advisory, has a 30-second budget, and never changes the matrix. See the
-[image update workflow](e2e.md#image-sources-and-reviewed-updates) for verification and acceptance.
-The explicit publisher option `--skip-e2e` omits all E2E-specific validation, including local
-infrastructure checks and image operations as well as the matrix. Formatting, lint, coverage,
-and rustdoc include the harness. `just test` excludes E2E tests by default; `just test --include-e2e`
-runs every local E2E regression alongside the non-E2E suite. Recipes that depend on `test`,
-including `just check` and `just update`, use its non-E2E default.
-
-The skip path uses private `_release-ci-without-e2e`, `_release-coverage-without-e2e`, and
-`_release-rustdoc-without-e2e` recipes backed by `scripts/release-validation.sh`. Their shared
-selection covers the four application packages and root integration targets other than `e2e_*`.
-Keep E2E-specific root tests under that prefix and their dedicated helpers outside non-E2E
-module trees. New packages or targets must be accounted for by the selection policy and its
-inventory regressions. Exclude E2E compilation through Cargo target/package selection, rather
-than test-name filters or coverage-report exclusions alone.
+are publication gates; they are not part of `just ci`. Ordinary formatting, lint, coverage,
+and rustdoc include the harness. Recipes that depend on `test`, including `just check` and
+`just update`, use its non-E2E default. The publisher's explicit `--skip-e2e` path has a separate
+validation selection; see [publication commands](../scripts/README.md#publication).
+Read the [E2E scope contract](e2e.md#scope-and-non-goals) before changing the runner, fixtures,
+provisioning, images, reporting, or release integration.
 
 CI/CD remains local. Dependabot version updates are the sole GitHub-hosted automation exception;
 do not add GitHub Actions workflows without explicit approval. Dependency changes must also follow
@@ -122,7 +121,7 @@ live validation requires explicit direction and a disposable environment.
 
 Mutation execution belongs to the user. Review their reports only after the unmutated baseline
 passes reliably. Prioritize `missed` and `timeout`; `unviable` is inconclusive unless it reveals
-dead, over-constrained, or confusing code. Preserve [historical triage evidence](mutation-triage.md)
+dead, over-constrained, or confusing code. Review the [mutation exclusion guidance](mutation-triage.md)
 and inspect [.cargo/mutants.toml](../.cargo/mutants.toml) when reviewing exclusions.
 
 For each relevant result, identify the changed contract and classify the cause: weak assertions,
@@ -168,29 +167,24 @@ Report whether this invocation changed file contents separately from its exit st
 Do not bump versions or create tags unless explicitly requested. When requested, keep `Cargo.toml`,
 `Cargo.lock`, README install examples, and tag-named release notes aligned.
 
-The publisher prepares a candidate in a temporary worktree, runs local CI and the release-note check,
-then runs the publication-only gates listed above. The binary exercises use a temporary runtime root,
-loopback feed, fake privileged commands, and Debian/Alpine containers. The publisher packages the
-tested static Linux x86_64 binary and, by default, selects the four required Debian and Ubuntu
-Incus VM targets against that archive. Separate `just e2e` runs also cover advisory Fedora and AlmaLinux.
-Each target validates its environment and then runs its application lifecycle; one target's
-failure does not suppress the others. The publisher then uses GitHub CLI to upload, verify,
-and publish the archive only after required coverage succeeds.
-`just publish-release X.Y.Z --skip-e2e` excludes E2E compilation, formatting, linting,
-documentation, harness/launcher/integration tests, image operations, and VM execution, without
-requiring E2E-only tools or invoking E2E cleanup. It retains application CI, all non-E2E
-integration tests in coverage, and strict application rustdoc. Region, function, and line
-coverage thresholds remain 90%. Shared dependency audits and license/policy checks still run;
-reading shared Cargo manifests and lockfile metadata is permitted. Release-note validation,
-static builds, binary exercises, compatibility, packaging, confirmation, source/artifact mutation
-checks, upload verification, and recovery remain unchanged. See the
-[command reference](../scripts/README.md) for skip reporting.
-Every attempt runs its selected gates, builds and packages a new candidate, and
-checks its source and artifact identity before publication. Prior local or E2E successes are
-not reused. A failure before refs are pushed removes newly created release artifacts, while
-E2E logs and frozen evidence remain in the original checkout. Existing artifacts are never
-overwritten; post-push failures retain the artifacts needed for publication recovery.
-The VM suite operates real guest firewalls and systemd only inside disposable VMs.
-Read [setup and diagnosis](e2e.md) for VM
-requirements and retained run evidence, and [commands and recovery](../scripts/README.md)
-for publication prerequisites and recovery steps.
+Publication is a separate, explicitly requested operation. Authenticate GitHub CLI with
+`gh auth login`, then use `just publish-release X.Y.Z` from a clean branch. The publisher prepares
+and validates a candidate in a temporary worktree, asks for confirmation, pushes the release commit
+and tag atomically, verifies uploaded assets, and publishes the release. Every attempt runs its
+selected gates; prior validation does not qualify a new attempt. See
+[publication commands](../scripts/README.md#publication) for prerequisites, retained application
+gates with `--skip-e2e`, and recovery before or after refs are pushed. The
+[E2E guide](e2e.md) owns matrix coverage, image updates, and retained VM evidence.
+
+## Maintaining documentation
+
+Write for operators first, then contributors. Keep installation and a short working example in
+the README, operator tasks in Operations, accepted settings in Configuration, and implementation
+and validation guidance in the developer guides. Link to the authoritative procedure instead of
+repeating it across several documents.
+
+Document current behavior, decisions readers need to make, and recovery steps. Keep task journals,
+individual test-run transcripts, scores, and one-time dependency checks in change reviews or run
+artifacts. Retain enduring rationale beside the procedure it explains; release notes record
+user-visible changes by version. Check examples against the implementation and update links when
+moving sections.

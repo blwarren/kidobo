@@ -1,85 +1,142 @@
 # Operating Kidobo
 
-Kidobo runs one command at a time; it is not a resident daemon. `sync` is the
-command that changes firewall and ipset enforcement. Run the commands below on
-the intended Linux host as an operator with the required privileges. For
-configuration keys and paths, see [Configuration](configuration.md).
+Kidobo runs one-shot commands. `sync` applies saved sources to firewall and
+ipset enforcement; `flush` removes managed enforcement. Run the commands below
+on the intended Linux host with the required privileges. For configuration keys
+and paths, see [Configuration](configuration.md).
 
-## First setup and routine changes
+## First setup
 
-1. Install Kidobo using the [README instructions](../README.md#install).
-2. For an interactive guided setup, run `sudo kidobo setup` from a terminal.
-   Setup reviews proposed values before saving, preserves an existing
-   configuration, provisions required files and units, then runs `doctor`
-   before offering an initial sync. A doctor failure stops setup before sync
-   or timer activation. Declining the initial sync leaves the saved
-   configuration pending; it does not apply firewall changes. At default
-   paths, setup separately asks whether to enable the scheduled timer; that
-   choice can apply even when the initial sync was declined. With
-   `KIDOBO_ROOT`, units stay under that root and no host timer is activated.
-   Setup does not stop an existing active timer; that timer may apply saved
-   settings while setup is running.
-   Noninteractive use prints guidance and exits with usage status without
-   creating files. Use `sudo kidobo init` for the existing noninteractive
-   provisioning workflow; it creates missing configuration, data, cache, and
-   systemd unit files without replacing existing ones. At default paths `init`
-   reloads systemd and enables and starts `kidobo-sync.timer`.
-3. Edit `/etc/kidobo/config.toml` and, if needed,
-   `/var/lib/kidobo/blocklist.txt`.
-4. Run `sudo kidobo doctor` and inspect its report. In an interactive terminal
-   it groups checks into human-readable sections; when stdout is redirected or
-   under systemd it keeps the JSON report. Use `--format human` or `--format
-   json` to choose explicitly. `doctor` performs read-only probes. A `FAIL`
-   exits with status `1`; a cache-access `SKIP` means it could not safely prove
-   effective writability without writing a probe file.
-5. Run `sudo kidobo sync` to load sources and apply the resulting IPv4 and IPv6
-   sets and firewall rules. Run it again after any source or configuration
-   change. A successful sync leaves one managed INPUT jump per enabled family at
-   position 1.
+Install Kidobo using the [README instructions](../README.md#install), then run
+the guided setup in a terminal:
 
-To calculate a proposed sync without changing enforcement, run
-`kidobo sync --dry-run`. The default preview is offline: it uses the local
-blocklist, active temporary bans, validated remote-feed and ASN caches, and
+```bash
+sudo kidobo setup
+```
+
+Setup starts from your existing configuration, reviews choices before saving,
+provisions missing files and units, then runs `doctor`. A doctor failure stops
+setup before it offers an initial sync or timer activation.
+
+The initial sync and scheduled timer have separate confirmations. Declining
+the initial sync skips that immediate application, but enabling the timer can
+still apply saved settings later. Setup leaves an existing active timer
+running, so it may apply settings while setup is in progress. Under
+`KIDOBO_ROOT`, unit files stay in that root and no host timer is activated.
+
+### Noninteractive provisioning
+
+`setup` requires terminal input and output; otherwise it exits with usage
+status without creating files. For automation, use:
+
+```bash
+sudo kidobo init
+```
+
+`init` creates missing configuration, data, cache, and systemd unit files
+without replacing existing files. At default paths it immediately reloads
+systemd and enables and starts `kidobo-sync.timer`. Prepare your intended
+configuration before activating scheduling. See [scheduling](#scheduling) for
+how to pause automatic runs while making changes.
+
+## Apply routine changes
+
+Edit `/etc/kidobo/config.toml` and, if needed,
+`/var/lib/kidobo/blocklist.txt`, or use the [configuration commands](#manage-feeds-and-exemptions).
+Check the configuration and prerequisites:
+
+```bash
+sudo kidobo doctor
+```
+
+`doctor` performs read-only probes: a `FAIL` exits with status `1`; a cache-access
+`SKIP` means it could not
+safely prove effective writability without writing a probe file. See
+[output formats](#logs-and-output-formats) for human and JSON reports.
+
+After reviewing the report and resolving failures, apply the changes:
+
+```bash
+sudo kidobo sync
+```
+
+Repeat sync after source or configuration changes. A successful sync replaces
+the enabled families' sets and leaves one managed `INPUT` jump per enabled
+family at position 1. Use [status and check](#inspect-live-state-and-saved-bans)
+to verify the result.
+
+## Preview a sync
+
+To calculate proposed counts without changing enforcement, run:
+
+```bash
+sudo kidobo sync --dry-run
+```
+
+The default preview is offline: it uses the local blocklist, active temporary
+bans, validated remote-feed and ASN caches, and
 cached GitHub metadata when configured. It does not fetch or refresh sources,
 write normalized cache data, promote or clean caches, prune temporary entries,
 or invoke firewall tools.
-The preview requires an existing sync lock file and reports a clear failure
-when it cannot acquire the lock or read that file. It does not create a lock
-file.
 
-`kidobo sync --dry-run --allow-network` explicitly permits remote-feed and
+The preview requires an existing sync lock file, created by setup or init, and
+does not create one itself. A root-owned lock hardened by a mutating command
+is readable only by root, so use `sudo` for a normal system installation. If
+the lock is held by another command, wait for that command to finish and retry.
+
+`sudo kidobo sync --dry-run --allow-network` explicitly permits remote-feed and
 GitHub metadata requests and ASN resolution for that preview. Fetched or
 resolved data stays in memory: the command does not stage or promote cache
 generations, change saved sources, prune expired records, or touch enforcement.
-Both forms apply the
-normal source bounds and admission checks. A missing or unusable required
-offline source, including an unavailable required ASN cache, fails the preview
-rather than reporting a partial successful result.
+Both forms apply the normal source bounds and admission checks. A missing or
+unusable required offline source, including an unavailable required ASN cache,
+fails the preview rather than reporting a partial successful result.
 
 The preview reports separate IPv4/IPv6 proposed counts and capacity outcomes.
 It does not enumerate live set members, so the exact live count delta is
 unavailable; proposed counts do not establish added or removed CIDRs. Preview
 success does not guarantee a later sync will succeed: configuration, source
 data, caches, live firewall state, and available capacity can change. The
-preview does not record last-sync or freshness receipts. `--allow-network` requires
-`--dry-run`; ordinary `kidobo sync` retains its existing enforcement behavior.
-`sync --timer` continues to profile a real sync.
+preview does not record last-sync or freshness receipts. `--allow-network`
+requires `--dry-run`. The separate `sync --timer` option profiles a real sync
+and cannot be combined with `--dry-run`.
 
-Generate shell completion scripts to stdout with `kidobo completions bash`,
-`kidobo completions zsh`, or `kidobo completions fish`. Redirect the selected
-script to the appropriate shell's completion directory; completion generation
-does not read configuration or call system tools.
+## Scheduling
 
 At default paths, `init` requires an installed binary at
 `/usr/local/bin/kidobo` or `/usr/bin/kidobo` for its generated service.
 The generated `Type=oneshot` service runs `kidobo sync`; its timer starts two
 minutes after boot and schedules another run one hour after the service was
 last active. The timer is persistent. The generated service writes journal
-format logs. To inspect scheduled runs and their diagnostics, use:
+format logs. To inspect scheduling and the most recent service run, use:
 
 ```bash
 systemctl status kidobo-sync.timer
 systemctl status kidobo-sync.service
+```
+
+To pause automatic runs, including across a reboot:
+
+```bash
+sudo systemctl disable --now kidobo-sync.timer
+```
+
+This leaves existing enforcement in place and does not stop an active sync.
+Wait for any active service or manually started sync to finish before making
+changes that must remain unapplied. Re-enable scheduling when ready:
+
+```bash
+sudo systemctl enable --now kidobo-sync.timer
+```
+
+Enabling the timer authorizes subsequent syncs to apply saved settings. To
+remove existing enforcement as well, follow [managed cleanup](#remove-managed-enforcement).
+
+## Logs and output formats
+
+Read diagnostics from scheduled runs with:
+
+```bash
 journalctl -u kidobo-sync.service
 ```
 
@@ -90,7 +147,7 @@ log formatting; `auto` uses human logs on an interactive terminal and journal
 fields for redirected or systemd output. `KIDOBO_LOG_COLOR=auto|always|never`
 controls log colors, and `NO_COLOR` disables automatic color.
 
-## Human-readable output and pipes
+### Human-readable output and pipes
 
 `lookup` prints labeled, streaming records and a summary by default. Its human
 layout wraps to the detected terminal width, with an 80-column fallback, and
@@ -148,7 +205,7 @@ limited to 50 records; use `--limit N` or `--all` to change that bound. Select
 ASN records. These commands are read-only and do not refresh sources or modify
 enforcement.
 
-## Check and change sources
+## Find offline source matches
 
 `kidobo lookup 203.0.113.7` and `kidobo lookup --file targets.txt` inspect
 local, active temporary, and compatible cached sources without network access,
@@ -161,6 +218,10 @@ Use `--format tsv` for scripts; see the [compatibility contract](compatibility.m
 for its record format. Results stream as targets are processed, so a large
 number of overlaps does not require retaining all matches. Targets, source
 labels, and matched entries escape control characters in both output formats.
+
+## Add and remove bans
+
+### Permanent bans and immediate application
 
 Without `--for`, `sudo kidobo ban 203.0.113.7` and its `--file` form add
 permanent entries to the local blocklist. A file supplies one strict IP or
@@ -188,17 +249,7 @@ because IPv4 and IPv6 set replacements are separate.
 not request sync or accept the later application prompt. Use `unban --apply`
 to apply after saving, or `unban --no-apply` to save without prompting.
 
-Configuration can also be inspected or edited with `kidobo config show`,
-`kidobo config path`, `kidobo sources`, and `kidobo allow`. These commands do
-not refresh remote data. Source and allow edits save configuration only; run
-`sudo kidobo sync` to apply them. `sources list` is offline. Exact canonical
-allow duplicates are no-ops. A distinct allow already covered by a broader
-range may be saved without expanding coverage or prompting, so the narrower
-entry remains if the broader one is later removed. An allow addition that
-expands coverage asks for a default-no confirmation in an interactive
-terminal; pass `--yes` to approve it noninteractively. Exact canonical removal
-does not carve a smaller range out of a wider saved CIDR. Configuration
-display redacts URL user information and query/fragment values.
+### Temporary bans
 
 Add an expiring local ban with `sudo kidobo ban 203.0.113.7 --for 12h`,
 `sudo kidobo ban --file targets.txt --for 3d`, or
@@ -219,8 +270,8 @@ lock. An entry is active when its expiry is later than that cutoff, and a
 source edit becomes eligible at the next sync. A ban that expires before its
 first sync is never enforced. Expiration takes effect when a later sync
 successfully replaces the relevant set; delayed or failed syncs can prolong
-enforcement, and another source can continue to
-block the same address. After a fully successful enforcement run, Kidobo
+enforcement, and another source can continue to block the same address.
+After a fully successful enforcement run, Kidobo
 best-effort removes expired records. Failed enforcement can leave one address
 family updated because IPv4 and IPv6 set replacements are separate.
 
@@ -228,6 +279,8 @@ With a nonzero `ipset.timeout`, the kernel timeout remains in force for every
 set entry. Kidobo warns when adding or renewing a temporary ban and during a
 sync with active temporary entries, because kernel expiry can remove it before
 the recorded deadline.
+
+### Remove a ban
 
 `unban` removes matching entries from both the permanent and temporary local
 stores. Repeated targets that identify the same canonical network count once
@@ -238,11 +291,51 @@ first and permanent state second, so a failure on the second write can leave a
 partial change. `flush` and `flush --cache-only` preserve the temporary-ban
 file.
 
+## Manage feeds and exemptions
+
+Use `kidobo sources list`, `kidobo allow list`, and `kidobo config show` to
+inspect saved configuration. `kidobo config path` locates the file, including
+before initialization. To save a feed or exemption:
+
+```bash
+sudo kidobo sources add https://example.org/feed.txt
+sudo kidobo allow add 203.0.113.7
+```
+
+Replace the example URL with your chosen feed. Additions that expand safelist
+coverage require confirmation; use `--yes` when approving one in automation.
+Source and allow edits do not fetch data or change enforcement. Run
+`sudo kidobo sync` to apply them. See [configuration management](configuration.md#managing-configured-sources-and-exemptions)
+for removal rules, overlapping exemptions, and redacted configuration display.
+
+## Shell completions
+
+Generate shell completion scripts with `kidobo completions bash`,
+`kidobo completions zsh`, or `kidobo completions fish`. For a Bash session:
+
+```bash
+kidobo completions bash > kidobo.bash
+source ./kidobo.bash
+```
+
+For persistent installation, put the generated script in your shell's completion
+directory. Generation writes only to stdout and does not read configuration or
+call system tools.
+
+## Remove managed enforcement
+
+`sudo kidobo flush` removes managed firewall rules, ipsets, and remote cache.
+It preserves configuration and saved bans. It also leaves scheduling active:
+the next timer-driven sync can recreate enforcement. To keep enforcement
+removed, [disable scheduling](#scheduling), wait for active syncs to finish,
+then flush. To restore enforcement, run `sudo kidobo sync` and re-enable the
+timer if you want automatic runs.
+
 Full `flush` prints what it will remove and asks for confirmation in an
 interactive terminal. Declining exits successfully without starting cleanup.
 Use `flush --yes` to skip the prompt; noninteractive full flush runs with a
-warning unless `--yes` was supplied. `flush --cache-only` never asks for
-confirmation and leaves firewall and ipset state unchanged.
+warning unless `--yes` was supplied. `sudo kidobo flush --cache-only` never
+asks for confirmation and leaves firewall and ipset state unchanged.
 
 ## When a command fails
 

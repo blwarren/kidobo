@@ -1,4 +1,11 @@
-# Kidobo 1.x compatibility contract
+# Operator interfaces and compatibility
+
+Kidobo is currently pre-1.0. The command, output, and path descriptions below
+document the current implementation. The compatibility guarantee across
+releases begins with 1.0; it does not apply to 0.x releases. Consult the
+[release notes](../CHANGELOG.md) before upgrading.
+
+## Compatibility policy for 1.x
 
 Kidobo 1.x keeps the documented operator contract compatible until 2.0. Minor
 releases may add commands, options, configuration keys, or output fields where
@@ -9,7 +16,7 @@ notes.
 The compatibility-sensitive surface includes:
 
 - The documented root status view, `status`, `check`, `bans`, `init`, `doctor`,
-  `sync`, `flush`, `lookup`, `ban`, `unban`, `setup`, `sources`, `allow`, and
+  `sync`, `flush`, `lookup`, `ban`, `unban`, `setup`, `sources`, `allow`,
   `config`, and `completions` commands and their documented options.
 - Exit status `0` for success, help, and version; `1` for runtime or check
   failure; `2` for usage errors; and `130` for SIGINT.
@@ -91,11 +98,11 @@ saved settings before the wizard completes.
 `sync --dry-run` is a read-only preview that calculates proposed family counts
 and capacity outcomes. It is offline by default and requires the existing sync
 lock file. `sync --dry-run --allow-network` explicitly permits feed and GitHub
-metadata requests and ASN resolution but still keeps results in memory and does not promote or clean
-caches, prune temporary entries, or alter enforcement. `--allow-network`
-without `--dry-run` is a usage error. Preview does not enumerate live set
+metadata requests and ASN resolution but still keeps results in memory and does
+not promote or clean caches, prune temporary entries, or alter enforcement.
+`--allow-network` without `--dry-run` is a usage error. Preview does not enumerate live set
 members, so its exact live delta is unavailable; no last-sync or freshness
-receipt is inferred. Preview output is human-oriented and is not a new JSON contract.
+receipt is inferred. Preview output is human-oriented and has no JSON contract.
 
 `completions bash|zsh|fish` writes the selected shell completion script to
 stdout without loading configuration or invoking system tools.

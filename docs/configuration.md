@@ -2,8 +2,8 @@
 
 Kidobo reads `/etc/kidobo/config.toml` by default. `kidobo init` creates a
 starter file only when one does not already exist. Edit it, then run
-`kidobo doctor` to check the configuration and host prerequisites before
-running `kidobo sync` to apply it. Unknown tables and keys are errors.
+`sudo kidobo doctor` to check the configuration and host prerequisites before
+running `sudo kidobo sync` to apply it. Unknown tables and keys are errors.
 
 ```toml
 [ipset]
@@ -103,11 +103,11 @@ does not split a wider CIDR into smaller ranges. These edits are saved source
 changes; run `sudo kidobo sync` before expecting the live managed set to
 reflect them.
 
-`kidobo config show` displays effective configuration values, their origins,
-and defaults, redacting URL credentials and query/fragment values. It does not
-print secrets. `kidobo config path` prints the active configuration path,
-including a path relocated by `KIDOBO_ROOT`. Both commands are read-only and
-work without creating a missing configuration file.
+`kidobo config show` requires an existing, valid configuration file. It displays
+effective values, their origins, and defaults, redacting URL credentials and
+query/fragment values. `kidobo config path` prints the selected configuration
+path, including a path relocated by `KIDOBO_ROOT`, even before the file exists.
+Both commands are read-only and never create a configuration file.
 
 ## Paths and validation
 
@@ -123,5 +123,5 @@ work without creating a missing configuration file.
 `data/blocklist.txt`, `data/temporary-bans.toml`, `cache/`, and
 `systemd/system/`. With this override, `init` does not enable a live systemd
 timer. Set names and configuration keys remain subject to the same validation.
-See the [1.x compatibility
-contract](compatibility.md) for the supported operator interface.
+See the [compatibility reference](compatibility.md) for current interfaces and
+the 1.x compatibility policy.

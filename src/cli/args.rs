@@ -417,7 +417,7 @@ pub enum Command {
             long,
             value_enum,
             default_value_t = LookupFormat::Human,
-            help = "Select readable table or legacy tab-separated output"
+            help = "Select readable records or tab-separated output for scripts"
         )]
         format: LookupFormat,
     },

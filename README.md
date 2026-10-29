@@ -79,7 +79,7 @@ existing installation.
 - `bgpq4` for ASN resolution and for the complete `doctor` check.
 - systemd only when using the generated periodic sync service and timer.
 
-## Quick Start
+## Quick start
 
 For an interactive first-run guide, start setup in a terminal:
 
@@ -87,10 +87,16 @@ For an interactive first-run guide, start setup in a terminal:
 sudo kidobo setup
 ```
 
-Setup reviews the proposed configuration before saving it, provisions local
-files and service units, and runs `doctor` before offering an initial sync. It
-does not apply firewall changes unless you accept that sync. For automated or
-noninteractive provisioning, use `sudo kidobo init`.
+Setup reviews configuration before saving, provisions missing files, and runs
+`doctor`. It asks separately whether to run an initial sync and enable the
+scheduled timer. Enabling the timer can apply saved settings even if you decline
+the initial sync. An already active timer keeps running during setup.
+
+For noninteractive provisioning, `sudo kidobo init` creates missing files and
+immediately enables scheduling at default paths. See [setup and
+scheduling](docs/operations.md#first-setup) before using it in automation.
+
+### Configure sources
 
 Configure your sources and safelist either in the TOML file or with the
 configuration commands:
@@ -117,26 +123,31 @@ Check configuration and host prerequisites:
 sudo kidobo doctor
 ```
 
-Add a local entry (optional):
+Add a local entry without requesting immediate enforcement (optional):
 
 ```bash
-sudo kidobo ban 203.0.113.7
+sudo kidobo ban 203.0.113.7 --no-apply
 ```
 
-`ban` and `unban` change source state only. Run `sync` to change live
-enforcement. See the [operations guide](docs/operations.md) for file and ASN
-bans, offline lookup, the timer, and failure recovery.
+`ban` and `unban` save source changes first. In an interactive terminal they
+offer to run `sync`; `--apply` requests it explicitly, and `--no-apply` saves
+without prompting. A scheduled sync can also apply saved changes. See
+[ban management](docs/operations.md#add-and-remove-bans) for temporary, file,
+and ASN bans.
+
+### Preview and apply
 
 Preview proposed counts and capacity without changing enforcement:
 
 ```bash
-kidobo sync --dry-run
+sudo kidobo sync --dry-run
 ```
 
-The preview uses validated local caches and stays offline by default. To
-explicitly allow feed, GitHub metadata, and ASN requests while keeping results
-in memory, use
-`kidobo sync --dry-run --allow-network`. A successful preview does not
+The preview stays offline and uses validated caches. It requires the existing
+lock file created by setup or init; `sudo` allows it to read a root-owned lock.
+If required cached sources are unavailable, use
+`sudo kidobo sync --dry-run --allow-network` to allow feed, GitHub metadata,
+and ASN requests with results kept in memory. A successful preview does not
 guarantee a later sync, because inputs and live state can change.
 
 Apply the configured blocklists. Repeat this after changing sources or
@@ -146,22 +157,36 @@ configuration:
 sudo kidobo sync
 ```
 
-Check whether targets match (offline):
+### Verify the result
+
+Inspect live enforcement and check one address:
 
 ```bash
+sudo kidobo status
+sudo kidobo check 203.0.113.7
+```
+
+`check` reports whether Kidobo's managed incoming path blocks the address. It
+reports `UNKNOWN` when it cannot verify that path. Running `kidobo` without a
+subcommand also opens the status view.
+
+Inspect saved bans and offline source overlaps:
+
+```bash
+kidobo bans
 kidobo lookup 203.0.113.7
 ```
 
-Lookup is offline and reports source overlaps, not the live enforced set.
-`sudo kidobo flush` removes managed firewall/ipset artifacts and remote cache;
-read the [operations guide](docs/operations.md#when-a-command-fails) before
-using it for recovery or uninstall.
+`bans` lists operator-managed entries; `lookup` reports local and cached source
+overlaps. Neither establishes live enforcement. For cleanup, read
+[removing managed enforcement](docs/operations.md#remove-managed-enforcement)
+or [uninstalling safely](docs/operations.md#uninstall-safely).
 
 Generate a completion script with `kidobo completions bash`,
 `kidobo completions zsh`, or `kidobo completions fish`; the selected script is
 written to stdout.
 
-## Minimal Config
+## Minimal configuration
 
 `/etc/kidobo/config.toml`:
 
@@ -205,69 +230,17 @@ for timer and logging details.
 
 - [Configuration](docs/configuration.md): keys, defaults, limits, and paths.
 - [Operations](docs/operations.md): routine commands, timer, logs, and recovery.
-- [1.x compatibility contract](docs/compatibility.md): stable operator interfaces.
+- [Compatibility](docs/compatibility.md): current interfaces and the 1.x policy.
+- [Release history](CHANGELOG.md): changes to released versions.
+- [Security policy](SECURITY.md): supported versions and private vulnerability reporting.
 
 ## Development
 
-Development commands are defined in `Justfile`. See the
-[development workflow](docs/development.md) for validation, testing, and release discipline,
-the [command reference](scripts/README.md) for release and recovery details, and the
-[architecture guide](docs/architecture.md) for extension boundaries and recipes.
-
-Development uses Rust 1.99.1 through `rust-toolchain.toml`. The minimum supported
-Rust version remains 1.97.1 in the Cargo manifests. Keep code compatible with that
-minimum and verify it with `RUSTUP_TOOLCHAIN=1.97.1 just test`.
-
-```bash
-cargo install --locked just --version 1.55.1
-just _install-cooldown _install-deny _install-audit
-just check
-just ci
-just release-notes-check
-```
-
-`just test-fast` runs the core, application, and CLI unit tests. The pre-commit hook
-uses `just commit-check` for whitespace checks and, when staged files affect Rust,
-formatting verification and these fast tests. It does not modify source files.
-`just check` runs the development format/test/lint loop with non-E2E tests. Run `just ci`
-before every push; GitHub does not run project CI for pushes or tags. The local CI gate
-checks formatting, lints, dependency policy, audits, and application correctness via `just test-app`.
-`just test` runs non-E2E workspace tests, including documentation, installer, and repository tooling
-tests. Use `just test --include-e2e` when changing the E2E system to also run its unit and local
-integration tests; this does not launch the VM matrix. Publication additionally
-requires coverage, strict rustdoc, the isolated release-binary exercise, static Debian/Alpine
-compatibility, and by default required Debian/Ubuntu coverage in the [Incus distro lifecycle
-matrix](docs/e2e.md). Separate `just e2e` runs cover all seven configured targets, including
-advisory Fedora and AlmaLinux with enforcing SELinux. Each target gets fresh provisioning and
-full application checks, with at most two VMs running concurrently. Read the
-[E2E scope contract](docs/e2e.md#scope-and-non-goals) before changing that infrastructure.
-Fedora and AlmaLinux use reviewed vendor-image pins. E2E startup reports available image and
-stable distro updates without adopting them. Use `just e2e-images-check` for discovery and
-`just e2e-images-refresh [DISTRO]` to verify/import sources and propose pin changes; neither
-command starts VMs. Follow the [image update workflow](docs/e2e.md#image-sources-and-reviewed-updates)
-for review and separately authorized lifecycle acceptance.
-The isolated exercises use a temporary `KIDOBO_ROOT`, a loopback HTTP feed, and fake privileged
-commands; they never
-touch the development host's firewall or systemd. The Incus matrix runs real privileged
-operations only inside disposable VMs. Dependabot update
-PRs are the only GitHub-hosted automation retained. Run
-`just release-notes-check` after every repository change.
-
-Authenticate with `gh auth login` before publishing, then run
-`just publish-release X.Y.Z` from a clean branch. The publisher validates and
-packages the release locally, pushes the release commit and tag atomically,
-verifies the draft's downloaded assets, and only then publishes it. See the
-[development-command reference](scripts/README.md) for the complete workflow
-and failure recovery. Use `just publish-release X.Y.Z --skip-e2e` to omit all E2E-specific
-validation: harness compilation, formatting, linting, documentation, local E2E tests, image
-operations, and the VM matrix. Application checks, unchanged coverage thresholds, shared
-dependency audits/license checks, and publication safeguards remain enabled. Standalone
-developer commands retain their existing scope, including local E2E infrastructure validation.
-Every publication attempt reruns validation and builds its candidate; prior E2E results are not
-reused. E2E logs and frozen evidence survive a failed attempt. The command reference distinguishes
-retrying before publication from recovery after Git refs have been pushed.
-
-Use `just --list` to see all available local and CI recipes.
+Start with the [development workflow](docs/development.md) for toolchain setup
+and required checks. Use `just --list` to discover commands. The
+[architecture guide](docs/architecture.md) explains implementation boundaries;
+the [command reference](scripts/README.md) covers performance checks,
+publication, and recovery.
 
 ## License
 

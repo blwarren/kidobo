@@ -1,58 +1,67 @@
-# Mutation result triage
+# Mutation exclusions
 
-This note records the review of the user-produced `mutants.out` reports. Codex
-does not run mutation testing for this repository.
+Use this guide when reviewing the `exclude_re` patterns in
+[`.cargo/mutants.toml`](../.cargo/mutants.toml). The
+[development workflow](development.md#mutation-results) describes how to assess user-produced
+mutation reports. Mutation execution belongs to the user; agents must not run it.
 
-The incremental run covering production changes since `480d98f` found seven
-missed mutations. Three exposed operator-visible human lookup gaps: removing
-table borders, coloring continuation rows instead of the first status row, and
-omitting the dim `NO MATCH` style. Exact border and color-placement regression
-tests now cover those behaviors.
+An exclusion needs a specific reason tied to the observable contract. Keep command attempts,
+failure ordering, family selection, bounded execution, and cleanup covered even when a mutation
+that changes only a warning or a redundant computation is excluded. A filtered mutation is not
+evidence that tests would catch it.
 
-The other four mutations do not change the relevant production outcome. One
-removes the best-effort join after the command process tree has already been
-terminated and waited upon. Three change only whether a failed or already
-missing temporary ipset destroy emits a warning; the destroy command and
-best-effort return behavior are unchanged. Narrow `exclude_re` entries keep
-future mutation runs focused without suppressing command sequencing or cleanup
-attempt coverage.
+## Patterns that match current code
 
-The focused rerun confirmed the remediation: 74 mutants were evaluated, with
-41 caught, 33 unviable, no missed mutants, and no timeouts. The three lookup
-mutants are now caught, and the four documented non-behavioral mutations are
-excluded. This incremental triage is complete; the unviable results remain
-inconclusive and do not justify score-driven test changes.
+### Best-effort temporary-set destruction
 
-The broader safety-critical run from 2026-07-18 evaluated 265 mutants across
-configuration, sync orchestration, command execution, locking, ipset,
-iptables, and flush behavior. The unmutated baseline passed. The report
-contained 47 missed, 3 timeout, 76 unviable, and 139 caught mutants.
+The match-guard and `||` patterns for `best_effort_destroy_set` in
+[`ipset.rs`](../crates/kidobo-adapters/src/ipset.rs) change which command results emit warnings.
+They preserve the `ipset destroy` attempt and the best-effort return behavior. These filters do
+not justify excluding removal of the command itself or changes to restore/swap ordering.
+The adapter tests assert command sequencing and the final destroy attempt after restore failure.
 
-The meaningful gaps now have focused behavioral coverage. Tests pin exact
-configuration time bounds and validated-newtype conversions, the 31-byte ipset
-name boundary, explicit `hash:net` parsing, nontrivial timeout conversion,
-lock and command-error classifiers, deterministic sorting and deduplication,
-temporary restore-script deletion on success and failure, UTF-8-safe byte
-truncation, temporary-set suffix sizing, and exact IPv4/IPv6 firewall binary
-selection. Redundant postcondition branches in temporary-set naming and
-disabled-IPv6 cleanup were simplified without changing production behavior.
-Test-only restore-script read limits now use their literal byte value so
-mutation testing does not spend time varying fixture arithmetic.
+### Diagnostic formatting
 
-Eight reported mutations are intentionally filtered. Diagnostic-only changes
-to `stderr_detail` and the disabled sync timer have no stable operator-visible
-contract. Forcing `is_sorted_and_unique` to return false is equivalent because
-the fallback still sorts and deduplicates. Allowing the UTF-8 truncation loop
-to inspect byte index zero is equivalent because zero is always a character
-boundary, while replacing its decrement with division creates artificial
-non-progress. The two `FirewallFamily::binary` replacement mutants are covered
-by exact unit assertions but cause unrelated integration tests to hang before
-cargo-mutants can classify the failure, so they are excluded narrowly by
-function name. The 76 unviable mutants remain inconclusive and are not a reason
-for score-driven production changes.
+The `stderr_detail` replacement pattern changes the text used for empty or trimmed stderr.
+It matches helpers in both [`ipset.rs`](../crates/kidobo-adapters/src/ipset.rs) and
+[`doctor.rs`](../crates/kidobo-app/src/doctor.rs). Their command results and doctor check statuses
+are decided separately. Reassess this pattern if exact diagnostic text becomes a supported
+contract or another function with this name is added; the regex does not restrict its module.
 
-The 2026-07-18 user-run confirmation rerun evaluated 246 selected mutants. The
-unmutated baseline passed; 170 mutants were caught, 76 were unviable, and none
-were missed or timed out. This confirms that all viable selected mutants are
-either behaviorally covered or intentionally excluded. The safety-critical
-triage is complete, and the unviable results require no score-driven follow-up.
+### Equivalent sorting and UTF-8 boundary checks
+
+In [`ipset.rs`](../crates/kidobo-adapters/src/ipset.rs):
+
+- Replacing `is_sorted_and_unique` with `false` forces sorting and deduplication even when the input
+  already has those properties. The output remains the same; the extra work is the difference.
+- Replacing `>` with `>=` in `truncate_to_max_bytes` permits a boundary check at byte index zero.
+  Zero is always a UTF-8 character boundary, so the resulting slice is unchanged.
+- Replacing `-=` with `/=` in that loop leaves its index unchanged because the operand is one.
+  This creates artificial nontermination when truncation lands inside a multibyte character.
+
+Keep the exact prefix and UTF-8 boundary assertions. Revisit these exclusions if either the
+fallback algorithm or the loop changes.
+
+### Firewall binary selection
+
+The `FirewallFamily::binary` replacement pattern excludes incorrect replacements of `iptables`
+and `ip6tables`. This is a test-execution workaround for integration-test hangs described in the
+mutation configuration, rather than equivalent behavior. The `firewall_family_selects_exact_binary`
+unit test in [`iptables.rs`](../crates/kidobo-adapters/src/iptables.rs) asserts both mappings.
+Reassess the filter when changing command fixtures or family dispatch; retain those exact assertions
+and coverage that keeps IPv4 and IPv6 operations separate.
+
+## Patterns without current targets
+
+The configuration also contains patterns for `best_effort_join_output_reader` and
+`SyncStageTimer::mark`. Neither symbol exists in the current source, so these patterns currently
+exclude nothing. The command executor now polls nonblocking output pipes, and timing is handled by
+`LoggingSyncObserver::stage_completed`. Remove obsolete patterns when maintaining the mutation
+configuration; do not transfer their rationale to new functions based only on similar names.
+
+## Maintaining the rationale
+
+When changing an exclusion or the code it matches, check its full match scope, identify the
+contract it could hide, and retain behavioral coverage for that contract. Record the current
+reason here. Keep run-specific commands, counts, and results with the reviewed report or change
+record rather than treating them as continuing qualification of later code.
