@@ -313,7 +313,7 @@ pub fn execute(
     dependencies.cancellation.check()?;
 
     start_stage(dependencies.observer, SyncStage::LoadConfig);
-    let config = dependencies.configs.load(&paths.config_file)?;
+    dependencies.configs.load(&paths.config_file)?;
     complete_stage(dependencies.observer, SyncStage::LoadConfig);
     dependencies.cancellation.check()?;
 
@@ -323,6 +323,9 @@ pub fn execute(
     let cutoff = dependencies.clock.now_unix_secs()?;
     dependencies.cancellation.check()?;
 
+    // A source-editing command may have published a new configuration before lock acquisition.
+    let config = dependencies.configs.load(&paths.config_file)?;
+    dependencies.cancellation.check()?;
     let temporary_path = paths.temporary_bans_file();
     let mut temporary_bans = dependencies.temporary_bans.load(&temporary_path)?;
     if config.ipset.timeout != 0
@@ -1302,6 +1305,175 @@ mod tests {
         )
     }
 
+    struct ConfigChangingAtLock {
+        ledger: Ledger,
+        contents: Mutex<String>,
+        replacement: String,
+    }
+
+    impl ConfigRepository for ConfigChangingAtLock {
+        fn load(&self, _path: &Path) -> Result<Config, AppError> {
+            record(&self.ledger, "config");
+            Config::from_toml_str(&self.contents.lock().expect("config contents"))
+                .map_err(AppError::from)
+        }
+    }
+
+    impl LockManager for ConfigChangingAtLock {
+        fn acquire(&self, path: &Path) -> Result<Box<dyn LockGuard>, AppError> {
+            *self.contents.lock().expect("config contents") = self.replacement.clone();
+            record(&self.ledger, "publish-config");
+            FakeLocks(Arc::clone(&self.ledger)).acquire(path)
+        }
+    }
+
+    impl ConfigChangingAtLock {
+        fn execute(
+            &self,
+            sources: &SyncSourceRegistry,
+            enforcement: &FakeEnforcement,
+        ) -> Result<super::SyncOutcome, AppError> {
+            let observer = RecordingObserver::default();
+            let temporary = TemporaryState {
+                ledger: Some(Arc::clone(&self.ledger)),
+                ..TemporaryState::default()
+            };
+            execute(
+                &request(),
+                &SyncDependencies {
+                    cancellation: &observer,
+                    paths: &FakePaths {
+                        ledger: Arc::clone(&self.ledger),
+                        paths: test_paths(),
+                    },
+                    configs: self,
+                    locks: self,
+                    clock: &temporary,
+                    temporary_bans: &temporary,
+                    sources,
+                    enforcement,
+                    observer: &observer,
+                },
+            )
+        }
+    }
+
+    #[test]
+    fn config_revision_published_before_lock_controls_enforcement() {
+        struct ConfigSafelist;
+
+        impl SyncSourceProvider for ConfigSafelist {
+            fn descriptor(&self) -> SyncSourceDescriptor {
+                SyncSourceDescriptor {
+                    id: "config-safelist",
+                    role: SourceRole::Safelist,
+                    failure_policy: FailurePolicy::Required,
+                }
+            }
+
+            fn load(&self, context: &SyncSourceContext<'_>) -> Result<SyncSourceLoad, AppError> {
+                Ok(SyncSourceLoad::ready(SyncSourceBatch {
+                    networks: context.config.safe.ips.clone(),
+                    notices: Vec::new(),
+                }))
+            }
+        }
+
+        let ledger = Ledger::default();
+        let original = "[ipset]\nset_name='kidobo'\nenable_ipv6=false\n";
+        let config = ConfigChangingAtLock {
+            ledger: Arc::clone(&ledger),
+            contents: Mutex::new(original.to_string()),
+            replacement: format!("{original}[safe]\nips=['203.0.113.7']\n"),
+        };
+        let mut sources = registry(
+            &ledger,
+            vec![provider(
+                &ledger,
+                "local",
+                SourceRole::Candidate,
+                FailurePolicy::Required,
+                vec![cidr("203.0.113.7"), cidr("198.51.100.9")],
+            )],
+        );
+        sources.register(ConfigSafelist).expect("safelist source");
+        let enforcement = FakeEnforcement {
+            ledger: Arc::clone(&ledger),
+            fail_at: None,
+            replacements: Mutex::new(Vec::new()),
+        };
+
+        config.execute(&sources, &enforcement).expect("sync");
+
+        assert_eq!(
+            *enforcement.replacements.lock().expect("replacements"),
+            [(AddressFamily::Ipv4, vec![cidr("198.51.100.9")])]
+        );
+        assert_eq!(events(&ledger).last().map(String::as_str), Some("unlock"));
+    }
+
+    #[test]
+    fn invalid_config_revision_stops_before_source_cache_or_firewall_work() {
+        for initially_valid in [false, true] {
+            let ledger = Ledger::default();
+            let config = ConfigChangingAtLock {
+                ledger: Arc::clone(&ledger),
+                contents: Mutex::new(if initially_valid {
+                    "[ipset]\nset_name='kidobo'\n".to_string()
+                } else {
+                    "invalid TOML".to_string()
+                }),
+                replacement: "invalid TOML".to_string(),
+            };
+            let mut sources = SyncSourceRegistry::new();
+            sources
+                .register(DeferredSource {
+                    ledger: Arc::clone(&ledger),
+                    descriptor: SyncSourceDescriptor {
+                        id: "remote",
+                        role: SourceRole::Candidate,
+                        failure_policy: FailurePolicy::Required,
+                    },
+                    primary: vec![cidr("203.0.113.7")],
+                    fallback: None,
+                    fail_promotion: false,
+                })
+                .expect("remote source");
+            let enforcement = FakeEnforcement {
+                ledger: Arc::clone(&ledger),
+                fail_at: None,
+                replacements: Mutex::new(Vec::new()),
+            };
+
+            let error = config
+                .execute(&sources, &enforcement)
+                .expect_err("invalid configuration must stop sync");
+
+            assert!(matches!(error, AppError::ConfigParse { .. }));
+            let expected = if initially_valid {
+                vec![
+                    "paths",
+                    "config",
+                    "publish-config",
+                    "lock",
+                    "clock",
+                    "config",
+                    "unlock",
+                ]
+            } else {
+                vec!["paths", "config"]
+            };
+            assert_eq!(events(&ledger), expected);
+            assert!(
+                enforcement
+                    .replacements
+                    .lock()
+                    .expect("replacements")
+                    .is_empty()
+            );
+        }
+    }
+
     #[test]
     fn temporary_bans_expire_at_one_cutoff_without_renewal_and_preserve_other_sources() {
         let ledger = Ledger::default();
@@ -1393,12 +1565,13 @@ mod tests {
     fn assert_temporary_snapshot_order(ledger: &Ledger, pruned: bool) {
         let actual = events(ledger);
         assert_eq!(
-            &actual[..6],
+            &actual[..7],
             [
                 "paths",
                 "config",
                 "lock",
                 "clock",
+                "config",
                 "load-temporary",
                 "ensure"
             ]
@@ -1451,6 +1624,7 @@ mod tests {
                 "config",
                 "lock",
                 "clock",
+                "config",
                 "load-temporary",
                 "unlock"
             ]
@@ -1814,6 +1988,7 @@ mod tests {
                 "paths",
                 "config",
                 "lock",
+                "config",
                 "ensure",
                 "source:candidate",
                 "source:safelist",
@@ -1900,6 +2075,7 @@ mod tests {
                 "paths",
                 "config",
                 "lock",
+                "config",
                 "ensure",
                 "source:required",
                 "unlock"

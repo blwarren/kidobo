@@ -10,6 +10,11 @@ use std::process::{Command, Stdio};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
+#[path = "support/pty.rs"]
+mod pty;
+
+use pty::{OutputDestination, PtyCommand};
+
 const TEST_VERSION: &str = "v9.8.7";
 const FIXTURE_FILE_READ_LIMIT: usize = 16 * 1024 * 1024;
 
@@ -274,6 +279,40 @@ uninstall_artifacts
         command
     }
 
+    fn use_current_binary(&self) -> Command {
+        fs::write(
+            self.root.join("config/config.toml"),
+            "[ipset]\nset_name='kidobo'\n",
+        )
+        .expect("valid config");
+        fs::write(self.root.join("data/blocklist.txt"), "203.0.113.7\n").expect("saved ban");
+        write_executable(
+            &self.install_dir.join("kidobo"),
+            r#"#!/bin/bash
+set -euo pipefail
+[[ "$#" == 1 && "$1" == flush ]]
+printf 'flush\n' >> "$KIDOBO_TEST_EVENTS"
+KIDOBO_ROOT="$KIDOBO_TEST_ROOT" "$KIDOBO_TEST_BINARY" "$@"
+printf 'flush-complete\n' >> "$KIDOBO_TEST_EVENTS"
+"#,
+        );
+        let cleanup_bin = write_cleanup_fakes(&self.temp);
+        for tool in ["sudo", "ipset", "iptables", "ip6tables"] {
+            fs::copy(
+                cleanup_bin.join(tool),
+                self.temp.path().join("fake-bin").join(tool),
+            )
+            .expect("install fake firewall command");
+        }
+        let mut command = self.command();
+        command
+            .env("KIDOBO_TEST_BINARY", env!("CARGO_BIN_EXE_kidobo"))
+            .env("KIDOBO_TEST_CLEANUP_LOG", &self.log)
+            .env_remove("INVOCATION_ID")
+            .env_remove("JOURNAL_STREAM");
+        command
+    }
+
     fn events(&self) -> Vec<String> {
         read_to_string_with_limit(&self.log, FIXTURE_FILE_READ_LIMIT)
             .lines()
@@ -295,6 +334,143 @@ uninstall_artifacts
             );
         }
         assert!(self.install_dir.join("kidobo").exists());
+    }
+}
+
+#[test]
+fn terminal_uninstall_completes_real_flush_before_removing_artifacts() {
+    let fixture = DefaultUninstallFixture::new();
+    let output = PtyCommand::spawn(
+        fixture.use_current_binary(),
+        80,
+        OutputDestination::Terminal,
+    )
+    .respond_after("running kidobo flush", "n\n");
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(!output.stdout.contains("[y/N]"), "{output:?}");
+    assert!(output.stderr.contains("Warning: full flush"), "{output:?}");
+    let events = fixture.events();
+    let destroyed = events
+        .iter()
+        .position(|event| event == "ipset destroy kidobo")
+        .expect("actual CLI must invoke the fake cleanup backend");
+    let flushed = events
+        .iter()
+        .position(|event| event == "flush-complete")
+        .expect("flush completed");
+    let disabled = events
+        .iter()
+        .position(|event| event == "disable kidobo-sync.timer")
+        .expect("timer disabled");
+    let removed = events
+        .iter()
+        .position(|event| event == "remove")
+        .expect("artifact removal");
+    assert!(
+        destroyed < flushed && flushed < disabled && disabled < removed,
+        "{events:?}"
+    );
+    for path in ["config", "data", "cache"] {
+        assert!(!fixture.root.join(path).exists(), "retained {path}");
+    }
+    assert!(!fixture.install_dir.join("kidobo").exists());
+}
+
+#[test]
+fn terminal_uninstall_preserves_artifacts_and_restores_timer_when_real_flush_fails() {
+    let fixture = DefaultUninstallFixture::new();
+    let mut command = fixture.use_current_binary();
+    command.env("KIDOBO_TEST_FAIL_CLEANUP", "iptables");
+    let output = PtyCommand::spawn(command, 80, OutputDestination::Terminal)
+        .respond_after("running kidobo flush", "n\n");
+
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(!output.stdout.contains("[y/N]"), "{output:?}");
+    assert!(
+        output.stderr.contains("config-aware flush failed"),
+        "{output:?}"
+    );
+    let events = fixture.events();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.starts_with("iptables -w 5 -F ")),
+        "{events:?}"
+    );
+    assert_eq!(
+        events.last().map(String::as_str),
+        Some("start kidobo-sync.timer")
+    );
+    assert!(
+        !events.iter().any(|event| event == "remove"
+            || event == "flush-complete"
+            || event.starts_with("disable ")),
+        "{events:?}"
+    );
+    assert!(fixture.install_dir.join("kidobo").exists());
+    for artifact in [
+        "config/config.toml",
+        "data/blocklist.txt",
+        "cache/remote.cache",
+        "systemd/system/kidobo-sync.service",
+        "systemd/system/kidobo-sync.timer",
+    ] {
+        assert!(fixture.root.join(artifact).is_file(), "removed {artifact}");
+    }
+    assert_eq!(
+        read_to_string_with_limit(&fixture.root.join("data/blocklist.txt"), 1024),
+        "203.0.113.7\n"
+    );
+}
+
+#[test]
+fn terminal_uninstall_flush_supports_legacy_binary_with_direct_and_sudo_invocation() {
+    for root_override in [true, false] {
+        let temp = TempDir::new().expect("tempdir");
+        let binary = temp.path().join("kidobo");
+        write_executable(
+            &binary,
+            r#"#!/bin/bash
+set -euo pipefail
+[[ "$#" == 1 && "$1" == flush ]] || exit 91
+[[ ! -t 0 && -t 1 ]] || exit 92
+if read -r unexpected; then exit 93; fi
+printf 'legacy-cleanup-complete\n'
+"#,
+        );
+        let mut command = Command::new("bash");
+        command
+            .args([
+                "-c",
+                r#"
+source "$INSTALLER"
+sudo() { [[ "$1" == -n ]]; shift; printf 'fake-sudo\n'; "$@"; }
+run_config_aware_flush
+if [[ -z "$KIDOBO_ROOT_OVERRIDE" && "$EUID" -ne 0 ]]; then
+    printf 'sudo-branch-selected\n'
+fi
+"#,
+            ])
+            .env("INSTALLER", installer_path())
+            .env("KIDOBO_INSTALL_DIR", temp.path())
+            .env_remove("KIDOBO_ROOT");
+        if root_override {
+            command.env("KIDOBO_ROOT", temp.path());
+        }
+        let output = PtyCommand::spawn(command, 80, OutputDestination::Terminal)
+            .respond_after("running kidobo flush", "n\n");
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        assert!(
+            output.stdout.contains("legacy-cleanup-complete"),
+            "{output:?}"
+        );
+        assert!(output.stderr.is_empty(), "{output:?}");
+        if output.stdout.contains("sudo-branch-selected") {
+            assert!(output.stdout.contains("fake-sudo"), "{output:?}");
+        } else {
+            assert!(!output.stdout.contains("fake-sudo"), "{output:?}");
+        }
     }
 }
 

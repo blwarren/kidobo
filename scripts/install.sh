@@ -300,19 +300,20 @@ run_config_aware_flush() {
     fi
 
     echo "running ${BINARY_NAME} flush"
+    # --uninstall authorizes cleanup; older binaries need plain flush without a TTY prompt.
     if [[ -n "${KIDOBO_ROOT_OVERRIDE}" ]]; then
-        if "${TARGET_PATH}" flush; then
+        if "${TARGET_PATH}" flush </dev/null; then
             return 0
         fi
     elif [[ "${EUID}" -eq 0 ]]; then
-        if "${TARGET_PATH}" flush; then
+        if "${TARGET_PATH}" flush </dev/null; then
             return 0
         fi
     elif has_cmd sudo; then
-        if sudo -n "${TARGET_PATH}" flush; then
+        if sudo -n "${TARGET_PATH}" flush </dev/null; then
             return 0
         fi
-    elif "${TARGET_PATH}" flush; then
+    elif "${TARGET_PATH}" flush </dev/null; then
         return 0
     fi
 

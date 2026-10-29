@@ -302,7 +302,11 @@ if work is active or that state cannot be established; it never stops an
 active sync. Wait for existing work to finish and retry.
 
 The installer must complete config-aware `flush` before disabling the timer
-or removing artifacts. A missing binary, invalid configuration, held lock, or
+or removing artifacts. `--uninstall` authorizes this cleanup; the installer runs
+its internal flush with noninteractive input and no additional confirmation,
+including when uninstall is started from a terminal. Cleanup output and failures
+remain visible. Standalone interactive `kidobo flush` still asks for confirmation.
+A missing binary, invalid configuration, held lock, or
 cleanup failure preserves the installed files. If uninstall fails before
 artifact removal, it restarts the timer only when it was previously active
 and reports any restoration failure. With `KIDOBO_ROOT`, uninstall skips host
