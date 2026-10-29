@@ -11,7 +11,7 @@ use kidobo_app::init::{
 use crate::command_runner::{
     CommandExecutor, CommandResult, CommandRunnerError, SudoCommandRunner, SystemCommandExecutor,
 };
-use crate::limited_io::write_string_atomic;
+use crate::limited_io::create_string_atomic;
 
 /// Command boundary used for systemd initialization.
 pub trait InitCommandRunner {
@@ -109,11 +109,30 @@ impl<R: InitCommandRunner> InitProvisioner for FileInitProvisioner<R> {
         if let Some(parent) = path.parent() {
             self.ensure_dir(parent)?;
         }
-        write_string_atomic(path, contents).map_err(|error| AppError::InitIo {
-            path: path.to_path_buf(),
-            source: error,
-        })?;
-        Ok(ProvisionState::Created)
+        match create_string_atomic(path, contents) {
+            Ok(()) => Ok(ProvisionState::Created),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let metadata = fs::metadata(path).map_err(|source| AppError::InitIo {
+                    path: path.to_path_buf(),
+                    source,
+                })?;
+                if metadata.is_file() {
+                    Ok(ProvisionState::Preserved)
+                } else {
+                    Err(AppError::InitIo {
+                        path: path.to_path_buf(),
+                        source: std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "path exists but is not a file",
+                        ),
+                    })
+                }
+            }
+            Err(source) => Err(AppError::InitIo {
+                path: path.to_path_buf(),
+                source,
+            }),
+        }
     }
 
     fn enable_systemd_timer(&self) -> Result<(), AppError> {
@@ -237,6 +256,143 @@ mod tests {
             crate::limited_io::read_to_string_with_limit(&path, 1024).expect("read"),
             "custom bytes\n"
         );
+    }
+
+    #[test]
+    fn creates_complete_files_and_preserves_them_on_repeated_provisioning() {
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("nested/config.toml");
+        let provisioner = FileInitProvisioner::new(Runner {
+            calls: RefCell::new(Vec::new()),
+            failure: None,
+        });
+        assert_eq!(
+            provisioner
+                .ensure_file(&path, "initial bytes\n")
+                .expect("create"),
+            ProvisionState::Created
+        );
+        assert_eq!(
+            provisioner
+                .ensure_file(&path, "replacement")
+                .expect("preserve"),
+            ProvisionState::Preserved
+        );
+        assert_eq!(
+            crate::limited_io::read_to_string_with_limit(&path, 1024).expect("read"),
+            "initial bytes\n"
+        );
+        assert_eq!(
+            fs::read_dir(path.parent().expect("parent"))
+                .expect("directory")
+                .count(),
+            1
+        );
+        assert!(provisioner.runner.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn preserves_a_file_created_between_staging_and_publication() {
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("config.toml");
+        let competing_path = path.clone();
+        let provisioner = FileInitProvisioner::new(Runner {
+            calls: RefCell::new(Vec::new()),
+            failure: None,
+        });
+        let state = crate::limited_io::publication_test::interleave(
+            move || {
+                assert!(!competing_path.exists());
+                fs::write(competing_path, "operator settings\n").expect("competing creation");
+            },
+            || provisioner.ensure_file(&path, "default settings\n"),
+        )
+        .expect("preserve concurrent creator");
+        assert_eq!(state, ProvisionState::Preserved);
+        assert_eq!(
+            crate::limited_io::read_to_string_with_limit(&path, 1024).expect("read"),
+            "operator settings\n"
+        );
+        assert_eq!(fs::read_dir(temp.path()).expect("directory").count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preserves_a_concurrently_acquired_lock_inode_and_exclusion() {
+        use crate::lock::{LockError, acquire_non_blocking};
+        use std::os::unix::fs::MetadataExt;
+        use std::rc::Rc;
+
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("sync.lock");
+        let competing_path = path.clone();
+        let held = Rc::new(RefCell::new(None));
+        let competing_held = Rc::clone(&held);
+        let provisioner = FileInitProvisioner::new(Runner {
+            calls: RefCell::new(Vec::new()),
+            failure: None,
+        });
+        let state = crate::limited_io::publication_test::interleave(
+            move || {
+                let guard = acquire_non_blocking(&competing_path).expect("competing lock");
+                let inode = fs::metadata(&competing_path).expect("lock metadata").ino();
+                *competing_held.borrow_mut() = Some((guard, inode));
+            },
+            || provisioner.ensure_file(&path, ""),
+        )
+        .expect("preserve lock");
+        assert_eq!(state, ProvisionState::Preserved);
+        assert_eq!(
+            fs::metadata(&path).expect("lock metadata").ino(),
+            held.borrow().as_ref().expect("held lock").1
+        );
+        match acquire_non_blocking(&path).expect_err("competing acquisition must fail") {
+            LockError::AlreadyHeld {
+                path: actual,
+                source,
+            } => {
+                assert_eq!(actual, path);
+                assert_eq!(source.kind(), std::io::ErrorKind::WouldBlock);
+            }
+            other => panic!("unexpected lock error: {other}"),
+        }
+        assert_eq!(fs::read_dir(temp.path()).expect("directory").count(), 1);
+        drop(held.borrow_mut().take());
+        let _guard = acquire_non_blocking(&path).expect("lock available after release");
+    }
+
+    #[test]
+    fn rejects_existing_or_concurrently_created_directories_without_replacing_them() {
+        for concurrent in [false, true] {
+            let temp = TempDir::new().expect("tempdir");
+            let path = temp.path().join("config.toml");
+            let competing_path = path.clone();
+            let provisioner = FileInitProvisioner::new(Runner {
+                calls: RefCell::new(Vec::new()),
+                failure: None,
+            });
+            if !concurrent {
+                fs::create_dir(&path).expect("existing directory");
+            }
+            let error = crate::limited_io::publication_test::interleave(
+                move || fs::create_dir(competing_path).expect("competing directory"),
+                || provisioner.ensure_file(&path, "default settings"),
+            )
+            .expect_err("directory must fail");
+            match error {
+                kidobo_app::AppError::InitIo {
+                    path: actual,
+                    source,
+                } => {
+                    assert_eq!(actual, path);
+                    assert_eq!(source.kind(), std::io::ErrorKind::InvalidInput);
+                    assert_eq!(source.to_string(), "path exists but is not a file");
+                }
+                other => panic!("unexpected init error: {other}"),
+            }
+            assert!(path.is_dir());
+            assert_eq!(fs::read_dir(temp.path()).expect("directory").count(), 1);
+        }
     }
 
     #[test]

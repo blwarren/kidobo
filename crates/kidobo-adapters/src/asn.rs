@@ -192,7 +192,14 @@ pub(crate) fn read_asn_for_preview(
     stale_after: Duration,
     resolver: Option<&dyn AsnPrefixResolver>,
 ) -> Result<CachedAsnPrefixes, AsnError> {
-    prepare_asn_prefixes(asn, cache_dir, stale_after, resolver)
+    let loaded = prepare_asn_prefixes(asn, cache_dir, stale_after, resolver)?;
+    if loaded.source == SourceProvenance::Network {
+        serialize_asn_cache(&loaded.prefixes).map_err(|source| AsnError::CacheWrite {
+            path: asn_cache_file(cache_dir, asn),
+            source,
+        })?;
+    }
+    Ok(loaded)
 }
 
 fn prepare_asn_prefixes(
@@ -332,19 +339,15 @@ fn read_asn_cache_file(path: &Path) -> Result<Option<AsnCacheState>, AsnError> {
 }
 
 fn write_asn_cache_file(path: &Path, prefixes: &[CanonicalCidr]) -> Result<(), AsnError> {
+    let output = serialize_asn_cache(prefixes).map_err(|source| AsnError::CacheWrite {
+        path: path.to_path_buf(),
+        source,
+    })?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|err| AsnError::CacheWrite {
             path: parent.to_path_buf(),
             source: err,
         })?;
-    }
-
-    let mut output = String::new();
-    output.push_str(ASN_CACHE_FILE_WRITE_HEADER);
-    output.push('\n');
-    for prefix in prefixes {
-        output.push_str(&prefix.to_string());
-        output.push('\n');
     }
 
     write_string_atomic_with_limit(path, &output, ASN_CACHE_FILE_READ_LIMIT).map_err(|err| {
@@ -353,6 +356,22 @@ fn write_asn_cache_file(path: &Path, prefixes: &[CanonicalCidr]) -> Result<(), A
             source: err,
         }
     })
+}
+
+fn serialize_asn_cache(prefixes: &[CanonicalCidr]) -> std::io::Result<String> {
+    let mut output = format!("{ASN_CACHE_FILE_WRITE_HEADER}\n");
+    for prefix in prefixes {
+        let prefix = prefix.to_string();
+        if output.len() + prefix.len() + 1 > ASN_CACHE_FILE_READ_LIMIT {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("file exceeds {ASN_CACHE_FILE_READ_LIMIT} byte limit"),
+            ));
+        }
+        output.push_str(&prefix);
+        output.push('\n');
+    }
+    Ok(output)
 }
 
 fn parse_cidrs_from_bgpq4_output(
@@ -919,18 +938,49 @@ mod tests {
     }
 
     #[test]
-    fn oversized_cache_refresh_preserves_existing_or_absent_cache() {
-        let prefixes = cache_limit_prefixes("2001:db8:1111:2222:3:4:5:6/128");
+    fn preview_accepts_exact_serialized_limit_without_changing_missing_or_stale_cache() {
+        let prefixes = cache_limit_prefixes("2001:db8:1111:222:3:4:5:6/128");
         for existing in [false, true] {
             let temp = TempDir::new().expect("tempdir");
-            let path = temp.path().join("as64512.iplist");
+            let cache_dir = temp.path().join("cache");
+            if existing {
+                fs::create_dir(&cache_dir).expect("cache directory");
+                fs::write(cache_dir.join("as64512.iplist"), "203.0.113.0/24\n")
+                    .expect("seed stale cache");
+            }
+            let before = snapshot(temp.path());
+            let resolver = Mutex::new(MockResolver::new(vec![Ok(prefixes.clone())]));
+            let loaded = read_asn_for_preview(64512, &cache_dir, Duration::ZERO, Some(&resolver))
+                .expect("exact-limit preview");
+            assert_eq!(loaded.source, SourceProvenance::Network);
+            assert!(!loaded.stale);
+            assert_eq!(loaded.prefixes, prefixes);
+            assert_eq!(snapshot(temp.path()), before);
+        }
+    }
+
+    #[test]
+    fn oversized_refresh_and_preview_preserve_existing_or_absent_cache() {
+        let prefixes = cache_limit_prefixes("2001:db8:1111:2222:3:4:5:6/128");
+        let effective = kidobo_core::sync::compute_effective_blocklists(&prefixes, &[], true);
+        assert_eq!(effective.ipv4.len(), 0);
+        assert!(effective.ipv6.len() < 64, "collapsed output fits capacity");
+        for (existing, preview) in [(false, true), (true, true), (false, false), (true, false)] {
+            let temp = TempDir::new().expect("tempdir");
+            let cache_dir = temp.path().join("cache");
+            let path = cache_dir.join("as64512.iplist");
             let original = "# kidobo-asn-cache-v1\n203.0.113.0/24\n";
             if existing {
+                fs::create_dir(&cache_dir).expect("cache directory");
                 fs::write(&path, original).expect("seed cache");
             }
+            let before = snapshot(temp.path());
             let resolver = Mutex::new(MockResolver::new(vec![Ok(prefixes.clone())]));
-            let result =
-                load_asn_prefixes_with_cache(64512, temp.path(), Duration::ZERO, &resolver);
+            let result = if preview {
+                read_asn_for_preview(64512, &cache_dir, Duration::ZERO, Some(&resolver))
+            } else {
+                load_asn_prefixes_with_cache(64512, &cache_dir, Duration::ZERO, &resolver)
+            };
             let Err(error) = result else {
                 panic!("oversized refresh must be rejected");
             };
@@ -941,6 +991,7 @@ mod tests {
                 } => {
                     assert_eq!(failed_path, path);
                     assert_eq!(source.kind(), std::io::ErrorKind::InvalidData);
+                    assert_eq!(source.to_string(), "file exceeds 8388608 byte limit");
                 }
                 error => panic!("unexpected error: {error}"),
             }
@@ -953,6 +1004,7 @@ mod tests {
             } else {
                 assert!(!path.try_exists().expect("inspect cache"));
             }
+            assert_eq!(snapshot(temp.path()), before);
         }
     }
 

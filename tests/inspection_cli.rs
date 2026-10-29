@@ -87,7 +87,11 @@ impl Fixture {
             r#"case "$1" in
     list)
         if [ "$2" = "-name" ]; then
-            printf 'kidobo\nkidobo-v6\n'
+            if [ "${KIDOBO_TEST_SET_NAMES+x}" = x ]; then
+                printf '%s\n' "$KIDOBO_TEST_SET_NAMES"
+            else
+                printf 'kidobo\nkidobo-v6\n'
+            fi
         elif [ "$3" = "-terse" ]; then
             case "$2" in
                 kidobo) family=inet; count=7 ;;
@@ -242,6 +246,81 @@ fn check_verifies_membership_and_keeps_offline_matches_separate() {
         report["offline_matches"].as_array().expect("matches").len(),
         0
     );
+}
+
+#[test]
+fn unrelated_set_names_do_not_change_status_or_membership_verdicts() {
+    let fixture = Fixture::new(Some(&config(true)), Some(""), Some("version = 1\n"));
+    let names = "other:valid\nkidobo\nother+valid\nkidobo-v6\nkidobo:shadow\nkidobo-v6:shadow";
+    let status = fixture.run(
+        &["status", "--format", "json"],
+        &[("KIDOBO_TEST_SET_NAMES", names)],
+    );
+    assert_eq!(status.status.code(), Some(0), "{status:?}");
+    let report = json_output(&status);
+    for (family, entries) in [("ipv4", 7), ("ipv6", 9)] {
+        assert_eq!(report[family]["set_state"], "verified");
+        assert_eq!(report[family]["enforcement"], "verified");
+        assert_eq!(report[family]["entries"], entries);
+        assert_eq!(report[family]["stable"], true);
+    }
+
+    for (address, family) in [("203.0.113.7", "ipv4"), ("2001:db8::7", "ipv6")] {
+        for (membership, verdict) in [("present", "blocked"), ("absent", "not_blocked")] {
+            let output = fixture.run(
+                &["check", address, "--format", "json"],
+                &[
+                    ("KIDOBO_TEST_SET_NAMES", names),
+                    ("KIDOBO_TEST_MEMBERSHIP", membership),
+                ],
+            );
+            assert_eq!(output.status.code(), Some(0), "{output:?}");
+            let report = json_output(&output);
+            assert_eq!(report["verdict"], verdict);
+            assert_eq!(report["family"]["family"], family);
+            assert_eq!(report["family"]["set_state"], "verified");
+            assert_eq!(report["family"]["membership"], membership);
+            assert_eq!(report["family"]["stable"], true);
+        }
+    }
+    let log = fixture.tool_log();
+    assert!(!log.contains("sudo "), "{log}");
+    assert!(!log.contains("other:valid -terse"), "{log}");
+    assert!(!log.contains("other+valid -terse"), "{log}");
+}
+
+#[test]
+fn unrelated_set_names_do_not_hide_managed_set_absence() {
+    let fixture = Fixture::new(Some(&config(true)), Some(""), Some("version = 1\n"));
+    for program in ["iptables", "ip6tables"] {
+        fixture.write_tool(
+            program,
+            "[ \"$*\" = '-S' ] || exit 94\nprintf '%s\\n' '-P INPUT ACCEPT'\n",
+        );
+    }
+    let environment = [(
+        "KIDOBO_TEST_SET_NAMES",
+        "kidobo:shadow\nkidobo-v6:shadow\nother+valid",
+    )];
+    let status = fixture.run(&["status", "--format", "json"], &environment);
+    assert_eq!(status.status.code(), Some(0), "{status:?}");
+    let report = json_output(&status);
+    for family in ["ipv4", "ipv6"] {
+        assert_eq!(report[family]["set_state"], "absent");
+        assert_eq!(report[family]["enforcement"], "absent");
+        assert_eq!(report[family]["entries"], serde_json::Value::Null);
+    }
+    for address in ["203.0.113.7", "2001:db8::7"] {
+        let output = fixture.run(&["check", address, "--format", "json"], &environment);
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        let report = json_output(&output);
+        assert_eq!(report["verdict"], "not_blocked");
+        assert_eq!(report["family"]["set_state"], "absent");
+        assert_eq!(report["family"]["stable"], true);
+    }
+    let log = fixture.tool_log();
+    assert!(!log.contains("-terse"), "{log}");
+    assert!(!log.contains("ipset test"), "{log}");
 }
 
 #[test]

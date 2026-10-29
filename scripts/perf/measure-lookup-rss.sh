@@ -40,7 +40,7 @@ tmp_root="$(mktemp -d)"
 trap 'rm -rf "${tmp_root}"' EXIT
 
 export KIDOBO_ROOT="${tmp_root}/root"
-binary="${KIDOBO_PERF_BINARY:-target/release/kidobo}"
+binary="${KIDOBO_PERF_BINARY:-${CARGO_TARGET_DIR:-target}/release/kidobo}"
 blocklist_path="${KIDOBO_ROOT}/data/blocklist.txt"
 targets_path="${tmp_root}/targets.txt"
 

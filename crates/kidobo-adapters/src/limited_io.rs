@@ -97,14 +97,32 @@ pub fn write_string_atomic(path: &Path, contents: &str) -> io::Result<()> {
 /// Returns an I/O error when temporary-file creation, writing, synchronization, permission
 /// preservation, replacement, or parent-directory synchronization fails.
 pub fn write_bytes_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
+    write_bytes_atomic_mode(path, contents, PublicationMode::Replace)
+}
+
+/// Publishes a complete file without replacing an existing destination.
+pub(crate) fn create_string_atomic(path: &Path, contents: &str) -> io::Result<()> {
+    write_bytes_atomic_mode(path, contents.as_bytes(), PublicationMode::CreateNew)
+}
+
+#[derive(Clone, Copy)]
+enum PublicationMode {
+    Replace,
+    CreateNew,
+}
+
+fn write_bytes_atomic_mode(path: &Path, contents: &[u8], mode: PublicationMode) -> io::Result<()> {
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let existing_permissions = match fs::metadata(path) {
-        Ok(metadata) => Some(metadata.permissions()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error),
+    let existing_permissions = match mode {
+        PublicationMode::CreateNew => None,
+        PublicationMode::Replace => match fs::metadata(path) {
+            Ok(metadata) => Some(metadata.permissions()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        },
     };
 
     for _ in 0..16 {
@@ -123,7 +141,18 @@ pub fn write_bytes_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
                     temp_file.sync_all()?;
                     drop(temp_file);
 
-                    fs::rename(&temp_path, path)?;
+                    #[cfg(test)]
+                    publication_test::before_publish();
+
+                    match mode {
+                        PublicationMode::Replace => fs::rename(&temp_path, path)?,
+                        PublicationMode::CreateNew => {
+                            let publication = fs::hard_link(&temp_path, path);
+                            fs::remove_file(&temp_path)?;
+                            sync_directory(parent)?;
+                            return publication;
+                        }
+                    }
                     sync_directory(parent)
                 })();
 
@@ -146,6 +175,40 @@ pub fn write_bytes_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
             path.display()
         ),
     ))
+}
+
+#[cfg(test)]
+pub(crate) mod publication_test {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static BEFORE_PUBLISH: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn before_publish() {
+        let callback = BEFORE_PUBLISH.with(|slot| slot.borrow_mut().take());
+        if let Some(callback) = callback {
+            callback();
+        }
+    }
+
+    pub(crate) fn interleave<T>(before: impl FnOnce() + 'static, action: impl FnOnce() -> T) -> T {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                BEFORE_PUBLISH.with(|slot| *slot.borrow_mut() = None);
+            }
+        }
+        BEFORE_PUBLISH.with(|slot| {
+            assert!(
+                slot.borrow().is_none(),
+                "publication hooks must not overlap"
+            );
+            *slot.borrow_mut() = Some(Box::new(before));
+        });
+        let _reset = Reset;
+        action()
+    }
 }
 
 fn temp_write_path(parent: &Path, path: &Path) -> PathBuf {
@@ -196,5 +259,57 @@ mod tests {
 
         let bytes = read_bytes_with_limit(&path, 3).expect("read");
         assert_eq!(bytes, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn atomic_creation_reports_existing_destination_and_removes_staging_file() {
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("config.toml");
+        fs::write(&path, "saved contents").expect("existing file");
+        let error = super::create_string_atomic(&path, "replacement")
+            .expect_err("existing destination must not be replaced");
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            read_to_string_with_limit(&path, 1024).expect("read"),
+            "saved contents"
+        );
+        assert_eq!(fs::read_dir(temp.path()).expect("directory").count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_creation_keeps_umask_and_replacement_keeps_existing_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().expect("tempdir");
+        let control = temp.path().join("control");
+        let path = temp.path().join("config.toml");
+        fs::write(&control, "control").expect("default permissions");
+        super::create_string_atomic(&path, "initial").expect("create");
+        assert_eq!(
+            fs::metadata(&path)
+                .expect("created metadata")
+                .permissions()
+                .mode(),
+            fs::metadata(&control)
+                .expect("control metadata")
+                .permissions()
+                .mode()
+        );
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).expect("set permissions");
+        super::write_string_atomic(&path, "replacement").expect("replace");
+        assert_eq!(
+            fs::metadata(&path)
+                .expect("replacement metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o640
+        );
+        assert_eq!(
+            read_to_string_with_limit(&path, 1024).expect("read"),
+            "replacement"
+        );
+        assert_eq!(fs::read_dir(temp.path()).expect("directory").count(), 2);
     }
 }

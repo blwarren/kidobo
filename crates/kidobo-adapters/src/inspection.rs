@@ -146,9 +146,6 @@ impl<E: CommandExecutor> SystemLiveProbe<E> {
             Ok(result) => return SetSnapshot::unknown(probe_failure("ipset list -name", &result)),
             Err(reason) => return SetSnapshot::unknown(reason),
         };
-        if !names.lines().all(valid_set_name) {
-            return SetSnapshot::unknown("ipset returned an unsupported set-name listing");
-        }
         if !names.lines().any(|name| name == spec.set_name) {
             return SetSnapshot {
                 state: Verification::Absent,
@@ -340,14 +337,6 @@ impl<E: CommandExecutor> LiveProbe for SystemLiveProbe<E> {
             Err(reason) => TimerInspection::unknown(reason),
         })
     }
-}
-
-fn valid_set_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 31
-        && name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
 }
 
 fn field<'a>(contents: &'a str, prefix: &str) -> Option<&'a str> {
