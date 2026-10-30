@@ -392,6 +392,197 @@ fn completions_render_without_reading_config_or_invoking_tools() {
     assert!(!fixture.root.join("config/config.toml").exists());
 }
 
+fn completion_script(fixture: &Fixture, shell: &str) -> String {
+    let output = fixture.run(&["completions", shell]);
+    assert!(output.status.success(), "{shell}: {output:?}");
+    assert_eq!(output.stderr, b"");
+    assert_eq!(fixture.log(), "");
+    String::from_utf8(output.stdout).expect("UTF-8 completion")
+}
+
+fn bash_completion_candidates(
+    fixture: &Fixture,
+    script: &Path,
+    words: &[&str],
+) -> (Vec<String>, Vec<String>) {
+    let output = Command::new("bash")
+        .args(["--noprofile", "--norc", "-c"])
+        .arg(
+            r#"source "$1"
+shift
+compopt() { printf '%s\n' "$*" >&2; }
+COMP_WORDS=("$@")
+COMP_CWORD=$((${#COMP_WORDS[@]} - 1))
+_kidobo "${COMP_WORDS[0]}" "${COMP_WORDS[COMP_CWORD]}" "${COMP_WORDS[COMP_CWORD - 1]}"
+if ((${#COMPREPLY[@]})); then
+    printf '%s\0' "${COMPREPLY[@]}"
+fi
+"#,
+        )
+        .arg("completion-test")
+        .arg(script)
+        .args(words)
+        .current_dir(&fixture.root)
+        .env_remove("BASH_ENV")
+        .env("LC_ALL", "C")
+        .output()
+        .expect("exercise generated Bash completion");
+    assert!(output.status.success(), "{words:?}: {output:?}");
+    let candidates = String::from_utf8(output.stdout)
+        .expect("UTF-8 candidates")
+        .split_terminator('\0')
+        .map(str::to_owned)
+        .collect();
+    let options = String::from_utf8(output.stderr)
+        .expect("UTF-8 completion options")
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    (candidates, options)
+}
+
+#[test]
+fn bash_completions_preserve_file_paths_containing_spaces() {
+    let fixture = Fixture::new("", "");
+    let script = fixture.root.join("kidobo.bash");
+    fs::write(&script, completion_script(&fixture, "bash")).expect("completion script");
+    fs::write(fixture.root.join("completion input.targets"), "").expect("target file");
+
+    for command in ["ban", "unban", "lookup"] {
+        let (candidates, options) = bash_completion_candidates(
+            &fixture,
+            &script,
+            &["kidobo", command, "--file", "completion"],
+        );
+        assert_eq!(candidates, ["completion input.targets"], "{command}");
+        assert_eq!(options, ["-o filenames"], "{command}");
+    }
+}
+
+#[test]
+fn bash_completions_do_not_offer_files_for_scalar_values() {
+    let fixture = Fixture::new("", "");
+    let script = fixture.root.join("kidobo.bash");
+    fs::write(&script, completion_script(&fixture, "bash")).expect("completion script");
+    fs::write(fixture.root.join("completion input.targets"), "").expect("target file");
+
+    for (command, option) in [
+        ("ban", "--for"),
+        ("ban", "--asn"),
+        ("unban", "--asn"),
+        ("bans", "--limit"),
+    ] {
+        let (candidates, options) = bash_completion_candidates(
+            &fixture,
+            &script,
+            &["kidobo", command, option, "completion"],
+        );
+        assert_eq!(candidates, ["completion"], "{command} {option}");
+        assert_eq!(options, ["-o nospace"], "{command} {option}");
+    }
+}
+
+#[test]
+fn zsh_completions_distinguish_files_urls_and_scalar_values() {
+    let fixture = Fixture::new("", "");
+    let script = completion_script(&fixture, "zsh");
+    assert_eq!(script.matches(":PATH:_files").count(), 3);
+    assert_eq!(script.matches("':url:_urls'").count(), 2);
+
+    for (label, count) in [
+        (":DURATION:", 1),
+        (":ASN:", 2),
+        (":LIMIT:", 1),
+        ("':ip:", 1),
+        ("'::ip -- ", 1),
+        ("':target:", 2),
+        ("'::target -- ", 2),
+    ] {
+        let arguments: Vec<_> = script.lines().filter(|line| line.contains(label)).collect();
+        assert_eq!(arguments.len(), count, "{label}: {arguments:?}");
+        for argument in arguments {
+            assert!(argument.ends_with(":' \\"), "{argument}");
+        }
+    }
+}
+
+fn fish_completion_option<'a>(script: &'a str, command: &str, option: &str) -> &'a str {
+    let context = format!("-n \"__fish_kidobo_using_subcommand {command}\"");
+    let option = format!(" -l {option} ");
+    script
+        .split("complete -c kidobo ")
+        .find(|entry| entry.starts_with(&context) && entry.contains(&option))
+        .expect("command-specific Fish option")
+}
+
+#[test]
+fn fish_completions_offer_files_only_for_file_options() {
+    let fixture = Fixture::new("", "");
+    let script = completion_script(&fixture, "fish");
+    for command in ["ban", "unban", "lookup"] {
+        let option = fish_completion_option(&script, command, "file");
+        assert!(option.trim_end().ends_with(" -r -F"), "{option}");
+    }
+    for (command, name) in [
+        ("ban", "for"),
+        ("ban", "asn"),
+        ("unban", "asn"),
+        ("bans", "limit"),
+    ] {
+        let option = fish_completion_option(&script, command, name);
+        assert!(option.trim_end().ends_with(" -r -f"), "{option}");
+    }
+}
+
+#[test]
+fn completions_preserve_supported_enum_choices() {
+    let fixture = Fixture::new("", "");
+    let bash = completion_script(&fixture, "bash");
+    let zsh = completion_script(&fixture, "zsh");
+    let fish = completion_script(&fixture, "fish");
+    let script = fixture.root.join("kidobo.bash");
+    fs::write(&script, bash).expect("completion script");
+    for (prefix, shell) in [("b", "bash"), ("z", "zsh"), ("f", "fish")] {
+        let (candidates, options) =
+            bash_completion_candidates(&fixture, &script, &["kidobo", "completions", prefix]);
+        assert_eq!(candidates, [shell]);
+        assert_eq!(options, Vec::<String>::new());
+    }
+    let (candidates, options) =
+        bash_completion_candidates(&fixture, &script, &["kidobo", "--log-level", ""]);
+    assert_eq!(candidates, ["trace", "debug", "info", "warn", "error"]);
+    assert_eq!(options, Vec::<String>::new());
+    assert!(zsh.contains(":shell:(bash zsh fish)"));
+    assert!(zsh.contains(":LOG_LEVEL:(trace debug info warn error)"));
+    let levels = fish_completion_option(&fish, "completions", "log-level");
+    assert!(
+        levels.contains(" -r -f -a \"trace\\t''\ndebug\\t''\ninfo\\t''\nwarn\\t''\nerror\\t''\"")
+    );
+
+    for (command, formats) in [
+        ("status", ["human", "json"]),
+        ("check", ["human", "json"]),
+        ("doctor", ["human", "json"]),
+        ("lookup", ["human", "tsv"]),
+    ] {
+        let (candidates, options) =
+            bash_completion_candidates(&fixture, &script, &["kidobo", command, "--format", ""]);
+        assert_eq!(candidates, formats, "{command}");
+        assert_eq!(options, Vec::<String>::new());
+        let (_, block) = zsh
+            .split_once(&format!("\n({command})\n"))
+            .expect("Zsh command block");
+        let (block, _) = block.split_once("\n;;").expect("end of Zsh command block");
+        assert!(block.contains(&format!(":FORMAT:({})", formats.join(" "))));
+        let option = fish_completion_option(&fish, command, "format");
+        let choices = formats.map(|value| format!("{value}\\t''")).join("\n");
+        assert!(
+            option.contains(&format!(" -r -f -a \"{choices}\"")),
+            "{option}"
+        );
+    }
+}
+
 #[test]
 fn preview_rejects_oversized_ipset_timeouts_before_fetch_or_enforcement() {
     for timeout in [2_147_484, 2_592_000] {

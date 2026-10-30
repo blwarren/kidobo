@@ -23,6 +23,9 @@
   characters outside Kidobo's managed-set naming rules.
 - Network-enabled sync previews now enforce the same ASN source size limit as
   normal synchronization, including when the resulting firewall entries fit capacity.
+- Shell completions now preserve Bash `--file` paths containing spaces, complete
+  feed URLs in Zsh, and suppress inappropriate filename suggestions for non-path
+  arguments where supported.
 
 ## [0.15.0] - 2026-10-28
 

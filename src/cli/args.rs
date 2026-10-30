@@ -2,7 +2,7 @@ use std::net::IpAddr;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
-use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
+use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum, ValueHint};
 use kidobo_app::blocklist::BanDuration;
 use log::LevelFilter;
 
@@ -87,12 +87,18 @@ pub enum SourceAction {
         about = "Save one HTTP(S) feed URL; enforcement waits for sync",
         after_help = "Example: sudo kidobo sources add https://example.org/feed.txt\nTo reverse: sudo kidobo sources remove URL, then sync."
     )]
-    Add { url: String },
+    Add {
+        #[arg(value_hint = ValueHint::Url)]
+        url: String,
+    },
     #[command(
         about = "Remove a configured feed URL; enforcement waits for sync",
         after_help = "Example: sudo kidobo sources remove https://example.org/feed.txt\nTo reverse: add the same URL, then sync."
     )]
-    Remove { url: String },
+    Remove {
+        #[arg(value_hint = ValueHint::Url)]
+        url: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -107,7 +113,7 @@ pub enum AllowAction {
         after_help = "Examples: sudo kidobo allow add 203.0.113.7\n          sudo kidobo allow add 2001:db8::/64 --yes\nThis subtracts addresses from Kidobo's effective blocklist. It does not install an ACCEPT rule.\nTo reverse: sudo kidobo allow remove IP_OR_CIDR, then sync."
     )]
     Add {
-        #[arg(value_name = "IP_OR_CIDR")]
+        #[arg(value_name = "IP_OR_CIDR", value_hint = ValueHint::Other)]
         target: String,
         #[arg(
             long,
@@ -120,7 +126,7 @@ pub enum AllowAction {
         after_help = "Example: sudo kidobo allow remove 203.0.113.7\nUses canonical exact identity, without splitting ranges. To reverse: add the same exemption and sync."
     )]
     Remove {
-        #[arg(value_name = "IP_OR_CIDR")]
+        #[arg(value_name = "IP_OR_CIDR", value_hint = ValueHint::Other)]
         target: String,
     },
 }
@@ -226,7 +232,11 @@ pub enum Command {
         after_help = "Examples: sudo kidobo check 203.0.113.7\n          sudo kidobo check 2001:db8::7 --format json\nCIDR/source overlaps: kidobo lookup 203.0.113.0/24\nVerified verdicts exit 0; unknown exits 1; invalid usage exits 2. No reversal or sync is needed."
     )]
     Check {
-        #[arg(value_name = "IP", value_parser = parse_check_ip)]
+        #[arg(
+            value_name = "IP",
+            value_parser = parse_check_ip,
+            value_hint = ValueHint::Other
+        )]
         ip: IpAddr,
         #[arg(long, value_enum, default_value_t = ReportFormat::Human)]
         format: ReportFormat,
@@ -243,7 +253,12 @@ pub enum Command {
         permanent: bool,
         #[arg(long, help = "Only list operator-managed ASN identities")]
         asn: bool,
-        #[arg(long, default_value = "50", help = "Maximum saved entries to display")]
+        #[arg(
+            long,
+            default_value = "50",
+            value_hint = ValueHint::Other,
+            help = "Maximum saved entries to display"
+        )]
         limit: NonZeroUsize,
         #[arg(
             long,
@@ -326,11 +341,13 @@ pub enum Command {
         #[arg(
             long = "for",
             value_name = "DURATION",
+            value_hint = ValueHint::Other,
             help = "Ban for whole hours or days (12h, 3d), starting when recorded; applied/removed by sync"
         )]
         duration: Option<BanDuration>,
         #[arg(
             value_name = "IP_OR_CIDR",
+            value_hint = ValueHint::Other,
             help = "Single IPv4/IPv6 address or CIDR to add"
         )]
         target: Option<String>,
@@ -338,6 +355,7 @@ pub enum Command {
         #[arg(
             long,
             value_name = "PATH",
+            value_hint = ValueHint::FilePath,
             help = "File with one IPv4/IPv6 address or CIDR per line"
         )]
         file: Option<PathBuf>,
@@ -346,6 +364,7 @@ pub enum Command {
             long = "asn",
             value_name = "ASN",
             num_args = 1..,
+            value_hint = ValueHint::Other,
             help = "ASN(s) to ban (e.g. 213412 or AS213412)"
         )]
         asn: Option<Vec<String>>,
@@ -366,6 +385,7 @@ pub enum Command {
         application: ApplicationArgs,
         #[arg(
             value_name = "IP_OR_CIDR",
+            value_hint = ValueHint::Other,
             help = "Single IPv4/IPv6 address or CIDR to remove"
         )]
         target: Option<String>,
@@ -373,6 +393,7 @@ pub enum Command {
         #[arg(
             long,
             value_name = "PATH",
+            value_hint = ValueHint::FilePath,
             help = "File with one IPv4/IPv6 address or CIDR per line"
         )]
         file: Option<PathBuf>,
@@ -381,6 +402,7 @@ pub enum Command {
             long = "asn",
             value_name = "ASN",
             num_args = 1..,
+            value_hint = ValueHint::Other,
             help = "ASN(s) to unban (e.g. 213412 or AS213412)"
         )]
         asn: Option<Vec<String>>,
@@ -403,12 +425,17 @@ pub enum Command {
         )
     )]
     Lookup {
-        #[arg(value_name = "IP_OR_CIDR", help = "Single target IP/CIDR to match")]
+        #[arg(
+            value_name = "IP_OR_CIDR",
+            value_hint = ValueHint::Other,
+            help = "Single target IP/CIDR to match"
+        )]
         ip: Option<String>,
 
         #[arg(
             long,
             value_name = "PATH",
+            value_hint = ValueHint::FilePath,
             help = "File with one target IP/CIDR per line"
         )]
         file: Option<PathBuf>,

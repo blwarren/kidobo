@@ -325,7 +325,13 @@ source ./kidobo.bash
 
 For persistent installation, put the generated script in your shell's completion
 directory. Generation writes only to stdout and does not read configuration or
-call system tools.
+call system tools. Regenerate and reinstall the script after upgrading Kidobo to
+pick up completion changes.
+
+File arguments support path completion, including paths with spaces in Bash.
+Zsh also supports URL completion. Filename suggestions are suppressed for
+non-path arguments where supported. Fish's generated script omits positional
+suggestions, including shell names after `kidobo completions`.
 
 ## Remove managed enforcement
 
