@@ -68,7 +68,9 @@ pub fn run_sync_command(timer: bool, io: &mut CliIo<'_>) -> Result<(), KidoboErr
     }
     observer.stage_completed("sync_pipeline_complete");
 
-    log_summary(&outcome);
+    if !human {
+        log_summary(&outcome);
+    }
     Ok(())
 }
 
@@ -82,12 +84,6 @@ fn render_failure(
         Status::Fail,
         "Sync incomplete",
         &progress.failure_summary(),
-    )?;
-    view.status(
-        output,
-        Status::Unknown,
-        "Live enforcement",
-        "Inspect current managed state before retrying.",
     )?;
     view.next(
         output,
@@ -138,15 +134,6 @@ fn render_summary(
             elapsed.as_secs_f64()
         ),
     )?;
-    if degraded > 0 {
-        view.status(
-            output,
-            Status::Warn,
-            "Degraded source coverage",
-            "Review the source warnings above; fallback or unavailable data was encountered.",
-        )?;
-    }
-    view.next(output, "kidobo status")?;
     Ok(())
 }
 
@@ -236,7 +223,68 @@ impl SyncObserver for CliSyncObserver<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::SyncProgress;
+    use super::{SyncProgress, render_failure, render_summary};
+    use crate::cli::presentation::Presentation;
+    use kidobo_app::sync::SyncOutcome;
+    use std::time::Duration;
+
+    #[test]
+    fn failure_output_reports_partial_progress_once_with_one_recovery_hint() {
+        let mut output = Vec::new();
+        render_failure(
+            Presentation::new(200, false),
+            &mut output,
+            &SyncProgress {
+                enforcement_started: true,
+                ipv6_replaced: true,
+                ..SyncProgress::default()
+            },
+        )
+        .expect("failure report");
+        let output = String::from_utf8(output).expect("UTF-8 failure report");
+        assert_eq!(output.matches("Sync incomplete").count(), 1);
+        assert_eq!(
+            output
+                .matches("Confirmed replacements: IPv4=false, IPv6=true")
+                .count(),
+            1
+        );
+        assert!(output.contains("partial application is possible"));
+        assert!(output.contains("failed operation may also have changed state"));
+        assert_eq!(output.matches("Next:").count(), 1);
+        assert!(!output.contains("[UNKNOWN] Live enforcement"));
+    }
+
+    #[test]
+    fn success_output_keeps_counts_and_timing_without_a_routine_next_step() {
+        let mut output = Vec::new();
+        render_summary(
+            Presentation::new(120, false),
+            &mut output,
+            &SyncOutcome {
+                ipv4_entries: 12,
+                ipv6_entries: 34,
+                ipv4_kernel_entries: 13,
+                ipv6_kernel_entries: 35,
+                sources: Vec::new(),
+            },
+            Duration::from_millis(1250),
+        )
+        .expect("success report");
+        let output = String::from_utf8(output).expect("UTF-8 success report");
+        assert_eq!(output.matches("Synchronization complete").count(), 1);
+        assert!(output.contains("IPv4"));
+        assert!(output.contains("IPv6"));
+        for count in [12, 34, 13, 35] {
+            assert!(
+                output
+                    .split_whitespace()
+                    .any(|word| word == count.to_string())
+            );
+        }
+        assert!(output.contains("Elapsed: 1.25s."));
+        assert!(!output.contains("Next:"));
+    }
     #[test]
     fn failed_replacement_does_not_claim_rollback() {
         let before = SyncProgress::default().failure_summary();

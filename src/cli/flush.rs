@@ -49,7 +49,10 @@ fn run_flush_with(
             let view = io.presentation();
             view.heading(io.stdout, "Remove Kidobo enforcement")?;
             view.paragraph(io.stdout, "Full flush removes Kidobo's managed firewall rules, ipsets, and remote cache. Saved bans and configuration remain.")?;
-            view.paragraph(io.stdout, "An enabled sync timer may recreate enforcement on its next run. This is a removal operation; use doctor to diagnose problems.")?;
+            view.paragraph(
+                io.stdout,
+                "An enabled sync timer may recreate enforcement on its next run.",
+            )?;
             if !confirm(io, "Remove the managed firewall state and remote cache?")? {
                 view.paragraph(io.stdout, "Flush cancelled; no cleanup was started.")?;
                 return Ok(());
@@ -81,12 +84,7 @@ fn render_outcome(
     let view = io.presentation();
     view.heading(io.stdout, "Kidobo cleanup")?;
     for operation in &outcome.completed {
-        view.status(
-            io.stdout,
-            Status::Pass,
-            operation,
-            "Removed or confirmed absent.",
-        )?;
+        view.status(io.stdout, Status::Pass, operation, "")?;
     }
     for failure in &outcome.failed {
         view.status(io.stdout, Status::Fail, &failure.operation, &failure.reason)?;
@@ -94,8 +92,13 @@ fn render_outcome(
     view.paragraph(
         io.stdout,
         &format!(
-            "{} cleanup steps completed; {} incomplete.",
+            "{} cleanup {} completed; {} incomplete.",
             outcome.completed.len(),
+            if outcome.completed.len() == 1 {
+                "step"
+            } else {
+                "steps"
+            },
             outcome.failed.len()
         ),
     )?;
@@ -222,6 +225,29 @@ mod tests {
         assert!(stdout.contains("[FAIL] IPv6 firewall"));
         assert!(stdout.contains("permission denied\\n\\x1B[31m"));
         assert!(!stdout.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn cleanup_successes_are_concise_and_pluralized() {
+        for (count, noun) in [(0, "steps"), (1, "step"), (2, "steps")] {
+            let (result, stdout, _) = with_io(&mut Input(None), (false, false), |io| {
+                render_outcome(
+                    &FlushOutcome {
+                        completed: (0..count)
+                            .map(|index| format!("Operation {index}"))
+                            .collect(),
+                        ..FlushOutcome::default()
+                    },
+                    true,
+                    io,
+                )
+            });
+            result.expect("cleanup result");
+            assert!(stdout.contains(&format!("{count} cleanup {noun} completed; 0 incomplete.")));
+            assert_eq!(stdout.matches("[PASS]").count(), count);
+            assert!(!stdout.contains("Removed or confirmed absent"));
+            assert_eq!(stdout.matches("Next:").count(), 1);
+        }
     }
 
     #[test]

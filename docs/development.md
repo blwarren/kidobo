@@ -188,3 +188,9 @@ individual test-run transcripts, scores, and one-time dependency checks in chang
 artifacts. Retain enduring rationale beside the procedure it explains; release notes record
 user-visible changes by version. Check examples against the implementation and update links when
 moving sections.
+
+Keep human command output focused on results and necessary actions. Put general
+limitations and interpretation guidance in Operations, avoid repeating facts,
+and reserve warnings for conditions encountered by the current run. Format
+counted nouns as singular for one and plural otherwise; never use parenthetical
+plurals such as `entry(ies)` in application output or help.

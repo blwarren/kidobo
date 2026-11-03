@@ -38,7 +38,6 @@ fn list_sources(io: &mut CliIo<'_>) -> Result<(), KidoboError> {
     )?;
     let view = io.presentation();
     view.heading(io.stdout, "Configured remote feeds")?;
-    view.paragraph(io.stdout, "Saved settings; enforcement changes at the next successful sync. Cache availability does not establish feed freshness.")?;
     if sources.is_empty() {
         view.paragraph(io.stdout, "No remote feeds are configured.")?;
         view.next(
@@ -92,7 +91,6 @@ fn list_allow(io: &mut CliIo<'_>) -> Result<(), KidoboError> {
     )?;
     let view = io.presentation();
     view.heading(io.stdout, "Operator safelist")?;
-    view.paragraph(io.stdout, "Saved exemptions subtract addresses from Kidobo's effective blocklist at the next successful sync. They do not install firewall ACCEPT rules.")?;
     if targets.is_empty() {
         view.paragraph(
             io.stdout,
@@ -105,7 +103,6 @@ fn list_allow(io: &mut CliIo<'_>) -> Result<(), KidoboError> {
             .collect::<Vec<_>>();
         view.table(io.stdout, &["Saved exemption"], &rows)?;
     }
-    view.next(io.stdout, "kidobo allow add --help")?;
     Ok(())
 }
 
@@ -165,7 +162,7 @@ fn render_exemption_preview(
     for target in added_values(&preview.before().safe.ips, &preview.after().safe.ips) {
         view.record(io.stdout, &[("New exemption", &target)])?;
     }
-    view.paragraph(io.stdout, "Addresses in this range will be exempt from every Kidobo blocklist source at the next successful sync. Broad CIDRs can exempt an entire address family.")?;
+    view.paragraph(io.stdout, "Exempts this range from all Kidobo blocklist sources after sync. A /0 exempts the entire address family.")?;
     Ok(())
 }
 
@@ -221,10 +218,6 @@ fn report_edit(
         return Ok(());
     }
     let result = (|| {
-        view.paragraph(
-            io.stdout,
-            "Configuration change saved; live enforcement is pending.",
-        )?;
         for (action, target) in changes {
             view.record(io.stdout, &[("Action", action), ("Target", target)])?;
         }
@@ -277,7 +270,6 @@ pub fn config(action: ConfigAction, io: &mut CliIo<'_>) -> Result<(), KidoboErro
         .map(|(key, value)| (*key, value.as_str()))
         .collect::<Vec<_>>();
     view.key_values(io.stdout, &fields)?;
-    view.paragraph(io.stdout, "Origins: explicit values come from the file; default values use built-in defaults; derived values depend on another setting.")?;
     for setting in configuration.settings {
         let value = format_setting(&setting.value)?;
         let origin = match setting.origin {
@@ -298,10 +290,6 @@ pub fn config(action: ConfigAction, io: &mut CliIo<'_>) -> Result<(), KidoboErro
         }
         writeln!(io.stdout)?;
     }
-    view.paragraph(
-        io.stdout,
-        "Manual file editing remains supported. Saved changes take effect after a successful sync.",
-    )?;
     Ok(())
 }
 
@@ -454,11 +442,12 @@ mod tests {
                 io,
             )
         });
-        assert!(saved.contains("Configuration change saved; live enforcement is pending."));
+        assert!(!saved.contains("live enforcement is pending"));
         assert!(saved.contains("Action: Added exemption"));
         assert!(saved.contains("Target: 192.0.2.0/24"));
         assert!(!saved.contains("192.0.2.129/24"));
         assert!(saved.ends_with("Next: sudo kidobo sync\n"));
+        assert_eq!(saved.matches("Next:").count(), 1);
     }
 
     #[test]

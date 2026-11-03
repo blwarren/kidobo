@@ -160,8 +160,6 @@ fn collect_preview(io: &mut CliIo<'_>) -> Result<ConfigurationPreview, KidoboErr
 fn introduction(current: &ConfigurationView, io: &mut CliIo<'_>) -> Result<(), KidoboError> {
     let view = io.presentation();
     view.heading(io.stdout, "Kidobo setup")?;
-    view.paragraph(io.stdout, "Kidobo runs one-shot syncs using ipset, iptables/ip6tables, and optional bgpq4 for ASN refresh. Install prerequisites with your distribution's package manager. This assistant does not install packages or elevate privileges.")?;
-    view.paragraph(io.stdout, "Existing files are preserved. Review choices before any writes. IPv4 is always managed; IPv6 is optional. New scheduling stays inactive until separately confirmed after doctor.")?;
     view.key_values(
         io.stdout,
         &[
@@ -174,7 +172,7 @@ fn introduction(current: &ConfigurationView, io: &mut CliIo<'_>) -> Result<(), K
                 if current.exists {
                     "Existing configuration"
                 } else {
-                    "Virtual starter; no files have been created"
+                    "New configuration"
                 },
             ),
         ],
@@ -183,7 +181,13 @@ fn introduction(current: &ConfigurationView, io: &mut CliIo<'_>) -> Result<(), K
     if !alternate_root {
         let timer =
             SystemLiveProbe::default().inspect_timer(&super::interrupt::SigintCancellation)?;
-        view.paragraph(io.stdout, &format!("Existing timer: {}. An already active timer is not stopped and may apply saved changes before setup finishes.", timer.detail))?;
+        view.key_values(io.stdout, &[("Existing timer", &timer.detail)])?;
+        if timer.active != Some(false) {
+            view.paragraph(
+                io.stdout,
+                "An active timer may apply saved changes before setup finishes.",
+            )?;
+        }
     }
     Ok(())
 }
@@ -252,7 +256,7 @@ fn review(preview: &ConfigurationPreview, io: &mut CliIo<'_>) -> Result<(), Kido
             (
                 "GitHub safelist",
                 if config.safe.include_github_meta {
-                    "Enabled with existing admission limits"
+                    "Enabled"
                 } else {
                     "Disabled"
                 },
@@ -267,9 +271,8 @@ fn review(preview: &ConfigurationPreview, io: &mut CliIo<'_>) -> Result<(), Kido
         view.key_values(io.stdout, &[("Exemption", &cidr.to_string())])?;
     }
     if preview.expands_exemption() {
-        view.status(io.stdout, Status::Warn, "Exemption coverage expands", "Safelist entries subtract from all Kidobo blocklist sources after sync. A /0 exempts the entire address family; this does not install a kernel ACCEPT rule.")?;
+        view.status(io.stdout, Status::Warn, "Exemption coverage expands", "Exempts the listed ranges from all Kidobo blocklist sources after sync. A /0 exempts the entire address family.")?;
     }
-    view.paragraph(io.stdout, "Saving writes configuration and provisions only missing files. Saved choices do not themselves update the firewall. Doctor runs next; first sync and new timer activation require separate affirmative answers.")?;
     Ok(())
 }
 
@@ -301,12 +304,12 @@ fn after_save(
     {
         (steps.sync)(io).map_err(|source| saved_error("first synchronization", source))?;
     } else {
-        io.presentation().paragraph(io.stdout, "Setup did not request an initial sync. Saved choices take effect through sync; existing scheduling may apply them.")?;
+        io.presentation().next(io.stdout, "sudo kidobo sync")?;
     }
     if alternate_root {
         io.presentation().paragraph(io.stdout, "Alternate root: systemd units were provisioned locally; the host timer was not activated.")?;
     } else {
-        io.presentation().paragraph(io.stdout, "Enabling scheduling authorizes periodic sync and can apply saved settings even if the manual first sync was declined. Existing active timers are not stopped.")?;
+        io.presentation().paragraph(io.stdout, "Scheduled synchronization can apply saved settings even if the first sync was declined.")?;
         if confirm(
             io,
             "Enable scheduled synchronization with kidobo-sync.timer?",
@@ -316,8 +319,6 @@ fn after_save(
             (steps.timer)().map_err(|source| saved_error("timer activation", source))?;
         }
     }
-    io.presentation()
-        .next(io.stdout, "kidobo status; sudo kidobo sync when ready")?;
     Ok(())
 }
 
@@ -417,7 +418,7 @@ mod tests {
         let (result, events, output) = follow_up(&["n", ""], false, None);
         result.expect("all optional actions declined");
         assert_eq!(events, ["provision", "doctor"]);
-        assert!(output.contains("periodic sync"));
+        assert!(output.contains("Scheduled synchronization can apply saved settings"));
         let (result, events, _) = follow_up(&["n", "yes"], false, None);
         result.expect("scheduling explicitly approved");
         assert_eq!(events, ["provision", "doctor", "timer"]);

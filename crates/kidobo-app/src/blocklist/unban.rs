@@ -307,7 +307,11 @@ fn unban_target_label(input: &BlocklistInput, targets: &UnbanTargetIndex) -> Str
             .targets()
             .first()
             .map_or_else(|| value.clone(), ToString::to_string),
-        BlocklistInput::File(_) => format!("{} file target(s)", targets.targets().len()),
+        BlocklistInput::File(_) => {
+            let count = targets.targets().len();
+            let noun = if count == 1 { "target" } else { "targets" };
+            format!("{count} file {noun}")
+        }
     }
 }
 

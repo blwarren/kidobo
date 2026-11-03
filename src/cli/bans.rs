@@ -30,13 +30,12 @@ pub fn run(
     )?;
     let view = io.presentation();
     view.heading(io.stdout, "Saved operator bans")?;
-    view.paragraph(io.stdout, "Saved source state, not necessarily applied to the live firewall. Expired records can remain enforced until a successful sync.")?;
     let rows = outcome
         .records
         .iter()
         .map(|record| {
             let (expiry, state) = record.expires_at.map_or_else(
-                || ("Permanent".to_string(), "Saved".to_string()),
+                || ("Permanent".to_string(), "—".to_string()),
                 |expires_at| {
                     (
                         format_utc(expires_at),
@@ -50,20 +49,33 @@ pub fn run(
     if rows.is_empty() {
         view.paragraph(io.stdout, "No saved bans match these filters.")?;
     } else {
-        view.table(io.stdout, &["Target", "Expires", "Saved lifetime"], &rows)?;
+        view.table(io.stdout, &["Target", "Expires", "Remaining"], &rows)?;
     }
-    view.paragraph(
-        io.stdout,
-        &format!(
-            "{} shown of {} matching entries; {} omitted.",
-            outcome.records.len(),
-            outcome.total,
-            outcome.omitted
-        ),
-    )?;
+    let noun = if outcome.total == 1 { "ban" } else { "bans" };
     if outcome.omitted > 0 {
-        view.next(io.stdout, "kidobo bans --all (retain any desired filters)")?;
+        view.paragraph(
+            io.stdout,
+            &format!(
+                "{} of {} {noun} shown; {} omitted.",
+                outcome.records.len(),
+                outcome.total,
+                outcome.omitted
+            ),
+        )?;
+        let lifetime_filter = match lifetime {
+            BanLifetimeFilter::All => "",
+            BanLifetimeFilter::Permanent => " --permanent",
+            BanLifetimeFilter::Temporary => " --temporary",
+        };
+        view.next(
+            io.stdout,
+            &format!(
+                "kidobo bans{lifetime_filter}{} --all",
+                if asn_only { " --asn" } else { "" }
+            ),
+        )?;
+    } else if outcome.total > 0 {
+        view.paragraph(io.stdout, &format!("{} {noun}.", outcome.total))?;
     }
-    view.next(io.stdout, "sudo kidobo sync to apply saved source changes")?;
     Ok(())
 }

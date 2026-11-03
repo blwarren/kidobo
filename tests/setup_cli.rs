@@ -134,6 +134,9 @@ fn setup_saves_reviewed_values_runs_doctor_then_allows_first_sync_decline() {
     );
     assert!(output.stdout.contains("Kidobo doctor"));
     assert!(output.stdout.contains("Run the first synchronization now?"));
+    assert!(!output.stdout.contains("This assistant does not"));
+    assert!(!output.stdout.contains("Saved choices do not themselves"));
+    assert_eq!(output.stdout.matches("Next: sudo kidobo sync").count(), 1);
     assert!(
         output
             .stdout

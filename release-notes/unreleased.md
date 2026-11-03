@@ -1,5 +1,8 @@
 ### Fixed
 
+- Repeated ASN bans now identify already saved ASNs, and local blocklist cleanup
+  correctly triggers the normal apply prompt or pending sync action.
+
 - Managed set names beginning with `-` are now rejected before firewall commands
   run, preventing ipset from treating a set name as a command option.
 - IPv4-only sync cleanup, flush, and uninstall now accept long IPv4 set names
@@ -22,3 +25,9 @@
 - Shell completions now preserve Bash `--file` paths containing spaces, complete
   feed URLs in Zsh, and suppress inappropriate filename suggestions for non-path
   arguments where supported.
+
+### Changed
+
+- Human command output and help now omit routine caveats and repeated results.
+  Address checks show a compact live summary and source matches, with full probe
+  evidence retained in JSON. Counted messages use singular or plural nouns.

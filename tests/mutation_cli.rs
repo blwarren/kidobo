@@ -22,6 +22,227 @@ fn fail_fake_sync(fixture: &Fixture) {
     fixture.write_tool("sudo", "echo 'injected fake sync failure' >&2\nexit 77\n");
 }
 
+fn asn_fixture(banned: &[u32], blocklist: &str) -> Fixture {
+    let fixture = Fixture::new(&format!("{CONFIG}[asn]\nbanned={banned:?}\n"), blocklist);
+    let cache = fixture.root().join("cache/asn");
+    fs::create_dir_all(&cache).expect("ASN cache directory");
+    for asn in [398_324, 398_705] {
+        fs::write(
+            cache.join(format!("as{asn}.iplist")),
+            "203.0.113.0/24\n2001:db8:1::/48\n",
+        )
+        .expect("fresh ASN cache");
+    }
+    fixture
+}
+
+#[test]
+fn asn_cleanup_only_prompts_and_preserves_overlapping_local_bans() {
+    let fixture = asn_fixture(
+        &[398_324],
+        "# keep\n203.0.113.0/24\n203.0.113.7\n2001:db8:1::/48\n2001:db8::/32\n198.51.100.0/24\n",
+    );
+    let output = fixture
+        .spawn(
+            &["ban", "--asn", "AS398324"],
+            100,
+            OutputDestination::Terminal,
+            &[],
+        )
+        .respond_after(APPLY_PROMPT, "n\n");
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(
+        output
+            .stdout
+            .contains("Already permanently banned: AS398324"),
+        "{output:?}"
+    );
+    assert!(
+        output
+            .stdout
+            .contains("Removed 2 local entries matching ASN prefixes."),
+        "{output:?}"
+    );
+    assert_eq!(output.stdout.matches(APPLY_PROMPT).count(), 1);
+    assert_eq!(output.stdout.matches("Next: sudo kidobo sync").count(), 1);
+    assert_eq!(
+        source(&fixture),
+        "# keep\n203.0.113.7\n2001:db8::/32\n198.51.100.0/24\n"
+    );
+    assert_eq!(fixture.tool_log(), "");
+
+    for token in ["AS398324", "398324", "as398324"] {
+        let repeated = fixture
+            .spawn(&["ban", "--asn", token], 100, OutputDestination::Pipe, &[])
+            .wait();
+        assert_eq!(repeated.status.code(), Some(0), "{repeated:?}");
+        assert_eq!(repeated.stdout, "Already permanently banned: AS398324\n");
+    }
+    assert_eq!(fixture.tool_log(), "");
+}
+
+#[test]
+fn asn_cleanup_only_no_apply_saves_without_prompting_or_syncing() {
+    for destination in [OutputDestination::Terminal, OutputDestination::Pipe] {
+        let fixture = asn_fixture(&[398_324], "203.0.113.0/24\n");
+        let output = fixture
+            .spawn(
+                &["ban", "--asn", "398324", "--no-apply"],
+                100,
+                destination,
+                &[],
+            )
+            .wait();
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        assert_eq!(
+            output.stdout,
+            "Already permanently banned: AS398324\nRemoved 1 local entry matching ASN prefixes.\nNext: sudo kidobo sync\n"
+        );
+        assert_eq!(source(&fixture), "");
+        assert_eq!(fixture.tool_log(), "");
+    }
+}
+
+#[test]
+fn asn_cleanup_and_noop_explicit_apply_preserve_saved_state_after_failure() {
+    for blocklist in ["203.0.113.0/24\n198.51.100.0/24\n", "198.51.100.0/24\n"] {
+        let fixture = asn_fixture(&[398_324], blocklist);
+        fail_fake_sync(&fixture);
+        let output = fixture
+            .spawn(
+                &["ban", "--asn", "AS398324", "--apply"],
+                100,
+                OutputDestination::Pipe,
+                &[],
+            )
+            .wait();
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        let expected_context = if blocklist.starts_with("203") {
+            "Source change saved"
+        } else {
+            "Source state unchanged"
+        };
+        assert!(
+            output
+                .stderr
+                .starts_with(&format!("{expected_context}; live firewall update failed")),
+            "{output:?}"
+        );
+        assert_eq!(source(&fixture), "198.51.100.0/24\n");
+        let config = read_to_string_with_limit(&fixture.root().join("config/config.toml"), 65_536)
+            .expect("saved ASN configuration");
+        assert!(config.contains("398324"));
+        assert!(fixture.tool_log().contains("sudo -n "), "sync was skipped");
+    }
+}
+
+#[test]
+fn asn_new_and_mixed_requests_report_normalized_results_once() {
+    for (existing, expected) in [
+        (
+            vec![],
+            "Added 2 ASN bans: AS398324, AS398705\nNext: sudo kidobo sync\n",
+        ),
+        (
+            vec![398_324],
+            "Added 1 ASN ban: AS398705\nAlready permanently banned: AS398324\nNext: sudo kidobo sync\n",
+        ),
+    ] {
+        let fixture = asn_fixture(&existing, "");
+        let output = fixture
+            .spawn(
+                &["ban", "--asn", "AS398705", "398324", "as398705"],
+                100,
+                OutputDestination::Pipe,
+                &[],
+            )
+            .wait();
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        assert_eq!(output.stdout, expected);
+        let text = read_to_string_with_limit(&fixture.root().join("config/config.toml"), 65_536)
+            .expect("saved ASNs");
+        let config =
+            kidobo_core::config::Config::from_toml_str(&text).expect("valid configuration");
+        assert_eq!(config.asn.banned, [398_324, 398_705]);
+        assert_eq!(fixture.tool_log(), "");
+    }
+}
+
+#[test]
+fn asn_unban_reports_counts_and_omits_zero_cache_deletions() {
+    for (banned, expected) in [
+        (
+            vec![398_324, 398_705],
+            "Removed 2 ASN bans: AS398324, AS398705\nDeleted 2 ASN cache files.\nNext: sudo kidobo sync\n",
+        ),
+        (
+            vec![398_324],
+            "Removed 1 ASN ban: AS398324\nDeleted 2 ASN cache files.\nNext: sudo kidobo sync\n",
+        ),
+    ] {
+        let fixture = asn_fixture(&banned, "");
+        let output = fixture
+            .spawn(
+                &["unban", "--asn", "AS398324", "398705"],
+                100,
+                OutputDestination::Pipe,
+                &[],
+            )
+            .wait();
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        assert_eq!(output.stdout, expected);
+        let repeated = fixture
+            .spawn(
+                &["unban", "--asn", "AS398324", "398705"],
+                100,
+                OutputDestination::Pipe,
+                &[],
+            )
+            .wait();
+        assert_eq!(repeated.status.code(), Some(0), "{repeated:?}");
+        assert_eq!(repeated.stdout, "No saved ASN bans matched the request.\n");
+        assert_eq!(fixture.tool_log(), "");
+    }
+}
+
+#[test]
+fn temporary_ban_output_keeps_one_utc_expiry_and_one_next_step() {
+    let fixture = Fixture::new(CONFIG, "");
+    let output = fixture
+        .spawn(
+            &["ban", "203.0.113.7", "--for", "12h"],
+            100,
+            OutputDestination::Pipe,
+            &[],
+        )
+        .wait();
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(
+        output
+            .stdout
+            .starts_with("added temporary ban 203.0.113.7/32 (expires "),
+        "{output:?}"
+    );
+    assert_eq!(output.stdout.matches("UTC").count(), 1);
+    assert_eq!(output.stdout.matches("Next: sudo kidobo sync").count(), 1);
+    for removed in [
+        "Unix",
+        "remaining",
+        "for 12h",
+        "The duration started",
+        "Source change saved",
+        "Live enforcement is pending",
+    ] {
+        assert!(
+            !output.stdout.contains(removed),
+            "unexpected text {removed}: {output:?}"
+        );
+    }
+    assert_eq!(source(&fixture), "");
+    assert_eq!(fixture.tool_log(), "");
+}
+
 #[test]
 fn nonterminal_ban_saves_without_prompt_or_sync() {
     let fixture = Fixture::new(CONFIG, "");
@@ -69,11 +290,8 @@ fn interactive_decline_keeps_saved_ban_pending() {
         .respond_after(APPLY_PROMPT, "n\n");
 
     assert_eq!(output.status.code(), Some(0), "{output:?}");
-    assert!(output.stdout.contains("Source change saved"), "{output:?}");
-    assert!(
-        output.stdout.contains("Live enforcement is pending."),
-        "{output:?}"
-    );
+    assert_eq!(output.stdout.matches("Next: sudo kidobo sync").count(), 1);
+    assert!(!output.stdout.contains("Live enforcement is pending."));
     assert!(source(&fixture).contains("203.0.113.7/32"));
     assert_eq!(fixture.tool_log(), "");
 }
@@ -245,7 +463,10 @@ fn cache_only_flush_needs_no_confirmation_and_flush_help_describes_removal() {
         .spawn(&["flush", "--help"], 80, OutputDestination::Pipe, &[])
         .wait();
     assert_eq!(help.status.code(), Some(0), "{help:?}");
-    assert!(help.stdout.contains("destructive removal operation"));
+    assert!(
+        help.stdout
+            .contains("Remove Kidobo's managed firewall rules, ipsets, and remote cache.")
+    );
     assert!(help.stdout.contains("--yes"));
     assert_eq!(fixture.tool_log(), "");
 }

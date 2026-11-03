@@ -1164,20 +1164,15 @@ fn lookup_human_output_shows_matches_no_matches_and_summary() {
         stdout,
         concat!(
             "Offline source overlaps\n",
-            "Saved and cached source evidence; this does not establish live enforcement.\n",
             "  Target: 198.51.100.9\n",
             "  Status: NO MATCH\n",
             "\n",
-            "  Target:        203.0.113.7\n",
-            "  Status:        MATCH\n",
+            "  Target: 203.0.113.7\n",
+            "  Status: MATCH\n",
             "  Source:        internal:blocklist\n",
             "  Matched Entry: 203.0.113.7\n",
             "\n",
-            "Summary\n",
-            "  Targets:    2\n",
-            "  Matched:    1\n",
-            "  Unmatched:  1\n",
-            "  Match rate: 50%\n",
+            "2 targets: 1 matched, 1 unmatched.\n",
         )
     );
 }
@@ -1193,15 +1188,9 @@ fn lookup_human_single_no_match_is_explicit() {
         stdout,
         concat!(
             "Offline source overlaps\n",
-            "Saved and cached source evidence; this does not establish live enforcement.\n",
             "  Target: 198.51.100.9\n",
             "  Status: NO MATCH\n",
             "\n",
-            "Summary\n",
-            "  Targets:    1\n",
-            "  Matched:    0\n",
-            "  Unmatched:  1\n",
-            "  Match rate: 0%\n",
         )
     );
 }
@@ -1244,7 +1233,7 @@ fn lookup_invalid_target_exits_with_one() {
         "missing invalid-target message: {stderr}"
     );
     assert!(
-        stderr.contains("lookup failed for 1 invalid target(s)"),
+        stderr.contains("lookup failed for 1 invalid target"),
         "missing final lookup error message: {stderr}"
     );
 }
@@ -1883,8 +1872,12 @@ fn sync_remote_worker_warning_does_not_deadlock() {
         "warning-feed sync failed: {stderr}"
     );
     assert!(
-        stderr.contains("ignored 1 invalid line(s)"),
+        stderr.contains("ignored 1 invalid line"),
         "missing remote parser warning: {stderr}"
+    );
+    assert!(
+        !stderr.contains("line(s)"),
+        "incorrect warning grammar: {stderr}"
     );
     assert!(
         stderr.contains("sync completed: ipv4_entries=1 ipv6_entries=0"),
@@ -2284,7 +2277,6 @@ fn doctor_human_format_groups_checks_and_keeps_them_on_stdout() {
         "Cache access",
         "Firewall permissions",
         "Summary",
-        "Next: sudo kidobo sync",
     ] {
         assert!(stdout.contains(group), "missing {group:?}: {stdout}");
     }
@@ -2302,7 +2294,7 @@ fn help_describes_doctor_formats_and_terminal_examples() {
     assert!(root_stdout.contains("Everyday:"));
     assert!(root_stdout.contains("Inspect and troubleshoot:"));
     assert!(root_stdout.contains("Configuration and advanced:"));
-    assert!(root_stdout.contains("kidobo doctor"));
+    assert!(root_stdout.contains("doctor    Check configuration and prerequisites"));
 
     let doctor_help = run_kidobo(&["doctor", "--help"]);
     assert_eq!(doctor_help.status.code(), Some(0));
@@ -2370,7 +2362,7 @@ fn ban_and_unban_target_flow_is_idempotent_and_updates_blocklist() {
     );
     let unban_stdout = String::from_utf8_lossy(&unban.stdout);
     assert!(
-        unban_stdout.contains("removed 1 blocklist entries for 203.0.113.7/32"),
+        unban_stdout.contains("removed 1 blocklist entry for 203.0.113.7/32"),
         "unexpected unban output: {unban_stdout}"
     );
 
@@ -2474,7 +2466,7 @@ fn ban_file_mode_invalid_target_fails_without_writes() {
         "missing invalid-target output: {stderr}"
     );
     assert!(
-        stderr.contains("blocklist update failed for 1 invalid target(s)"),
+        stderr.contains("blocklist update failed for 1 invalid target"),
         "missing final invalid-target error: {stderr}"
     );
 
@@ -2504,7 +2496,7 @@ fn ban_file_mode_rejects_target_with_trailing_junk() {
         "missing invalid-target output: {stderr}"
     );
     assert!(
-        stderr.contains("blocklist update failed for 1 invalid target(s)"),
+        stderr.contains("blocklist update failed for 1 invalid target"),
         "missing final invalid-target error: {stderr}"
     );
 
@@ -2780,7 +2772,7 @@ fn unban_yes_removes_overlapping_entries_without_prompt() {
         "missing auto-approve message: {stdout}"
     );
     assert!(
-        stdout.contains("removed 1 blocklist entries for 203.0.113.7/32"),
+        stdout.contains("removed 1 blocklist entry for 203.0.113.7/32"),
         "unexpected unban --yes output: {stdout}"
     );
 
@@ -2801,7 +2793,7 @@ fn interactive_unban_decline_removes_exact_but_preserves_partial_matches() {
         run_interactive_kidobo(root.path(), &["unban", "203.0.113.7"], "n\n", |_| {});
 
     assert_eq!(code, Some(0), "interactive unban failed: {stderr}");
-    assert!(stdout.contains("removed 1 blocklist entries for 203.0.113.7/32"));
+    assert!(stdout.contains("removed 1 blocklist entry for 203.0.113.7/32"));
     assert_eq!(
         read_to_string_with_limit(&blocklist, BLOCKLIST_READ_LIMIT).expect("read blocklist"),
         "203.0.113.0/24\n198.51.100.0/24\n"
@@ -2909,7 +2901,7 @@ fn unban_file_mode_yes_removes_exact_and_partial_matches() {
         "missing auto-approve output: {stdout}"
     );
     assert!(
-        stdout.contains("removed 2 blocklist entries for 2 file target(s)"),
+        stdout.contains("removed 2 blocklist entries for 2 file targets"),
         "unexpected removal summary: {stdout}"
     );
 
@@ -2936,7 +2928,7 @@ fn unban_file_mode_invalid_target_fails_without_writes() {
         "missing invalid-target output: {stderr}"
     );
     assert!(
-        stderr.contains("blocklist update failed for 1 invalid target(s)"),
+        stderr.contains("blocklist update failed for 1 invalid target"),
         "missing final invalid-target error: {stderr}"
     );
 

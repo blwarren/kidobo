@@ -154,7 +154,19 @@ controls log colors, and `NO_COLOR` disables automatic color.
 
 ### Human-readable output and pipes
 
-`lookup` prints labeled, streaming records and a summary by default. Its human
+Human output reports results and relevant observations once. Errors and warnings
+identify conditions encountered by that run, such as unreadable state, stale-cache
+fallback, or incomplete enforcement. Read-only listings do not suggest applying
+changes simply because saved data exists.
+
+`check IP` prints the verdict, a compact live-set summary, and matching saved or
+cached sources. Use `--format json` for the complete live probe evidence. Its
+verdict covers Kidobo's managed incoming `INPUT` blocking path, rather than every
+firewall, routing, or application policy on the host. Offline source matches can
+be stale and never determine the live verdict. Safelists can exempt addresses;
+other sources can continue blocking them after a local unban.
+
+`lookup` prints labeled, streaming records and a totals line for file input. Its human
 layout wraps to the detected terminal width, with an 80-column fallback, and
 disables color when stdout is redirected, `TERM=dumb`, or `NO_COLOR` is set.
 Use `kidobo lookup ... --format tsv` for scripts; TSV records and file-mode
@@ -237,6 +249,13 @@ before any enforcement work. Their interactive application behavior is
 described below.
 ASN arguments accept bare numbers or an `AS` prefix in any ASCII letter case,
 such as `AS64496`, `as64496`, `As64496`, and `aS64496`.
+
+An ASN already in `[asn].banned` is reported as already permanently banned.
+Permanent ASN requests also remove local blocklist entries that exactly match
+the resolved ASN prefixes; overlapping narrower or broader entries remain. This
+cleanup counts as a saved change even when the ASN was already present. Removed
+local entries subsequently depend on ASN coverage; removing that ASN or a later
+prefix change can remove their coverage unless another source supplies it.
 
 When both stdin and stdout are terminals outside systemd, a changed ban or
 unban asks whether to run `sync` after saving. Accepting applies the saved

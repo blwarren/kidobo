@@ -934,7 +934,7 @@ mod tests {
             panic!("valid targets");
         };
         assert_eq!(preview.requested_target_count, 2);
-        assert_eq!(preview.target_label, "2 file target(s)");
+        assert_eq!(preview.target_label, "2 file targets");
         assert_eq!(preview.exact_entries, ["203.0.113.0/24"]);
         assert_eq!(preview.partial_entries, ["198.51.100.0/24"]);
 

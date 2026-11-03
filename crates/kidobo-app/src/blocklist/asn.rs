@@ -33,7 +33,9 @@ pub struct AsnBanRequest {
 pub struct AsnBanOutcome {
     /// Normalized ASNs newly added to configuration.
     pub added: Vec<u32>,
-    /// Duplicate configured ASN entries removed during normalization.
+    /// Normalized requested ASNs already permanently saved in configuration.
+    pub already_present: Vec<u32>,
+    /// Local blocklist entries removed because they exactly match resolved ASN prefixes.
     pub removed_duplicate_entries: usize,
     /// Stale-cache and other best-effort notices.
     pub notices: Vec<Notice>,
@@ -250,6 +252,10 @@ pub fn execute_ban_asn(
         }
     };
     Ok(AsnBanOutcome {
+        already_present: requested_asns
+            .into_iter()
+            .filter(|asn| !update.added.contains(asn))
+            .collect(),
         added: update.added,
         removed_duplicate_entries,
         notices,

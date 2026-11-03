@@ -30,19 +30,6 @@ pub fn finish_change(
     } else {
         "Source state unchanged"
     };
-    io.presentation()
-        .paragraph(io.stdout, source_state)
-        .map_err(|source| {
-            let source = KidoboError::from(source);
-            if changed {
-                KidoboError::SavedConfirmationFailed {
-                    source: Box::new(source),
-                }
-            } else {
-                source
-            }
-        })?;
-
     let apply = match mode {
         ApplyMode::Apply => true,
         ApplyMode::Prompt if io.interactive() => confirm(io, "Apply to the firewall now?")
@@ -58,11 +45,11 @@ pub fn finish_change(
         })
     } else {
         let view = io.presentation();
-        view.paragraph(io.stdout, "Live enforcement is pending.")
-            .and_then(|()| view.next(io.stdout, "sudo kidobo sync"))
-            .map_err(|source| KidoboError::SavedConfirmationFailed {
+        view.next(io.stdout, "sudo kidobo sync").map_err(|source| {
+            KidoboError::SavedConfirmationFailed {
                 source: Box::new(source.into()),
-            })
+            }
+        })
     }
 }
 
@@ -167,10 +154,7 @@ mod tests {
             result.expect("save only");
             assert_eq!(calls, 0);
             assert_eq!(input.reads, 0);
-            assert_eq!(
-                stdout,
-                "Source change saved\nLive enforcement is pending.\nNext: sudo kidobo sync\n"
-            );
+            assert_eq!(stdout, "Next: sudo kidobo sync\n");
         }
     }
 
@@ -198,7 +182,7 @@ mod tests {
             assert_eq!(input.reads, 1);
             assert!(stdout.contains("Apply to the firewall now? [y/N]: "));
             assert_eq!(
-                stdout.contains("Live enforcement is pending."),
+                stdout.contains("Next: sudo kidobo sync"),
                 expected_calls == 0
             );
         }
@@ -218,7 +202,7 @@ mod tests {
             result.expect("explicit apply");
             assert_eq!(calls, 1);
             assert_eq!(input.reads, 0);
-            assert_eq!(stdout, "Source state unchanged\n");
+            assert_eq!(stdout, "");
         }
     }
 
@@ -236,7 +220,7 @@ mod tests {
             result.expect("source only");
             assert_eq!(calls, 0);
             assert_eq!(input.reads, 0);
-            assert_eq!(stdout.contains("Source change saved"), changed);
+            assert_eq!(stdout.contains("Next: sudo kidobo sync"), changed);
         }
     }
 
@@ -317,11 +301,11 @@ mod tests {
     }
 
     #[test]
-    fn post_save_output_failures_keep_context_and_do_not_start_enforcement() {
+    fn confirmation_output_failures_keep_context_and_do_not_start_enforcement() {
         let mut input = Input::unused();
         let mut calls = 0;
         let error = finish_change(
-            ApplyMode::Apply,
+            ApplyMode::Prompt,
             true,
             &mut CliIo {
                 input: &mut input,

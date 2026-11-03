@@ -194,10 +194,6 @@ impl LookupRenderer<'_> {
     fn human_header(&mut self) -> Result<(), KidoboError> {
         if !self.header_written {
             self.view.heading(self.output, "Offline source overlaps")?;
-            self.view.paragraph(
-                self.output,
-                "Saved and cached source evidence; this does not establish live enforcement.",
-            )?;
             self.header_written = true;
         }
         Ok(())
@@ -207,16 +203,24 @@ impl LookupRenderer<'_> {
         match self.format {
             LookupFormat::Human => {
                 self.human_header()?;
-                if matches.is_empty() {
-                    self.view
-                        .record(self.output, &[("Target", target), ("Status", "NO MATCH")])?;
-                }
+                self.view.record(
+                    self.output,
+                    &[
+                        ("Target", target),
+                        (
+                            "Status",
+                            if matches.is_empty() {
+                                "NO MATCH"
+                            } else {
+                                "MATCH"
+                            },
+                        ),
+                    ],
+                )?;
                 for source in matches {
                     self.view.record(
                         self.output,
                         &[
-                            ("Target", target),
-                            ("Status", "MATCH"),
                             ("Source", &source.source_label),
                             ("Matched Entry", &source.source_line),
                         ],
@@ -247,18 +251,19 @@ impl LookupRenderer<'_> {
         let total_count = summary.total_count;
         let matched_count = summary.matched_count;
         match self.format {
-            LookupFormat::Human => {
+            LookupFormat::Human if summary.file_mode => {
                 self.human_header()?;
                 let unmatched_count = total_count.saturating_sub(matched_count);
-                self.view.heading(self.output, "Summary")?;
-                self.view.key_values(
+                self.view.paragraph(
                     self.output,
-                    &[
-                        ("Targets", &total_count.to_string()),
-                        ("Matched", &matched_count.to_string()),
-                        ("Unmatched", &unmatched_count.to_string()),
-                        ("Match rate", &percent_str(matched_count, total_count)),
-                    ],
+                    &format!(
+                        "{total_count} {}: {matched_count} matched, {unmatched_count} unmatched.",
+                        if total_count == 1 {
+                            "target"
+                        } else {
+                            "targets"
+                        }
+                    ),
                 )?;
             }
             LookupFormat::Tsv if summary.file_mode => {
@@ -271,7 +276,7 @@ impl LookupRenderer<'_> {
                     percent_str(matched_count, total_count)
                 )?;
             }
-            LookupFormat::Tsv => {}
+            LookupFormat::Human | LookupFormat::Tsv => {}
         }
         Ok(())
     }
@@ -295,6 +300,39 @@ fn percent_str(numerator: usize, denominator: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::encode_lookup_field;
+
+    #[test]
+    fn human_lookup_totals_use_one_line_only_for_file_input() {
+        for (total, matched, expected) in [
+            (0, 0, "0 targets: 0 matched, 0 unmatched.\n"),
+            (1, 1, "1 target: 1 matched, 0 unmatched.\n"),
+            (2, 1, "2 targets: 1 matched, 1 unmatched.\n"),
+        ] {
+            for file_mode in [false, true] {
+                let mut output = Vec::new();
+                let mut renderer = super::LookupRenderer {
+                    format: super::LookupFormat::Human,
+                    view: crate::cli::presentation::Presentation::new(80, false),
+                    header_written: true,
+                    unmatched_targets: Vec::new(),
+                    output: &mut output,
+                };
+                renderer
+                    .finish(&super::LookupSummary {
+                        total_count: total,
+                        matched_count: matched,
+                        invalid_targets: Vec::new(),
+                        file_mode,
+                        notices: Vec::new(),
+                    })
+                    .expect("lookup summary");
+                assert_eq!(
+                    String::from_utf8(output).expect("UTF-8 output"),
+                    if file_mode { expected } else { "" }
+                );
+            }
+        }
+    }
 
     #[test]
     fn completion_write_errors_keep_the_cli_exit_and_os_cause() {

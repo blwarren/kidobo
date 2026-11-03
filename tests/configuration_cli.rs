@@ -27,6 +27,8 @@ fn source_listing_is_offline_and_reports_unknown_freshness_without_ansi() {
     assert!(output.stdout.contains("Configured remote feeds"));
     assert!(output.stdout.contains("Freshness"));
     assert!(output.stdout.contains("Unknown"));
+    assert!(!output.stdout.contains("Saved settings;"));
+    assert!(!output.stdout.contains("does not establish feed freshness"));
     assert!(!output.stdout.contains('\u{1b}'));
     assert_eq!(fixture.tool_log(), "");
     assert_eq!(saved_config(&fixture), INLINE_CONFIG);
@@ -45,7 +47,9 @@ fn source_add_preserves_comments_inline_tables_and_unrelated_configuration() {
         .wait();
 
     assert!(output.status.success(), "{}", output.stderr);
-    assert!(output.stdout.contains("live enforcement is pending"));
+    assert!(output.stdout.contains("Action: Added feed"));
+    assert_eq!(output.stdout.matches("Next: sudo kidobo sync").count(), 1);
+    assert!(!output.stdout.contains("live enforcement is pending"));
     let contents = saved_config(&fixture);
     assert!(contents.starts_with("# preserve this comment\n"));
     assert!(contents.contains("remote = {"));
@@ -144,7 +148,7 @@ fn covered_distinct_allow_can_be_saved_without_a_confirmation_prompt() {
         .wait();
 
     assert!(output.status.success(), "{}", output.stderr);
-    assert!(output.stdout.contains("Configuration change saved"));
+    assert!(output.stdout.contains("Action: Added exemption"));
     assert!(
         !output
             .stdout
@@ -200,7 +204,8 @@ fn explicit_allow_approval_saves_configuration_without_syncing() {
 
     assert!(output.status.success(), "{}", output.stderr);
     assert!(saved_config(&fixture).contains("198.51.100.0/24"));
-    assert!(output.stdout.contains("live enforcement is pending"));
+    assert!(output.stdout.contains("Action: Added exemption"));
+    assert_eq!(output.stdout.matches("Next: sudo kidobo sync").count(), 1);
     assert_eq!(fixture.tool_log(), "");
 }
 
@@ -225,6 +230,12 @@ fn config_show_redacts_sensitive_url_parts_and_reports_origins_and_unused_legacy
     assert!(output.stdout.contains("explicit"));
     assert!(output.stdout.contains("default"));
     assert!(output.stdout.contains("derived"));
+    assert!(!output.stdout.contains("Origins: explicit values"));
+    assert!(
+        !output
+            .stdout
+            .contains("Manual file editing remains supported")
+    );
     assert!(output.stdout.contains("remote.cache_stale_after_secs"));
     assert!(
         output

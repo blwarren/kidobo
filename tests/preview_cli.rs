@@ -676,15 +676,24 @@ fn offline_preview_uses_validated_local_remote_asn_github_and_temporary_inputs_r
         stdout.contains("IPv6"),
         "missing IPv6 preview totals: {stdout}"
     );
-    assert!(
-        stdout.to_ascii_lowercase().contains("capacity"),
-        "missing capacity result: {stdout}"
-    );
     assert!(stdout.contains("Source evidence"));
     assert!(stdout.contains("Validated cache"));
     assert!(stdout.contains("AS64512"));
     assert!(stdout.contains("github-metadata"));
-    assert!(stdout.contains("Exact live delta unavailable"));
+    assert_eq!(stdout.matches("Preview completed in").count(), 1);
+    assert_eq!(stdout.matches("Next:").count(), 1);
+    assert!(stdout.ends_with("Next: sudo kidobo sync\n"));
+    for boilerplate in [
+        "Capacity preflight",
+        "Exact live delta unavailable",
+        "Preview does not",
+        "Inputs may change",
+    ] {
+        assert!(
+            !stdout.contains(boilerplate),
+            "unexpected boilerplate: {stdout}"
+        );
+    }
     assert!(!stdout.contains('\u{1b}'));
     assert_eq!(
         before, after,

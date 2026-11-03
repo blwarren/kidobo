@@ -508,8 +508,13 @@ fn validate_remote_response(
         return None;
     }
     if parsed.invalid_lines > 0 {
+        let noun = if parsed.invalid_lines == 1 {
+            "line"
+        } else {
+            "lines"
+        };
         warn!(
-            "remote source {url} ignored {} invalid line(s)",
+            "remote source {url} ignored {} invalid {noun}",
             parsed.invalid_lines
         );
     }

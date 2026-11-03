@@ -40,6 +40,9 @@ The compatibility-sensitive surface includes:
 
 ## Read-only inspection commands
 
+Human output favors compact results; interpretation and detailed evidence are
+described in [Operations](operations.md#human-readable-output-and-pipes).
+
 Running `kidobo` without a subcommand is compatible with `kidobo status` and
 opens the read-only status view. `status` and `check` use versioned JSON when
 `--format json` is selected; their reports identify `schema_version: 1`. Status

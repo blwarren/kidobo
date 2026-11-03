@@ -170,7 +170,7 @@ pub enum AppError {
     },
 
     /// A mutation was rejected because at least one target was invalid.
-    #[error("blocklist update failed for {count} invalid target(s)")]
+    #[error("blocklist update failed for {count} invalid {noun}", noun = if *count == 1 { "target" } else { "targets" })]
     BlocklistInvalidTargets {
         /// Number of invalid targets.
         count: usize,
@@ -199,7 +199,7 @@ pub enum AppError {
     },
 
     /// One or more required full-flush cleanup operations failed.
-    #[error("flush cleanup incomplete ({failures} failure(s)): {details}")]
+    #[error("flush cleanup incomplete ({failures} {noun}): {details}", noun = if *failures == 1 { "failure" } else { "failures" })]
     FlushIncomplete {
         /// Number of incomplete operations.
         failures: usize,
@@ -223,7 +223,7 @@ pub enum AppError {
     },
 
     /// Lookup input contained invalid targets.
-    #[error("lookup failed for {count} invalid target(s)")]
+    #[error("lookup failed for {count} invalid {noun}", noun = if *count == 1 { "target" } else { "targets" })]
     LookupInvalidTargets {
         /// Number of invalid targets.
         count: usize,
@@ -324,4 +324,35 @@ pub enum AppError {
         /// Duplicated provider identifier.
         provider: &'static str,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AppError;
+
+    #[test]
+    fn counted_errors_use_singular_only_for_one() {
+        for (count, target, failure) in [
+            (0, "targets", "failures"),
+            (1, "target", "failure"),
+            (2, "targets", "failures"),
+        ] {
+            assert_eq!(
+                AppError::BlocklistInvalidTargets { count }.to_string(),
+                format!("blocklist update failed for {count} invalid {target}")
+            );
+            assert_eq!(
+                AppError::LookupInvalidTargets { count }.to_string(),
+                format!("lookup failed for {count} invalid {target}")
+            );
+            assert_eq!(
+                AppError::FlushIncomplete {
+                    failures: count,
+                    details: "cleanup failed".to_string()
+                }
+                .to_string(),
+                format!("flush cleanup incomplete ({count} {failure}): cleanup failed")
+            );
+        }
+    }
 }

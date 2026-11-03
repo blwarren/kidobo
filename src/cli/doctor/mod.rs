@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use log::info;
 
 use crate::cli::CliIo;
@@ -54,13 +56,15 @@ pub fn run_doctor_command(
         DoctorOverall::Ok => "OK",
         DoctorOverall::Fail => "FAIL",
     };
-    info!(
-        "doctor summary: overall={} checks_total={} checks_failed={} checks_skipped={}",
-        overall,
-        report.checks.len(),
-        failed_count,
-        skipped_count
-    );
+    if format == ReportFormat::Json || !io.stdout_is_terminal || io.under_systemd {
+        info!(
+            "doctor summary: overall={} checks_total={} checks_failed={} checks_skipped={}",
+            overall,
+            report.checks.len(),
+            failed_count,
+            skipped_count
+        );
+    }
     if report.overall == DoctorOverall::Ok {
         Ok(())
     } else {
@@ -113,19 +117,25 @@ fn render_human(report: &DoctorReport, io: &mut CliIo<'_>) -> Result<(), KidoboE
     view.paragraph(
         io.stdout,
         &format!(
-            "{} checks: {} passed, {failed} failed, {skipped} skipped.",
+            "{} {}: {} passed, {failed} failed, {skipped} skipped.",
             report.checks.len(),
+            if report.checks.len() == 1 {
+                "check"
+            } else {
+                "checks"
+            },
             report.checks.len() - failed - skipped
         ),
     )?;
-    view.next(
-        io.stdout,
-        if failed == 0 {
-            "sudo kidobo sync"
-        } else {
-            "correct the reported issues, then rerun kidobo doctor"
-        },
-    )?;
+    let remedies = report
+        .checks
+        .iter()
+        .filter(|check| check.status == DoctorCheckStatus::Fail)
+        .map(|check| remedy(&check.name))
+        .collect::<BTreeSet<_>>();
+    for remedy in remedies {
+        view.paragraph(io.stdout, remedy)?;
+    }
     Ok(())
 }
 
@@ -140,19 +150,19 @@ fn render_check(
         DoctorCheckStatus::Skip => Status::Skip,
     };
     view.status(out, status, &check.name.replace('_', " "), &check.detail)?;
-    if check.status == DoctorCheckStatus::Fail {
-        let remedy = if check.name.starts_with("config_") {
-            "Correct the reported configuration path or error; sudo kidobo init creates missing configuration."
-        } else if check.name.starts_with("binary_") {
-            "Install the named tool using your distribution's package manager, then rerun doctor."
-        } else if check.name.starts_with("sudo_") {
-            "Retry sudo kidobo doctor; check privilege configuration if the probe still fails."
-        } else {
-            "Inspect the reported path and permissions; sudo kidobo init creates missing files without replacing existing files."
-        };
-        view.paragraph(out, remedy)?;
-    }
     Ok(())
+}
+
+fn remedy(name: &str) -> &'static str {
+    if name.starts_with("config_") {
+        "Correct the reported configuration path or error; sudo kidobo init creates missing configuration."
+    } else if name.starts_with("binary_") {
+        "Install the missing tools using your distribution's package manager, then rerun doctor."
+    } else if name.starts_with("sudo_") {
+        "Retry sudo kidobo doctor; check privilege configuration if the probe still fails."
+    } else {
+        "Inspect the reported path and permissions; sudo kidobo init creates missing files without replacing existing files."
+    }
 }
 
 fn render_report(report: &DoctorReport) -> Result<String, KidoboError> {
@@ -165,7 +175,80 @@ fn render_report(report: &DoctorReport) -> Result<String, KidoboError> {
 mod tests {
     use kidobo_app::doctor::{DoctorCheck, DoctorCheckStatus, DoctorOverall, DoctorReport};
 
-    use super::render_report;
+    use super::{render_human, render_report};
+    use crate::cli::{CliIo, PromptInput};
+    use crate::error::KidoboError;
+
+    struct NoInput;
+
+    impl PromptInput for NoInput {
+        fn read_response(&mut self) -> Result<String, KidoboError> {
+            panic!("doctor must not prompt")
+        }
+    }
+
+    fn human_output(checks: Vec<DoctorCheck>) -> String {
+        let mut stdout = Vec::new();
+        render_human(
+            &DoctorReport {
+                overall: DoctorOverall::Fail,
+                checks,
+            },
+            &mut CliIo {
+                input: &mut NoInput,
+                stdout: &mut stdout,
+                stderr: &mut Vec::new(),
+                stdin_is_terminal: false,
+                stdout_is_terminal: false,
+                stderr_is_terminal: false,
+                terminal_width: 120,
+                term_dumb: false,
+                under_systemd: false,
+                no_color: true,
+            },
+        )
+        .expect("human doctor report");
+        String::from_utf8(stdout).expect("UTF-8 doctor output")
+    }
+
+    #[test]
+    fn human_report_lists_failures_and_prints_each_remedy_once() {
+        let output = human_output(
+            ["binary_ipset", "binary_iptables"]
+                .into_iter()
+                .map(|name| DoctorCheck {
+                    name: name.into(),
+                    status: DoctorCheckStatus::Fail,
+                    detail: format!("missing {name}"),
+                })
+                .collect(),
+        );
+        assert_eq!(output.matches("[FAIL]").count(), 2);
+        assert!(output.contains("missing binary_ipset"));
+        assert!(output.contains("missing binary_iptables"));
+        assert_eq!(output.matches("Install the missing tools").count(), 1);
+        assert!(output.contains("2 checks: 0 passed, 2 failed, 0 skipped."));
+    }
+
+    #[test]
+    fn successful_human_reports_use_count_appropriate_nouns_without_navigation() {
+        for (count, noun) in [(0, "checks"), (1, "check"), (2, "checks")] {
+            let output = human_output(
+                (0..count)
+                    .map(|index| DoctorCheck {
+                        name: format!("binary_tool_{index}"),
+                        status: DoctorCheckStatus::Ok,
+                        detail: "available".into(),
+                    })
+                    .collect(),
+            );
+            assert!(output.contains(&format!(
+                "{count} {noun}: {count} passed, 0 failed, 0 skipped."
+            )));
+            assert!(!output.contains("Next:"));
+            assert!(!output.contains("Install the missing tools"));
+        }
+    }
 
     #[test]
     fn report_renderer_preserves_machine_readable_shape() {

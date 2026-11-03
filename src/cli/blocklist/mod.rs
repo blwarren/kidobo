@@ -4,7 +4,7 @@ use std::path::Path;
 use log::warn;
 
 use crate::cli::CliIo;
-use crate::cli::presentation::{format_utc, remaining_duration};
+use crate::cli::presentation::format_utc;
 use crate::error::KidoboError;
 use kidobo_adapters::blocklist_file::FileBlocklistRepository;
 use kidobo_adapters::blocklist_operations::SystemAsnOperations;
@@ -19,7 +19,6 @@ use kidobo_app::blocklist::{
     BanDependencies, BanOutcome, BanRequest, BlocklistInput, UnbanApplyDependencies, UnbanDecision,
     UnbanPreparationDependencies, UnbanRequest,
 };
-use kidobo_app::temporary_bans::Clock;
 
 pub fn run_ban_command(
     target: Option<&str>,
@@ -45,24 +44,45 @@ pub fn run_ban_command(
             render_ban_changes(&outcome.temporary_changes, Some(duration), io)?;
             return Ok(changes_saved(&outcome.temporary_changes));
         }
-        output(
-            io,
-            format_args!(
-                "added {} ASN ban(s): {}",
-                outcome.added.len(),
-                format_asn_list(&outcome.added)
-            ),
-        )?;
+        if !outcome.added.is_empty() {
+            output(
+                io,
+                format_args!(
+                    "Added {} ASN {}: {}",
+                    outcome.added.len(),
+                    if outcome.added.len() == 1 {
+                        "ban"
+                    } else {
+                        "bans"
+                    },
+                    format_asn_list(&outcome.added)
+                ),
+            )?;
+        }
+        if !outcome.already_present.is_empty() {
+            output(
+                io,
+                format_args!(
+                    "Already permanently banned: {}",
+                    format_asn_list(&outcome.already_present)
+                ),
+            )?;
+        }
         if outcome.removed_duplicate_entries > 0 {
             output(
                 io,
                 format_args!(
-                    "removed {} duplicate IP/CIDR entry(ies) from local blocklist",
-                    outcome.removed_duplicate_entries
+                    "Removed {} local {} matching ASN prefixes.",
+                    outcome.removed_duplicate_entries,
+                    if outcome.removed_duplicate_entries == 1 {
+                        "entry"
+                    } else {
+                        "entries"
+                    }
                 ),
             )?;
         }
-        return Ok(!outcome.added.is_empty());
+        return Ok(!outcome.added.is_empty() || outcome.removed_duplicate_entries > 0);
     }
 
     let input = command_input(target, file)?;
@@ -112,18 +132,37 @@ pub fn run_unban_command(
         for notice in &outcome.notices {
             warn!("{}", notice.message);
         }
-        output(
-            io,
-            format_args!(
-                "removed {} ASN ban(s): {}",
-                outcome.removed.len(),
-                format_asn_list(&outcome.removed)
-            ),
-        )?;
-        output(
-            io,
-            format_args!("deleted {} ASN cache file(s)", outcome.deleted_cache_files),
-        )?;
+        if outcome.removed.is_empty() {
+            output(io, format_args!("No saved ASN bans matched the request."))?;
+        } else {
+            output(
+                io,
+                format_args!(
+                    "Removed {} ASN {}: {}",
+                    outcome.removed.len(),
+                    if outcome.removed.len() == 1 {
+                        "ban"
+                    } else {
+                        "bans"
+                    },
+                    format_asn_list(&outcome.removed)
+                ),
+            )?;
+        }
+        if outcome.deleted_cache_files > 0 {
+            output(
+                io,
+                format_args!(
+                    "Deleted {} ASN cache {}.",
+                    outcome.deleted_cache_files,
+                    if outcome.deleted_cache_files == 1 {
+                        "file"
+                    } else {
+                        "files"
+                    }
+                ),
+            )?;
+        }
         return Ok(!outcome.removed.is_empty());
     }
 
@@ -149,22 +188,24 @@ pub fn run_unban_command(
         &UnbanDecision { remove_partial },
         &unban_apply_dependencies(),
     )?;
+    render_unban_outcome(&outcome, file_mode, io)
+}
+
+fn render_unban_outcome(
+    outcome: &blocklist::UnbanOutcome,
+    file_mode: bool,
+    io: &mut CliIo<'_>,
+) -> Result<bool, KidoboError> {
     if outcome.total_removed() == 0 {
-        if file_mode && outcome.had_partial_matches {
+        if file_mode {
+            let action = if outcome.had_partial_matches {
+                "were removed for"
+            } else {
+                "matched"
+            };
             output(
                 io,
-                format_args!(
-                    "no blocklist entries were removed for {} file target(s)",
-                    outcome.requested_target_count
-                ),
-            )?;
-        } else if file_mode {
-            output(
-                io,
-                format_args!(
-                    "no blocklist entries matched {} file target(s)",
-                    outcome.requested_target_count
-                ),
+                format_args!("no blocklist entries {action} {}", outcome.target_label),
             )?;
         } else {
             output(
@@ -174,25 +215,19 @@ pub fn run_unban_command(
         }
         return Ok(false);
     }
-    if file_mode {
-        output(
-            io,
-            format_args!(
-                "removed {} blocklist entries for {} file target(s)",
-                outcome.total_removed(),
-                outcome.requested_target_count
-            ),
-        )?;
-    } else {
-        output(
-            io,
-            format_args!(
-                "removed {} blocklist entries for {}",
-                outcome.total_removed(),
-                outcome.target_label
-            ),
-        )?;
-    }
+    output(
+        io,
+        format_args!(
+            "removed {} blocklist {} for {}",
+            outcome.total_removed(),
+            if outcome.total_removed() == 1 {
+                "entry"
+            } else {
+                "entries"
+            },
+            outcome.target_label
+        ),
+    )?;
     Ok(true)
 }
 
@@ -270,25 +305,20 @@ fn render_ban_changes(
     duration: Option<BanDuration>,
     io: &mut CliIo<'_>,
 ) -> Result<(), KidoboError> {
-    let duration_text = duration
-        .map(|duration| format!(" for {duration}"))
-        .unwrap_or_default();
     for change in changes {
         match change {
             BanChange::TemporaryAdded { target, expires_at } => output(
                 io,
                 format_args!(
-                    "added temporary ban {target}{duration_text} (expires {}; {}; Unix {expires_at})",
-                    format_utc(*expires_at),
-                    remaining_duration(*expires_at, SystemClock.now_unix_secs()?)
+                    "added temporary ban {target} (expires {})",
+                    format_utc(*expires_at)
                 ),
             )?,
             BanChange::TemporaryRescheduled { target, expires_at } => output(
                 io,
                 format_args!(
-                    "rescheduled temporary ban {target}{duration_text} (expires {}; {}; Unix {expires_at})",
-                    format_utc(*expires_at),
-                    remaining_duration(*expires_at, SystemClock.now_unix_secs()?)
+                    "rescheduled temporary ban {target} (expires {})",
+                    format_utc(*expires_at)
                 ),
             )?,
             BanChange::AlreadyPermanent(target) => {
@@ -303,9 +333,6 @@ fn render_ban_changes(
             }
             BanChange::Added(target) => output(io, format_args!("added blocklist entry {target}"))?,
         }
-    }
-    if duration.is_some() && changes_saved(changes) {
-        io.presentation().paragraph(io.stdout, "The duration started when saved. Delayed or failed sync/timer runs can delay activation or removal; another source may continue blocking the address.")?;
     }
     Ok(())
 }

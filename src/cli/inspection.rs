@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::net::IpAddr;
 
 use crate::cli::CliIo;
@@ -47,7 +48,7 @@ pub fn status(format: ReportFormat, io: &mut CliIo<'_>) -> Result<(), KidoboErro
     let view = io.presentation();
     view.heading(io.stdout, &format!("Kidobo {}", env!("CARGO_PKG_VERSION")))?;
     if report.initialized == Some(false) {
-        view.paragraph(io.stdout, "Welcome. Kidobo manages incoming IP/CIDR blocks through one-shot synchronization. Create and review your configuration to begin.")?;
+        view.paragraph(io.stdout, "Welcome. Create your configuration to begin.")?;
         view.next(io.stdout, "sudo kidobo setup")?;
     }
     view.status(
@@ -58,17 +59,24 @@ pub fn status(format: ReportFormat, io: &mut CliIo<'_>) -> Result<(), KidoboErro
     )?;
     render_family(view, io.stdout, &report.ipv4)?;
     render_family(view, io.stdout, &report.ipv6)?;
-    if report.ipv4.enforcement == Verification::Unknown
-        || report.ipv6.enforcement == Verification::Unknown
-    {
-        for family in [&report.ipv4, &report.ipv6] {
-            if family.enforcement == Verification::Unknown {
-                for evidence in family.evidence.iter().take(2) {
+    let mut shown = HashSet::from([
+        report.configuration_detail.as_str(),
+        report.timer.detail.as_str(),
+    ]);
+    for family in [&report.ipv4, &report.ipv6] {
+        if family.enforcement != Verification::Verified {
+            for evidence in std::iter::once(&family.detail).chain(&family.evidence) {
+                if shown.insert(evidence.as_str()) {
                     view.paragraph(io.stdout, evidence)?;
                 }
             }
         }
-        view.next(io.stdout, "sudo kidobo status if permissions prevent verification; kidobo doctor for prerequisites")?;
+    }
+    if report.initialized != Some(false)
+        && (report.ipv4.enforcement == Verification::Unknown
+            || report.ipv6.enforcement == Verification::Unknown)
+    {
+        view.next(io.stdout, "sudo kidobo status; kidobo doctor")?;
     }
     let counts = &report.saved_bans;
     view.key_values(
@@ -98,10 +106,10 @@ pub fn status(format: ReportFormat, io: &mut CliIo<'_>) -> Result<(), KidoboErro
         ],
     )?;
     for notice in report.notices.iter().chain(&counts.notices) {
-        view.paragraph(io.stdout, notice)?;
+        if shown.insert(notice.as_str()) {
+            view.paragraph(io.stdout, notice)?;
+        }
     }
-    view.paragraph(io.stdout, "Saved bans may await sync. Unknown means unable to verify; it never establishes an unblocked host.")?;
-    view.next(io.stdout, "kidobo help; sudo kidobo check IP; kidobo bans")?;
     Ok(())
 }
 
@@ -132,8 +140,7 @@ fn render_family(
         status_label(family.enforcement),
         &format!("{} managed enforcement", family.family.to_uppercase()),
         &format!(
-            "{} Live kernel entries: {}. Configuration: {enabled}.",
-            family.detail,
+            "Kernel entries: {}. Configuration: {enabled}.",
             count(family.entries)
         ),
     )?;
@@ -192,46 +199,87 @@ pub fn check(ip: IpAddr, format: ReportFormat, io: &mut CliIo<'_>) -> Result<(),
         serde_json::to_writer_pretty(&mut *io.stdout, &report)?;
         writeln!(io.stdout)?;
     } else {
-        let view = io.presentation();
-        let (label, result) = match report.verdict {
-            CheckVerdict::Blocked => ("BLOCKED BY KIDOBO", Status::Pass),
-            CheckVerdict::NotBlocked => ("NOT BLOCKED BY KIDOBO", Status::Pass),
-            CheckVerdict::Unknown => ("UNKNOWN", Status::Unknown),
-        };
-        view.heading(io.stdout, "Live managed enforcement")?;
-        view.status(io.stdout, result, label, &report.target)?;
-        render_family(view, io.stdout, &report.family)?;
-        for notice in report.family.evidence.iter().chain(&report.notices) {
-            view.paragraph(io.stdout, notice)?;
-        }
-        view.paragraph(
-            io.stdout,
-            "This assessment covers Kidobo's managed incoming blocking path only.",
-        )?;
-        view.heading(io.stdout, "Offline source evidence")?;
-        view.paragraph(io.stdout, "Saved/cached overlaps may be stale and do not establish enforcement. Safelists can exempt addresses; remote or ASN sources can keep blocking an address after local unban.")?;
-        let rows = report
-            .offline_matches
-            .iter()
-            .map(|entry| vec![entry.source.clone(), entry.entry.clone()])
-            .collect::<Vec<_>>();
-        if rows.is_empty() {
-            view.paragraph(io.stdout, "No readable offline source matches.")?;
-        } else {
-            view.table(io.stdout, &["Source", "Matched entry"], &rows)?;
-        }
-        for notice in &report.offline_notices {
-            view.paragraph(io.stdout, notice)?;
-        }
-        if report.verdict == CheckVerdict::Unknown {
-            view.next(io.stdout, &format!("sudo kidobo check {ip}; kidobo doctor"))?;
-        }
+        render_check(&report, io)?;
     }
     if report.verdict == CheckVerdict::Unknown {
         Err(KidoboError::CheckUnknown)
     } else {
         Ok(())
     }
+}
+
+fn render_check(report: &inspection::CheckReport, io: &mut CliIo<'_>) -> Result<(), KidoboError> {
+    let view = io.presentation();
+    let (label, result) = match report.verdict {
+        CheckVerdict::Blocked => ("BLOCKED BY KIDOBO", Status::Pass),
+        CheckVerdict::NotBlocked => ("NOT BLOCKED BY KIDOBO", Status::Pass),
+        CheckVerdict::Unknown => ("UNKNOWN", Status::Unknown),
+    };
+    view.status(io.stdout, result, label, &report.target)?;
+    let family = &report.family;
+    let entries = family.entries.map_or_else(
+        || {
+            if family.set_state == Verification::Absent {
+                "set absent".to_string()
+            } else {
+                "entries unknown".to_string()
+            }
+        },
+        |entries| {
+            format!(
+                "{entries} {}",
+                if entries == 1 { "entry" } else { "entries" }
+            )
+        },
+    );
+    view.paragraph(
+        io.stdout,
+        &format!(
+            "{}: {}; {entries}.",
+            if family.family == "ipv4" {
+                "IPv4"
+            } else {
+                "IPv6"
+            },
+            family.set_name.as_deref().unwrap_or("set unknown")
+        ),
+    )?;
+    let mut shown = HashSet::new();
+    if report.verdict == CheckVerdict::Unknown {
+        for notice in std::iter::once(&family.detail).chain(&family.evidence) {
+            if shown.insert(notice.as_str()) {
+                view.paragraph(io.stdout, notice)?;
+            }
+        }
+    }
+    for notice in &report.notices {
+        if shown.insert(notice.as_str()) {
+            view.paragraph(io.stdout, notice)?;
+        }
+    }
+    view.heading(io.stdout, "Source matches")?;
+    let rows = report
+        .offline_matches
+        .iter()
+        .map(|entry| vec![entry.source.clone(), entry.entry.clone()])
+        .collect::<Vec<_>>();
+    if rows.is_empty() {
+        view.paragraph(io.stdout, "No source matches.")?;
+    } else {
+        view.table(io.stdout, &["Source", "Matched entry"], &rows)?;
+    }
+    for notice in &report.offline_notices {
+        if shown.insert(notice.as_str()) {
+            view.paragraph(io.stdout, notice)?;
+        }
+    }
+    if report.verdict == CheckVerdict::Unknown && report.notices.is_empty() {
+        view.next(
+            io.stdout,
+            &format!("sudo kidobo check {}; kidobo doctor", report.target),
+        )?;
+    }
+    Ok(())
 }
 
 fn offline_evidence(ip: IpAddr) -> Result<(Vec<OfflineMatch>, Vec<String>), KidoboError> {

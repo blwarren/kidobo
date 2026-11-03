@@ -242,10 +242,113 @@ fn check_verifies_membership_and_keeps_offline_matches_separate() {
     let report = json_output(&blocked);
     assert_eq!(report["verdict"], "blocked");
     assert_eq!(report["family"]["membership"], "present");
+    assert_eq!(report["notices"], serde_json::json!([]));
+    let evidence = report["family"]["evidence"]
+        .as_array()
+        .expect("probe evidence");
+    assert_eq!(evidence.len(), 3);
+    assert!(
+        evidence[0]
+            .as_str()
+            .expect("set evidence")
+            .contains("Verified hash:net inet set kidobo: 7 kernel entries")
+    );
+    assert!(
+        evidence[1]
+            .as_str()
+            .expect("wiring evidence")
+            .contains("Verified first INPUT jump")
+    );
+    assert!(
+        evidence[2]
+            .as_str()
+            .expect("membership evidence")
+            .contains("Live ipset test verified membership")
+    );
     assert_ne!(
         report["offline_matches"].as_array().expect("matches").len(),
         0
     );
+}
+
+#[test]
+fn human_check_reports_one_verdict_one_live_summary_and_source_matches() {
+    let fixture = Fixture::new(
+        Some(&config(true)),
+        Some("203.0.113.7\n2001:db8::7\n"),
+        Some("version = 1\n"),
+    );
+    for (address, summary) in [
+        ("203.0.113.7", "IPv4: kidobo; 7 entries."),
+        ("2001:db8::7", "IPv6: kidobo-v6; 9 entries."),
+    ] {
+        for (membership, verdict) in [
+            ("present", "BLOCKED BY KIDOBO"),
+            ("absent", "NOT BLOCKED BY KIDOBO"),
+        ] {
+            let output = fixture.run(
+                &["check", address],
+                &[("KIDOBO_TEST_MEMBERSHIP", membership)],
+            );
+            assert_eq!(output.status.code(), Some(0), "{output:?}");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert_eq!(stdout.matches(verdict).count(), 1, "{stdout}");
+            assert_eq!(stdout.matches(summary).count(), 1, "{stdout}");
+            assert_eq!(stdout.matches("Source matches").count(), 1, "{stdout}");
+            assert!(stdout.contains(address), "{stdout}");
+            assert!(stdout.contains("internal:blocklist"), "{stdout}");
+            for removed in [
+                "Verified hash:net",
+                "INPUT jump",
+                "Live ipset test",
+                "This assess",
+                "may be stale",
+                "does not establish",
+                "Next:",
+            ] {
+                assert!(!stdout.contains(removed), "{stdout}");
+            }
+        }
+    }
+}
+
+#[test]
+fn human_unknown_check_keeps_the_probe_failure_and_one_recovery_hint() {
+    let fixture = Fixture::new(Some(&config(true)), Some(""), Some("version = 1\n"));
+    let output = fixture.run(
+        &["check", IPSET_MEMBERSHIP],
+        &[("KIDOBO_TEST_MEMBERSHIP", "unknown")],
+    );
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(stdout.matches("[UNKNOWN] UNKNOWN").count(), 1, "{stdout}");
+    assert_eq!(
+        stdout.matches("Operation not permitted").count(),
+        1,
+        "{stdout}"
+    );
+    assert_eq!(stdout.matches("Next:").count(), 1, "{stdout}");
+    assert!(
+        stdout.contains("Unable to verify selected-address membership"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("This assess"), "{stdout}");
+}
+
+#[test]
+fn human_status_omits_boilerplate_and_repeated_unknown_reasons() {
+    let fixture = Fixture::new(Some(&config(false)), Some(""), Some("version = 1\n"));
+    let output = fixture.run(&["status"], &[]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        stdout.matches("IPv6 is disabled in configuration").count(),
+        1,
+        "{stdout}"
+    );
+    assert!(!stdout.contains("Saved bans may await sync"), "{stdout}");
+    assert!(!stdout.contains("kidobo help;"), "{stdout}");
+    assert_eq!(stdout.matches("Next:").count(), 1, "{stdout}");
 }
 
 #[test]
@@ -385,17 +488,22 @@ fn bans_apply_default_limit_filters_and_expiry_utc_format() {
     let default = fixture.run(&["bans"], &[]);
     assert_eq!(default.status.code(), Some(0), "{default:?}");
     let default_stdout = String::from_utf8_lossy(&default.stdout);
-    assert!(default_stdout.contains("50 shown of 56 matching entries; 6 omitted."));
+    assert!(default_stdout.contains("50 of 56 bans shown; 6 omitted."));
+    assert_eq!(default_stdout.matches("Next:").count(), 1);
+    assert!(default_stdout.contains("kidobo bans --all"));
+    assert!(!default_stdout.contains("not necessarily"));
 
     let all = fixture.run(&["bans", "--all"], &[]);
     assert_eq!(all.status.code(), Some(0), "{all:?}");
     let all_stdout = String::from_utf8_lossy(&all.stdout);
-    assert!(all_stdout.contains("56 shown of 56 matching entries; 0 omitted."));
+    assert!(all_stdout.contains("56 bans."));
+    assert!(!all_stdout.contains("omitted"));
+    assert!(!all_stdout.contains("Next:"));
 
     let temporary = fixture.run(&["bans", "--temporary"], &[]);
     assert_eq!(temporary.status.code(), Some(0), "{temporary:?}");
     let temporary_stdout = String::from_utf8_lossy(&temporary.stdout);
-    assert!(temporary_stdout.contains("3 shown of 3 matching entries; 0 omitted."));
+    assert!(temporary_stdout.contains("3 bans."));
     assert!(temporary_stdout.contains("1970-01-01 00:00:01 UTC"));
     assert!(temporary_stdout.contains("2033-05-18 03:33:20 UTC"));
     assert!(temporary_stdout.contains("expired"));
@@ -404,7 +512,11 @@ fn bans_apply_default_limit_filters_and_expiry_utc_format() {
     let permanent_asns = fixture.run(&["bans", "--permanent", "--asn"], &[]);
     assert_eq!(permanent_asns.status.code(), Some(0), "{permanent_asns:?}");
     let permanent_stdout = String::from_utf8_lossy(&permanent_asns.stdout);
-    assert!(permanent_stdout.contains("2 shown of 2 matching entries; 0 omitted."));
+    assert!(permanent_stdout.contains("2 bans."));
+    assert!(permanent_stdout.contains("Remaining"));
+    assert!(permanent_stdout.contains("Permanent"));
+    assert!(permanent_stdout.contains('—'));
+    assert!(!permanent_stdout.contains("Saved lifetime"));
     assert!(permanent_stdout.contains("AS64512"));
     assert!(permanent_stdout.contains("AS64513"));
     assert!(!permanent_stdout.contains("198.51.100."));
@@ -412,11 +524,41 @@ fn bans_apply_default_limit_filters_and_expiry_utc_format() {
     let temporary_asns = fixture.run(&["bans", "--temporary", "--asn"], &[]);
     assert_eq!(temporary_asns.status.code(), Some(0), "{temporary_asns:?}");
     let temporary_asn_stdout = String::from_utf8_lossy(&temporary_asns.stdout);
-    assert!(temporary_asn_stdout.contains("1 shown of 1 matching entries; 0 omitted."));
+    assert!(temporary_asn_stdout.contains("1 ban."));
     assert!(temporary_asn_stdout.contains("AS64496"));
     assert_eq!(
         fixture.tool_log(),
         "",
         "saved bans must not inspect live commands"
     );
+}
+
+#[test]
+fn empty_saved_ban_inventory_needs_no_sync_or_repeated_zero_summary() {
+    let fixture = Fixture::new(
+        Some("[ipset]\nset_name='kidobo'\n"),
+        Some(""),
+        Some("version = 1\n"),
+    );
+    let output = fixture.run(&["bans"], &[]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "Saved operator bans\nNo saved bans match these filters.\n"
+    );
+    assert_eq!(fixture.tool_log(), "");
+}
+
+#[test]
+fn truncated_ban_inventory_preserves_filters_in_the_all_hint() {
+    let fixture = Fixture::new(Some(&config(true)), Some(""), Some("version = 1\n"));
+    let output = fixture.run(&["bans", "--permanent", "--asn", "--limit", "1"], &[]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("1 of 2 bans shown; 1 omitted."), "{stdout}");
+    assert!(
+        stdout.contains("Next: kidobo bans --permanent --asn --all"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("sync"), "{stdout}");
 }

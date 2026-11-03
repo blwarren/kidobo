@@ -13,9 +13,9 @@ const ROOT_HELP: &str = "{name} {version}\n{about-with-newline}\n{usage-heading}
     name = "kidobo",
     version,
     about = "One-shot firewall blocklist manager",
-    long_about = "Manage Kidobo firewall blocklists with one-shot commands (no daemon/background service).",
+    long_about = "Manage Kidobo firewall blocklists with one-shot commands.",
     help_template = ROOT_HELP,
-    after_help = "Start: kidobo\nDiagnose: kidobo doctor\nExamples: kidobo ban 203.0.113.7 --for 12h\n          kidobo ban --asn AS64496\n          kidobo lookup 203.0.113.7 --format tsv\nUse kidobo COMMAND --help for effects, examples, and recovery."
+    after_help = "Examples: kidobo ban 203.0.113.7 --for 12h\n          kidobo ban --asn AS64496\n          kidobo lookup 203.0.113.7 --format tsv"
 )]
 pub struct Cli {
     #[arg(
@@ -80,12 +80,12 @@ impl ApplicationArgs {
 pub enum SourceAction {
     #[command(
         about = "List configured feeds and validated cache availability",
-        after_help = "Example: kidobo sources list\nRead-only; does not fetch or refresh caches. No sync or reversal is needed."
+        after_help = "Example: kidobo sources list"
     )]
     List,
     #[command(
         about = "Save one HTTP(S) feed URL; enforcement waits for sync",
-        after_help = "Example: sudo kidobo sources add https://example.org/feed.txt\nTo reverse: sudo kidobo sources remove URL, then sync."
+        after_help = "Example: sudo kidobo sources add https://example.org/feed.txt"
     )]
     Add {
         #[arg(value_hint = ValueHint::Url)]
@@ -93,7 +93,7 @@ pub enum SourceAction {
     },
     #[command(
         about = "Remove a configured feed URL; enforcement waits for sync",
-        after_help = "Example: sudo kidobo sources remove https://example.org/feed.txt\nTo reverse: add the same URL, then sync."
+        after_help = "Example: sudo kidobo sources remove https://example.org/feed.txt"
     )]
     Remove {
         #[arg(value_hint = ValueHint::Url)]
@@ -105,12 +105,12 @@ pub enum SourceAction {
 pub enum AllowAction {
     #[command(
         about = "List saved operator-controlled exemptions",
-        after_help = "Example: kidobo allow list\nRead-only saved state; live enforcement changes only through sync. No reversal is needed."
+        after_help = "Example: kidobo allow list"
     )]
     List,
     #[command(
         about = "Save an exemption applied by the next sync",
-        after_help = "Examples: sudo kidobo allow add 203.0.113.7\n          sudo kidobo allow add 2001:db8::/64 --yes\nThis subtracts addresses from Kidobo's effective blocklist. It does not install an ACCEPT rule.\nTo reverse: sudo kidobo allow remove IP_OR_CIDR, then sync."
+        after_help = "Examples: sudo kidobo allow add 203.0.113.7\n          sudo kidobo allow add 2001:db8::/64 --yes"
     )]
     Add {
         #[arg(value_name = "IP_OR_CIDR", value_hint = ValueHint::Other)]
@@ -123,7 +123,7 @@ pub enum AllowAction {
     },
     #[command(
         about = "Remove an exact saved exemption; enforcement waits for sync",
-        after_help = "Example: sudo kidobo allow remove 203.0.113.7\nUses canonical exact identity, without splitting ranges. To reverse: add the same exemption and sync."
+        after_help = "Example: sudo kidobo allow remove 203.0.113.7"
     )]
     Remove {
         #[arg(value_name = "IP_OR_CIDR", value_hint = ValueHint::Other)]
@@ -134,13 +134,13 @@ pub enum AllowAction {
 #[derive(Debug, Clone, Copy, Subcommand)]
 pub enum ConfigAction {
     #[command(
-        about = "Show effective settings, defaults, and their origins",
-        after_help = "Example: kidobo config show\nRead-only; credentials and URL query/fragment values are redacted. No sync or reversal is needed."
+        about = "Show redacted settings, defaults, and their origins",
+        after_help = "Example: kidobo config show"
     )]
     Show,
     #[command(
         about = "Print the resolved configuration filename",
-        after_help = "Example: kidobo config path\nRead-only and available before initialization. No sync or reversal is needed."
+        after_help = "Example: kidobo config path"
     )]
     Path,
 }
@@ -178,8 +178,8 @@ impl From<LogLevel> for LevelFilter {
 pub enum Command {
     #[command(
         about = "Print shell completion code without reading configuration",
-        long_about = "Generate completion code for Bash, Zsh, or Fish from Kidobo's own command definitions. Writes the script to stdout only; does not read configuration, contact services, or install files.",
-        after_help = "Examples: kidobo completions bash > kidobo.bash\n          source ./kidobo.bash\n          kidobo completions zsh\n          kidobo completions fish\nNo sync is needed. To reverse installation, remove your completion file or start a fresh shell."
+        long_about = "Generate Bash, Zsh, or Fish completion code and write it to stdout without reading configuration.",
+        after_help = "Examples: kidobo completions bash > kidobo.bash\n          source ./kidobo.bash\n          kidobo completions zsh\n          kidobo completions fish"
     )]
     Completions {
         #[arg(value_enum)]
@@ -187,14 +187,14 @@ pub enum Command {
     },
     #[command(
         about = "Review settings and guide first-time configuration",
-        long_about = "Interactive, linear setup: review IPv4/IPv6, remote feeds, and safelists before saving. Existing files are preserved. After saving, provision missing files and run doctor, then separately confirm first sync and timer activation. Never installs packages or elevates privileges. Existing active timers are not stopped and may apply saved settings.",
-        after_help = "Example: sudo kidobo setup\nNoninteractive alternatives: kidobo init, sources, allow, doctor, and sync.\nAt default paths, init activates scheduling immediately; setup defers activation.\nTo reverse source choices, use sources remove or allow remove and sync; flush removes managed enforcement."
+        long_about = "Interactively review IPv4/IPv6, feeds, and safelists before saving. Preserve existing files, provision missing files, and run doctor. Confirm initial sync and timer activation separately.",
+        after_help = "Example: sudo kidobo setup"
     )]
     Setup,
     #[command(
         about = "Inspect, add, or remove configured remote feeds",
-        long_about = "List feeds without fetching, or edit remote.urls atomically while preserving other configuration. Cache availability is validated; refresh time is Unknown because no trustworthy receipt is recorded. Source edits do not change live enforcement until sync. Sensitive URL values are redacted in output.",
-        after_help = "Examples: kidobo sources\n          sudo kidobo sources add https://example.org/feed.txt\n          sudo kidobo sources remove https://example.org/feed.txt\nNext after an edit: sudo kidobo sync. Reverse an addition with remove and vice versa."
+        long_about = "List configured feeds and validated cache availability, or edit remote.urls. Edits take effect at the next sync. Sensitive URL values are redacted.",
+        after_help = "Examples: kidobo sources\n          sudo kidobo sources add https://example.org/feed.txt\n          sudo kidobo sources remove https://example.org/feed.txt"
     )]
     Sources {
         #[command(subcommand)]
@@ -202,8 +202,8 @@ pub enum Command {
     },
     #[command(
         about = "Manage operator-controlled safelist exemptions",
-        long_about = "List or edit safe.ips. Exemptions subtract from all Kidobo blocklist sources at the next sync; they are not kernel ACCEPT rules. Additions expanding coverage require confirmation, or explicit --yes without a terminal. Broad ranges can exempt an entire address family. Removals use exact canonical identity.",
-        after_help = "Examples: kidobo allow\n          sudo kidobo allow add 203.0.113.7\n          sudo kidobo allow add 2001:db8::/64 --yes\n          sudo kidobo allow remove 203.0.113.7\nNext after an edit: sudo kidobo sync. Reverse using the opposite edit and sync."
+        long_about = "List or edit safe.ips exemptions, applied at the next sync. Expanding coverage requires confirmation or --yes. Removal uses exact canonical identity.",
+        after_help = "Examples: kidobo allow\n          sudo kidobo allow add 203.0.113.7\n          sudo kidobo allow add 2001:db8::/64 --yes\n          sudo kidobo allow remove 203.0.113.7"
     )]
     Allow {
         #[command(subcommand)]
@@ -211,7 +211,7 @@ pub enum Command {
     },
     #[command(
         about = "Show effective configuration or its filename",
-        after_help = "Examples: kidobo config show\n          kidobo config path\nRead-only; manual editing remains supported. Use setup, sources, and allow for guided changes, then sync."
+        after_help = "Examples: kidobo config show\n          kidobo config path"
     )]
     Config {
         #[command(subcommand)]
@@ -219,8 +219,8 @@ pub enum Command {
     },
     #[command(
         about = "Inspect configuration and live managed enforcement",
-        long_about = "Read-only overview of saved configuration, managed live sets and wiring, local bans, and timer scheduling. Unknown fields mean the evidence could not be verified. No sources are fetched and no sync is needed.",
-        after_help = "Examples: kidobo\n          sudo kidobo status\n          kidobo status --format json\nIf permissions prevent verification, retry sudo kidobo status. No reversal is needed."
+        long_about = "Inspect saved configuration, live managed sets and wiring, local bans, and timer scheduling. Unverified fields are shown as unknown.",
+        after_help = "Examples: kidobo\n          sudo kidobo status\n          kidobo status --format json"
     )]
     Status {
         #[arg(long, value_enum, default_value_t = ReportFormat::Human)]
@@ -228,8 +228,8 @@ pub enum Command {
     },
     #[command(
         about = "Check Kidobo's live enforcement for one IP",
-        long_about = "Probe managed set membership and firewall wiring for one IPv4 or IPv6 address. Reports BLOCKED BY KIDOBO, NOT BLOCKED BY KIDOBO, or UNKNOWN. This verifies Kidobo's managed incoming blocking path, not the entire host's packet-filtering verdict. Read-only; never fetches sources. Offline overlaps are separate evidence and can be stale.",
-        after_help = "Examples: sudo kidobo check 203.0.113.7\n          sudo kidobo check 2001:db8::7 --format json\nCIDR/source overlaps: kidobo lookup 203.0.113.0/24\nVerified verdicts exit 0; unknown exits 1; invalid usage exits 2. No reversal or sync is needed."
+        long_about = "Check managed set membership and incoming firewall wiring for one IPv4 or IPv6 address. Report BLOCKED BY KIDOBO, NOT BLOCKED BY KIDOBO, or UNKNOWN. Verified verdicts exit 0; unknown exits 1.",
+        after_help = "Examples: sudo kidobo check 203.0.113.7\n          sudo kidobo check 2001:db8::7 --format json"
     )]
     Check {
         #[arg(
@@ -243,8 +243,8 @@ pub enum Command {
     },
     #[command(
         about = "List saved operator-managed bans",
-        long_about = "List permanent local IP/CIDR and ASN bans and saved temporary bans, including expired records awaiting cleanup. This is saved source state; it does not prove live enforcement. Read-only and offline. Use sync to apply source changes and expiration.",
-        after_help = "Examples: kidobo bans\n          kidobo bans --temporary\n          kidobo bans --permanent --asn --all\n          kidobo bans --limit 100\nTo remove an entry: sudo kidobo unban IP_OR_CIDR (or --asn ASN), then sync."
+        long_about = "List saved permanent IP/CIDR and ASN bans and temporary bans, including expired records awaiting cleanup. Read-only and offline.",
+        after_help = "Examples: kidobo bans\n          kidobo bans --temporary\n          kidobo bans --permanent --asn --all\n          kidobo bans --limit 100"
     )]
     Bans {
         #[arg(long, conflicts_with = "permanent")]
@@ -269,14 +269,14 @@ pub enum Command {
     },
     #[command(
         about = "Create missing config/data/cache files and systemd units",
-        long_about = "Create any missing Kidobo config/data/cache files and default systemd unit files.\n\nAt default system paths, this also runs systemctl daemon-reload, reset-failed, and enable --now for kidobo-sync.timer. Existing files are preserved. The timer runs sync and can change firewall enforcement.",
-        after_help = "Example: sudo kidobo init\nNext: sudo kidobo doctor\nTo remove enforcement: sudo kidobo flush; inspect timer scheduling separately."
+        long_about = "Create missing config, data, cache, and systemd unit files. Preserve existing files. At default system paths, reload systemd, reset failed units, and enable and start kidobo-sync.timer.",
+        after_help = "Example: sudo kidobo init"
     )]
     Init,
     #[command(
         about = "Check configuration and host prerequisites read-only",
-        long_about = "Run read-only environment and dependency checks. Terminal output is grouped for people; redirected output defaults to the existing JSON report. Existing privileged probes use noninteractive sudo -n and never ask for a password.\n\nExits 0 when overall status is OK and 1 when a required check fails. No sync is needed.",
-        after_help = "Examples: kidobo doctor\n          sudo kidobo doctor --format human\n          kidobo doctor --format json\nFix reported prerequisites, rerun doctor, then use sudo kidobo sync."
+        long_about = "Check configuration, environment, and dependencies without changing state. Default to human output in a terminal and JSON when redirected. Exit 0 when all required checks pass, otherwise 1.",
+        after_help = "Examples: kidobo doctor\n          sudo kidobo doctor --format human\n          kidobo doctor --format json"
     )]
     Doctor {
         #[arg(
@@ -288,8 +288,8 @@ pub enum Command {
     },
     #[command(
         about = "Sync local+remote blocklists into firewall/ipset state",
-        long_about = "Load config and sources, apply safelist subtraction, collapse entries, then update managed ipsets and firewall wiring. Each family replacement is atomic; a later failure can leave a partial update. Existing firewall adapters use noninteractive sudo -n.\n\nThis one-shot command writes firewall and cache state. Both enabled families are capacity checked before either replacement.",
-        after_help = "Examples: sudo kidobo sync\n          sudo kidobo sync --timer\n          sudo kidobo sync --dry-run\n          sudo kidobo sync --dry-run --allow-network\nDry-run is offline unless --allow-network is explicit. It never writes caches, files, sets, or rules. An existing process lock is required; setup creates it. Preview does not prove future cache persistence or sync success.\nAfter failure: inspect kidobo doctor, correct the cause, and retry sync.\nTo remove managed enforcement: sudo kidobo flush."
+        long_about = "Load sources, subtract safelists, collapse entries, and update managed ipsets and firewall wiring. Validate both enabled families before replacing either set; each set replacement is atomic.",
+        after_help = "Examples: sudo kidobo sync\n          sudo kidobo sync --timer\n          sudo kidobo sync --dry-run\n          sudo kidobo sync --dry-run --allow-network"
     )]
     Sync {
         #[arg(
@@ -312,8 +312,8 @@ pub enum Command {
     },
     #[command(
         about = "Best-effort cleanup of kidobo runtime state",
-        long_about = "Remove Kidobo's managed firewall rules/ipsets and remote cache. This is a destructive removal operation. Local bans, configuration, and temporary-ban records are preserved. Use --cache-only to leave enforcement unchanged.",
-        after_help = "Examples: sudo kidobo flush --yes\n          kidobo flush --cache-only\nTo restore enforcement: sudo kidobo sync."
+        long_about = "Remove Kidobo's managed firewall rules, ipsets, and remote cache. Preserve local bans, configuration, and temporary-ban records. --cache-only clears the remote cache while preserving enforcement.",
+        after_help = "Examples: sudo kidobo flush --yes\n          kidobo flush --cache-only"
     )]
     Flush {
         #[arg(long, help = "Confirm full removal without an interactive prompt")]
@@ -326,8 +326,8 @@ pub enum Command {
     },
     #[command(
         about = "Add permanent or temporary IP/CIDR or ASN bans",
-        long_about = "Ban one IPv4/IPv6 address or CIDR, targets from `--file`, or one or more ASNs with `--asn`.\n\nUse `--for 12h` or `--for 3d` for temporary bans. Durations start when recorded; repeating a temporary ban replaces its deadline, even if shorter. Without `--for`, bans are permanent.\n\nThis saves local source data. Interactive terminals offer to run sync after a change; --apply requests sync explicitly and --no-apply saves only. Noninteractive runs save only by default. Expiration/removal takes effect at a subsequent successful sync.",
-        after_help = "Examples: sudo kidobo ban 203.0.113.7\n          sudo kidobo ban 203.0.113.7 --for 12h\n          sudo kidobo ban --asn AS64496\n          sudo kidobo ban 203.0.113.7 --apply\nNext: sudo kidobo sync\nTo reverse: sudo kidobo unban 203.0.113.7, then sync.",
+        long_about = "Save an IP/CIDR, targets from --file, or ASNs from --asn. Bans are permanent unless --for sets a duration. Repeating a temporary ban replaces its deadline. Sync applies saved bans and expiration. Interactive terminals offer sync after changes; noninteractive runs save only by default.",
+        after_help = "Examples: sudo kidobo ban 203.0.113.7\n          sudo kidobo ban 203.0.113.7 --for 12h\n          sudo kidobo ban --asn AS64496\n          sudo kidobo ban 203.0.113.7 --apply",
         group(
             ArgGroup::new("ban_input")
                 .args(["target", "file", "asn"])
@@ -365,14 +365,14 @@ pub enum Command {
             value_name = "ASN",
             num_args = 1..,
             value_hint = ValueHint::Other,
-            help = "ASN(s) to ban (e.g. 213412 or AS213412)"
+            help = "ASNs to ban (e.g. 213412 or AS213412)"
         )]
         asn: Option<Vec<String>>,
     },
     #[command(
         about = "Remove permanent and temporary IP/CIDR or ASN bans",
-        long_about = "Remove one IPv4/IPv6 address or CIDR, targets from `--file`, or one or more ASNs with `--asn` from both permanent and temporary local sources.\n\nThis saves local source changes. Interactive terminals offer to run sync afterward; --apply requests sync explicitly and --no-apply saves only. Noninteractive runs save only by default. --yes approves overlapping-entry removal only, never synchronization.",
-        after_help = "Examples: sudo kidobo unban 203.0.113.7\n          sudo kidobo unban --asn AS64496\n          sudo kidobo unban 203.0.113.0/24 --yes\nNext: sudo kidobo sync\nOther sources can still block this address. To restore a local ban, use ban and sync.",
+        long_about = "Remove an IP/CIDR, targets from --file, or ASNs from --asn from permanent and temporary local sources. Interactive terminals offer sync after changes; noninteractive runs save only by default. --yes approves overlap removal only.",
+        after_help = "Examples: sudo kidobo unban 203.0.113.7\n          sudo kidobo unban --asn AS64496\n          sudo kidobo unban 203.0.113.0/24 --yes",
         group(
             ArgGroup::new("unban_input")
                 .args(["target", "file", "asn"])
@@ -403,7 +403,7 @@ pub enum Command {
             value_name = "ASN",
             num_args = 1..,
             value_hint = ValueHint::Other,
-            help = "ASN(s) to unban (e.g. 213412 or AS213412)"
+            help = "ASNs to unban (e.g. 213412 or AS213412)"
         )]
         asn: Option<Vec<String>>,
 
@@ -415,8 +415,8 @@ pub enum Command {
     },
     #[command(
         about = "Offline lookup across blocklist, safelist, and ASN sources",
-        long_about = "Lookup candidate targets against the local blocklist, unexpired temporary bans, cached remote sources, configured safelist entries, cached GitHub safelist entries, and cached prefixes for permanent or temporary ASN bans.\n\nLookup reports source overlaps, runs offline only, and never fetches or refreshes source data. Config-backed sources are included when the config is valid; local, temporary, and cached remote lookup remains available without a valid config. Warnings identify unavailable source coverage. Expired temporary entries may still be enforced until sync applies their removal.",
-        after_help = "Examples: kidobo lookup 203.0.113.7\n          kidobo lookup --file targets.txt --format tsv\nRead-only and offline: overlaps do not prove live firewall enforcement. No reversal or sync is needed.",
+        long_about = "Find offline source overlaps for an IP/CIDR or targets from --file. Search saved bans, safelists, and validated caches without fetching data. Warnings identify unavailable sources.",
+        after_help = "Examples: kidobo lookup 203.0.113.7\n          kidobo lookup --file targets.txt --format tsv",
         group(
             ArgGroup::new("lookup_input")
                 .args(["ip", "file"])
@@ -757,7 +757,7 @@ mod tests {
     }
 
     #[test]
-    fn all_user_commands_have_built_in_examples_and_recovery_guidance() {
+    fn all_user_commands_have_built_in_examples() {
         use clap::CommandFactory;
         fn inspect(command: &clap::Command) {
             for child in command
@@ -766,7 +766,7 @@ mod tests {
             {
                 let help = child
                     .get_after_help()
-                    .expect("each command has effects/examples/recovery guidance")
+                    .expect("each command has examples")
                     .to_string();
                 assert!(
                     help.contains("Example"),

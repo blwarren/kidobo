@@ -45,7 +45,7 @@ pub fn run(allow_network: bool, io: &mut CliIo<'_>) -> Result<(), KidoboError> {
         Ok(outcome) => outcome,
         Err(source) => {
             if matches!(&source, kidobo_app::AppError::Lock { .. }) {
-                let _result = view.next(io.stderr, "ensure setup has created the existing lock, retry with sudo if needed, and wait for any active mutation to finish; preview never creates lock state");
+                let _result = view.next(io.stderr, "ensure setup has created the lock, retry with sudo if needed, and wait for any active mutation to finish");
             }
             return Err(source.into());
         }
@@ -88,12 +88,6 @@ fn render(
             ],
         ],
     )?;
-    view.status(
-        output,
-        Status::Pass,
-        "Capacity preflight",
-        "Every enabled family's proposed kernel entries fit its configured capacity.",
-    )?;
     view.heading(output, "Source evidence")?;
     let rows = outcome
         .sources
@@ -115,19 +109,11 @@ fn render(
         };
         view.status(output, status, "Preview notice", &notice.message)?;
     }
-    view.status(output, Status::Unknown, "Exact live delta unavailable", "Live set members are not enumerated by this preview. Proposed counts do not establish added/removed CIDRs or current packet enforcement; use status and check for live observations.")?;
-    view.paragraph(output, "No source/config/temporary-ban files, cache generations/manifests, firewall sets/rules, or systemd state were written. Preview does not test cache persistence or guarantee that a later sync will succeed. Inputs may change before the real sync.")?;
     view.paragraph(
         output,
         &format!("Preview completed in {:.2}s.", elapsed.as_secs_f64()),
     )?;
-    if !outcome.allow_network {
-        view.next(
-            output,
-            "sudo kidobo sync --dry-run --allow-network to permit fresh reads without saving",
-        )?;
-    }
-    view.next(output, "sudo kidobo sync to perform the actual update")?;
+    view.next(output, "sudo kidobo sync")?;
     Ok(())
 }
 

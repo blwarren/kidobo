@@ -21,7 +21,7 @@ fn doctor_uses_human_output_for_a_real_terminal_and_preserves_explicit_json() {
     assert!(human.stdout.contains("Kidobo doctor"), "{human:?}");
     assert!(human.stdout.contains("[PASS]"), "{human:?}");
     assert!(human.stdout.contains("\u{1b}[1m"), "{human:?}");
-    assert!(human.stderr.contains("doctor summary:"), "{human:?}");
+    assert!(!human.stderr.contains("doctor summary:"), "{human:?}");
 
     let explicit = fixture
         .spawn(
@@ -36,6 +36,7 @@ fn doctor_uses_human_output_for_a_real_terminal_and_preserves_explicit_json() {
         .wait();
     assert_eq!(explicit.status.code(), Some(0), "{explicit:?}");
     assert_eq!(piped.status.code(), Some(0), "{piped:?}");
+    assert!(piped.stderr.contains("doctor summary:"), "{piped:?}");
     assert_eq!(explicit.stdout, piped.stdout);
     let report: serde_json::Value = serde_json::from_str(&explicit.stdout).expect("doctor JSON");
     assert_eq!(report["overall"], "OK");
@@ -94,6 +95,10 @@ fn real_terminal_lookup_preserves_ipv6_and_escapes_untrusted_unicode_labels_at_a
         assert!(output.stdout.contains("\\x1B[31m\\nFAKE"), "{output:?}");
         assert!(!output.stdout.contains('\u{1b}'), "{output:?}");
         assert!(!output.stdout.lines().any(|line| line == "FAKE"));
+        assert_eq!(output.stdout.matches("Target:").count(), 1, "{output:?}");
+        assert_eq!(output.stdout.matches("Status:").count(), 1, "{output:?}");
+        assert!(!output.stdout.contains("Summary"), "{output:?}");
+        assert!(!output.stdout.contains("does not establish"), "{output:?}");
         assert!(
             output
                 .stdout

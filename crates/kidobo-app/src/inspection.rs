@@ -401,10 +401,14 @@ pub fn check(
         schema_version: 1,
         target: request.target.to_string(),
         verdict: CheckVerdict::Unknown,
-        family: FamilyInspection::unknown(family, None, "Valid configuration is required to identify the managed set"),
+        family: FamilyInspection::unknown(
+            family,
+            None,
+            "Valid configuration is required to identify the managed set",
+        ),
         offline_matches: Vec::new(),
         offline_notices: Vec::new(),
-        notices: vec!["This assesses Kidobo's managed INPUT blocking path only; it does not determine the entire host's packet-filtering outcome".to_string()],
+        notices: Vec::new(),
     };
     let config = match dependencies.configs.load(&paths.config_file) {
         Ok(config) => config,

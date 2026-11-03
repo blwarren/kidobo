@@ -389,7 +389,9 @@ fn asns(context: &PreviewSourceContext<'_>) -> Result<PreviewSourceLoad, AppErro
             provenance: loaded.source,
         });
         if loaded.stale {
-            notices.push(Notice::warning(format!("Preview uses stale cached ASN prefixes for AS{asn}; this does not establish current ASN announcements")));
+            notices.push(Notice::warning(format!(
+                "Preview uses stale cached ASN prefixes for AS{asn}"
+            )));
         }
         networks.extend(loaded.prefixes);
     }
