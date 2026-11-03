@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+
+## [0.15.1] - 2026-11-03
+
 ### Fixed
 
 - Repeated ASN bans now identify already saved ASNs, and local blocklist cleanup
