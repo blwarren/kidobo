@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+
+## [0.15.2] - 2026-11-07
+
 ### Security
 
 - Require `--yes` for partial-overlap unbans in noninteractive runs; exact matches

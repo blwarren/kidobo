@@ -55,7 +55,7 @@ wildcard_dependencies = "deny"
 
 [package]
 name = "kidobo"
-version = "0.15.1"
+version = "0.15.2"
 edition = "2024"
 license = "MIT"
 description = "One-shot Linux firewall blocklist manager with atomic ipset updates"
