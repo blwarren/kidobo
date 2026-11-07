@@ -29,6 +29,284 @@ fn io_cause<'a>(mut error: &'a (dyn Error + 'static)) -> &'a io::Error {
     }
 }
 
+#[cfg(unix)]
+fn unix_mode(path: &std::path::Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::metadata(path)
+        .expect("artifact metadata")
+        .permissions()
+        .mode()
+        & 0o7777
+}
+
+#[cfg(unix)]
+#[test]
+fn owner_only_permissions_are_independent_of_process_umask() {
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    for umask in ["000", "022", "077"] {
+        let root = TempDir::new().expect("permission test root");
+        let mut child = Command::new("bash")
+            .args([
+                "-c",
+                "umask \"$1\"; shift; exec \"$@\"",
+                "permission-test",
+                umask,
+            ])
+            .arg(std::env::current_exe().expect("integration test binary"))
+            .args(["--exact", "owner_only_permissions_child", "--nocapture"])
+            .env("KIDOBO_PERMISSION_CHILD_ROOT", root.path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("isolated umask child");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while child.try_wait().expect("child state").is_none() {
+            if Instant::now() >= deadline {
+                child.kill().expect("kill stalled permission fixture");
+                let output = child.wait_with_output().expect("reap permission fixture");
+                panic!("permission fixture stalled under umask {umask}: {output:?}");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let output = child.wait_with_output().expect("permission test output");
+        assert!(output.status.success(), "umask {umask}: {output:?}");
+        assert_eq!(unix_mode(&root.path().join("config/config.toml")), 0o600);
+        assert_eq!(unix_mode(&root.path().join("cache/remote")), 0o700);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "keep the isolated init, migration, and configuration-writer permission lifecycle together"
+)]
+fn owner_only_permissions_child() {
+    use std::collections::BTreeMap;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+
+    use kidobo_adapters::command_runner::{CommandResult, CommandRunnerError};
+    use kidobo_adapters::config_edit::update_asn_bans;
+    use kidobo_adapters::config_management::FileConfigurationManager;
+    use kidobo_adapters::init::{FileInitProvisioner, InitCommandRunner};
+    use kidobo_adapters::limited_io::read_to_string_with_limit;
+    use kidobo_adapters::path::{ENV_KIDOBO_ROOT, SystemPathResolver};
+    use kidobo_adapters::storage::FileSyncStorage;
+    use kidobo_app::configuration::{
+        ConfigurationEdit, ConfigurationEditor, ConfigurationWriteMode, ConfigurationWriter,
+    };
+    use kidobo_app::init::{self, InitDependencies, InitRequest, ProvisionState};
+    use kidobo_app::paths::PathResolutionInput;
+    use kidobo_app::sync::SyncStoragePreparer;
+
+    struct NoCommands;
+    impl InitCommandRunner for NoCommands {
+        fn run(&self, _: &str, _: &[&str]) -> Result<CommandResult, CommandRunnerError> {
+            panic!("alternate-root init must not execute a system command");
+        }
+    }
+    let Some(root) = std::env::var_os("KIDOBO_PERMISSION_CHILD_ROOT").map(PathBuf::from) else {
+        return;
+    };
+    let request = InitRequest {
+        paths: PathResolutionInput {
+            explicit_config_path: None,
+            temp_dir: root.join("tmp"),
+            env: BTreeMap::from([(ENV_KIDOBO_ROOT.into(), root.as_os_str().to_owned())]),
+        },
+        executable_candidates: vec![std::env::current_exe().expect("existing executable")],
+    };
+    let provisioner = FileInitProvisioner::new(NoCommands);
+    let dependencies = InitDependencies {
+        cancellation: &NoCancellation,
+        paths: &SystemPathResolver,
+        provisioner: &provisioner,
+    };
+    init::execute(&request, &dependencies).expect("new initialization");
+    let config = root.join("config/config.toml");
+    let cache = root.join("cache/remote");
+    assert_eq!(unix_mode(&config), 0o600);
+    assert_eq!(unix_mode(&cache), 0o700);
+    let ordinary = root.join("ordinary-directory");
+    fs::create_dir(&ordinary).expect("default-permission control directory");
+    assert_eq!(unix_mode(&root.join("cache")), unix_mode(&ordinary));
+
+    let configured = "# keep private settings\n[ipset]\nset_name='kidobo'\n[remote]\nurls=['https://alice:private-feed-password@feed.example/list?token=private-feed-token']\n";
+    fs::write(&config, configured).expect("existing credential-bearing config");
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o644)).expect("legacy config mode");
+    fs::set_permissions(&cache, fs::Permissions::from_mode(0o755)).expect("legacy cache mode");
+    let legacy = cache.join("feed.meta.json");
+    let generation_id = "a".repeat(64);
+    let generation = cache.join(format!(
+        "v2/remote/0123456789abcdef/generations/{generation_id}/meta.json"
+    ));
+    let github_legacy = cache.join("github-meta.meta.json");
+    let github_generation = cache.join(format!(
+        "v2/github-meta/generations/{generation_id}/meta.json"
+    ));
+    fs::create_dir_all(
+        github_generation
+            .parent()
+            .expect("GitHub generation directory"),
+    )
+    .expect("GitHub cache fixture");
+    fs::create_dir_all(generation.parent().expect("generation directory")).expect("old generation");
+    for path in [&legacy, &generation, &github_legacy, &github_generation] {
+        fs::write(path, configured).expect("credential-bearing cache sentinel");
+    }
+    let secured = init::execute(&request, &dependencies).expect("secure existing initialization");
+    for path in [&config, &cache] {
+        assert!(secured.artifacts.iter().any(|artifact| artifact.path == *path && artifact.state == ProvisionState::Secured));
+    }
+    assert_eq!(unix_mode(&config), 0o600);
+    assert_eq!(unix_mode(&cache), 0o700);
+    assert_eq!(
+        read_to_string_with_limit(&config, 65_536).expect("preserved config"),
+        configured
+    );
+    for path in [&legacy, &generation, &github_legacy, &github_generation] {
+        assert_eq!(
+            read_to_string_with_limit(path, 65_536).expect("preserved cache"),
+            configured
+        );
+    }
+    let repeated = init::execute(&request, &dependencies).expect("repeat secure initialization");
+    for path in [&config, &cache] {
+        assert!(
+            repeated
+                .artifacts
+                .iter()
+                .any(|artifact| artifact.path == *path
+                    && artifact.state == ProvisionState::Preserved)
+        );
+    }
+    fs::set_permissions(&cache, fs::Permissions::from_mode(0o755)).expect("old sync cache mode");
+    FileSyncStorage
+        .prepare_remote_cache(&cache)
+        .expect("sync migration");
+    assert_eq!(unix_mode(&cache), 0o700);
+    for path in [&legacy, &generation, &github_legacy, &github_generation] {
+        assert_eq!(
+            read_to_string_with_limit(path, 65_536).expect("unchanged cache"),
+            configured
+        );
+    }
+
+    let manager = FileConfigurationManager;
+    let setup_config = root.join("setup/config.toml");
+    manager
+        .write(&setup_config, configured, ConfigurationWriteMode::CreateNew)
+        .expect("setup publication");
+    assert_eq!(unix_mode(&setup_config), 0o600);
+    for edit in [
+        ConfigurationEdit::AddSource(
+            "https://bob:second-password@second.example/list?token=second-token".to_string(),
+        ),
+        ConfigurationEdit::RemoveSource(
+            "https://bob:second-password@second.example/list?token=second-token".to_string(),
+        ),
+        ConfigurationEdit::AddAllow("192.0.2.7".to_string()),
+        ConfigurationEdit::RemoveAllow("192.0.2.7".to_string()),
+        ConfigurationEdit::SetBasic {
+            enable_ipv6: false,
+            include_github_meta: false,
+            remote_urls: vec!["https://private.example/list?token=private-token".to_string()],
+            safe_ips: vec!["198.51.100.7".to_string()],
+        },
+    ] {
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o644)).expect("old edit mode");
+        let before = read_to_string_with_limit(&config, 65_536).expect("config before edit");
+        let candidate = manager
+            .render(&before, &edit)
+            .expect("reviewed config edit");
+        manager
+            .write(&config, &candidate, ConfigurationWriteMode::ReplaceExisting)
+            .expect("private edit publication");
+        assert_eq!(unix_mode(&config), 0o600);
+        assert_eq!(
+            read_to_string_with_limit(&config, 65_536).expect("saved candidate"),
+            candidate
+        );
+    }
+    for (add, remove) in [(&[64512][..], &[][..]), (&[][..], &[64512][..])] {
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o640)).expect("old ASN mode");
+        update_asn_bans(&config, add, remove).expect("private ASN edit");
+        assert_eq!(unix_mode(&config), 0o600);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn private_storage_rejects_links_and_nonregular_files_without_changing_targets() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    use kidobo_adapters::command_runner::{CommandResult, CommandRunnerError};
+    use kidobo_adapters::init::{FileInitProvisioner, InitCommandRunner};
+    use kidobo_adapters::storage::FileSyncStorage;
+    use kidobo_app::init::{ArtifactAccess, InitProvisioner};
+    use kidobo_app::sync::SyncStoragePreparer;
+
+    struct NoCommands;
+    impl InitCommandRunner for NoCommands {
+        fn run(&self, _: &str, _: &[&str]) -> Result<CommandResult, CommandRunnerError> {
+            panic!("file validation must not execute commands");
+        }
+    }
+    let temp = TempDir::new().expect("storage validation root");
+    let target = temp.path().join("outside");
+    fs::create_dir(&target).expect("outside cache directory");
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).expect("outside mode");
+    let link = temp.path().join("remote");
+    symlink(&target, &link).expect("remote cache symlink");
+    let error = FileSyncStorage
+        .prepare_remote_cache(&link)
+        .expect_err("cache link rejected");
+    assert!(matches!(error, AppError::StoragePreparation { path, .. } if path == link));
+    assert_eq!(unix_mode(&target), 0o755);
+    assert_eq!(fs::read_link(&link).expect("link retained"), target);
+
+    let remote = target.join("remote");
+    fs::create_dir(&remote).expect("outside remote directory");
+    fs::set_permissions(&remote, fs::Permissions::from_mode(0o755)).expect("outside remote mode");
+    let linked_parent = temp.path().join("cache-parent");
+    symlink(&target, &linked_parent).expect("cache parent symlink");
+    let selected_remote = linked_parent.join("remote");
+    let error = FileSyncStorage
+        .prepare_remote_cache(&selected_remote)
+        .expect_err("cache parent link rejected");
+    assert!(matches!(error, AppError::StoragePreparation { path, .. } if path == selected_remote));
+    assert_eq!(unix_mode(&remote), 0o755);
+
+    let provisioner = FileInitProvisioner::new(NoCommands);
+    let fifo = temp.path().join("config.fifo");
+    nix::unistd::mkfifo(
+        &fifo,
+        nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+    )
+    .expect("nonregular config");
+    let error = provisioner
+        .ensure_file(&fifo, "secret", ArtifactAccess::OwnerOnly)
+        .expect_err("nonregular config rejected");
+    assert!(matches!(&error, AppError::InitIo { path, .. } if path == &fifo));
+    assert_eq!(io_cause(&error).kind(), io::ErrorKind::InvalidInput);
+    let not_directory = temp.path().join("cache-file");
+    fs::write(&not_directory, "preserve").expect("cache path file");
+    let error = FileSyncStorage
+        .prepare_remote_cache(&not_directory)
+        .expect_err("cache file rejected");
+    assert!(matches!(error, AppError::StoragePreparation { path, .. } if path == not_directory));
+    assert_eq!(
+        kidobo_adapters::limited_io::read_to_string_with_limit(&not_directory, 16)
+            .expect("preserved cache file"),
+        "preserve"
+    );
+}
+
 #[test]
 #[expect(
     clippy::too_many_lines,
@@ -55,11 +333,20 @@ fn init_uses_the_resolved_root_for_all_provisioning() {
         fn resolve_installed_executable(&self, _: &[PathBuf]) -> Result<PathBuf, AppError> {
             Ok(PathBuf::from("/usr/local/bin/kidobo"))
         }
-        fn ensure_dir(&self, path: &Path) -> Result<ProvisionState, AppError> {
+        fn ensure_dir(
+            &self,
+            path: &Path,
+            _access: kidobo_app::init::ArtifactAccess,
+        ) -> Result<ProvisionState, AppError> {
             self.directories.borrow_mut().push(path.to_path_buf());
             Ok(ProvisionState::Created)
         }
-        fn ensure_file(&self, path: &Path, contents: &str) -> Result<ProvisionState, AppError> {
+        fn ensure_file(
+            &self,
+            path: &Path,
+            contents: &str,
+            _access: kidobo_app::init::ArtifactAccess,
+        ) -> Result<ProvisionState, AppError> {
             self.files
                 .borrow_mut()
                 .push((path.to_path_buf(), contents.to_string()));
@@ -508,7 +795,11 @@ fn atomic_writes_and_init_preserve_uninspectable_destinations() {
             .raw_os_error();
         if initialize {
             let error = FileInitProvisioner::new(NoCommands)
-                .ensure_file(&path, "replacement")
+                .ensure_file(
+                    &path,
+                    "replacement",
+                    kidobo_app::init::ArtifactAccess::Default,
+                )
                 .expect_err("init must preserve uninspectable file");
             assert_eq!(io_cause(&error).raw_os_error(), expected);
         } else {

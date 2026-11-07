@@ -12,6 +12,7 @@ use kidobo_adapters::config::FileConfigRepository;
 use kidobo_adapters::enforcement::SystemEnforcementBackend;
 use kidobo_adapters::lock::FileLockManager;
 use kidobo_adapters::path::{SystemPathResolver, path_resolution_input_from_process};
+use kidobo_adapters::storage::FileSyncStorage;
 use kidobo_adapters::sync_observer::LoggingSyncObserver;
 use kidobo_adapters::sync_sources::build_sync_source_registry;
 use kidobo_adapters::temporary_bans::{FileTemporaryBanRepository, SystemClock};
@@ -42,6 +43,7 @@ pub fn run_sync_command(timer: bool, io: &mut CliIo<'_>) -> Result<(), KidoboErr
             paths: &paths,
             configs: &configs,
             locks: &locks,
+            storage: &FileSyncStorage,
             clock: &SystemClock,
             temporary_bans: &FileTemporaryBanRepository,
             sources: &sources,

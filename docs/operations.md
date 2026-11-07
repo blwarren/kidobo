@@ -270,7 +270,10 @@ update failed`; the saved source remains in place. Inspect the failure and run
 because IPv4 and IPv6 set replacements are separate.
 
 `unban --yes` only approves removal of partially overlapping entries. It does
-not request sync or accept the later application prompt. Use `unban --apply`
+not request sync or accept the later application prompt. Without `--yes`,
+noninteractive runs remove exact matches and retain partial overlaps without
+reading stdin. Interactive runs ask a separate default-no overlap question.
+Use `unban --apply`
 to apply after saving, or `unban --no-apply` to save without prompting.
 
 ### Temporary bans
@@ -434,3 +437,6 @@ cleanup failure preserves the installed files. If uninstall fails before
 artifact removal, it restarts the timer only when it was previously active
 and reports any restoration failure. With `KIDOBO_ROOT`, uninstall skips host
 systemd operations and applies cleanup to the selected root.
+Alternate-root cleanup rejects symlinked intermediate systemd and cache directories and
+aborts if the root or unit directory changes during flush. It removes only
+the managed unit names, preserving unrelated units.

@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Security
+
+- Require `--yes` for partial-overlap unbans in noninteractive runs; exact matches
+  are still removed without consuming stdin.
+- Confine alternate-root uninstall and remote-cache cleanup to pinned directories
+  and reject symlinked intermediate paths.
+- Protect configuration files and remote caches with owner-only permissions,
+  including existing configs on initialization or writes and caches on sync.
 
 ## [0.15.1] - 2026-11-03
 

@@ -6,7 +6,7 @@ use std::path::Path;
 use toml_edit::{Array, DocumentMut, Item, Table, value};
 
 use crate::config::CONFIG_READ_LIMIT;
-use crate::limited_io::{read_to_string_with_limit, write_string_atomic_with_limit};
+use crate::limited_io::{read_to_string_with_limit, write_private_string_atomic_with_limit};
 use kidobo_app::AppError;
 use kidobo_core::config::{ConfigError, DEFAULT_ASN_CACHE_STALE_AFTER_SECS};
 
@@ -71,12 +71,12 @@ pub fn update_asn_bans(
     }
 
     let rendered = doc.to_string();
-    write_string_atomic_with_limit(config_path, &rendered, CONFIG_READ_LIMIT).map_err(|err| {
-        AppError::ConfigWrite {
+    write_private_string_atomic_with_limit(config_path, &rendered, CONFIG_READ_LIMIT).map_err(
+        |err| AppError::ConfigWrite {
             path: config_path.to_path_buf(),
             source: err,
-        }
-    })?;
+        },
+    )?;
     Ok(AsnBanUpdateResult { added, removed })
 }
 

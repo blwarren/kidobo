@@ -81,6 +81,11 @@ fn open_idle_fifo_writer(path: &Path) -> std::os::fd::OwnedFd {
     .unwrap_or_else(|error| panic!("open idle FIFO {}: {error}", path.display()))
 }
 
+#[cfg(unix)]
+#[path = "support/pty.rs"]
+mod pty;
+
+#[cfg(unix)]
 fn run_interactive_kidobo<F>(
     root: &Path,
     args: &[&str],
@@ -88,66 +93,20 @@ fn run_interactive_kidobo<F>(
     after_prompt: F,
 ) -> (Option<i32>, String, String)
 where
-    F: FnOnce(&mut std::process::Child),
+    F: FnOnce(&mut std::process::Child, &mut fs::File),
 {
-    let mut child = kidobo_with_root_command(root, args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn interactive kidobo");
-    let mut stdout = child.stdout.take().expect("stdout pipe");
-    let mut stderr = child.stderr.take().expect("stderr pipe");
-    let (stdout_tx, stdout_rx) = mpsc::channel();
-    let stdout_reader = thread::spawn(move || {
-        let mut output = Vec::new();
-        let mut byte = [0_u8; 1];
-        loop {
-            match stdout.read(&mut byte) {
-                Ok(0) => break,
-                Ok(_) => {
-                    output.push(byte[0]);
-                    let _send_result = stdout_tx.send(byte[0]);
-                }
-                Err(err) => panic!("read child stdout: {err}"),
-            }
-        }
-        output
-    });
-    let stderr_reader = thread::spawn(move || {
-        let mut output = Vec::new();
-        stderr.read_to_end(&mut output).expect("read child stderr");
-        output
-    });
-
-    let prompt = b"Remove these entries as well? [y/N]: ";
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let mut observed = Vec::new();
-    while !observed.ends_with(prompt) {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        assert!(!remaining.is_zero(), "timed out waiting for unban prompt");
-        observed.push(
-            stdout_rx
-                .recv_timeout(remaining)
-                .expect("interactive command ended before prompting"),
+    let mut command = kidobo_with_root_command(root, args);
+    command
+        .arg("--no-apply")
+        .env_remove("INVOCATION_ID")
+        .env_remove("JOURNAL_STREAM");
+    let output = pty::PtyCommand::spawn(command, 120, pty::OutputDestination::Terminal)
+        .respond_after_with(
+            "Remove these entries as well? [y/N]: ",
+            response,
+            after_prompt,
         );
-    }
-
-    after_prompt(&mut child);
-    let mut stdin = child.stdin.take().expect("stdin pipe");
-    stdin
-        .write_all(response.as_bytes())
-        .expect("write prompt response");
-    drop(stdin);
-
-    let status = child.wait().expect("wait for interactive kidobo");
-    let stdout = stdout_reader.join().expect("join stdout reader");
-    let stderr = stderr_reader.join().expect("join stderr reader");
-    (
-        status.code(),
-        String::from_utf8(stdout).expect("UTF-8 stdout"),
-        String::from_utf8(stderr).expect("UTF-8 stderr"),
-    )
+    (output.status.code(), output.stdout, output.stderr)
 }
 
 fn create_root(config_contents: &str, blocklist_contents: &str) -> TempDir {
@@ -1513,7 +1472,7 @@ fn unban_revalidates_configuration_after_the_prompt() {
     let initial = "203.0.113.0/24\n";
     let root = create_lookup_root(initial);
     let (code, _, stderr) =
-        run_interactive_kidobo(root.path(), &["unban", "203.0.113.7"], "yes\n", |_| {
+        run_interactive_kidobo(root.path(), &["unban", "203.0.113.7"], "yes\n", |_, _| {
             fs::write(
                 root.path().join("config/config.toml"),
                 "[ipset]\nmaxelem=0\n",
@@ -1537,12 +1496,12 @@ fn sigint_cancels_idle_and_partial_unban_prompts_without_mutating() {
     for partial in ["", "y"] {
         let initial = "203.0.113.0/24\n203.0.113.7\n";
         let root = create_lookup_root(initial);
-        let (code, stdout, stderr) =
-            run_interactive_kidobo(root.path(), &["unban", "203.0.113.7"], "", |child| {
-                child
-                    .stdin
-                    .as_mut()
-                    .expect("stdin")
+        let (code, stdout, stderr) = run_interactive_kidobo(
+            root.path(),
+            &["unban", "203.0.113.7"],
+            "",
+            |child, terminal| {
+                terminal
                     .write_all(partial.as_bytes())
                     .expect("partial response");
                 assert!(
@@ -1561,7 +1520,8 @@ fn sigint_cancels_idle_and_partial_unban_prompts_without_mutating() {
                     }
                     thread::sleep(Duration::from_millis(10));
                 }
-            });
+            },
+        );
         assert_eq!(code, Some(130), "{stderr}");
         assert!(!stdout.contains("removed "));
         assert_eq!(
@@ -2751,6 +2711,105 @@ fn unban_asn_cleanup_failure_warns_without_reverting_config_update() {
 }
 
 #[test]
+fn piped_unban_requires_yes_for_partial_permanent_and_temporary_matches() {
+    for file_mode in [false, true] {
+        for approve_partial in [false, true] {
+            let root = create_root(
+                "[ipset]\nset_name='kidobo'\n",
+                "203.0.113.7/32\n203.0.113.0/24\n198.51.100.0/24\n",
+            );
+            let temporary = temporary_bans_path(root.path());
+            fs::write(
+                &temporary,
+                "version = 1\n[[ips]]\ncidr = '203.0.113.7/32'\nexpires_at = 4102444800\n[[ips]]\ncidr = '203.0.113.0/24'\nexpires_at = 4102444800\n",
+            )
+            .expect("temporary source");
+            let targets = root.path().join("targets.txt");
+            fs::write(&targets, "203.0.113.7\n").expect("file targets");
+            let mut command = kidobo_with_root_command(root.path(), &["unban"]);
+            if file_mode {
+                command.arg("--file").arg(&targets);
+            } else {
+                command.arg("203.0.113.7");
+            }
+            if approve_partial {
+                command.arg("--yes");
+            }
+            let mut child = command
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("piped unban");
+            let mut input = child.stdin.take().expect("piped input");
+            input.write_all(b"yes\n").expect("affirmative input");
+            let output = wait_child_with_deadline(child, Duration::from_secs(5))
+                .expect("unban must not wait for pipe closure");
+            drop(input);
+            assert_eq!(output.status.code(), Some(0), "{output:?}");
+            let stdout = String::from_utf8(output.stdout).expect("stdout");
+            assert!(!stdout.contains("Remove these entries as well?"));
+            assert_eq!(stdout.contains("use --yes"), !approve_partial);
+            assert_eq!(
+                read_to_string_with_limit(
+                    &root.path().join("data/blocklist.txt"),
+                    BLOCKLIST_READ_LIMIT,
+                )
+                .expect("saved permanent source"),
+                if approve_partial {
+                    "198.51.100.0/24\n"
+                } else {
+                    "203.0.113.0/24\n198.51.100.0/24\n"
+                }
+            );
+            let saved = FileTemporaryBanRepository
+                .load(&temporary)
+                .expect("temporary source");
+            let entries = saved
+                .ips
+                .keys()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                entries,
+                if approve_partial {
+                    Vec::<String>::new()
+                } else {
+                    vec!["203.0.113.0/24".to_string()]
+                }
+            );
+        }
+    }
+}
+
+#[test]
+fn noninteractive_unban_does_not_wait_for_input_from_an_open_pipe() {
+    let root = create_root(
+        "[ipset]\nset_name='kidobo'\n",
+        "203.0.113.7/32\n203.0.113.0/24\n",
+    );
+    let mut child = kidobo_with_root_command(root.path(), &["unban", "203.0.113.7"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("unban with open stdin");
+    let input = child.stdin.take().expect("keep stdin open");
+    let output = wait_child_with_deadline(child, Duration::from_secs(5))
+        .expect("noninteractive unban must not read stdin");
+    drop(input);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(
+        read_to_string_with_limit(
+            &root.path().join("data/blocklist.txt"),
+            BLOCKLIST_READ_LIMIT
+        )
+        .expect("saved source"),
+        "203.0.113.0/24\n"
+    );
+}
+
+#[test]
 fn unban_yes_removes_overlapping_entries_without_prompt() {
     let root = create_root(
         "[ipset]\nset_name='kidobo'\n",
@@ -2790,7 +2849,7 @@ fn interactive_unban_decline_removes_exact_but_preserves_partial_matches() {
     let blocklist = root.path().join("data/blocklist.txt");
 
     let (code, stdout, stderr) =
-        run_interactive_kidobo(root.path(), &["unban", "203.0.113.7"], "n\n", |_| {});
+        run_interactive_kidobo(root.path(), &["unban", "203.0.113.7"], "n\n", |_, _| {});
 
     assert_eq!(code, Some(0), "interactive unban failed: {stderr}");
     assert!(stdout.contains("removed 1 blocklist entry for 203.0.113.7/32"));
@@ -2809,7 +2868,7 @@ fn interactive_unban_accept_removes_exact_and_partial_matches() {
     let blocklist = root.path().join("data/blocklist.txt");
 
     let (code, stdout, stderr) =
-        run_interactive_kidobo(root.path(), &["unban", "203.0.113.7"], "yes\n", |_| {});
+        run_interactive_kidobo(root.path(), &["unban", "203.0.113.7"], "yes\n", |_, _| {});
 
     assert_eq!(code, Some(0), "interactive unban failed: {stderr}");
     assert!(stdout.contains("removed 2 blocklist entries for 203.0.113.7/32"));
@@ -2826,7 +2885,7 @@ fn interactive_unban_target_detects_blocklist_change_after_preview() {
     let externally_updated = "203.0.112.0/23\n198.51.100.0/24\n";
 
     let (code, _stdout, stderr) =
-        run_interactive_kidobo(root.path(), &["unban", "203.0.113.7"], "y\n", |_| {
+        run_interactive_kidobo(root.path(), &["unban", "203.0.113.7"], "y\n", |_, _| {
             fs::write(&blocklist, externally_updated).expect("external blocklist update");
         });
 
@@ -2854,7 +2913,7 @@ fn interactive_unban_file_detects_blocklist_change_after_preview() {
         root.path(),
         &["unban", "--file", target_path.as_str()],
         "y\n",
-        |_| {
+        |_, _| {
             fs::write(&blocklist, externally_updated).expect("external blocklist update");
         },
     );

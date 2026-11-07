@@ -64,12 +64,48 @@ where
 }
 
 fn clear_remote_cache_dir(remote_cache_dir: &Path) -> Result<(), std::io::Error> {
+    #[cfg(unix)]
+    {
+        let parent = pin_cache_parent(remote_cache_dir)?;
+        let name = remote_cache_dir.file_name().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "remote cache must have a child directory name",
+            )
+        })?;
+        clear_pinned_cache_dir(&parent, name)
+    }
+    #[cfg(not(unix))]
+    clear_cache_path(remote_cache_dir)
+}
+
+#[cfg(unix)]
+fn pin_cache_parent(remote_cache_dir: &Path) -> std::io::Result<fs::File> {
+    crate::private_fs::open_parent_directory(remote_cache_dir)
+}
+
+#[cfg(unix)]
+fn clear_pinned_cache_dir(parent: &fs::File, name: &std::ffi::OsStr) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // The live directory descriptor stays pinned if an attacker renames its pathname.
+    let path = std::path::PathBuf::from(format!("/dev/fd/{}", parent.as_raw_fd())).join(name);
+    remove_cache_path(&path)?;
+    crate::private_fs::ensure_private_dir_at(parent, name).map(|_| ())
+}
+
+#[cfg(not(unix))]
+fn clear_cache_path(remote_cache_dir: &Path) -> std::io::Result<()> {
+    remove_cache_path(remote_cache_dir)?;
+    crate::private_fs::ensure_private_dir(remote_cache_dir).map(|_| ())
+}
+
+fn remove_cache_path(remote_cache_dir: &Path) -> std::io::Result<()> {
     match fs::remove_dir_all(remote_cache_dir) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
-    fs::create_dir_all(remote_cache_dir)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -142,6 +178,76 @@ mod tests {
 
         assert!(cache.is_dir());
         assert_eq!(fs::read_dir(cache).expect("read dir").count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_cleanup_rejects_a_symlinked_parent_without_deleting_outside_files() {
+        let temp = TempDir::new().expect("tempdir");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(outside.join("remote")).expect("outside cache");
+        fs::write(outside.join("remote/sentinel"), "preserve").expect("outside sentinel");
+        let parent = temp.path().join("cache");
+        std::os::unix::fs::symlink(&outside, &parent).expect("cache parent symlink");
+        let backend = backend_with_outcome(Ok(CommandResult {
+            status: ProcessStatus::Exited(0),
+            stdout: String::new(),
+            stderr: String::new(),
+        }));
+        let error = backend
+            .clear_remote_cache(&parent.join("remote"))
+            .expect_err("symlinked cache parent must fail closed");
+        assert!(error.raw_os_error().is_some());
+        assert_eq!(
+            crate::limited_io::read_to_string_with_limit(&outside.join("remote/sentinel"), 1024)
+                .expect("outside survived"),
+            "preserve"
+        );
+        assert_eq!(backend.runner.calls.borrow().len(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_cleanup_uses_the_pinned_parent_after_path_replacement() {
+        let temp = TempDir::new().expect("tempdir");
+        let parent = temp.path().join("cache");
+        let outside = temp.path().join("outside");
+        for directory in [&parent, &outside] {
+            fs::create_dir_all(directory.join("remote")).expect("cache directory");
+            fs::write(directory.join("remote/sentinel"), "preserve").expect("cache sentinel");
+        }
+        let descriptor = super::pin_cache_parent(&parent.join("remote")).expect("pin parent");
+        let moved = temp.path().join("moved-cache");
+        fs::rename(&parent, &moved).expect("move pinned parent");
+        std::os::unix::fs::symlink(&outside, &parent).expect("replace parent");
+        super::clear_pinned_cache_dir(&descriptor, std::ffi::OsStr::new("remote"))
+            .expect("clear pinned cache");
+        assert!(!moved.join("remote/sentinel").exists());
+        assert!(moved.join("remote").is_dir());
+        assert_eq!(
+            crate::limited_io::read_to_string_with_limit(&outside.join("remote/sentinel"), 1024)
+                .expect("outside survived"),
+            "preserve"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_cleanup_unlinks_a_final_symlink_without_following_its_target() {
+        let temp = TempDir::new().expect("tempdir");
+        let outside = temp.path().join("outside");
+        fs::create_dir(&outside).expect("outside directory");
+        fs::write(outside.join("sentinel"), "preserve").expect("outside sentinel");
+        let remote = temp.path().join("remote");
+        std::os::unix::fs::symlink(&outside, &remote).expect("remote symlink");
+        clear_remote_cache_dir(&remote).expect("unlink remote symlink");
+        assert!(!remote.is_symlink());
+        assert!(remote.is_dir());
+        assert_eq!(
+            crate::limited_io::read_to_string_with_limit(&outside.join("sentinel"), 1024)
+                .expect("outside survived"),
+            "preserve"
+        );
     }
 
     #[test]

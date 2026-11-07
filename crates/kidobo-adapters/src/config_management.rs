@@ -1,10 +1,9 @@
 //! Formatting-preserving, bounded configuration management and read-only source cache evidence.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::fs;
+use std::io;
+use std::path::Path;
 
 use kidobo_app::AppError;
 use kidobo_app::configuration::{
@@ -19,9 +18,9 @@ use toml_edit::{Array, DocumentMut, Item, Table, Value, value};
 
 use crate::config::CONFIG_READ_LIMIT;
 use crate::http_cache::inspect_cached_source;
-use crate::limited_io::{read_to_string_with_limit, write_string_atomic_with_limit};
-
-static NEW_CONFIG_COUNTER: AtomicU64 = AtomicU64::new(0);
+use crate::limited_io::{
+    create_private_string_atomic, read_to_string_with_limit, write_private_string_atomic_with_limit,
+};
 
 /// Exact configuration reads, pure TOML editing, and atomic publication through narrow app ports.
 #[derive(Debug, Default, Clone, Copy)]
@@ -118,7 +117,7 @@ impl ConfigurationWriter for FileConfigurationManager {
         Config::from_toml_str(contents)?;
         match mode {
             ConfigurationWriteMode::ReplaceExisting => {
-                write_string_atomic_with_limit(path, contents, CONFIG_READ_LIMIT).map_err(
+                write_private_string_atomic_with_limit(path, contents, CONFIG_READ_LIMIT).map_err(
                     |source| AppError::ConfigWrite {
                         path: path.to_path_buf(),
                         source,
@@ -432,64 +431,16 @@ fn publish_new(path: &Path, contents: &str) -> Result<(), AppError> {
         path: path.to_path_buf(),
         source,
     })?;
-    let (temporary_path, mut file) =
-        create_temporary(parent).map_err(|source| AppError::ConfigWrite {
-            path: path.to_path_buf(),
-            source,
-        })?;
-    let publication = (|| -> io::Result<()> {
-        file.write_all(contents.as_bytes())?;
-        file.sync_all()?;
-        drop(file);
-        fs::hard_link(&temporary_path, path)?;
-        Ok(())
-    })();
-    let cleanup = fs::remove_file(&temporary_path);
-    if let Err(source) = publication {
+    create_private_string_atomic(path, contents).map_err(|source| {
         if source.kind() == io::ErrorKind::AlreadyExists {
-            return Err(AppError::ConfigurationChanged);
+            AppError::ConfigurationChanged
+        } else {
+            AppError::ConfigWrite {
+                path: path.to_path_buf(),
+                source,
+            }
         }
-        return Err(AppError::ConfigWrite {
-            path: path.to_path_buf(),
-            source,
-        });
-    }
-    cleanup.map_err(|source| AppError::ConfigWrite {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    File::open(parent)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|source| AppError::ConfigWrite {
-            path: path.to_path_buf(),
-            source,
-        })
-}
-
-fn create_temporary(parent: &Path) -> io::Result<(PathBuf, File)> {
-    for _ in 0..16 {
-        let sequence = NEW_CONFIG_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = parent.join(format!(
-            ".kidobo-config-new-{}-{sequence}",
-            std::process::id()
-        ));
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        match options.open(&path) {
-            Ok(file) => return Ok((path, file)),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error),
-        }
-    }
-    Err(io::Error::new(
-        io::ErrorKind::AlreadyExists,
-        "no unique configuration staging filename was available",
-    ))
+    })
 }
 
 #[cfg(test)]
@@ -498,6 +449,7 @@ mod tests {
     use kidobo_app::configuration::{ReadDependencies, SettingOrigin, SettingValue};
     use kidobo_app::paths::PathResolutionInput;
     use kidobo_app::ports::NoCancellation;
+    use std::path::PathBuf;
     use tempfile::TempDir;
 
     const CONFIG: &str = "# configuration header\nipset = { set_name = 'custom', maxelem = 65536 }\nsafe = { ips = ['203.0.113.0/24'], include_github_meta = true }\nremote = { urls = ['HTTP://EXAMPLE.test:80/feed'], timeout_secs = 91 }\n# keep these ASN settings exactly\n[asn]\nbanned = [64512]\ncache_stale_after_secs = 7200\n";
@@ -785,7 +737,7 @@ mod tests {
     }
 
     #[test]
-    fn replacement_preserves_permissions_and_atomic_failures_leave_complete_existing_state() {
+    fn replacement_secures_permissions_and_atomic_failures_leave_complete_existing_state() {
         let temp = TempDir::new().expect("tempdir");
         let path = temp.path().join("config.toml");
         fs::write(&path, CONFIG).expect("original");
@@ -812,7 +764,7 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             assert_eq!(
                 fs::metadata(&path).expect("metadata").permissions().mode() & 0o777,
-                0o640
+                0o600
             );
         }
         let directory = temp.path().join("directory");

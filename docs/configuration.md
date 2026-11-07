@@ -118,6 +118,32 @@ query/fragment values. `kidobo config path` prints the selected configuration
 path, including a path relocated by `KIDOBO_ROOT`, even before the file exists.
 Both commands are read-only and never create a configuration file.
 
+## Private configuration and caches
+
+New configuration files and configuration writes use Unix mode `0600`,
+including source, exemption, setup, and ASN edits. `init` also secures an
+existing config without changing its contents. Group access ends when these
+operations protect a previously shared config; unchanged edits do not run a
+configuration write.
+
+`init` and normal `sync` set the remote cache directory to `0700` before online
+source loading. This protects URL credentials in legacy and current remote-feed
+and GitHub metadata caches. Offline cache inspection requires the owning
+account or suitable privilege. Read-only commands never repair permissions.
+Permission failures stop initialization or synchronization rather than
+continuing with unprotected storage.
+
+For installations awaiting upgrade, restrict the existing files directly
+(adjust paths when using `KIDOBO_ROOT`):
+
+```bash
+sudo chmod 600 /etc/kidobo/config.toml
+sudo chmod 700 /var/cache/kidobo/remote
+```
+
+If credential-bearing URLs were previously stored in files readable by other
+users, rotate those credentials at the feed provider after restricting access.
+
 ## Paths and validation
 
 | Item | Default path |

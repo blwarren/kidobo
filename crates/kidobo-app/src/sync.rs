@@ -249,6 +249,16 @@ pub struct PreparedSyncEntries {
     pub ipv6_networks: usize,
 }
 
+/// Required preparation of private persistent source storage.
+pub trait SyncStoragePreparer {
+    /// Protects remote cache storage before any online source can access it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when storage cannot be secured; sync must stop.
+    fn prepare_remote_cache(&self, path: &std::path::Path) -> Result<(), AppError>;
+}
+
 /// Ports and registries required by the synchronization workflow.
 pub struct SyncDependencies<'a> {
     /// Cooperative cancellation outside a started mutation.
@@ -259,6 +269,8 @@ pub struct SyncDependencies<'a> {
     pub configs: &'a dyn ConfigRepository,
     /// Nonblocking process lock manager.
     pub locks: &'a dyn LockManager,
+    /// Required preparation of owner-only remote cache storage.
+    pub storage: &'a dyn SyncStoragePreparer,
     /// Time source for one consistent expiry decision per sync.
     pub clock: &'a dyn Clock,
     /// Persistent operator-managed temporary bans.
@@ -300,6 +312,10 @@ struct PendingPromotion {
 /// Returns an error when required paths, configuration, locking, sources, capacity preflight,
 /// atomic set replacement, or firewall activation fails. Best-effort source and disabled-family
 /// cleanup failures are reported as notices instead.
+#[expect(
+    clippy::too_many_lines,
+    reason = "keep locked configuration, required storage privacy, cache admission, and enforcement ordering visible together"
+)]
 pub fn execute(
     request: &PathResolutionInput,
     dependencies: &SyncDependencies<'_>,
@@ -325,6 +341,10 @@ pub fn execute(
 
     // A source-editing command may have published a new configuration before lock acquisition.
     let config = dependencies.configs.load(&paths.config_file)?;
+    dependencies.cancellation.check()?;
+    dependencies
+        .storage
+        .prepare_remote_cache(&paths.remote_cache_dir)?;
     dependencies.cancellation.check()?;
     let temporary_path = paths.temporary_bans_file();
     let mut temporary_bans = dependencies.temporary_bans.load(&temporary_path)?;
@@ -899,6 +919,116 @@ mod tests {
 
     struct FakeLocks(Ledger);
 
+    struct FakeStorage;
+
+    impl super::SyncStoragePreparer for FakeStorage {
+        fn prepare_remote_cache(&self, _path: &Path) -> Result<(), AppError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn private_storage_precedes_enforcement_and_source_loading_and_failure_is_fatal() {
+        struct Storage {
+            ledger: Ledger,
+            fail: bool,
+        }
+        impl super::SyncStoragePreparer for Storage {
+            fn prepare_remote_cache(&self, path: &Path) -> Result<(), AppError> {
+                assert_eq!(path, test_paths().remote_cache_dir);
+                record(&self.ledger, "secure-storage");
+                if self.fail {
+                    return Err(AppError::StoragePreparation {
+                        path: path.to_path_buf(),
+                        source: std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            "injected privacy failure",
+                        ),
+                    });
+                }
+                Ok(())
+            }
+        }
+        for fail in [false, true] {
+            let ledger = Ledger::default();
+            let storage = Storage {
+                ledger: Arc::clone(&ledger),
+                fail,
+            };
+            let sources = registry(
+                &ledger,
+                vec![provider(
+                    &ledger,
+                    "remote",
+                    SourceRole::Candidate,
+                    FailurePolicy::BestEffort,
+                    vec![],
+                )],
+            );
+            let enforcement = FakeEnforcement {
+                ledger: Arc::clone(&ledger),
+                fail_at: None,
+                replacements: Mutex::new(Vec::new()),
+            };
+            let temporary = TemporaryState::default();
+            let result = execute(
+                &request(),
+                &SyncDependencies {
+                    cancellation: &crate::ports::NoCancellation,
+                    paths: &FakePaths {
+                        ledger: Arc::clone(&ledger),
+                        paths: test_paths(),
+                    },
+                    configs: &FakeConfigs {
+                        ledger: Arc::clone(&ledger),
+                        config: config(true, 10),
+                    },
+                    locks: &FakeLocks(Arc::clone(&ledger)),
+                    storage: &storage,
+                    clock: &temporary,
+                    temporary_bans: &temporary,
+                    sources: &sources,
+                    enforcement: &enforcement,
+                    observer: &RecordingObserver::default(),
+                },
+            );
+            if fail {
+                match result.expect_err("privacy failure must stop sync") {
+                    AppError::StoragePreparation { path, source } => {
+                        assert_eq!(path, test_paths().remote_cache_dir);
+                        assert_eq!(source.kind(), std::io::ErrorKind::PermissionDenied);
+                    }
+                    error => panic!("unexpected error: {error}"),
+                }
+                assert_eq!(
+                    events(&ledger),
+                    [
+                        "paths",
+                        "config",
+                        "lock",
+                        "config",
+                        "secure-storage",
+                        "unlock"
+                    ]
+                );
+            } else {
+                result.expect("secure sync");
+                let events = events(&ledger);
+                assert_eq!(
+                    &events[..5],
+                    ["paths", "config", "lock", "config", "secure-storage"]
+                );
+                assert!(
+                    events
+                        .iter()
+                        .position(|event| event == "source:remote")
+                        .expect("source was loaded")
+                        > 4
+                );
+            }
+        }
+    }
+
     impl LockManager for FakeLocks {
         fn acquire(&self, _path: &Path) -> Result<Box<dyn LockGuard>, AppError> {
             record(&self.0, "lock");
@@ -1296,6 +1426,7 @@ mod tests {
                 paths: &paths,
                 configs: &configs,
                 locks: &locks,
+                storage: &FakeStorage,
                 clock: temporary,
                 temporary_bans: temporary,
                 sources,
@@ -1348,6 +1479,7 @@ mod tests {
                     },
                     configs: self,
                     locks: self,
+                    storage: &FakeStorage,
                     clock: &temporary,
                     temporary_bans: &temporary,
                     sources,

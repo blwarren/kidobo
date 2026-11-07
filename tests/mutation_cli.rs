@@ -353,6 +353,50 @@ fn explicit_apply_runs_sync_for_noop_changes_after_the_mutation_lock_is_released
 }
 
 #[test]
+fn explicit_apply_does_not_approve_partial_unban_removal() {
+    let fixture = Fixture::new(CONFIG, "203.0.113.7\n203.0.113.0/24\n");
+    fail_fake_sync(&fixture);
+    let output = fixture
+        .spawn(
+            &["unban", "203.0.113.7", "--apply"],
+            100,
+            OutputDestination::Pipe,
+            &[],
+        )
+        .wait();
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(output.stdout.contains("use --yes"));
+    assert!(
+        output
+            .stderr
+            .starts_with("Source change saved; live firewall update failed")
+    );
+    assert_eq!(source(&fixture), "203.0.113.0/24\n");
+    assert!(fixture.tool_log().contains("sudo -n "));
+}
+
+#[test]
+fn systemd_unban_preserves_partial_matches_without_prompting() {
+    for environment in ["INVOCATION_ID", "JOURNAL_STREAM"] {
+        let fixture = Fixture::new(CONFIG, "203.0.113.7\n203.0.113.0/24\n");
+        let output = fixture
+            .spawn(
+                &["unban", "203.0.113.7"],
+                100,
+                OutputDestination::Terminal,
+                &[(environment, "fixture")],
+            )
+            .wait();
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        assert!(output.stdout.contains("use --yes"));
+        assert!(!output.stdout.contains("Remove these entries as well?"));
+        assert!(!output.stdout.contains(APPLY_PROMPT));
+        assert_eq!(source(&fixture), "203.0.113.0/24\n");
+        assert_eq!(fixture.tool_log(), "");
+    }
+}
+
+#[test]
 fn unban_yes_approves_overlap_removal_but_still_prompts_before_sync() {
     let fixture = Fixture::new(CONFIG, "203.0.113.0/24\n");
 

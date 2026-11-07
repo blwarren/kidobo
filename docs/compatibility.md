@@ -75,7 +75,9 @@ failure while retaining the saved source. Operators can retry with `kidobo
 sync`; the existing IPv4/IPv6 partial-update boundary still applies.
 
 `unban --yes` approves only removal of partial overlaps and never approves
-sync. In an interactive session, the later sync question remains independent.
+sync. Without it, noninteractive runs remove exact matches and preserve partial
+overlaps without reading stdin. In an interactive session, the later sync
+question remains independent.
 
 `sources` and `allow` inspect or edit saved configuration only. They do not
 fetch remote feeds, refresh caches, or update firewall enforcement. Exact
@@ -97,6 +99,18 @@ whether to enable the scheduled timer after the initial-sync choice; under
 `KIDOBO_ROOT`, unit files are kept under that root and no host timer is
 activated. Existing active timers remain active during setup and may apply
 saved settings before the wizard completes.
+
+Configuration creation and writes use owner-only access (`0600` on Unix),
+including ASN edits. `init` also secures existing config permissions while
+preserving its contents. `init` and normal `sync` secure the remote cache
+directory to `0700`; offline cache reads require the owning account or suitable
+privilege. Read-only commands do not change permissions. See
+[configuration permissions](configuration.md#private-configuration-and-caches)
+for upgrade guidance.
+
+Remote-cache cleanup rejects a symlinked cache parent and deletes from a pinned
+directory context. A symlink at the final remote-cache path is unlinked without
+removing its target.
 
 `sync --dry-run` is a read-only preview that calculates proposed family counts
 and capacity outcomes. It is offline by default and requires the existing sync

@@ -388,6 +388,13 @@ fn confirm_partial_matches(
         )?;
         return Ok(true);
     }
+    if !io.interactive() {
+        output(
+            io,
+            format_args!("Keeping partial matches; use --yes to approve their removal."),
+        )?;
+        return Ok(false);
+    }
     write!(io.stdout, "Remove these entries as well? [y/N]: ")?;
     io.stdout
         .flush()

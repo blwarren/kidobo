@@ -74,6 +74,17 @@ pub enum ProvisionState {
     Created,
     /// Existing artifact was preserved unchanged.
     Preserved,
+    /// Existing contents were retained and access permissions were secured.
+    Secured,
+}
+
+/// Access policy for a provisioned artifact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtifactAccess {
+    /// Preserve existing permissions and use normal creation defaults.
+    Default,
+    /// Restrict access to the owning account.
+    OwnerOnly,
 }
 
 /// Path and state of one provisioned directory or file.
@@ -103,19 +114,24 @@ pub trait InitProvisioner {
     /// Returns an error when no candidate resolves to an acceptable executable.
     fn resolve_installed_executable(&self, candidates: &[PathBuf]) -> Result<PathBuf, AppError>;
 
-    /// Creates a directory if it is absent.
+    /// Creates a missing directory and enforces its requested access policy.
     ///
     /// # Errors
     ///
     /// Returns an error when the directory cannot be inspected or created safely.
-    fn ensure_dir(&self, path: &Path) -> Result<ProvisionState, AppError>;
+    fn ensure_dir(&self, path: &Path, access: ArtifactAccess) -> Result<ProvisionState, AppError>;
 
-    /// Creates a file with the supplied contents if it is absent.
+    /// Creates a missing file or preserves its contents while enforcing requested access.
     ///
     /// # Errors
     ///
     /// Returns an error when the file cannot be inspected or created safely.
-    fn ensure_file(&self, path: &Path, contents: &str) -> Result<ProvisionState, AppError>;
+    fn ensure_file(
+        &self,
+        path: &Path,
+        contents: &str,
+        access: ArtifactAccess,
+    ) -> Result<ProvisionState, AppError>;
 
     /// Reloads systemd and enables the managed timer.
     ///
@@ -205,14 +221,14 @@ fn execute_with_timer(
     let timer_file = systemd_dir.join(KIDOBO_SYNC_TIMER_FILE);
     let mut outcome = InitOutcome::default();
 
-    for directory in [
-        &paths.config_dir,
-        &paths.data_dir,
-        &paths.remote_cache_dir,
-        &systemd_dir,
+    for (directory, access) in [
+        (&paths.config_dir, ArtifactAccess::Default),
+        (&paths.data_dir, ArtifactAccess::Default),
+        (&paths.remote_cache_dir, ArtifactAccess::OwnerOnly),
+        (&systemd_dir, ArtifactAccess::Default),
     ] {
         dependencies.cancellation.check()?;
-        let state = dependencies.provisioner.ensure_dir(directory)?;
+        let state = dependencies.provisioner.ensure_dir(directory, access)?;
         outcome.artifacts.push(ProvisionedArtifact {
             path: directory.clone(),
             state,
@@ -222,16 +238,38 @@ fn execute_with_timer(
     let service_template =
         build_systemd_service_template(&executable, paths.root_override.as_deref());
     let temporary_bans_file = paths.temporary_bans_file();
-    for (file, contents) in [
-        (&paths.config_file, DEFAULT_CONFIG_TEMPLATE),
-        (&paths.blocklist_file, DEFAULT_BLOCKLIST_TEMPLATE),
-        (&paths.lock_file, ""),
-        (&temporary_bans_file, DEFAULT_TEMPORARY_BANS_TEMPLATE),
-        (&service_file, service_template.as_str()),
-        (&timer_file, DEFAULT_SYSTEMD_TIMER_TEMPLATE),
+    for (file, contents, access) in [
+        (
+            &paths.config_file,
+            DEFAULT_CONFIG_TEMPLATE,
+            ArtifactAccess::OwnerOnly,
+        ),
+        (
+            &paths.blocklist_file,
+            DEFAULT_BLOCKLIST_TEMPLATE,
+            ArtifactAccess::Default,
+        ),
+        (&paths.lock_file, "", ArtifactAccess::Default),
+        (
+            &temporary_bans_file,
+            DEFAULT_TEMPORARY_BANS_TEMPLATE,
+            ArtifactAccess::Default,
+        ),
+        (
+            &service_file,
+            service_template.as_str(),
+            ArtifactAccess::Default,
+        ),
+        (
+            &timer_file,
+            DEFAULT_SYSTEMD_TIMER_TEMPLATE,
+            ArtifactAccess::Default,
+        ),
     ] {
         dependencies.cancellation.check()?;
-        let state = dependencies.provisioner.ensure_file(file, contents)?;
+        let state = dependencies
+            .provisioner
+            .ensure_file(file, contents, access)?;
         outcome.artifacts.push(ProvisionedArtifact {
             path: file.clone(),
             state,
@@ -342,7 +380,11 @@ mod tests {
             Ok(PathBuf::from("/usr/local/bin/kidobo"))
         }
 
-        fn ensure_dir(&self, path: &Path) -> Result<ProvisionState, AppError> {
+        fn ensure_dir(
+            &self,
+            path: &Path,
+            _access: super::ArtifactAccess,
+        ) -> Result<ProvisionState, AppError> {
             self.events
                 .lock()
                 .expect("events")
@@ -350,7 +392,12 @@ mod tests {
             Ok(ProvisionState::Created)
         }
 
-        fn ensure_file(&self, path: &Path, _contents: &str) -> Result<ProvisionState, AppError> {
+        fn ensure_file(
+            &self,
+            path: &Path,
+            _contents: &str,
+            _access: super::ArtifactAccess,
+        ) -> Result<ProvisionState, AppError> {
             self.events
                 .lock()
                 .expect("events")

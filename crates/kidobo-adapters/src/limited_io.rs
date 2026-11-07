@@ -112,12 +112,32 @@ pub fn write_string_atomic(path: &Path, contents: &str) -> io::Result<()> {
 /// Returns an I/O error when temporary-file creation, writing, synchronization, permission
 /// preservation, replacement, or parent-directory synchronization fails.
 pub fn write_bytes_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
-    write_bytes_atomic_mode(path, contents, PublicationMode::Replace)
+    write_bytes_atomic_mode(path, contents, PublicationMode::Replace, false)
 }
 
 /// Publishes a complete file without replacing an existing destination.
 pub(crate) fn create_string_atomic(path: &Path, contents: &str) -> io::Result<()> {
-    write_bytes_atomic_mode(path, contents.as_bytes(), PublicationMode::CreateNew)
+    write_bytes_atomic_mode(path, contents.as_bytes(), PublicationMode::CreateNew, false)
+}
+
+/// Publishes a config without exposing its staging file to other users.
+pub(crate) fn create_private_string_atomic(path: &Path, contents: &str) -> io::Result<()> {
+    write_bytes_atomic_mode(path, contents.as_bytes(), PublicationMode::CreateNew, true)
+}
+
+/// Replaces a bounded config with owner-only access, independently of its old permissions.
+pub(crate) fn write_private_string_atomic_with_limit(
+    path: &Path,
+    contents: &str,
+    max_bytes: usize,
+) -> io::Result<()> {
+    if contents.len() > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("file exceeds {max_bytes} byte limit"),
+        ));
+    }
+    write_bytes_atomic_mode(path, contents.as_bytes(), PublicationMode::Replace, true)
 }
 
 #[derive(Clone, Copy)]
@@ -126,7 +146,12 @@ enum PublicationMode {
     CreateNew,
 }
 
-fn write_bytes_atomic_mode(path: &Path, contents: &[u8], mode: PublicationMode) -> io::Result<()> {
+fn write_bytes_atomic_mode(
+    path: &Path,
+    contents: &[u8],
+    mode: PublicationMode,
+    private: bool,
+) -> io::Result<()> {
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -144,12 +169,23 @@ fn write_bytes_atomic_mode(path: &Path, contents: &[u8], mode: PublicationMode) 
         let temp_path = temp_write_path(parent, path);
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
+        #[cfg(unix)]
+        if private {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
 
         match options.open(&temp_path) {
             Ok(mut temp_file) => {
                 let write_result = (|| {
-                    if let Some(permissions) = &existing_permissions {
-                        fs::set_permissions(&temp_path, permissions.clone())?;
+                    if private {
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::PermissionsExt;
+                            temp_file.set_permissions(fs::Permissions::from_mode(0o600))?;
+                        }
+                    } else if let Some(permissions) = &existing_permissions {
+                        temp_file.set_permissions(permissions.clone())?;
                     }
 
                     temp_file.write_all(contents)?;
@@ -358,5 +394,65 @@ mod tests {
             "replacement"
         );
         assert_eq!(fs::read_dir(temp.path()).expect("directory").count(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_writes_protect_staging_before_publication() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for create in [true, false] {
+            let temp = TempDir::new().expect("tempdir");
+            let path = temp.path().join("config.toml");
+            if !create {
+                fs::write(&path, "old").expect("old config");
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o644))
+                    .expect("public old mode");
+            }
+            let directory = temp.path().to_path_buf();
+            let destination = path.clone();
+            super::publication_test::interleave(
+                move || {
+                    let staging = fs::read_dir(&directory)
+                        .expect("staging directory")
+                        .map(|entry| entry.expect("staging entry").path())
+                        .find(|entry| entry != &destination)
+                        .expect("staging file");
+                    assert_eq!(
+                        fs::metadata(&staging)
+                            .expect("staging mode")
+                            .permissions()
+                            .mode()
+                            & 0o7777,
+                        0o600
+                    );
+                    assert_eq!(
+                        read_to_string_with_limit(&staging, 1024).expect("staged bytes"),
+                        "secret"
+                    );
+                },
+                || {
+                    if create {
+                        super::create_private_string_atomic(&path, "secret")
+                    } else {
+                        super::write_private_string_atomic_with_limit(&path, "secret", 1024)
+                    }
+                },
+            )
+            .expect("private publication");
+            assert_eq!(
+                fs::metadata(&path)
+                    .expect("published mode")
+                    .permissions()
+                    .mode()
+                    & 0o7777,
+                0o600
+            );
+            assert_eq!(
+                read_to_string_with_limit(&path, 1024).expect("published bytes"),
+                "secret"
+            );
+            assert_eq!(fs::read_dir(temp.path()).expect("directory").count(), 1);
+        }
     }
 }

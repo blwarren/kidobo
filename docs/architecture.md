@@ -118,9 +118,11 @@ The application sync use case explicitly preserves this order:
 1. Resolve paths and validate config before acquiring the nonblocking lock,
    preserving configuration-error precedence. Discard this preliminary snapshot.
 2. Capture the temporary-ban cutoff time, then reload config under the lock.
-   Use only this locked revision for sources and enforcement. Load/validate temporary
-   state once before preparing firewall artifacts; a failed config reload aborts
-   without source, cache, or firewall work.
+   Use only this locked revision for sources and enforcement. Secure the remote
+   cache directory to owner-only access through the required storage-preparation
+   port, then load/validate temporary state once before preparing firewall artifacts.
+   A failed config reload aborts without source, cache, or firewall work; a storage
+   permission failure aborts before source loading or firewall preparation.
 3. Ensure sets and chains without activating new wiring.
 4. Load every registered source and apply provider failure policy. Temporary
    IP and ASN entries are active only when `expires_at` is later than the

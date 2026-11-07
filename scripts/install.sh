@@ -275,13 +275,6 @@ resolve_uninstall_paths() {
         CACHE_DIR="${KIDOBO_ROOT_OVERRIDE}/cache"
         SYSTEMD_DIR="${KIDOBO_ROOT_OVERRIDE}/systemd/system"
 
-        local scoped_path
-        for scoped_path in "${CONFIG_DIR}" "${DATA_DIR}" "${CACHE_DIR}" "${SYSTEMD_DIR}"; do
-            if [[ "${scoped_path}" != "${KIDOBO_ROOT_OVERRIDE}/"* ]]; then
-                echo "refusing uninstall path outside KIDOBO_ROOT: ${scoped_path}" >&2
-                exit 1
-            fi
-        done
     else
         CONFIG_DIR="/etc/kidobo"
         DATA_DIR="/var/lib/kidobo"
@@ -292,6 +285,76 @@ resolve_uninstall_paths() {
     SYSTEMD_SERVICE_PATH="${SYSTEMD_DIR}/kidobo-sync.service"
     SYSTEMD_TIMER_PATH="${SYSTEMD_DIR}/kidobo-sync.timer"
 }
+
+validate_scoped_uninstall_directories() {
+    local directory
+    for directory in ./systemd ./systemd/system ./cache; do
+        if [[ -L "${directory}" || ( -e "${directory}" && ! -d "${directory}" ) ]]; then
+            echo "refusing uninstall through unsafe runtime directory: ${directory}" >&2
+            return 1
+        fi
+    done
+}
+
+uninstall_scoped_artifacts() (
+    if [[ "${TARGET_PATH}" != /* ]]; then
+        TARGET_PATH="$(pwd -P)/${TARGET_PATH}"
+    fi
+    if ! cd -P -- "${KIDOBO_ROOT_OVERRIDE}" || [[ "$(pwd -P)" != "${KIDOBO_ROOT_OVERRIDE}" ]]; then
+        echo "uninstall aborted: alternate root could not be pinned; runtime artifacts were preserved" >&2
+        return 1
+    fi
+    validate_scoped_uninstall_directories || return 1
+
+    local root_directory_fd
+    if ! exec {root_directory_fd}< .; then
+        echo "uninstall aborted: alternate root could not be pinned; runtime artifacts were preserved" >&2
+        return 1
+    fi
+    local unit_directory_fd=""
+    if [[ -d ./systemd/system ]]; then
+        if ! cd -P -- ./systemd/system || [[ "$(pwd -P)" != "${SYSTEMD_DIR}" ]]; then
+            echo "uninstall aborted: systemd directory escaped alternate root; runtime artifacts were preserved" >&2
+            return 1
+        fi
+        if ! exec {unit_directory_fd}< .; then
+            echo "uninstall aborted: systemd directory could not be pinned; runtime artifacts were preserved" >&2
+            return 1
+        fi
+        cd -P -- "/dev/fd/${root_directory_fd}" || return 1
+        validate_scoped_uninstall_directories || return 1
+    fi
+
+    # The child resolves relative state paths from the pinned root, even if its name is replaced.
+    if ! KIDOBO_ROOT=. run_config_aware_flush; then
+        echo "uninstall aborted: config-aware flush failed; runtime artifacts were preserved" >&2
+        return 1
+    fi
+    if [[ -L "${KIDOBO_ROOT_OVERRIDE}" || ! . -ef "${KIDOBO_ROOT_OVERRIDE}" ]]; then
+        echo "uninstall aborted: alternate root changed during flush; runtime artifacts were preserved" >&2
+        return 1
+    fi
+    validate_scoped_uninstall_directories || return 1
+    if [[ -n "${unit_directory_fd}" ]]; then
+        if [[ ! ./systemd/system -ef "/dev/fd/${unit_directory_fd}" ]]; then
+            echo "uninstall aborted: systemd directory changed during flush; runtime artifacts were preserved" >&2
+            return 1
+        fi
+        (
+            cd -P -- "/dev/fd/${unit_directory_fd}" || return 1
+            remove_path ./kidobo-sync.timer "systemd timer"
+            remove_path ./kidobo-sync.service "systemd service"
+        ) || return 1
+    elif [[ -e ./systemd/system ]]; then
+        echo "uninstall aborted: systemd directory appeared during flush; runtime artifacts were preserved" >&2
+        return 1
+    fi
+
+    remove_path ./cache "cache dir"
+    remove_path ./data "data dir"
+    remove_path ./config "config dir"
+    remove_path "${TARGET_PATH}" "binary"
+)
 
 run_config_aware_flush() {
     if [[ ! -x "${TARGET_PATH}" ]]; then
@@ -371,6 +434,11 @@ uninstall_artifacts() {
     resolve_uninstall_paths
 
     echo "uninstalling ${BINARY_NAME} artifacts"
+
+    if [[ -n "${KIDOBO_ROOT_OVERRIDE}" ]]; then
+        uninstall_scoped_artifacts
+        return $?
+    fi
 
     local timer_was_active=0
     local timer_present=0

@@ -46,6 +46,10 @@ pub(super) fn write_init_outcome(
         let (status, label) = match artifact.state {
             ProvisionState::Created => (crate::cli::presentation::Status::Pass, "Created"),
             ProvisionState::Preserved => (crate::cli::presentation::Status::Skip, "Preserved"),
+            ProvisionState::Secured => (
+                crate::cli::presentation::Status::Pass,
+                "Secured permissions; contents preserved",
+            ),
         };
         view.status(
             io.stdout,
@@ -77,12 +81,20 @@ pub(super) fn render_init_outcome(outcome: &InitOutcome) -> String {
         .filter(|artifact| artifact.state == ProvisionState::Preserved)
         .collect::<Vec<_>>();
     let mut output = String::new();
+    let secured = outcome
+        .artifacts
+        .iter()
+        .filter(|artifact| artifact.state == ProvisionState::Secured)
+        .collect::<Vec<_>>();
     let _header = writeln!(
         &mut output,
         "init completed: created={} unchanged={}",
         created.len(),
         preserved.len()
     );
+    if !secured.is_empty() {
+        let _secured_count = writeln!(&mut output, "secured permissions: {}", secured.len());
+    }
     for artifact in created {
         let _created = writeln!(
             &mut output,
@@ -94,6 +106,13 @@ pub(super) fn render_init_outcome(outcome: &InitOutcome) -> String {
         let _preserved = writeln!(
             &mut output,
             "unchanged: {}",
+            crate::cli::presentation::escape(&artifact.path.display().to_string())
+        );
+    }
+    for artifact in secured {
+        let _secured = writeln!(
+            &mut output,
+            "secured permissions (contents preserved): {}",
             crate::cli::presentation::escape(&artifact.path.display().to_string())
         );
     }
@@ -126,6 +145,21 @@ mod tests {
         assert_eq!(
             rendered,
             "init completed: created=1 unchanged=1\ncreated: /created\nunchanged: /unchanged\n"
+        );
+    }
+
+    #[test]
+    fn renderer_reports_secured_permissions_without_claiming_unchanged_metadata() {
+        let rendered = render_init_outcome(&InitOutcome {
+            artifacts: vec![ProvisionedArtifact {
+                path: PathBuf::from("/config.toml"),
+                state: ProvisionState::Secured,
+            }],
+            systemd_enabled: false,
+        });
+        assert_eq!(
+            rendered,
+            "init completed: created=0 unchanged=0\nsecured permissions: 1\nsecured permissions (contents preserved): /config.toml\n"
         );
     }
 }

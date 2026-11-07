@@ -1188,6 +1188,326 @@ fn uninstall_canonicalizes_scoped_root_without_touching_siblings() {
     );
 }
 
+struct ScopedUninstallFixture {
+    temp: TempDir,
+    root: PathBuf,
+    outside: PathBuf,
+    binary: PathBuf,
+}
+
+impl ScopedUninstallFixture {
+    fn new() -> Self {
+        let temp = TempDir::new().expect("tempdir");
+        let root = temp.path().join("root");
+        let outside = temp.path().join("outside");
+        for parent in [&root, &outside] {
+            for name in [
+                "config/config.toml",
+                "data/blocklist.txt",
+                "cache/remote/cache",
+                "systemd/system/kidobo-sync.service",
+                "systemd/system/kidobo-sync.timer",
+                "systemd/system/other.service",
+            ] {
+                let path = parent.join(name);
+                fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+                fs::write(path, "preserve").expect("write sentinel");
+            }
+        }
+        let binary = temp.path().join("bin/kidobo");
+        write_executable(&binary, "#!/bin/bash\nexit 0\n");
+        Self {
+            temp,
+            root,
+            outside,
+            binary,
+        }
+    }
+
+    fn command(&self, script: &str) -> Command {
+        let mut command = Command::new("bash");
+        command
+            .arg("-c")
+            .arg(script)
+            .current_dir(self.temp.path())
+            .env("INSTALLER", installer_path())
+            .env("KIDOBO_ROOT", &self.root)
+            .env("KIDOBO_TEST_ROOT", &self.root)
+            .env("KIDOBO_TEST_OUTSIDE", &self.outside)
+            .env(
+                "KIDOBO_TEST_MOVED_ROOT",
+                self.temp.path().join("moved-root"),
+            )
+            .env("KIDOBO_INSTALL_DIR", "bin");
+        command
+    }
+
+    fn assert_outside_preserved(&self) {
+        for name in [
+            "config/config.toml",
+            "data/blocklist.txt",
+            "cache/remote/cache",
+            "systemd/system/kidobo-sync.service",
+            "systemd/system/kidobo-sync.timer",
+            "systemd/system/other.service",
+        ] {
+            assert_eq!(
+                read_to_string_with_limit(&self.outside.join(name), 1024),
+                "preserve",
+                "outside artifact changed: {name}"
+            );
+        }
+    }
+}
+
+#[test]
+fn scoped_uninstall_rejects_intermediate_runtime_symlinks_before_flush() {
+    for component in ["systemd", "systemd/system", "cache"] {
+        for dangling in [false, true] {
+            let fixture = ScopedUninstallFixture::new();
+            let path = fixture.root.join(component);
+            fs::remove_dir_all(&path).expect("remove unit directory");
+            let target = if dangling {
+                fixture.outside.join("missing")
+            } else {
+                fixture.outside.join(component)
+            };
+            std::os::unix::fs::symlink(target, &path).expect("symlink directory");
+            let output = fixture
+                .command(
+                    "source \"$INSTALLER\"; \
+                     run_config_aware_flush() { touch \"$KIDOBO_TEST_ROOT/flushed\"; }; \
+                     uninstall_artifacts",
+                )
+                .output()
+                .expect("isolated uninstall");
+            assert_eq!(output.status.code(), Some(1), "{output:?}");
+            assert!(!fixture.root.join("flushed").exists());
+            assert!(fixture.root.join("config/config.toml").is_file());
+            assert!(fixture.binary.is_file());
+            fixture.assert_outside_preserved();
+        }
+    }
+}
+
+#[test]
+fn scoped_uninstall_rejects_a_nondirectory_cache_before_legacy_flush() {
+    let fixture = ScopedUninstallFixture::new();
+    fs::remove_dir_all(fixture.root.join("cache")).expect("remove cache fixture");
+    fs::write(fixture.root.join("cache"), "preserve").expect("cache file");
+    let output = fixture
+        .command(
+            "source \"$INSTALLER\"; \
+             run_config_aware_flush() { touch \"$KIDOBO_TEST_ROOT/flushed\"; }; \
+             uninstall_artifacts",
+        )
+        .output()
+        .expect("isolated uninstall");
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(!fixture.root.join("flushed").exists());
+    assert!(fixture.binary.is_file());
+    assert_eq!(
+        read_to_string_with_limit(&fixture.root.join("cache"), 1024),
+        "preserve"
+    );
+    fixture.assert_outside_preserved();
+}
+
+#[test]
+fn scoped_uninstall_protects_outside_cache_before_running_the_current_binary() {
+    let fixture = ScopedUninstallFixture::new();
+    fs::write(
+        fixture.root.join("config/config.toml"),
+        "[ipset]\nset_name='kidobo'\n[safe]\ninclude_github_meta=false\n",
+    )
+    .expect("valid config");
+    fs::write(fixture.outside.join("cache/sync.lock"), "").expect("outside lock");
+    fs::remove_dir_all(fixture.root.join("cache")).expect("remove cache fixture");
+    std::os::unix::fs::symlink(fixture.outside.join("cache"), fixture.root.join("cache"))
+        .expect("outside cache link");
+    fs::remove_file(&fixture.binary).expect("remove fake binary");
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_kidobo"), &fixture.binary)
+        .expect("current binary");
+    let fake_bin = write_cleanup_fakes(&fixture.temp);
+    let cleanup_log = fixture.temp.path().join("cleanup.log");
+    let output = fixture
+        .command("source \"$INSTALLER\"; uninstall_artifacts")
+        .env("PATH", path_with_prefix(&fake_bin))
+        .env("KIDOBO_TEST_CLEANUP_LOG", &cleanup_log)
+        .output()
+        .expect("isolated uninstall");
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unsafe runtime directory: ./cache"));
+    assert!(
+        !cleanup_log.exists(),
+        "cleanup began before cache validation"
+    );
+    assert!(fixture.binary.is_symlink());
+    assert!(fixture.root.join("config/config.toml").is_file());
+    fixture.assert_outside_preserved();
+}
+
+#[test]
+fn scoped_uninstall_accepts_missing_runtime_directories() {
+    for missing in ["systemd", "systemd/system", "cache"] {
+        let fixture = ScopedUninstallFixture::new();
+        fs::remove_dir_all(fixture.root.join(missing)).expect("remove missing directory fixture");
+        let output = fixture
+            .command("source \"$INSTALLER\"; uninstall_artifacts")
+            .output()
+            .expect("isolated uninstall");
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        assert!(!fixture.binary.exists());
+        assert!(!fixture.root.join("config").exists());
+        fixture.assert_outside_preserved();
+    }
+}
+
+#[test]
+fn scoped_uninstall_accepts_a_root_symlink_alias() {
+    let fixture = ScopedUninstallFixture::new();
+    let alias = fixture.temp.path().join("root-alias");
+    std::os::unix::fs::symlink(&fixture.root, &alias).expect("root alias");
+    let output = fixture
+        .command("source \"$INSTALLER\"; uninstall_artifacts")
+        .env("KIDOBO_ROOT", alias)
+        .output()
+        .expect("isolated uninstall");
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(!fixture.binary.exists());
+    assert!(!fixture.root.join("config").exists());
+    fixture.assert_outside_preserved();
+}
+
+#[test]
+fn scoped_uninstall_rejects_runtime_directory_replacement_during_flush() {
+    for component in ["systemd", "systemd/system", "cache"] {
+        let fixture = ScopedUninstallFixture::new();
+        let script = format!(
+            "#!/bin/bash\nset -euo pipefail\n\
+             mv \"$KIDOBO_TEST_ROOT/{component}\" \"$KIDOBO_TEST_ROOT/retained-units\"\n\
+             ln -s \"$KIDOBO_TEST_OUTSIDE/{component}\" \"$KIDOBO_TEST_ROOT/{component}\"\n"
+        );
+        write_executable(&fixture.binary, &script);
+        let output = fixture
+            .command("source \"$INSTALLER\"; uninstall_artifacts")
+            .output()
+            .expect("isolated uninstall");
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert!(fixture.root.join("retained-units").is_dir());
+        assert!(fixture.root.join("config/config.toml").is_file());
+        assert!(fixture.binary.is_file());
+        fixture.assert_outside_preserved();
+    }
+}
+
+#[test]
+fn scoped_uninstall_does_not_block_when_a_directory_becomes_a_fifo_before_pinning() {
+    let fixture = ScopedUninstallFixture::new();
+    let command = fixture.command(
+        r#"source "$INSTALLER"
+set -T
+trap 'if [[ "$BASH_COMMAND" == "exec {unit_directory_fd}"* && ! -e "$KIDOBO_TEST_ROOT/fifo-swap" ]]; then
+    : > "$KIDOBO_TEST_ROOT/fifo-swap"
+    mv "$KIDOBO_TEST_ROOT/systemd/system" "$KIDOBO_TEST_ROOT/systemd/retained"
+    mkfifo "$KIDOBO_TEST_ROOT/systemd/system"
+fi' DEBUG
+uninstall_artifacts
+"#,
+    );
+    let output = PtyCommand::spawn(command, 80, OutputDestination::Pipe).wait();
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(fixture.root.join("fifo-swap").exists());
+    assert!(fixture.root.join("config/config.toml").is_file());
+    assert!(fixture.binary.is_file());
+    fixture.assert_outside_preserved();
+}
+
+#[test]
+fn scoped_uninstall_rejects_root_replacement_during_flush() {
+    let fixture = ScopedUninstallFixture::new();
+    write_executable(
+        &fixture.binary,
+        "#!/bin/bash\nset -euo pipefail\n\
+         mv \"$KIDOBO_TEST_ROOT\" \"$KIDOBO_TEST_MOVED_ROOT\"\n\
+         ln -s \"$KIDOBO_TEST_OUTSIDE\" \"$KIDOBO_TEST_ROOT\"\n",
+    );
+    let output = fixture
+        .command("source \"$INSTALLER\"; uninstall_artifacts")
+        .output()
+        .expect("isolated uninstall");
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(fixture.binary.is_file());
+    assert!(
+        fixture
+            .temp
+            .path()
+            .join("moved-root/config/config.toml")
+            .is_file()
+    );
+    fixture.assert_outside_preserved();
+}
+
+#[test]
+fn scoped_uninstall_removes_final_symlinks_without_removing_their_targets() {
+    let fixture = ScopedUninstallFixture::new();
+    for name in [
+        "data",
+        "config",
+        "systemd/system/kidobo-sync.service",
+        "systemd/system/kidobo-sync.timer",
+    ] {
+        let path = fixture.root.join(name);
+        if path.is_dir() {
+            fs::remove_dir_all(&path).expect("remove directory fixture");
+        } else {
+            fs::remove_file(&path).expect("remove file fixture");
+        }
+        std::os::unix::fs::symlink(fixture.outside.join(name), &path).expect("leaf symlink");
+    }
+    let output = fixture
+        .command("source \"$INSTALLER\"; uninstall_artifacts")
+        .output()
+        .expect("isolated uninstall");
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(!fixture.binary.exists());
+    assert!(!fixture.root.join("config").is_symlink());
+    assert!(
+        !fixture
+            .root
+            .join("systemd/system/kidobo-sync.timer")
+            .is_symlink()
+    );
+    assert!(fixture.root.join("systemd/system/other.service").is_file());
+    fixture.assert_outside_preserved();
+}
+
+#[test]
+fn scoped_uninstall_pins_directories_through_root_replacement_at_deletion() {
+    let fixture = ScopedUninstallFixture::new();
+    let output = fixture
+        .command(
+            "source \"$INSTALLER\"; \
+             remove_path() { \
+               if [[ \"$1\" == ./kidobo-sync.timer ]]; then \
+                 mv \"$KIDOBO_TEST_ROOT\" \"$KIDOBO_TEST_MOVED_ROOT\"; \
+                 ln -s \"$KIDOBO_TEST_OUTSIDE\" \"$KIDOBO_TEST_ROOT\"; \
+               fi; \
+               rm -rf -- \"$1\"; \
+             }; \
+             uninstall_artifacts",
+        )
+        .output()
+        .expect("isolated uninstall");
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(!fixture.binary.exists());
+    let moved_root = fixture.temp.path().join("moved-root");
+    assert!(!moved_root.join("config").exists());
+    assert!(!moved_root.join("systemd/system/kidobo-sync.timer").exists());
+    assert!(moved_root.join("systemd/system/other.service").is_file());
+    fixture.assert_outside_preserved();
+}
+
 #[test]
 fn uninstall_rejects_root_aliases_before_cleanup() {
     let temp = TempDir::new().expect("tempdir");

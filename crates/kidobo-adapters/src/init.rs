@@ -5,13 +5,14 @@ use std::path::{Path, PathBuf};
 
 use kidobo_app::AppError;
 use kidobo_app::init::{
-    InitProvisioner, KIDOBO_SYNC_SERVICE_FILE, KIDOBO_SYNC_TIMER_FILE, ProvisionState,
+    ArtifactAccess, InitProvisioner, KIDOBO_SYNC_SERVICE_FILE, KIDOBO_SYNC_TIMER_FILE,
+    ProvisionState,
 };
 
 use crate::command_runner::{
     CommandExecutor, CommandResult, CommandRunnerError, SudoCommandRunner, SystemCommandExecutor,
 };
-use crate::limited_io::create_string_atomic;
+use crate::limited_io::{create_private_string_atomic, create_string_atomic};
 
 /// Command boundary used for systemd initialization.
 pub trait InitCommandRunner {
@@ -67,23 +68,35 @@ impl<R: InitCommandRunner> InitProvisioner for FileInitProvisioner<R> {
             })
     }
 
-    fn ensure_dir(&self, path: &Path) -> Result<ProvisionState, AppError> {
+    fn ensure_dir(&self, path: &Path, access: ArtifactAccess) -> Result<ProvisionState, AppError> {
         let existed = path.try_exists().map_err(|source| AppError::InitIo {
             path: path.to_path_buf(),
             source,
         })?;
-        fs::create_dir_all(path).map_err(|error| AppError::InitIo {
+        let secured = if access == ArtifactAccess::OwnerOnly {
+            crate::private_fs::ensure_private_dir(path)
+        } else {
+            fs::create_dir_all(path).map(|()| false)
+        }
+        .map_err(|error| AppError::InitIo {
             path: path.to_path_buf(),
             source: error,
         })?;
-        Ok(if existed {
+        Ok(if existed && secured {
+            ProvisionState::Secured
+        } else if existed {
             ProvisionState::Preserved
         } else {
             ProvisionState::Created
         })
     }
 
-    fn ensure_file(&self, path: &Path, contents: &str) -> Result<ProvisionState, AppError> {
+    fn ensure_file(
+        &self,
+        path: &Path,
+        contents: &str,
+        access: ArtifactAccess,
+    ) -> Result<ProvisionState, AppError> {
         let metadata = match fs::metadata(path) {
             Ok(metadata) => Some(metadata),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -104,12 +117,17 @@ impl<R: InitCommandRunner> InitProvisioner for FileInitProvisioner<R> {
                     ),
                 });
             }
-            return Ok(ProvisionState::Preserved);
+            return existing_file_state(path, access);
         }
         if let Some(parent) = path.parent() {
-            self.ensure_dir(parent)?;
+            self.ensure_dir(parent, ArtifactAccess::Default)?;
         }
-        match create_string_atomic(path, contents) {
+        let create = if access == ArtifactAccess::OwnerOnly {
+            create_private_string_atomic
+        } else {
+            create_string_atomic
+        };
+        match create(path, contents) {
             Ok(()) => Ok(ProvisionState::Created),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 let metadata = fs::metadata(path).map_err(|source| AppError::InitIo {
@@ -117,7 +135,7 @@ impl<R: InitCommandRunner> InitProvisioner for FileInitProvisioner<R> {
                     source,
                 })?;
                 if metadata.is_file() {
-                    Ok(ProvisionState::Preserved)
+                    existing_file_state(path, access)
                 } else {
                     Err(AppError::InitIo {
                         path: path.to_path_buf(),
@@ -144,6 +162,19 @@ impl<R: InitCommandRunner> InitProvisioner for FileInitProvisioner<R> {
             run_required_systemd_command(&self.runner, &arguments)?;
         }
         Ok(())
+    }
+}
+
+fn existing_file_state(path: &Path, access: ArtifactAccess) -> Result<ProvisionState, AppError> {
+    if access == ArtifactAccess::OwnerOnly
+        && crate::private_fs::secure_file(path).map_err(|source| AppError::InitIo {
+            path: path.to_path_buf(),
+            source,
+        })?
+    {
+        Ok(ProvisionState::Secured)
+    } else {
+        Ok(ProvisionState::Preserved)
     }
 }
 
@@ -187,7 +218,7 @@ mod tests {
     use std::cell::RefCell;
     use std::fs;
 
-    use kidobo_app::init::{InitProvisioner, ProvisionState};
+    use kidobo_app::init::{ArtifactAccess, InitProvisioner, ProvisionState};
     use tempfile::TempDir;
 
     use super::{FileInitProvisioner, InitCommandRunner};
@@ -248,7 +279,7 @@ mod tests {
         });
 
         let state = provisioner
-            .ensure_file(&path, "replacement")
+            .ensure_file(&path, "replacement", ArtifactAccess::Default)
             .expect("ensure");
 
         assert_eq!(state, ProvisionState::Preserved);
@@ -256,6 +287,38 @@ mod tests {
             crate::limited_io::read_to_string_with_limit(&path, 1024).expect("read"),
             "custom bytes\n"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_init_secures_a_config_that_appears_during_creation() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("config.toml");
+        let raced_path = path.clone();
+        let provisioner = FileInitProvisioner::new(Runner {
+            calls: RefCell::new(Vec::new()),
+            failure: None,
+        });
+        let state = crate::limited_io::publication_test::interleave(
+            move || {
+                fs::write(&raced_path, "operator config\n").expect("competing config");
+                fs::set_permissions(&raced_path, fs::Permissions::from_mode(0o644))
+                    .expect("competing mode");
+            },
+            || provisioner.ensure_file(&path, "default config\n", ArtifactAccess::OwnerOnly),
+        )
+        .expect("secure existing config");
+        assert_eq!(state, ProvisionState::Secured);
+        assert_eq!(
+            crate::limited_io::read_to_string_with_limit(&path, 1024).expect("config bytes"),
+            "operator config\n"
+        );
+        assert_eq!(
+            fs::metadata(&path).expect("mode").permissions().mode() & 0o7777,
+            0o600
+        );
+        assert_eq!(fs::read_dir(temp.path()).expect("directory").count(), 1);
     }
 
     #[test]
@@ -268,13 +331,13 @@ mod tests {
         });
         assert_eq!(
             provisioner
-                .ensure_file(&path, "initial bytes\n")
+                .ensure_file(&path, "initial bytes\n", ArtifactAccess::Default)
                 .expect("create"),
             ProvisionState::Created
         );
         assert_eq!(
             provisioner
-                .ensure_file(&path, "replacement")
+                .ensure_file(&path, "replacement", ArtifactAccess::Default)
                 .expect("preserve"),
             ProvisionState::Preserved
         );
@@ -305,7 +368,7 @@ mod tests {
                 assert!(!competing_path.exists());
                 fs::write(competing_path, "operator settings\n").expect("competing creation");
             },
-            || provisioner.ensure_file(&path, "default settings\n"),
+            || provisioner.ensure_file(&path, "default settings\n", ArtifactAccess::Default),
         )
         .expect("preserve concurrent creator");
         assert_eq!(state, ProvisionState::Preserved);
@@ -338,7 +401,7 @@ mod tests {
                 let inode = fs::metadata(&competing_path).expect("lock metadata").ino();
                 *competing_held.borrow_mut() = Some((guard, inode));
             },
-            || provisioner.ensure_file(&path, ""),
+            || provisioner.ensure_file(&path, "", ArtifactAccess::Default),
         )
         .expect("preserve lock");
         assert_eq!(state, ProvisionState::Preserved);
@@ -376,7 +439,7 @@ mod tests {
             }
             let error = crate::limited_io::publication_test::interleave(
                 move || fs::create_dir(competing_path).expect("competing directory"),
-                || provisioner.ensure_file(&path, "default settings"),
+                || provisioner.ensure_file(&path, "default settings", ArtifactAccess::Default),
             )
             .expect_err("directory must fail");
             match error {

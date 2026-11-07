@@ -93,12 +93,30 @@ impl PtyCommand {
         reason = "Prompt-free waiting is used by CLI terminal tests."
     )]
     pub fn wait(mut self) -> CapturedOutput {
-        self.collect(&[])
+        self.collect(&[], |_, _| {})
     }
 
     #[allow(dead_code, reason = "Used by single-prompt integration test binaries.")]
     pub fn respond_after(mut self, prompt: &str, response: &str) -> CapturedOutput {
-        self.collect(&[(prompt, response)])
+        self.collect(&[(prompt, response)], |_, _| {})
+    }
+
+    #[allow(
+        dead_code,
+        reason = "Used by prompt revalidation and interruption tests."
+    )]
+    pub fn respond_after_with(
+        mut self,
+        prompt: &str,
+        response: &str,
+        action: impl FnOnce(&mut Child, &mut File),
+    ) -> CapturedOutput {
+        let mut action = Some(action);
+        self.collect(&[(prompt, response)], |child, terminal| {
+            if let Some(action) = action.take() {
+                action(child, terminal);
+            }
+        })
     }
 
     #[allow(
@@ -106,10 +124,14 @@ impl PtyCommand {
         reason = "Used by the multi-prompt setup integration test binary."
     )]
     pub fn respond_to_all(mut self, interactions: &[(&str, &str)]) -> CapturedOutput {
-        self.collect(interactions)
+        self.collect(interactions, |_, _| {})
     }
 
-    fn collect(&mut self, interactions: &[(&str, &str)]) -> CapturedOutput {
+    fn collect(
+        &mut self,
+        interactions: &[(&str, &str)],
+        mut after_prompt: impl FnMut(&mut Child, &mut File),
+    ) -> CapturedOutput {
         let deadline = Instant::now() + DEADLINE;
         let mut terminal = Vec::new();
         let mut stdout = Vec::new();
@@ -163,6 +185,7 @@ impl PtyCommand {
                     .iter()
                     .any(|bytes| String::from_utf8_lossy(bytes).contains(prompt))
                 {
+                    after_prompt(&mut self.child, &mut self.master);
                     self.master
                         .write_all(response.as_bytes())
                         .expect("terminal response");

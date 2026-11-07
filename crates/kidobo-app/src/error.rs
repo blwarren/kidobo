@@ -8,6 +8,15 @@ use thiserror::Error;
 /// Failure returned by an application workflow or port.
 #[derive(Debug, Error)]
 pub enum AppError {
+    /// Required private cache storage could not be prepared.
+    #[error("could not secure remote cache directory {path}: {source}")]
+    StoragePreparation {
+        /// Selected remote cache directory.
+        path: PathBuf,
+        /// Filesystem failure preventing private access.
+        #[source]
+        source: std::io::Error,
+    },
     /// Temporary ban state could not be read, validated, or persisted.
     #[error("temporary ban state failed for {path}: {reason}")]
     TemporaryBans {

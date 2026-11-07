@@ -17,6 +17,77 @@ fn saved_config(fixture: &Fixture) -> String {
 }
 
 #[test]
+fn read_only_commands_leave_existing_config_and_cache_permissions_untouched() {
+    use std::os::unix::fs::PermissionsExt;
+
+    const METADATA: &str =
+        "{\"url\":\"https://alice:cache-password@feed.example/list?token=cache-token\"}";
+
+    let fixture = Fixture::new(INLINE_CONFIG, "203.0.113.7\n");
+    let config = fixture.root().join("config/config.toml");
+    let cache = fixture.root().join("cache/remote");
+    let legacy = cache.join("feed.meta.json");
+    let generation_id = "a".repeat(64);
+    let generation = cache.join(format!(
+        "v2/remote/0123456789abcdef/generations/{generation_id}/meta.json"
+    ));
+    let github_legacy = cache.join("github-meta.meta.json");
+    let github_generation = cache.join(format!(
+        "v2/github-meta/generations/{generation_id}/meta.json"
+    ));
+    fs::create_dir_all(
+        github_generation
+            .parent()
+            .expect("GitHub generation directory"),
+    )
+    .expect("GitHub cache fixture");
+    fs::create_dir_all(generation.parent().expect("generation directory")).expect("cache fixture");
+    for path in [&legacy, &generation, &github_legacy, &github_generation] {
+        fs::write(path, METADATA).expect("cache metadata fixture");
+    }
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o644)).expect("existing config mode");
+    fs::set_permissions(&cache, fs::Permissions::from_mode(0o755)).expect("existing cache mode");
+
+    for arguments in [
+        &["config", "show"][..],
+        &["config", "path"],
+        &["sources", "list"],
+        &["allow", "list"],
+        &["lookup", "203.0.113.7"],
+        &["bans"],
+        &["doctor", "--format", "json"],
+    ] {
+        let output = fixture
+            .spawn(arguments, 100, OutputDestination::Pipe, &[])
+            .wait();
+        assert!(output.status.success(), "{arguments:?}: {output:?}");
+        assert_eq!(
+            fs::metadata(&config)
+                .expect("config metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o644
+        );
+        assert_eq!(
+            fs::metadata(&cache)
+                .expect("cache metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+        assert_eq!(saved_config(&fixture), INLINE_CONFIG);
+        for path in [&legacy, &generation, &github_legacy, &github_generation] {
+            assert_eq!(
+                read_to_string_with_limit(path, 65_536).expect("unchanged metadata"),
+                METADATA
+            );
+        }
+    }
+}
+
+#[test]
 fn source_listing_is_offline_and_reports_unknown_freshness_without_ansi() {
     let fixture = Fixture::new(INLINE_CONFIG, "");
     let output = fixture
