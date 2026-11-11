@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+
+## [0.15.3] - 2026-11-11
+
 ### Changed
 
 - Preserve tracked established and related replies to server-initiated traffic
