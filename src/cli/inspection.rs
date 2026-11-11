@@ -216,6 +216,12 @@ fn render_check(report: &inspection::CheckReport, io: &mut CliIo<'_>) -> Result<
         CheckVerdict::Unknown => ("UNKNOWN", Status::Unknown),
     };
     view.status(io.stdout, result, label, &report.target)?;
+    if report.verdict == CheckVerdict::Blocked {
+        view.paragraph(
+            io.stdout,
+            "Incoming traffic from this address is blocked except tracked replies to server-initiated traffic, which follow the remaining host firewall rules.",
+        )?;
+    }
     let family = &report.family;
     let entries = family.entries.map_or_else(
         || {

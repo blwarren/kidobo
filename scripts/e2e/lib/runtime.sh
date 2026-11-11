@@ -161,11 +161,16 @@ ensure_unrelated_sentinels() {
   ip6tables -C INPUT -j E2E-UNRELATED-SENTINEL 2>/dev/null || ip6tables -I INPUT 1 -j E2E-UNRELATED-SENTINEL
 }
 
-assert_one_managed_rule() {
-  local binary=$1 set_name=$2 chain_rules first_input jump_rule
+assert_managed_rules() {
+  local binary=$1 set_name=$2 profile=${3:-candidate} chain_rules first_input jump_rule drop_rule return_rule alternate_return_rule
+  [[ "$profile" == candidate || "$profile" == baseline ]] || fail "unknown managed-rule profile: $profile"
   chain_rules=$("$binary" -S kidobo-input | sed -n '/^-A kidobo-input /p')
-  [[ "$(printf '%s\n' "$chain_rules" | sed '/^$/d' | wc -l)" -eq 1 ]] || fail "$binary managed chain must contain exactly one rule"
-  [[ "$chain_rules" == "-A kidobo-input -m set --match-set $set_name src -j DROP" ]] || fail "$binary managed chain does not have the expected set-match DROP rule"
+  drop_rule="-A kidobo-input -m set --match-set $set_name src -j DROP"
+  return_rule='-A kidobo-input -m conntrack --ctstate RELATED,ESTABLISHED --ctdir REPLY -j RETURN'
+  alternate_return_rule='-A kidobo-input -m conntrack --ctstate ESTABLISHED,RELATED --ctdir REPLY -j RETURN'
+  if [[ "$chain_rules" != "$return_rule"$'\n'"$drop_rule" && "$chain_rules" != "$alternate_return_rule"$'\n'"$drop_rule" ]]; then
+    [[ "$profile" == baseline && "$chain_rules" == "$drop_rule" ]] || fail "$binary managed chain must contain the expected established/related reply RETURN followed by set-match DROP rules"
+  fi
   jump_rule=$("$binary" -S INPUT | grep -Fxc -- '-A INPUT -j kidobo-input' || true)
   [[ "$jump_rule" == 1 ]] || fail "$binary INPUT must contain exactly one managed jump"
   first_input=$("$binary" -S INPUT | sed -n '/^-A INPUT /{p;q;}')
@@ -174,8 +179,9 @@ assert_one_managed_rule() {
 }
 
 assert_live_rules() {
-  assert_one_managed_rule iptables "$SET4"
-  assert_one_managed_rule ip6tables "$SET6"
+  local profile=${1:-candidate}
+  assert_managed_rules iptables "$SET4" "$profile"
+  assert_managed_rules ip6tables "$SET6" "$profile"
   assert_unrelated_sentinels
 }
 

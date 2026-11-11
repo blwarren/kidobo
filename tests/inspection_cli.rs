@@ -117,13 +117,13 @@ esac
         self.write_tool(
             "iptables",
             r#"[ "$1" = "-S" ] || exit 94
-printf '%s\n' '-P INPUT ACCEPT' '-N kidobo-input' '-A INPUT -j kidobo-input' '-A kidobo-input -m set --match-set kidobo src -j DROP'
+printf '%s\n' '-P INPUT ACCEPT' '-N kidobo-input' '-A INPUT -j kidobo-input' '-A kidobo-input -m conntrack --ctstate RELATED,ESTABLISHED --ctdir REPLY -j RETURN' '-A kidobo-input -m set --match-set kidobo src -j DROP'
 "#,
         );
         self.write_tool(
             "ip6tables",
             r#"[ "$1" = "-S" ] || exit 95
-printf '%s\n' '-P INPUT ACCEPT' '-N kidobo-input' '-A INPUT -j kidobo-input' '-A kidobo-input -m set --match-set kidobo-v6 src -j DROP'
+printf '%s\n' '-P INPUT ACCEPT' '-N kidobo-input' '-A INPUT -j kidobo-input' '-A kidobo-input -m conntrack --ctstate RELATED,ESTABLISHED --ctdir REPLY -j RETURN' '-A kidobo-input -m set --match-set kidobo-v6 src -j DROP'
 "#,
         );
         self.write_tool("systemctl", "exit 98\n");
@@ -297,6 +297,11 @@ fn human_check_reports_one_verdict_one_live_summary_and_source_matches() {
             assert_eq!(stdout.matches("Source matches").count(), 1, "{stdout}");
             assert!(stdout.contains(address), "{stdout}");
             assert!(stdout.contains("internal:blocklist"), "{stdout}");
+            assert_eq!(
+                stdout.contains("tracked replies"),
+                membership == "present",
+                "{stdout}"
+            );
             for removed in [
                 "Verified hash:net",
                 "INPUT jump",
@@ -310,6 +315,33 @@ fn human_check_reports_one_verdict_one_live_summary_and_source_matches() {
             }
         }
     }
+}
+
+#[test]
+fn legacy_firewall_wiring_is_unknown_with_sync_guidance() {
+    let fixture = Fixture::new(Some(&config(true)), Some(""), Some("version = 1\n"));
+    for (binary, address, set_name) in [
+        ("iptables", "203.0.113.7", "kidobo"),
+        ("ip6tables", "2001:db8::7", "kidobo-v6"),
+    ] {
+        fixture.write_tool(binary, &format!(
+            "[ \"$1\" = \"-S\" ] || exit 94\nprintf '%s\\n' '-P INPUT ACCEPT' '-N kidobo-input' '-A INPUT -j kidobo-input' '-A kidobo-input -m set --match-set {set_name} src -j DROP'\n"
+        ));
+        let human = fixture.run(&["check", address], &[]);
+        assert_eq!(human.status.code(), Some(1));
+        let stdout = String::from_utf8_lossy(&human.stdout);
+        assert!(stdout.contains("UNKNOWN"), "{stdout}");
+        assert!(stdout.contains("Legacy strict"), "{stdout}");
+        let normalized = stdout.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(normalized.contains("sudo kidobo sync"), "{stdout}");
+        let json = fixture.run(&["check", address, "--format", "json"], &[]);
+        assert_eq!(json.status.code(), Some(1));
+        let report: serde_json::Value = serde_json::from_slice(&json.stdout).expect("check JSON");
+        assert_eq!(report["schema_version"], 1);
+        assert_eq!(report["verdict"], "unknown");
+        assert_eq!(report["family"]["wiring"], "unknown");
+    }
+    assert!(!fixture.tool_log().contains("sudo"));
 }
 
 #[test]

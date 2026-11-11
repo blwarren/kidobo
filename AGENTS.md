@@ -9,6 +9,10 @@ deterministic computation, operator compatibility, and reliable installation and
 - Keep IPv4 and IPv6 separate. Validate every enabled family's capacity before swapping either set;
   atomicity is per set. Establish new firewall enforcement before removing old wiring, and never
   modify unrelated firewall chains.
+- Each managed input chain must return tracked `RELATED,ESTABLISHED` traffic in conntrack's
+  `REPLY` direction before its source-set `DROP` or `REJECT` rule. Keep exactly one managed `INPUT`
+  jump at position 1. Returned replies remain subject to the host's other firewall rules; incoming
+  traffic on connections initiated by banned clients must remain blocked, including existing sessions.
 - Keep `lookup` offline and `doctor` read-only. `ban` and `unban` save source/config state
   first; immediate application, when requested, runs `sync` after saving.
 - Never validate against the development host's live firewall or systemd using `sync`, `flush`,

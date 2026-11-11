@@ -412,6 +412,23 @@ fn refers_to_managed_chain(line: &str) -> bool {
     })
 }
 
+fn matches_block_rule(spec: &ManagedSetSpec, action: FirewallAction, rule: &str) -> bool {
+    let target = match action {
+        FirewallAction::Drop => "DROP",
+        FirewallAction::Reject => "REJECT",
+    };
+    let expected = format!(
+        "-A kidobo-input -m set --match-set {} src -j {target}",
+        spec.set_name
+    );
+    let reject_suffix = match spec.family {
+        AddressFamily::Ipv4 => " --reject-with icmp-port-unreachable",
+        AddressFamily::Ipv6 => " --reject-with icmp6-port-unreachable",
+    };
+    rule == expected
+        || (action == FirewallAction::Reject && rule.strip_prefix(&expected) == Some(reject_suffix))
+}
+
 fn parse_wiring(spec: &ManagedSetSpec, action: FirewallAction, contents: &str) -> WiringSnapshot {
     let lines = contents
         .lines()
@@ -464,41 +481,34 @@ fn parse_wiring(spec: &ManagedSetSpec, action: FirewallAction, contents: &str) -
         .copied()
         .filter(|line| line.starts_with("-A kidobo-input "))
         .collect::<Vec<_>>();
-    let target = match action {
-        FirewallAction::Drop => "DROP",
-        FirewallAction::Reject => "REJECT",
-    };
-    let expected = format!(
-        "-A kidobo-input -m set --match-set {} src -j {target}",
-        spec.set_name
-    );
-    let reject_suffix = match spec.family {
-        AddressFamily::Ipv4 => " --reject-with icmp-port-unreachable",
-        AddressFamily::Ipv6 => " --reject-with icmp6-port-unreachable",
-    };
-    let valid_rule = managed_rules.first().is_some_and(|rule| {
-        *rule == expected
-            || (action == FirewallAction::Reject
-                && rule.strip_prefix(&expected) == Some(reject_suffix))
-    });
     let staging = lines
         .iter()
         .any(|line| *line == "-N kidobo-input-stage" || line.starts_with("-A kidobo-input-stage "));
-    if references == ["-A INPUT -j kidobo-input"]
+    let canonical_input = references == ["-A INPUT -j kidobo-input"]
         && input_first == Some("-A INPUT -j kidobo-input")
-        && managed_rules.len() == 1
-        && valid_rule
-        && !staging
-    {
-        WiringSnapshot {
-            state: Verification::Verified,
-            signature,
-            detail: format!("Verified first INPUT jump and managed source-set {target} rule"),
+        && !staging;
+    match managed_rules.as_slice() {
+        [block] if canonical_input && matches_block_rule(spec, action, block) => WiringSnapshot::unknown(
+            "Legacy strict firewall wiring lacks the established/related reply exemption; run sudo kidobo sync to update it",
+        ),
+        [exemption, block]
+            if canonical_input
+                && matches!(
+                    *exemption,
+                    "-A kidobo-input -m conntrack --ctstate RELATED,ESTABLISHED --ctdir REPLY -j RETURN"
+                        | "-A kidobo-input -m conntrack --ctstate ESTABLISHED,RELATED --ctdir REPLY -j RETURN"
+                )
+                && matches_block_rule(spec, action, block) =>
+        {
+            WiringSnapshot {
+                state: Verification::Verified,
+                signature,
+                detail: "Verified first INPUT jump, established/related reply RETURN exemption, and managed source-set blocking rule".to_string(),
+            }
         }
-    } else {
-        WiringSnapshot::unknown(
-            "Managed firewall wiring is noncanonical, indirect, duplicated, staged, or differs from configuration",
-        )
+        _ => WiringSnapshot::unknown(
+            "Managed firewall wiring is noncanonical, indirect, duplicated, staged, or differs from configuration; run sudo kidobo sync to reconcile it",
+        ),
     }
 }
 
@@ -657,7 +667,7 @@ mod tests {
 
     fn wiring(spec: &ManagedSetSpec) -> String {
         format!(
-            "-P INPUT ACCEPT\n-P FORWARD ACCEPT\n-P OUTPUT ACCEPT\n-N kidobo-input\n-A INPUT -j kidobo-input\n-A kidobo-input -m set --match-set {} src -j DROP\n",
+            "-P INPUT ACCEPT\n-P FORWARD ACCEPT\n-P OUTPUT ACCEPT\n-N kidobo-input\n-A INPUT -j kidobo-input\n-A kidobo-input -m conntrack --ctstate RELATED,ESTABLISHED --ctdir REPLY -j RETURN\n-A kidobo-input -m set --match-set {} src -j DROP\n",
             spec.set_name
         )
     }
@@ -805,6 +815,62 @@ mod tests {
             Verification::Unknown
         );
         probe.executor.finished();
+    }
+
+    #[test]
+    fn only_the_complete_reply_direction_policy_is_verified() {
+        let exemption =
+            "-A kidobo-input -m conntrack --ctstate RELATED,ESTABLISHED --ctdir REPLY -j RETURN\n";
+        for ipv6 in [false, true] {
+            let spec = spec(ipv6);
+            let canonical = wiring(&spec);
+            assert_eq!(
+                parse_wiring(
+                    &spec,
+                    FirewallAction::Drop,
+                    &canonical.replace("RELATED,ESTABLISHED", "ESTABLISHED,RELATED")
+                )
+                .state,
+                Verification::Verified
+            );
+            let block = format!(
+                "-A kidobo-input -m set --match-set {} src -j DROP\n",
+                spec.set_name
+            );
+            for unsupported in [
+                canonical.replace(exemption, ""),
+                canonical.replace(&block, ""),
+                canonical.replace(exemption, &format!("{exemption}{exemption}")),
+                canonical.replace(&block, &format!("{block}{block}")),
+                canonical.replace(
+                    &format!("{exemption}{block}"),
+                    &format!("{block}{exemption}"),
+                ),
+                canonical.replace("RELATED,ESTABLISHED", "NEW,RELATED,ESTABLISHED"),
+                canonical.replace("RELATED,ESTABLISHED", "ESTABLISHED"),
+                canonical.replace("RELATED,ESTABLISHED", "RELATED"),
+                canonical.replace("RELATED,ESTABLISHED", "ESTABLISHED,ESTABLISHED"),
+                canonical.replace(" --ctdir REPLY", ""),
+                canonical.replace("--ctdir REPLY", "--ctdir ORIGINAL"),
+                canonical.replace("-j RETURN", "--ctdir REPLY -j RETURN"),
+                canonical.replace("-j RETURN", "-p tcp -j RETURN"),
+                canonical.replace("-j RETURN", "-j ACCEPT"),
+                canonical.replace("-j RETURN", "-j DROP"),
+            ] {
+                assert_eq!(
+                    parse_wiring(&spec, FirewallAction::Drop, &unsupported).state,
+                    Verification::Unknown,
+                    "{unsupported}"
+                );
+            }
+            let legacy = parse_wiring(
+                &spec,
+                FirewallAction::Drop,
+                &canonical.replace(exemption, ""),
+            );
+            assert!(legacy.detail.contains("Legacy strict"));
+            assert!(legacy.detail.contains("sudo kidobo sync"));
+        }
     }
 
     #[test]

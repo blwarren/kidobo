@@ -273,7 +273,7 @@ run_baseline_enforcement_check() {
   printf '\nBASELINE SYNC: stderr follows\n' >&9
   cat "$STATE/baseline-sync.stderr" >&9
   if [[ "$baseline_sync_status" == 0 ]]; then
-    assert_live_rules
+    assert_live_rules baseline
     probe_pair blocked
     e2e_check_pass 'baseline sync exited 0; exact managed rules verified; IPv4/IPv6 probes blocked'
     return 0

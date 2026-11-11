@@ -349,6 +349,22 @@ fn replace_chain_rule_fail_closed(
             "-A",
             chain_name,
             "-m",
+            "conntrack",
+            "--ctstate",
+            "RELATED,ESTABLISHED",
+            "--ctdir",
+            "REPLY",
+            "-j",
+            "RETURN",
+        ],
+    )?;
+    run_checked(
+        runner,
+        binary,
+        &[
+            "-A",
+            chain_name,
+            "-m",
             "set",
             "--match-set",
             set_name,
@@ -511,6 +527,7 @@ mod tests {
         unrelated_injection: UnrelatedInjection,
         fail_stage_activation: bool,
         fail_post_stage_command: Option<usize>,
+        fail_command: Option<usize>,
         stage_active: bool,
         post_stage_commands: usize,
     }
@@ -571,15 +588,21 @@ mod tests {
             self.control.borrow_mut().fail_post_stage_command = Some(command_number);
         }
 
+        fn set_fail_command(&self, command_number: usize) {
+            self.control.borrow_mut().fail_command = Some(command_number);
+        }
+
         fn enforcement_active(&self, binary: &str) -> bool {
             let control = self.control.borrow();
             let Some(table) = control.tables.get(binary) else {
                 return false;
             };
-            let stable_ready = table
-                .chains
-                .get(KIDOBO_CHAIN_NAME)
-                .is_some_and(|rules| !rules.is_empty());
+            let stable_ready = table.chains.get(KIDOBO_CHAIN_NAME).is_some_and(|rules| {
+                matches!(
+                    chain_verdict(rules, "NEW", "ORIGINAL", true),
+                    Some("DROP" | "REJECT")
+                )
+            });
             let stable_active = table
                 .input_rules
                 .iter()
@@ -603,6 +626,9 @@ mod tests {
                 command.to_string(),
                 args.iter().map(|value| (*value).to_string()).collect(),
             ));
+            if control.fail_command == Some(control.invocations.len()) {
+                return Ok(command_failure("injected command failure"));
+            }
             let operation = args.get(2..).expect("xtables wait prefix");
             let activates_stage =
                 operation == ["-I", "INPUT", "1", "-j", KIDOBO_STAGING_CHAIN_NAME];
@@ -634,6 +660,35 @@ mod tests {
             }
             Ok(result)
         }
+    }
+
+    fn chain_verdict<'a>(
+        rules: &'a [String],
+        state: &str,
+        direction: &str,
+        member: bool,
+    ) -> Option<&'a str> {
+        for rule in rules {
+            let tokens = rule.split_whitespace().collect::<Vec<_>>();
+            if let Some(states) = tokens.windows(2).find(|pair| pair[0] == "--ctstate")
+                && !states[1].split(',').any(|candidate| candidate == state)
+            {
+                continue;
+            }
+            if let Some(expected) = tokens.windows(2).find(|pair| pair[0] == "--ctdir")
+                && expected[1] != direction
+            {
+                continue;
+            }
+            if tokens.contains(&"--match-set") && !member {
+                continue;
+            }
+            return tokens
+                .windows(2)
+                .find(|pair| pair[0] == "-j")
+                .map(|pair| pair[1]);
+        }
+        None
     }
 
     fn apply_stateful_operation(
@@ -984,6 +1039,143 @@ mod tests {
     }
 
     #[test]
+    fn stateful_policy_preserves_replies_and_blocks_client_initiated_traffic() {
+        for family in [FirewallFamily::Ipv4, FirewallFamily::Ipv6] {
+            for action in [ChainAction::Drop, ChainAction::Reject] {
+                let runner = StatefulRunner::with_existing_wiring(1);
+                if family == FirewallFamily::Ipv6 {
+                    let mut control = runner.control.borrow_mut();
+                    let table = control.tables.remove("iptables").expect("legacy table");
+                    control.tables.insert("ip6tables".to_string(), table);
+                }
+                for _ in 0..2 {
+                    ensure_firewall_wiring(&runner, family, "kidobo-set", action)
+                        .expect("migrate and repeat sync");
+                    let rules = runner.chain_rules(family.binary(), KIDOBO_CHAIN_NAME);
+                    assert_eq!(rules.len(), 2);
+                    for state in ["ESTABLISHED", "RELATED"] {
+                        for member in [false, true] {
+                            assert_eq!(
+                                chain_verdict(&rules, state, "REPLY", member),
+                                Some("RETURN")
+                            );
+                            assert_eq!(
+                                chain_verdict(&rules, state, "ORIGINAL", member),
+                                member.then_some(action.as_target())
+                            );
+                        }
+                    }
+                    for state in ["NEW", "INVALID", "UNTRACKED"] {
+                        for direction in ["ORIGINAL", "REPLY"] {
+                            assert_eq!(
+                                chain_verdict(&rules, state, direction, true),
+                                Some(action.as_target())
+                            );
+                            assert_eq!(chain_verdict(&rules, state, direction, false), None);
+                        }
+                    }
+                    assert_eq!(
+                        runner.input_rules(family.binary()),
+                        [format!("-j {KIDOBO_CHAIN_NAME}")]
+                    );
+                    assert!(runner.enforcement_active(family.binary()));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_replacement_failure_preserves_reachable_blocking() {
+        for modern in [false, true] {
+            let prepare = || {
+                let runner = StatefulRunner::with_existing_wiring(1);
+                if modern {
+                    ensure_firewall_wiring(
+                        &runner,
+                        FirewallFamily::Ipv4,
+                        "kidobo-set",
+                        ChainAction::Drop,
+                    )
+                    .expect("initial stateful wiring");
+                }
+                runner
+            };
+            let successful = prepare();
+            let initial_commands = successful.invocations().len();
+            ensure_firewall_wiring(
+                &successful,
+                FirewallFamily::Ipv4,
+                "kidobo-set",
+                ChainAction::Drop,
+            )
+            .expect("count replacement commands");
+            let command_count = successful.invocations().len() - initial_commands;
+            for command in 1..=command_count {
+                let runner = prepare();
+                runner.set_fail_command(runner.invocations().len() + command);
+                ensure_firewall_wiring(
+                    &runner,
+                    FirewallFamily::Ipv4,
+                    "kidobo-set",
+                    ChainAction::Drop,
+                )
+                .expect_err("each command failure must surface");
+                assert!(
+                    runner.enforcement_active("iptables"),
+                    "modern={modern}, failed command={command}"
+                );
+                if command <= 4 {
+                    assert!(
+                        runner
+                            .invocations()
+                            .iter()
+                            .skip(initial_commands)
+                            .all(|(_, args)| {
+                                !args.iter().any(|arg| matches!(arg.as_str(), "-D" | "-I"))
+                            })
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn incomplete_first_install_never_activates_a_jump() {
+        for command in 1..=5 {
+            let runner = StatefulRunner::default();
+            runner.set_fail_command(command);
+            ensure_firewall_wiring(
+                &runner,
+                FirewallFamily::Ipv4,
+                "kidobo-set",
+                ChainAction::Drop,
+            )
+            .expect_err("initial preparation failure");
+            assert_eq!(runner.input_rules("iptables").len(), 0);
+        }
+    }
+
+    #[test]
+    fn exemption_alone_does_not_count_as_active_blocking() {
+        let runner = StatefulRunner::with_existing_wiring(1);
+        runner
+            .control
+            .borrow_mut()
+            .tables
+            .get_mut("iptables")
+            .expect("table")
+            .chains
+            .insert(
+                KIDOBO_CHAIN_NAME.to_string(),
+                vec![
+                    "-m conntrack --ctstate RELATED,ESTABLISHED --ctdir REPLY -j RETURN"
+                        .to_string(),
+                ],
+            );
+        assert!(!runner.enforcement_active("iptables"));
+    }
+
+    #[test]
     fn ensures_chain_rule_before_input_jump_without_flushing() {
         let runner = StatefulRunner::default();
 
@@ -1002,6 +1194,23 @@ mod tests {
         assert_eq!(invocations[2].1, vec!["-w", "5", "-S", KIDOBO_CHAIN_NAME]);
         assert_eq!(
             invocations[3].1,
+            [
+                "-w",
+                "5",
+                "-A",
+                KIDOBO_CHAIN_NAME,
+                "-m",
+                "conntrack",
+                "--ctstate",
+                "RELATED,ESTABLISHED",
+                "--ctdir",
+                "REPLY",
+                "-j",
+                "RETURN"
+            ]
+        );
+        assert_eq!(
+            invocations[4].1,
             vec![
                 "-w",
                 "5",
@@ -1020,14 +1229,17 @@ mod tests {
             .iter()
             .position(|(_, args)| args.get(2).is_some_and(|arg| arg == "-I"))
             .expect("INPUT insertion");
-        assert!(first_input_insert > 3);
+        assert!(first_input_insert > 4);
         assert_eq!(
             runner.input_rules("iptables"),
             [format!("-j {KIDOBO_CHAIN_NAME}")]
         );
         assert_eq!(
             runner.chain_rules("iptables", KIDOBO_CHAIN_NAME),
-            ["-m set --match-set kidobo-set src -j DROP"]
+            [
+                "-m conntrack --ctstate RELATED,ESTABLISHED --ctdir REPLY -j RETURN",
+                "-m set --match-set kidobo-set src -j DROP"
+            ]
         );
         assert_eq!(
             runner
@@ -1144,7 +1356,8 @@ mod tests {
                 stdout: "-A kidobo-input -j DROP\n".to_string(),
                 stderr: String::new(),
             }), // query rules
-            Ok(ok(0)), // append desired
+            Ok(ok(0)), // append exemption
+            Ok(ok(0)), // append desired block
             Ok(CommandResult {
                 status: ProcessStatus::Exited(2),
                 stdout: String::new(),
@@ -1162,10 +1375,10 @@ mod tests {
 
         assert!(matches!(err, FirewallError::CommandFailed { .. }));
         let invocations = runner.invocations();
-        assert_eq!(invocations.len(), 4);
+        assert_eq!(invocations.len(), 5);
         assert!(invocations[2].1.contains(&"-A".to_string()));
         assert_eq!(
-            invocations[3].1,
+            invocations[4].1,
             vec!["-w", "5", "-D", KIDOBO_CHAIN_NAME, "1"]
         );
     }
@@ -1204,7 +1417,10 @@ mod tests {
 
         assert_eq!(
             runner.chain_rules("iptables", KIDOBO_CHAIN_NAME),
-            ["-m set --match-set kidobo-set src -j REJECT"]
+            [
+                "-m conntrack --ctstate RELATED,ESTABLISHED --ctdir REPLY -j RETURN",
+                "-m set --match-set kidobo-set src -j REJECT"
+            ]
         );
     }
 

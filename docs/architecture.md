@@ -148,8 +148,19 @@ The enforcement adapter retains the 31-character ipset name constraint, the exis
 suffix, restore-and-swap replacement, per-set atomicity, and best-effort temporary-set destruction.
 IPv4 and IPv6 stay separate; their replacements are not one transaction. Establish new enforcement
 before deleting old copies, even if a partial failure leaves duplicates. A successful sync leaves one
-`kidobo-input` chain, one set-match action rule, and exactly one `INPUT` jump at position 1 per managed
-family. Never modify unrelated firewall chains.
+`kidobo-input` chain with exactly two ordered rules: a conntrack `RELATED,ESTABLISHED` match in the
+`REPLY` direction returning to the caller, then the source-set `DROP` or `REJECT` rule. The exemption
+preserves replies to server-initiated traffic without bypassing other host firewall rules. Incoming
+packets on client-initiated connections use the `ORIGINAL` direction and remain subject to bans,
+including packets on existing sessions.
+Exactly one `INPUT` jump remains at position 1 per managed family. Never modify unrelated firewall
+chains.
+
+Append both replacement rules before removing old rules. A failed append must retain the old rules
+and must not activate incomplete wiring. Missing conntrack support is an enforcement failure, with
+no fallback to strict source-only blocking. Existing one-rule wiring and two-rule wiring without the
+reply-direction restriction are reported as unknown by live inspection until a successful sync
+installs the current policy.
 
 To normalize a family's shared `INPUT` chain without numeric-position deletion, the adapter temporarily
 creates `kidobo-input-stage`, points that chain at `kidobo-input`, and activates the staging jump before

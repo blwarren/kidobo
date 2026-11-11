@@ -70,6 +70,19 @@ the enabled families' sets and leaves one managed `INPUT` jump per enabled
 family at position 1. Use [status and check](#inspect-live-state-and-saved-bans)
 to verify the result.
 
+Kidobo exempts tracked `ESTABLISHED,RELATED` traffic in the reply direction
+before applying any IP, CIDR, ASN, or feed-based ban. Replies to server-initiated
+requests can continue even when the remote address becomes banned. The exemption
+returns packets to the host's remaining firewall rules; those rules can still
+block them. Incoming traffic on connections initiated by banned clients remains
+blocked on all ports, including existing sessions.
+
+After upgrading from source-only blocking, run `sudo kidobo sync` to install
+this policy. Upgrading the binary alone does not change live rules. Until sync
+succeeds, `status` and `check` report legacy wiring as unknown and request sync.
+An established-traffic exemption without the reply-direction restriction is also
+reported as unknown. Missing connection-tracking support causes sync to fail visibly.
+
 ## Preview a sync
 
 To calculate proposed counts without changing enforcement, run:
@@ -200,8 +213,12 @@ when live fields are unknown.
 `sudo kidobo check 203.0.113.7` verifies one address against the corresponding
 managed set and the effective Kidobo jump from `INPUT`. A verified match prints
 `BLOCKED BY KIDOBO`; verified nonmembership prints `NOT BLOCKED BY KIDOBO`.
-These describe Kidobo's managed incoming blocking path, not every firewall,
-routing, or application policy on the host. Insufficient, conflicting, or
+Blocked means incoming traffic from that address is blocked except tracked
+established and related replies to server-initiated traffic. Exempt replies
+follow the remaining host firewall policy; existing client-initiated sessions
+remain subject to bans. These verdicts
+describe Kidobo's managed incoming blocking path, not every firewall, routing,
+or application policy on the host. Insufficient, conflicting, or
 disabled-family evidence reports `UNKNOWN`. Known verdicts exit `0`; unknown
 exits `1`; malformed input, including a CIDR, exits `2`. Use `lookup` to inspect
 CIDR or saved/cached source overlaps.

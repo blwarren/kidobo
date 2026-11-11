@@ -214,7 +214,7 @@ pub struct StatusDependencies<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CheckVerdict {
-    /// Set membership and an effective managed blocking path were verified.
+    /// Set membership and incoming blocking with tracked reply exemption were verified.
     Blocked,
     /// Sufficient live information verifies no managed block for this address.
     NotBlocked,

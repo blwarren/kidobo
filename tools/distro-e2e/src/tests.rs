@@ -113,6 +113,78 @@ fn lifecycle_probe_function() -> String {
     )
 }
 
+#[test]
+fn managed_rule_assertions_require_stateful_candidates_and_exact_historical_baselines() {
+    let temp = TestDir::new();
+    let runtime = include_str!("../../../scripts/e2e/lib/runtime.sh");
+    let script = format!(
+        r#"
+set -euo pipefail
+{runtime}
+fail() {{ printf '%s\n' "$*" >&2; exit 1; }}
+iptables() {{
+  case "$*" in
+    '-S kidobo-input') printf '%s\n' "$CHAIN_RULES" ;;
+    '-S INPUT') printf '%s\n' '-A INPUT -j kidobo-input' ;;
+    '-S kidobo-input-stage') return 1 ;;
+    *) exit 90 ;;
+  esac
+}}
+ip6tables() {{ iptables "$@"; }}
+assert_managed_rules "$FAMILY" fixture "$PROFILE"
+"#
+    );
+    let drop_rule = "-A kidobo-input -m set --match-set fixture src -j DROP";
+    let return_rule =
+        "-A kidobo-input -m conntrack --ctstate RELATED,ESTABLISHED --ctdir REPLY -j RETURN";
+    let stateful = format!("{return_rule}\n{drop_rule}");
+    let cases = [
+        (stateful.clone(), true, true),
+        (
+            stateful.replace("RELATED,ESTABLISHED", "ESTABLISHED,RELATED"),
+            true,
+            true,
+        ),
+        (drop_rule.to_owned(), false, true),
+        (return_rule.to_owned(), false, false),
+        (format!("{drop_rule}\n{return_rule}"), false, false),
+        (format!("{stateful}\n{drop_rule}"), false, false),
+        (format!("{return_rule}\n{stateful}"), false, false),
+        (
+            stateful.replace("RELATED,ESTABLISHED", "NEW,RELATED,ESTABLISHED"),
+            false,
+            false,
+        ),
+        (stateful.replace("-j RETURN", "-j ACCEPT"), false, false),
+        (stateful.replace("--ctdir REPLY ", ""), false, false),
+        (
+            stateful.replace("--ctdir REPLY", "--ctdir ORIGINAL"),
+            false,
+            false,
+        ),
+        (stateful.replace("fixture src", "other src"), false, false),
+    ];
+    for family in ["iptables", "ip6tables"] {
+        for (rules, candidate_ok, baseline_ok) in &cases {
+            for (profile, expected) in [("candidate", *candidate_ok), ("baseline", *baseline_ok)] {
+                let output = Command::new("bash")
+                    .args(["-c", &script])
+                    .env("FAMILY", family)
+                    .env("PROFILE", profile)
+                    .env("CHAIN_RULES", rules)
+                    .current_dir(temp.path())
+                    .output()
+                    .expect("exercise managed-rule assertions with inert firewall functions");
+                assert_eq!(
+                    output.status.success(),
+                    expected,
+                    "{family} {profile} rules {rules:?}: {output:?}"
+                );
+            }
+        }
+    }
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "The faithful stateful shell fixture keeps dual-stack probes, packet counters, and baseline recovery in one observable process boundary"

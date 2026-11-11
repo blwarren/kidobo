@@ -36,6 +36,11 @@ keys are optional. The defaults below apply when a key is omitted.
 | `ipset.maxelem` | `500000` | Integer from `1` through `500000`, per managed set. |
 | `ipset.timeout` | `0` | Integer seconds from `0` through `2147483`; `0` means entries do not expire. |
 
+The configured action applies after the default `ESTABLISHED,RELATED`
+connection-tracking exemption in the reply direction. No setting is needed to
+preserve replies to server-initiated requests. Existing client-initiated sessions
+remain subject to bans. See [Operations](operations.md) for ban coverage.
+
 With IPv6 disabled, sync and flush still remove managed IPv6 firewall wiring
 and any valid configured IPv6 set. If the derived IPv6 name exceeds 31
 characters, cleanup skips that impossible set name without reporting a failure.

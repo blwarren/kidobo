@@ -56,6 +56,14 @@ reported as zero or inferred from configuration.
 path only. Verified blocked and not-blocked results exit `0`, unknown exits
 `1`, and invalid syntax exits `2`. The optional `offline_matches` list contains
 separate saved/cache overlap evidence and cannot change the live verdict.
+`blocked` means incoming traffic is blocked except tracked `ESTABLISHED,RELATED`
+packets in the reply direction. This preserves replies to server-initiated
+requests, subject to the host's other firewall rules. Incoming traffic on
+client-initiated connections remains subject to bans, including existing sessions.
+Legacy source-only wiring or an established-traffic exemption without the reply
+direction restriction reports `unknown` with sync guidance until the next
+successful sync installs the current policy. Verdict names, JSON schemas, and
+exit codes are unchanged.
 
 `bans` is a read-only inventory of locally saved operator-managed entries. Its
 default display limit is 50; `--limit N` and `--all` adjust that bound.
