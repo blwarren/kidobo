@@ -318,6 +318,37 @@ fn config_show_redacts_sensitive_url_parts_and_reports_origins_and_unused_legacy
 }
 
 #[test]
+fn config_and_sources_redact_alternative_url_spellings_without_changing_saved_urls() {
+    for separator in ["", "/", "//", "\\", "\\\\"] {
+        let url = format!(
+            "Ht\tTpS:{separator}alice:password-secret@feed.example/list?query-secret#fragment-secret"
+        );
+        let config = format!(
+            "[ipset]\nset_name = 'custom'\n[safe]\ninclude_github_meta = false\ngithub_meta_url = '{url}'\n[remote]\nurls = ['{url}']\n"
+        );
+        let fixture = Fixture::new(&config, "");
+        for arguments in [&["config", "show"][..], &["sources", "list"]] {
+            let output = fixture
+                .spawn(arguments, 120, OutputDestination::Pipe, &[])
+                .wait();
+            assert!(output.status.success(), "{}", output.stderr);
+            let rendered = format!("{}{}", output.stdout, output.stderr);
+            for secret in [
+                "alice",
+                "password-secret",
+                "query-secret",
+                "fragment-secret",
+            ] {
+                assert!(!rendered.contains(secret), "leaked {secret}: {rendered}");
+            }
+            assert!(output.stdout.contains("REDACTED@feed.example/list"));
+            assert_eq!(saved_config(&fixture), config);
+            assert_eq!(fixture.tool_log(), "");
+        }
+    }
+}
+
+#[test]
 fn config_path_is_available_before_initialization_and_does_not_create_files() {
     let fixture = Fixture::new(INLINE_CONFIG, "");
     fs::remove_file(fixture.root().join("config/config.toml")).expect("remove config fixture");

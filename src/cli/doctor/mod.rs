@@ -4,7 +4,7 @@ use log::info;
 
 use crate::cli::CliIo;
 use crate::cli::args::ReportFormat;
-use crate::cli::presentation::{Presentation, Status};
+use crate::cli::presentation::{Presentation, Status, redact_urls};
 use crate::error::KidoboError;
 use kidobo_adapters::config::FileConfigRepository;
 use kidobo_adapters::doctor::SystemDoctorProbe;
@@ -22,7 +22,7 @@ pub fn run_doctor_command(
     let configs = FileConfigRepository;
     let probes = SystemDoctorProbe::default();
     let temporary_bans = FileTemporaryBanRepository;
-    let report = doctor::execute(
+    let mut report = doctor::execute(
         &path_resolution_input_from_process(None),
         &DoctorDependencies {
             cancellation: &crate::cli::interrupt::SigintCancellation,
@@ -32,6 +32,9 @@ pub fn run_doctor_command(
             probes: &probes,
         },
     )?;
+    for check in &mut report.checks {
+        check.detail = redact_urls(&check.detail);
+    }
     let format = format.unwrap_or(if io.stdout_is_terminal && !io.under_systemd {
         ReportFormat::Human
     } else {

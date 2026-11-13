@@ -11,7 +11,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::hash::hex_lower;
-use crate::limited_io::{read_bytes_with_limit, write_bytes_atomic};
+use crate::limited_io::{
+    AtomicWriteError, read_bytes_with_limit, write_bytes_atomic,
+    write_bytes_atomic_with_publication,
+};
 
 const CACHE_SCHEMA_VERSION: u8 = 2;
 const MANIFEST_FILE_NAME: &str = "current.json";
@@ -54,10 +57,11 @@ enum CommitStage {
 
 /// Fresh generation or deferred repair admitted before its promotion.
 ///
-/// Dropping an unpromoted generation removes a newly published directory when possible. A
+/// Dropping an unselected generation removes a newly published directory when possible. A
 /// content-addressed directory that already existed is left untouched because another selected
 /// manifest may still reference it. A repair retains staging data until promotion and removes only
-/// that staging directory when abandoned.
+/// that staging directory when abandoned. A published manifest retains its generation even when
+/// the final directory synchronization fails.
 #[derive(Debug)]
 pub(crate) struct StagedGeneration {
     store_root: PathBuf,
@@ -134,7 +138,17 @@ impl StagedGeneration {
         }
         let manifest_bytes = serde_json::to_vec_pretty(&manifest)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        write_bytes_atomic(&self.store_root.join(MANIFEST_FILE_NAME), &manifest_bytes)?;
+        match write_bytes_atomic_with_publication(
+            &self.store_root.join(MANIFEST_FILE_NAME),
+            &manifest_bytes,
+        ) {
+            Ok(()) => {}
+            Err(AtomicWriteError::BeforePublication(error)) => return Err(error),
+            Err(AtomicWriteError::AfterPublication(error)) => {
+                self.remove_on_drop = false;
+                return Err(error);
+            }
+        }
         self.promoted = true;
         self.remove_on_drop = false;
         hook(CommitStage::ManifestCommitted)?;
@@ -714,7 +728,131 @@ mod tests {
                     .expect("read payload"),
                 b"old"
             );
+            assert_eq!(
+                std::fs::read_dir(temp.path().join(GENERATIONS_DIRECTORY))
+                    .expect("generations")
+                    .count(),
+                1
+            );
         }
+    }
+
+    #[test]
+    fn manifest_rename_failure_preserves_previous_and_removes_unselected_generation() {
+        let temp = TempDir::new().expect("tempdir");
+        let old = commit(temp.path(), b"old", None);
+        let selected = generation_candidates(temp.path());
+        let staged = stage_generation(
+            temp.path(),
+            &[GenerationFile {
+                name: "payload",
+                contents: b"new",
+            }],
+            Some(&old),
+        )
+        .expect("stage new generation");
+        let store = temp.path().to_path_buf();
+        let error = crate::limited_io::publication_test::interleave(
+            move || {
+                let manifest_staging = std::fs::read_dir(&store)
+                    .expect("store directory")
+                    .map(|entry| entry.expect("store entry").path())
+                    .find(|path| {
+                        path.file_name()
+                            .expect("file name")
+                            .to_string_lossy()
+                            .starts_with(".current.json.kidobo-tmp-")
+                    })
+                    .expect("manifest staging file");
+                std::fs::remove_file(manifest_staging).expect("inject rename failure");
+            },
+            || staged.promote(),
+        )
+        .expect_err("manifest rename must fail");
+
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert_eq!(generation_candidates(temp.path()), selected);
+        assert_eq!(
+            read_bytes_with_limit(&selected[0].directory.join("payload"), 16)
+                .expect("previous payload"),
+            b"old"
+        );
+        assert_eq!(
+            std::fs::read_dir(temp.path().join(GENERATIONS_DIRECTORY))
+                .expect("generations")
+                .count(),
+            1
+        );
+    }
+
+    fn assert_manifest_sync_failure_retains_generation(with_previous: bool) {
+        let temp = TempDir::new().expect("tempdir");
+        let older = with_previous.then(|| commit(temp.path(), b"older", None));
+        let old = older
+            .as_deref()
+            .map(|previous| commit(temp.path(), b"old", Some(previous)));
+        let staged = stage_generation(
+            temp.path(),
+            &[GenerationFile {
+                name: "payload",
+                contents: b"new",
+            }],
+            old.as_deref(),
+        )
+        .expect("stage new generation");
+        let error = crate::limited_io::directory_sync_test::fail_once_at(
+            temp.path(),
+            io::Error::from_raw_os_error(nix::libc::EIO),
+            || staged.promote(),
+        )
+        .expect_err("manifest directory synchronization must fail");
+
+        assert_eq!(error.raw_os_error(), Some(nix::libc::EIO));
+        let selected = generation_candidates(temp.path());
+        assert_eq!(selected.len(), if with_previous { 2 } else { 1 });
+        assert_eq!(
+            read_bytes_with_limit(&selected[0].directory.join("payload"), 16)
+                .expect("new selected payload must survive"),
+            b"new"
+        );
+        if let Some(old) = old {
+            assert_eq!(selected[1].id, old);
+            assert_eq!(
+                read_bytes_with_limit(&selected[1].directory.join("payload"), 16)
+                    .expect("previous payload must survive"),
+                b"old"
+            );
+        }
+        if let Some(older) = older {
+            let older_payload = temp
+                .path()
+                .join(GENERATIONS_DIRECTORY)
+                .join(older)
+                .join("payload");
+            assert_eq!(
+                read_bytes_with_limit(&older_payload, 16).expect("failed promotion must not prune"),
+                b"older"
+            );
+        }
+
+        let retried = commit(temp.path(), b"new", Some(&selected[0].id));
+        assert_eq!(retried, selected[0].id);
+        assert_eq!(generation_candidates(temp.path()), selected);
+        assert_eq!(
+            read_bytes_with_limit(&selected[0].directory.join("payload"), 16)
+                .expect("retried payload remains readable"),
+            b"new"
+        );
+    }
+
+    #[test]
+    fn initial_manifest_sync_failure_preserves_selected_generation() {
+        assert_manifest_sync_failure_retains_generation(false);
+    }
+
+    #[test]
+    fn replacement_manifest_sync_failure_preserves_selected_generations_without_pruning() {
+        assert_manifest_sync_failure_retains_generation(true);
     }
 
     #[test]

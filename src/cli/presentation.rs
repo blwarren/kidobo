@@ -272,7 +272,7 @@ fn encode_human(value: &str) -> String {
 /// tokens are concealed rather than risking disclosure of credentials from invalid user input.
 /// Terminal controls are deliberately left to the output encoder so fields are escaped once.
 pub fn redact_urls(value: &str) -> String {
-    if next_url_start(value) == Some(0) && Url::parse(value).is_ok() {
+    if Url::parse(value).is_ok_and(|url| matches!(url.scheme(), "http" | "https")) {
         return redact_url_token(value);
     }
     let mut rendered = String::with_capacity(value.len());
@@ -291,15 +291,27 @@ pub fn redact_urls(value: &str) -> String {
 }
 
 fn next_url_start(value: &str) -> Option<usize> {
-    value.char_indices().find_map(|(index, _)| {
-        let suffix = value.get(index..)?;
-        (suffix
-            .get(..7)
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"))
-            || suffix
-                .get(..8)
-                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://")))
-        .then_some(index)
+    value.char_indices().find_map(|(index, character)| {
+        if !character.eq_ignore_ascii_case(&'h') {
+            return None;
+        }
+        // URL parsing removes ASCII tabs and newlines even within the scheme.
+        let mut bytes = value
+            .get(index..)?
+            .bytes()
+            .filter(|byte| !matches!(byte, b'\t' | b'\r' | b'\n'));
+        if !b"http".iter().all(|expected| {
+            bytes
+                .next()
+                .is_some_and(|byte| byte.eq_ignore_ascii_case(expected))
+        }) {
+            return None;
+        }
+        match bytes.next()? {
+            b':' => Some(index),
+            b's' | b'S' if bytes.next() == Some(b':') => Some(index),
+            _ => None,
+        }
     })
 }
 
@@ -322,7 +334,8 @@ fn url_token_end(value: &str, preceding: Option<char>) -> usize {
             return index;
         }
         if closing.is_none()
-            && (character.is_whitespace() || matches!(character, '\'' | '"' | '`' | '<' | '>'))
+            && ((character.is_whitespace() && !matches!(character, '\t' | '\r' | '\n'))
+                || matches!(character, '\'' | '"' | '`' | '<' | '>'))
         {
             return index;
         }
@@ -362,17 +375,8 @@ fn redact_url_token(token: &str) -> String {
 }
 
 fn nested_url_has_sensitive_parts(token: &str) -> bool {
-    let scheme_length = |text: &str| {
-        if text
-            .get(..7)
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"))
-        {
-            7
-        } else {
-            8
-        }
-    };
-    let mut remaining = token.get(scheme_length(token)..).unwrap_or_default();
+    let after_scheme = |text: &str| text.find(':').map_or(text.len(), |index| index + 1);
+    let mut remaining = token.get(after_scheme(token)..).unwrap_or_default();
     while let Some(start) = next_url_start(remaining) {
         let nested = remaining.get(start..).unwrap_or_default();
         match Url::parse(nested) {
@@ -383,7 +387,7 @@ fn nested_url_has_sensitive_parts(token: &str) -> bool {
                     && url.fragment().is_none() => {}
             _ => return true,
         }
-        remaining = nested.get(scheme_length(nested)..).unwrap_or_default();
+        remaining = nested.get(after_scheme(nested)..).unwrap_or_default();
     }
     false
 }
@@ -642,6 +646,62 @@ mod tests {
             input,
             "the exact TSV encoder must not redact fields"
         );
+    }
+
+    #[test]
+    fn accepted_http_url_spellings_redact_complete_and_embedded_values() {
+        for scheme in ["http", "https", "HtTpS", "h\tttps", "ht\ntps", "htt\rps"] {
+            for separator in ["", "/", "//", "\\", "\\\\", "/\\"] {
+                let input = format!(
+                    "{scheme}:{separator}alice:password-secret@example.org/feed?query-secret#fragment-secret"
+                );
+                let parsed = url::Url::parse(&input).expect("accepted HTTP URL");
+                let expected = format!(
+                    "{}://REDACTED@example.org/feed?REDACTED#REDACTED",
+                    parsed.scheme()
+                );
+                assert_eq!(redact_urls(&input), expected, "{input}");
+                assert_eq!(redact_urls(&expected), expected);
+                assert_eq!(
+                    redact_urls(&format!("source '{input}' failed")),
+                    format!("source '{expected}' failed")
+                );
+                assert_eq!(
+                    redact_urls(&format!("source {input} failed")),
+                    format!("source {expected} failed")
+                );
+                let nested = format!("https://public.example/proxy/{input}");
+                assert_eq!(redact_urls(&nested), "[redacted URL]", "{nested}");
+            }
+        }
+        assert_eq!(
+            redact_urls(" ht\ttps:alice:password-secret@example.org/feed?query-secret\n"),
+            "https://REDACTED@example.org/feed?REDACTED"
+        );
+        assert_eq!(
+            redact_urls(
+                "source https://ali\tce:password-\rsecret@example.org/feed?query-\nsecret failed"
+            ),
+            "source https://REDACTED@example.org/feed?REDACTED failed"
+        );
+    }
+
+    #[test]
+    fn alternative_url_spellings_preserve_public_values_and_conceal_malformed_ones() {
+        for separator in ["", "/", "\\"] {
+            let public = format!("HTTPS:{separator}EXAMPLE.org/界/feed");
+            assert_eq!(redact_urls(&public), public);
+            assert_eq!(
+                redact_urls(&format!("feed '{public}' failed")),
+                format!("feed '{public}' failed")
+            );
+            let malformed = format!("https:{separator}alice:password-secret@");
+            assert_eq!(redact_urls(&malformed), "[redacted URL]");
+            assert_eq!(
+                redact_urls(&format!("source '{malformed}' failed")),
+                "source '[redacted URL]' failed"
+            );
+        }
     }
 
     #[test]

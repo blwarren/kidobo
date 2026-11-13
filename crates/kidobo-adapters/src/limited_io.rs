@@ -112,17 +112,42 @@ pub fn write_string_atomic(path: &Path, contents: &str) -> io::Result<()> {
 /// Returns an I/O error when temporary-file creation, writing, synchronization, permission
 /// preservation, replacement, or parent-directory synchronization fails.
 pub fn write_bytes_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
+    write_bytes_atomic_with_publication(path, contents).map_err(AtomicWriteError::into_io_error)
+}
+
+/// Distinguishes write failures before and after destination publication.
+#[derive(Debug)]
+pub(crate) enum AtomicWriteError {
+    BeforePublication(io::Error),
+    AfterPublication(io::Error),
+}
+
+impl AtomicWriteError {
+    fn into_io_error(self) -> io::Error {
+        match self {
+            Self::BeforePublication(error) | Self::AfterPublication(error) => error,
+        }
+    }
+}
+
+/// Retains publication state when callers own data referenced by the destination file.
+pub(crate) fn write_bytes_atomic_with_publication(
+    path: &Path,
+    contents: &[u8],
+) -> Result<(), AtomicWriteError> {
     write_bytes_atomic_mode(path, contents, PublicationMode::Replace, false)
 }
 
 /// Publishes a complete file without replacing an existing destination.
 pub(crate) fn create_string_atomic(path: &Path, contents: &str) -> io::Result<()> {
     write_bytes_atomic_mode(path, contents.as_bytes(), PublicationMode::CreateNew, false)
+        .map_err(AtomicWriteError::into_io_error)
 }
 
 /// Publishes a config without exposing its staging file to other users.
 pub(crate) fn create_private_string_atomic(path: &Path, contents: &str) -> io::Result<()> {
     write_bytes_atomic_mode(path, contents.as_bytes(), PublicationMode::CreateNew, true)
+        .map_err(AtomicWriteError::into_io_error)
 }
 
 /// Replaces a bounded config with owner-only access, independently of its old permissions.
@@ -138,6 +163,7 @@ pub(crate) fn write_private_string_atomic_with_limit(
         ));
     }
     write_bytes_atomic_mode(path, contents.as_bytes(), PublicationMode::Replace, true)
+        .map_err(AtomicWriteError::into_io_error)
 }
 
 #[derive(Clone, Copy)]
@@ -151,7 +177,7 @@ fn write_bytes_atomic_mode(
     contents: &[u8],
     mode: PublicationMode,
     private: bool,
-) -> io::Result<()> {
+) -> Result<(), AtomicWriteError> {
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -161,7 +187,7 @@ fn write_bytes_atomic_mode(
         PublicationMode::Replace => match fs::metadata(path) {
             Ok(metadata) => Some(metadata.permissions()),
             Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-            Err(error) => return Err(error),
+            Err(error) => return Err(AtomicWriteError::BeforePublication(error)),
         },
     };
 
@@ -177,6 +203,7 @@ fn write_bytes_atomic_mode(
 
         match options.open(&temp_path) {
             Ok(mut temp_file) => {
+                let mut published = false;
                 let write_result = (|| {
                     if private {
                         #[cfg(unix)]
@@ -196,9 +223,13 @@ fn write_bytes_atomic_mode(
                     publication_test::before_publish();
 
                     match mode {
-                        PublicationMode::Replace => fs::rename(&temp_path, path)?,
+                        PublicationMode::Replace => {
+                            fs::rename(&temp_path, path)?;
+                            published = true;
+                        }
                         PublicationMode::CreateNew => {
                             let publication = fs::hard_link(&temp_path, path);
+                            published = publication.is_ok();
                             fs::remove_file(&temp_path)?;
                             sync_directory(parent)?;
                             return publication;
@@ -209,23 +240,27 @@ fn write_bytes_atomic_mode(
 
                 if let Err(err) = write_result {
                     let _cleanup_result = fs::remove_file(&temp_path);
-                    return Err(err);
+                    return Err(if published {
+                        AtomicWriteError::AfterPublication(err)
+                    } else {
+                        AtomicWriteError::BeforePublication(err)
+                    });
                 }
 
                 return Ok(());
             }
             Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(err) => return Err(err),
+            Err(err) => return Err(AtomicWriteError::BeforePublication(err)),
         }
     }
 
-    Err(io::Error::new(
+    Err(AtomicWriteError::BeforePublication(io::Error::new(
         io::ErrorKind::AlreadyExists,
         format!(
             "failed to create unique temporary file for atomic write to {}",
             path.display()
         ),
-    ))
+    )))
 }
 
 #[cfg(test)]
@@ -275,12 +310,56 @@ fn temp_write_path(parent: &Path, path: &Path) -> PathBuf {
 }
 
 fn sync_directory(path: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    directory_sync_test::before_sync(path)?;
+
     #[cfg(unix)]
     {
         File::open(path)?.sync_all()?;
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+pub(crate) mod directory_sync_test {
+    use std::cell::RefCell;
+    use std::io;
+    use std::path::{Path, PathBuf};
+
+    thread_local! {
+        static FAILURE: RefCell<Option<(PathBuf, io::Error)>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn before_sync(path: &Path) -> io::Result<()> {
+        FAILURE.with(|slot| {
+            let mut failure = slot.borrow_mut();
+            if failure.as_ref().is_some_and(|(target, _)| target == path)
+                && let Some((_, error)) = failure.take()
+            {
+                return Err(error);
+            }
+            Ok(())
+        })
+    }
+
+    pub(crate) fn fail_once_at<T>(path: &Path, error: io::Error, action: impl FnOnce() -> T) -> T {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                FAILURE.with(|slot| *slot.borrow_mut() = None);
+            }
+        }
+        FAILURE.with(|slot| {
+            assert!(
+                slot.borrow().is_none(),
+                "directory sync hooks must not overlap"
+            );
+            *slot.borrow_mut() = Some((path.to_path_buf(), error));
+        });
+        let _reset = Reset;
+        action()
+    }
 }
 
 #[cfg(test)]
@@ -355,6 +434,25 @@ mod tests {
         assert_eq!(
             read_to_string_with_limit(&path, 1024).expect("read"),
             "saved contents"
+        );
+        assert_eq!(fs::read_dir(temp.path()).expect("directory").count(), 1);
+    }
+
+    #[test]
+    fn atomic_wrapper_preserves_error_after_publication() {
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("published");
+        let error = super::directory_sync_test::fail_once_at(
+            temp.path(),
+            std::io::Error::from_raw_os_error(nix::libc::EIO),
+            || super::write_bytes_atomic(&path, b"published contents"),
+        )
+        .expect_err("directory synchronization must fail");
+
+        assert_eq!(error.raw_os_error(), Some(nix::libc::EIO));
+        assert_eq!(
+            read_bytes_with_limit(&path, 64).expect("published contents"),
+            b"published contents"
         );
         assert_eq!(fs::read_dir(temp.path()).expect("directory").count(), 1);
     }
