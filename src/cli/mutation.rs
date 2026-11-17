@@ -15,21 +15,46 @@ pub enum ApplyMode {
     SaveOnly,
 }
 
+pub struct SourceChange {
+    pub changed: bool,
+    pub output: Result<(), KidoboError>,
+}
+
 /// Completes the CLI orchestration after a source-only use case has released its lock.
 pub fn finish_change(
     mode: ApplyMode,
-    changed: bool,
+    change: SourceChange,
     io: &mut CliIo<'_>,
     sync: &mut dyn FnMut(&mut CliIo<'_>) -> Result<(), KidoboError>,
 ) -> Result<(), KidoboError> {
-    if !changed && mode != ApplyMode::Apply {
-        return Ok(());
-    }
+    let SourceChange { changed, output } = change;
     let source_state = if changed {
         "Source change saved"
     } else {
         "Source state unchanged"
     };
+    if mode == ApplyMode::Apply {
+        return match (apply_change(source_state, io, sync), output) {
+            (result, Ok(())) => result,
+            (Ok(()), Err(source)) => Err(KidoboError::SourceOutputFailed {
+                source_state,
+                apply_state: "live firewall update completed",
+                source: Box::new(source),
+            }),
+            (Err(source), Err(output)) => Err(KidoboError::AdditionalOutputFailure {
+                source: Box::new(source),
+                output: Box::new(output),
+            }),
+        };
+    }
+    output.map_err(|source| KidoboError::SourceOutputFailed {
+        source_state,
+        apply_state: "live firewall update was not started",
+        source: Box::new(source),
+    })?;
+    if !changed {
+        return Ok(());
+    }
     let apply = match mode {
         ApplyMode::Apply => true,
         ApplyMode::Prompt if io.interactive() => confirm(io, "Apply to the firewall now?")
@@ -39,10 +64,7 @@ pub fn finish_change(
         ApplyMode::Prompt | ApplyMode::SaveOnly => false,
     };
     if apply {
-        sync(io).map_err(|source| KidoboError::SourceApplyFailed {
-            source_state,
-            source: Box::new(source),
-        })
+        apply_change(source_state, io, sync)
     } else {
         let view = io.presentation();
         view.next(io.stdout, "sudo kidobo sync").map_err(|source| {
@@ -51,6 +73,22 @@ pub fn finish_change(
             }
         })
     }
+}
+
+fn apply_change(
+    source_state: &'static str,
+    io: &mut CliIo<'_>,
+    sync: &mut dyn FnMut(&mut CliIo<'_>) -> Result<(), KidoboError>,
+) -> Result<(), KidoboError> {
+    sync(io).map_err(|source| match source {
+        KidoboError::SyncOutputFailed { .. } | KidoboError::SyncInterruptedAfterCompletion => {
+            source
+        }
+        source => KidoboError::SourceApplyFailed {
+            source_state,
+            source: Box::new(source),
+        },
+    })
 }
 
 /// Asks a terminal-safe default-no question and accepts only an explicit `y` or `yes`.
@@ -84,6 +122,13 @@ mod tests {
 
     use super::*;
     use crate::cli::PromptInput;
+
+    fn saved(changed: bool) -> SourceChange {
+        SourceChange {
+            changed,
+            output: Ok(()),
+        }
+    }
 
     struct Input {
         response: Option<Result<String, KidoboError>>,
@@ -146,7 +191,7 @@ mod tests {
             let mut input = Input::unused();
             let mut calls = 0;
             let (result, stdout) = with_io(&mut input, terminals, systemd, |io| {
-                finish_change(ApplyMode::Prompt, true, io, &mut |_| {
+                finish_change(ApplyMode::Prompt, saved(true), io, &mut |_| {
                     calls += 1;
                     Ok(())
                 })
@@ -172,7 +217,7 @@ mod tests {
             let mut input = Input::answer(answer);
             let mut calls = 0;
             let (result, stdout) = with_io(&mut input, (true, true), false, |io| {
-                finish_change(ApplyMode::Prompt, true, io, &mut |_| {
+                finish_change(ApplyMode::Prompt, saved(true), io, &mut |_| {
                     calls += 1;
                     Ok(())
                 })
@@ -194,7 +239,7 @@ mod tests {
             let mut input = Input::unused();
             let mut calls = 0;
             let (result, stdout) = with_io(&mut input, terminals, false, |io| {
-                finish_change(ApplyMode::Apply, false, io, &mut |_| {
+                finish_change(ApplyMode::Apply, saved(false), io, &mut |_| {
                     calls += 1;
                     Ok(())
                 })
@@ -212,7 +257,7 @@ mod tests {
             let mut input = Input::unused();
             let mut calls = 0;
             let (result, stdout) = with_io(&mut input, (true, true), false, |io| {
-                finish_change(mode, changed, io, &mut |_| {
+                finish_change(mode, saved(changed), io, &mut |_| {
                     calls += 1;
                     Ok(())
                 })
@@ -229,7 +274,7 @@ mod tests {
         for changed in [false, true] {
             let mut input = Input::unused();
             let (result, _) = with_io(&mut input, (false, false), false, |io| {
-                finish_change(ApplyMode::Apply, changed, io, &mut |_| {
+                finish_change(ApplyMode::Apply, saved(changed), io, &mut |_| {
                     Err(KidoboError::DoctorFailed)
                 })
             });
@@ -254,7 +299,7 @@ mod tests {
             assert_eq!(error.exit_code(), 1);
         }
         let (result, _) = with_io(&mut Input::unused(), (false, false), false, |io| {
-            finish_change(ApplyMode::Apply, true, io, &mut |_| {
+            finish_change(ApplyMode::Apply, saved(true), io, &mut |_| {
                 Err(KidoboError::Interrupted)
             })
         });
@@ -276,7 +321,7 @@ mod tests {
             };
             let mut calls = 0;
             let (result, _) = with_io(&mut input, (true, true), false, |io| {
-                finish_change(ApplyMode::Prompt, true, io, &mut |_| {
+                finish_change(ApplyMode::Prompt, saved(true), io, &mut |_| {
                     calls += 1;
                     Ok(())
                 })
@@ -306,7 +351,7 @@ mod tests {
         let mut calls = 0;
         let error = finish_change(
             ApplyMode::Prompt,
-            true,
+            saved(true),
             &mut CliIo {
                 input: &mut input,
                 stdout: &mut FailingWriter,

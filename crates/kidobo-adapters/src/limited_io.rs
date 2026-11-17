@@ -309,7 +309,7 @@ fn temp_write_path(parent: &Path, path: &Path) -> PathBuf {
     ))
 }
 
-fn sync_directory(path: &Path) -> io::Result<()> {
+pub(crate) fn sync_directory(path: &Path) -> io::Result<()> {
     #[cfg(test)]
     directory_sync_test::before_sync(path)?;
 
@@ -317,6 +317,8 @@ fn sync_directory(path: &Path) -> io::Result<()> {
     {
         File::open(path)?.sync_all()?;
     }
+    #[cfg(not(unix))]
+    let _ = path;
 
     Ok(())
 }

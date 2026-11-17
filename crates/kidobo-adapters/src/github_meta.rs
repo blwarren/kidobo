@@ -10,8 +10,8 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::cache_generation::{
-    GenerationFile, GenerationFileLimit, StagedGeneration, cleanup_unselected_generations,
-    generation_candidates, generation_contents_match, stage_generation,
+    GenerationFile, GenerationFileLimit, StagedGeneration, generation_candidates,
+    generation_contents_match, prepare_online_generations, stage_generation,
 };
 use crate::cached_fetch::{read_optional_json_lossy, read_validated_bytes_lossy};
 use crate::hash::sha256_hex;
@@ -113,6 +113,16 @@ pub(crate) struct ReadOnlyGithubMeta {
 /// Failure to persist a fully validated GitHub metadata generation.
 #[derive(Debug, Error)]
 pub enum GithubMetaLoadError {
+    /// The selected manifest could not be made durable before reuse.
+    #[error("failed to synchronize github meta cache manifest directory {path}: {source}")]
+    SyncManifestDirectory {
+        /// Cache generation store path.
+        path: PathBuf,
+        /// Filesystem diagnostic.
+        #[source]
+        source: std::io::Error,
+    },
+
     /// A generation member or manifest could not be atomically written.
     #[error("failed to write github meta cache file {path}: {source}")]
     WriteCacheFile {
@@ -197,7 +207,12 @@ pub(crate) fn prepare_github_meta_safelist(
     let selection = CategorySelection::from_mode(category_mode);
     let max_bytes = max_http_body_bytes(env).min(GITHUB_META_CACHE_READ_LIMIT);
     let paths = CachePaths::from_cache_dir(cache_dir);
-    cleanup_unselected_generations(&paths.generation_store);
+    prepare_online_generations(&paths.generation_store).map_err(|source| {
+        GithubMetaLoadError::SyncManifestDirectory {
+            path: paths.generation_store.clone(),
+            source,
+        }
+    })?;
     let cache = read_github_meta_cache(&paths, &selection, github_meta_url);
     let (cached_etag, cached_last_modified) = cache.http_validators();
 
@@ -966,6 +981,50 @@ mod tests {
             );
             assert_eq!(snapshot(temp.path()), before);
         }
+    }
+
+    #[test]
+    fn partial_github_response_keeps_the_selected_metadata() {
+        let temp = TempDir::new().expect("root");
+        let env = BTreeMap::new();
+        let mode = GithubMetaCategoryMode::All;
+        let body = br#"{"api":["192.0.2.0/24","203.0.113.0/24"]}"#;
+        let expected = load_github_meta_safelist(
+            &MockHttpClient::new(vec![Ok(network_response(body))]),
+            temp.path(),
+            TEST_GITHUB_META_URL,
+            &mode,
+            &env,
+        )
+        .expect("seed metadata");
+        let before = snapshot(temp.path());
+        let mut partial = network_response(br#"{"api":["192.0.2.0/24"]}"#);
+        partial.status = StatusCode::PARTIAL_CONTENT;
+
+        let client = MockHttpClient::new(vec![Ok(partial.clone())]);
+        let sync = super::prepare_github_meta_safelist(
+            &client,
+            temp.path(),
+            TEST_GITHUB_META_URL,
+            &mode,
+            &env,
+        )
+        .expect("sync metadata fallback");
+        assert_eq!(sync.primary.source, GithubMetaSource::FallbackCache);
+        assert_eq!(sync.primary.networks, expected.networks);
+        assert!(sync.pending_promotion.is_none());
+
+        let client = MockHttpClient::new(vec![Ok(partial)]);
+        let preview = read_github_meta_for_preview(
+            Some(&client),
+            temp.path(),
+            TEST_GITHUB_META_URL,
+            &mode,
+            &env,
+        );
+        assert_eq!(preview.primary.provenance, SourceProvenance::FallbackCache);
+        assert_eq!(preview.primary.networks, expected.networks);
+        assert_eq!(snapshot(temp.path()), before);
     }
 
     #[test]

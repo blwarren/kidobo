@@ -795,6 +795,18 @@ fn application(
     )?;
     Ok(())
 }
+fn clean_after_run(runner: &mut Runner, config: &Config) -> Result<()> {
+    runner.stage("cleanup requested after run")?;
+    let outcome = coordination::lock(runner).and_then(|_operation_lock| {
+        runner.ignore_cancellation = true;
+        clean(runner, config)
+    });
+    runner
+        .report
+        .finish_stage(if outcome.is_err() { "failed" } else { "passed" })?;
+    outcome
+}
+
 fn clean(runner: &mut Runner, config: &Config) -> Result<()> {
     let owned: Owned = serde_json::from_str(&read_text(&runner.dir.join("ownership.json"))?)?;
     let run_id = runner
@@ -891,46 +903,44 @@ fn run(cli: Cli) -> Result<()> {
         command_poll_interval: Duration::from_millis(100),
         ignore_cancellation: false,
     };
-    let is_clean = matches!(&cli.action, Action::Clean { .. });
+    if matches!(&cli.action, Action::Clean { .. }) {
+        return clean_after_run(&mut runner, &config);
+    }
     let is_images = matches!(&cli.action, Action::Images { .. });
-    if is_clean {
-        runner.stage("cleanup requested after run")?;
+    let (tag, archive, targets) = match &cli.action {
+        Action::Run {
+            tag,
+            archive,
+            distro,
+            required_only,
+            ..
+        } => (
+            tag.as_str(),
+            archive.as_ref(),
+            selected_targets(&config, distro.as_deref(), *required_only)
+                .into_iter()
+                .map(|d| d.id.clone())
+                .collect::<Vec<_>>(),
+        ),
+        _ => ("setup", None, Vec::new()),
+    };
+    runner.report.document["validation_contract"] = json!(contract::VERSION);
+    runner.report.document["run_id"] = json!(run_id);
+    runner.report.document["tag"] = json!(tag);
+    runner.report.document["archive"] = json!(archive);
+    runner.report.document["targets"] = json!(targets);
+    runner.report.document["status"] = json!("running");
+    runner.report.save()?;
+    if is_images {
+        runner.report.progress(&format!(
+            "[images] Source maintenance; no VM or application qualification. Evidence: {}",
+            runner.dir.display()
+        ))?;
     } else {
-        let (tag, archive, targets) = match &cli.action {
-            Action::Run {
-                tag,
-                archive,
-                distro,
-                required_only,
-                ..
-            } => (
-                tag.as_str(),
-                archive.as_ref(),
-                selected_targets(&config, distro.as_deref(), *required_only)
-                    .into_iter()
-                    .map(|d| d.id.clone())
-                    .collect::<Vec<_>>(),
-            ),
-            _ => ("setup", None, Vec::new()),
-        };
-        runner.report.document["validation_contract"] = json!(contract::VERSION);
-        runner.report.document["run_id"] = json!(run_id);
-        runner.report.document["tag"] = json!(tag);
-        runner.report.document["archive"] = json!(archive);
-        runner.report.document["targets"] = json!(targets);
-        runner.report.document["status"] = json!("running");
-        runner.report.save()?;
-        if is_images {
-            runner.report.progress(&format!(
-                "[images] Source maintenance; no VM or application qualification. Evidence: {}",
-                runner.dir.display()
-            ))?;
-        } else {
-            runner.report.progress(&format!(
-                "E2E run {run_id}: release={tag} archive={archive:?} targets={targets:?}; results: {}",
-                runner.dir.display()
-            ))?;
-        }
+        runner.report.progress(&format!(
+            "E2E run {run_id}: release={tag} archive={archive:?} targets={targets:?}; results: {}",
+            runner.dir.display()
+        ))?;
     }
     let started = Instant::now();
     let mut refresh = None;
@@ -941,12 +951,6 @@ fn run(cli: Cli) -> Result<()> {
         execute(cli, &config, &run_id, &mut runner)
     };
     runner.report.document["run_wall_seconds"] = json!(started.elapsed().as_secs_f64());
-    if is_clean {
-        runner
-            .report
-            .finish_stage(if outcome.is_err() { "failed" } else { "passed" })?;
-        return outcome;
-    }
     let interrupted = runner.cancelled.load(Ordering::Relaxed);
     runner.ignore_cancellation = true;
     runner.report.document["status"] = json!(if interrupted {
@@ -1020,35 +1024,30 @@ fn run(cli: Cli) -> Result<()> {
     reason = "Matrix execution keeps diagnostics and cleanup adjacent to lifecycle execution"
 )]
 fn execute(cli: Cli, config: &Config, run_id: &str, runner: &mut Runner) -> Result<()> {
-    if !matches!(&cli.action, Action::Clean { .. }) {
-        fs::create_dir_all(runner.evidence())?;
-        runner.command("tar", &strings(&["--version"]), 10)?;
-        if std::env::consts::OS != "linux" || std::env::consts::ARCH != "x86_64" {
-            return Err("distro E2E requires a Linux x86_64 host".into());
-        }
-        runner
-            .command(
-                "sh",
-                &strings(&[
-                    "-c",
-                    "command -v genisoimage >/dev/null || command -v mkisofs >/dev/null",
-                ]),
-                10,
-            )
-            .map_err(|error| {
-                format!("Incus agent CD-ROM requires host genisoimage or mkisofs: {error}")
-            })?;
+    fs::create_dir_all(runner.evidence())?;
+    runner.command("tar", &strings(&["--version"]), 10)?;
+    if std::env::consts::OS != "linux" || std::env::consts::ARCH != "x86_64" {
+        return Err("distro E2E requires a Linux x86_64 host".into());
     }
+    runner
+        .command(
+            "sh",
+            &strings(&[
+                "-c",
+                "command -v genisoimage >/dev/null || command -v mkisofs >/dev/null",
+            ]),
+            10,
+        )
+        .map_err(|error| {
+            format!("Incus agent CD-ROM requires host genisoimage or mkisofs: {error}")
+        })?;
     match cli.action {
-        Action::Images { .. } => unreachable!("image commands handled without VM prerequisites"),
+        Action::Clean { .. } | Action::Images { .. } => {
+            unreachable!("cleanup and image commands handled without VM prerequisites")
+        }
         Action::Setup => {
             let _operation_lock = coordination::lock(runner)?;
             setup(runner, config)
-        }
-        Action::Clean { .. } => {
-            let _operation_lock = coordination::lock(runner)?;
-            runner.ignore_cancellation = true;
-            clean(runner, config)
         }
         Action::Run {
             archive,

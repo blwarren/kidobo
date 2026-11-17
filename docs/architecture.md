@@ -219,7 +219,9 @@ so extra unselected directories can remain after success. Incomplete or unselect
 never selected and are removed opportunistically by online cache work. Normal cache flush removes the
 containing remote-cache directory and therefore both layouts.
 
-An unchanged current generation retains its previous manifest entry and skips redundant promotion.
+Online loads sync the manifest directory before using an existing selection or pruning generations.
+A failure aborts sync before set replacement. An unchanged promotion syncs the directory while
+retaining the existing manifest and its previous generation.
 Existing same-ID content is verified before reuse. Corrupt or missing members are repaired from retained
 staging data only after admission, using atomic member replacement followed by whole-generation
 verification. Repair failure preserves the previous generation, and abandoned repairs remove only their

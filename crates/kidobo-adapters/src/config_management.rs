@@ -388,7 +388,7 @@ fn replace_allow(
     Ok(())
 }
 
-fn append_value(array: &mut Array, mut value: Value) {
+pub(crate) fn append_value(array: &mut Array, mut value: Value) {
     let trailing = array.trailing().as_str().unwrap_or_default();
     if trailing.contains('\n') {
         let closing_indent = trailing.rsplit('\n').next().unwrap_or_default();

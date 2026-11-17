@@ -1,6 +1,6 @@
 //! Private generation-atomic cache storage shared by remote-source adapters.
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process;
@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 
 use crate::hash::hex_lower;
 use crate::limited_io::{
-    AtomicWriteError, read_bytes_with_limit, write_bytes_atomic,
+    AtomicWriteError, read_bytes_with_limit, sync_directory, write_bytes_atomic,
     write_bytes_atomic_with_publication,
 };
 
@@ -132,8 +132,10 @@ impl StagedGeneration {
             .is_some_and(|candidate| candidate.id == manifest.current)
             && selected.get(1).map(|candidate| &candidate.id) == manifest.previous.as_ref()
         {
-            self.promoted = true;
             self.remove_on_drop = false;
+            // An earlier rename can be visible even if its directory sync failed.
+            sync_directory(&self.store_root)?;
+            self.promoted = true;
             return Ok(());
         }
         let manifest_bytes = serde_json::to_vec_pretty(&manifest)
@@ -227,24 +229,25 @@ pub(crate) fn generation_candidates(store_root: &Path) -> Vec<GenerationCandidat
         .collect()
 }
 
-pub(crate) fn cleanup_unselected_generations(store_root: &Path) {
+/// Confirms the selected manifest's durability before pruning or online reuse.
+pub(crate) fn prepare_online_generations(store_root: &Path) -> io::Result<()> {
     let manifest_path = store_root.join(MANIFEST_FILE_NAME);
     let candidates = generation_candidates(store_root);
     if candidates.is_empty() {
         match fs::symlink_metadata(&manifest_path) {
-            Ok(_) => return,
+            Ok(_) => return Ok(()),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => {
                 warn!(
                     "cannot inspect cache manifest {}; preserving generations: {error}",
                     manifest_path.display()
                 );
-                return;
+                return Ok(());
             }
         }
         let generations_root = store_root.join(GENERATIONS_DIRECTORY);
         let Ok(entries) = fs::read_dir(&generations_root) else {
-            return;
+            return Ok(());
         };
         for entry in entries.flatten() {
             let metadata = match fs::metadata(entry.path()) {
@@ -263,18 +266,20 @@ pub(crate) fn cleanup_unselected_generations(store_root: &Path) {
             }
         }
         let _sync_result = sync_directory(&generations_root);
-        return;
+        return Ok(());
     }
 
     let Some(current) = candidates.first() else {
-        return;
+        return Ok(());
     };
+    sync_directory(store_root)?;
     let manifest = GenerationManifest {
         version: CACHE_SCHEMA_VERSION,
         current: current.id.clone(),
         previous: candidates.get(1).map(|candidate| candidate.id.clone()),
     };
     prune_generations(store_root, &manifest);
+    Ok(())
 }
 
 pub(crate) fn generation_contents_match(
@@ -523,16 +528,6 @@ fn is_safe_file_name(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
-fn sync_directory(path: &Path) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        File::open(path)?.sync_all()?;
-    }
-    #[cfg(not(unix))]
-    let _ = path;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use std::io;
@@ -542,9 +537,9 @@ mod tests {
     use crate::limited_io::read_bytes_with_limit;
 
     use super::{
-        CommitStage, GENERATIONS_DIRECTORY, GenerationFile, GenerationFileLimit,
-        cleanup_unselected_generations, commit_generation, commit_generation_with_hook,
-        generation_candidates, generation_contents_match, stage_generation,
+        CommitStage, GENERATIONS_DIRECTORY, GenerationFile, GenerationFileLimit, commit_generation,
+        commit_generation_with_hook, generation_candidates, generation_contents_match,
+        prepare_online_generations, stage_generation,
     };
 
     fn commit(store: &std::path::Path, value: &[u8], previous: Option<&str>) -> String {
@@ -568,7 +563,7 @@ mod tests {
         std::fs::remove_file(&manifest).expect("remove manifest");
         std::os::unix::fs::symlink(super::MANIFEST_FILE_NAME, &manifest).expect("manifest loop");
 
-        cleanup_unselected_generations(temp.path());
+        prepare_online_generations(temp.path()).expect("prepare generations");
 
         let payload = temp
             .path()
@@ -835,6 +830,24 @@ mod tests {
             );
         }
 
+        let retry = stage_generation(
+            temp.path(),
+            &[GenerationFile {
+                name: "payload",
+                contents: b"new",
+            }],
+            Some(&selected[0].id),
+        )
+        .expect("stage identical generation");
+        let error = crate::limited_io::directory_sync_test::fail_once_at(
+            temp.path(),
+            io::Error::from_raw_os_error(nix::libc::EIO),
+            || retry.promote(),
+        )
+        .expect_err("a visible manifest still requires directory synchronization");
+        assert_eq!(error.raw_os_error(), Some(nix::libc::EIO));
+        assert_eq!(generation_candidates(temp.path()), selected);
+
         let retried = commit(temp.path(), b"new", Some(&selected[0].id));
         assert_eq!(retried, selected[0].id);
         assert_eq!(generation_candidates(temp.path()), selected);
@@ -941,7 +954,7 @@ mod tests {
         .expect("stage generation");
         std::mem::forget(staged);
 
-        cleanup_unselected_generations(temp.path());
+        prepare_online_generations(temp.path()).expect("prepare generations");
 
         let directories = std::fs::read_dir(temp.path().join(GENERATIONS_DIRECTORY))
             .expect("read generations")

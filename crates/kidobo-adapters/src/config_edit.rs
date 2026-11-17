@@ -3,9 +3,10 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use toml_edit::{Array, DocumentMut, Item, Table, value};
+use toml_edit::{Array, DocumentMut, Item, Table, Value, value};
 
 use crate::config::CONFIG_READ_LIMIT;
+use crate::config_management::append_value;
 use crate::limited_io::{read_to_string_with_limit, write_private_string_atomic_with_limit};
 use kidobo_app::AppError;
 use kidobo_core::config::{ConfigError, DEFAULT_ASN_CACHE_STALE_AFTER_SECS};
@@ -47,7 +48,7 @@ pub fn update_asn_bans(
         .unwrap_or_default();
 
     let mut before = BTreeSet::new();
-    before.extend(existing);
+    before.extend(existing.iter().copied());
     let mut after = before.clone();
     for asn in add {
         after.insert(*asn);
@@ -58,11 +59,20 @@ pub fn update_asn_bans(
 
     let added = after.difference(&before).copied().collect::<Vec<_>>();
     let removed = before.difference(&after).copied().collect::<Vec<_>>();
-    let mut values = Array::default();
-    for asn in after {
-        values.push(i64::from(asn));
+    if added.is_empty() && removed.is_empty() {
+        return Ok(AsnBanUpdateResult::default());
     }
-    asn_table.insert("banned", value(values));
+    let values = asn_table.entry("banned").or_insert(value(Array::new()));
+    if let Some(values) = values.as_array_mut() {
+        for (index, asn) in existing.into_iter().enumerate().rev() {
+            if !after.contains(&asn) {
+                remove_asn_value(values, index);
+            }
+        }
+        for asn in &added {
+            append_value(values, Value::from(i64::from(*asn)));
+        }
+    }
     if !asn_table.contains_key("cache_stale_after_secs") {
         asn_table.insert(
             "cache_stale_after_secs",
@@ -78,6 +88,33 @@ pub fn update_asn_bans(
         },
     )?;
     Ok(AsnBanUpdateResult { added, removed })
+}
+
+fn remove_asn_value(values: &mut Array, index: usize) {
+    let removed = values.remove(index);
+    // A comment after the previous element's comma belongs to this value's prefix in TOML.
+    if let Some(prefix) = removed
+        .decor()
+        .prefix()
+        .and_then(toml_edit::RawString::as_str)
+        .filter(|prefix| prefix.contains('#'))
+    {
+        if let Some(next) = values.get_mut(index) {
+            let next_prefix = next
+                .decor()
+                .prefix()
+                .and_then(toml_edit::RawString::as_str)
+                .unwrap_or_default();
+            let prefix = format!("{}{next_prefix}", prefix.trim_end_matches([' ', '\t']));
+            next.decor_mut().set_prefix(prefix);
+        } else {
+            let trailing = values.trailing().as_str().unwrap_or_default();
+            values.set_trailing(format!(
+                "{}{trailing}",
+                prefix.trim_end_matches([' ', '\t'])
+            ));
+        }
+    }
 }
 
 fn load_config_document(path: &Path) -> Result<DocumentMut, AppError> {
@@ -179,6 +216,77 @@ mod tests {
             let config = crate::config::load_config_from_file(&path).expect("config");
             assert_eq!(config.asn.banned, Vec::<u32>::new());
             assert_eq!(doc["asn"]["cache_stale_after_secs"].as_integer(), Some(123));
+        }
+    }
+
+    #[test]
+    fn asn_noops_preserve_original_file() {
+        #[cfg(unix)]
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        for (original, add) in [
+            ("# none configured\n", &[][..]),
+            (
+                "asn = { banned = [64513, 64_512, 64513] } # inline\n",
+                &[64512][..],
+            ),
+            (
+                "[asn]\nbanned = [\n    64513, # keep\n    64512,\n]\n",
+                &[64513][..],
+            ),
+        ] {
+            let temp = TempDir::new().expect("tempdir");
+            let path = temp.path().join("config.toml");
+            std::fs::write(&path, original).expect("fixture");
+            #[cfg(unix)]
+            let before = {
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640))
+                    .expect("set shared mode");
+                std::fs::metadata(&path).expect("original metadata")
+            };
+            assert_eq!(
+                update_asn_bans(&path, add, &[64514]).expect("no-op"),
+                super::AsnBanUpdateResult::default()
+            );
+            assert_eq!(
+                read_to_string_with_limit(&path, 65536).expect("read"),
+                original
+            );
+            #[cfg(unix)]
+            {
+                let after = std::fs::metadata(&path).expect("result metadata");
+                assert_eq!(after.ino(), before.ino());
+                assert_eq!(after.mode(), before.mode());
+            }
+        }
+    }
+
+    #[test]
+    fn asn_edits_keep_retained_element_comments() {
+        for (before, after) in [("[asn]\nbanned = ", "\n"), ("asn = { banned = ", " }\n")] {
+            let temp = TempDir::new().expect("tempdir");
+            let path = temp.path().join("config.toml");
+            std::fs::write(
+                &path,
+                format!("{before}[\n  # retained ASN\n  64_512, # comment after retained comma\n  64513,\n  # another retained ASN\n  64514, # final retained ASN\n]{after}"),
+            )
+            .expect("fixture");
+            let result = update_asn_bans(&path, &[64515], &[64513]).expect("edit");
+            assert_eq!(result.added, [64515]);
+            assert_eq!(result.removed, [64513]);
+            let rendered = read_to_string_with_limit(&path, 65536).expect("read");
+            assert!(rendered.starts_with(before), "{rendered}");
+            for fragment in [
+                "# retained ASN\n  64_512, # comment after retained comma\n",
+                "# another retained ASN\n  64514, # final retained ASN\n",
+            ] {
+                assert!(rendered.contains(fragment), "{rendered}");
+            }
+            let config = kidobo_core::config::Config::from_toml_str(&format!(
+                "{rendered}\n[ipset]\nset_name = 'kidobo'\n"
+            ))
+            .expect("valid TOML");
+            assert_eq!(config.asn.banned, [64512, 64514, 64515]);
         }
     }
 

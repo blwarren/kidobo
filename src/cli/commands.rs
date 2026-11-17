@@ -74,14 +74,14 @@ pub fn dispatch_with(command: Command, io: &mut CliIo<'_>) -> Result<(), KidoboE
             duration,
             application,
         } => {
-            let changed = run_ban_command(
+            let change = run_ban_command(
                 target.as_deref(),
                 file.as_deref(),
                 asn.as_deref(),
                 duration,
                 io,
             )?;
-            super::mutation::finish_change(application.mode(), changed, io, &mut |io| {
+            super::mutation::finish_change(application.mode(), change, io, &mut |io| {
                 run_sync_command(false, io)
             })
         }
@@ -92,9 +92,9 @@ pub fn dispatch_with(command: Command, io: &mut CliIo<'_>) -> Result<(), KidoboE
             yes,
             application,
         } => {
-            let changed =
+            let change =
                 run_unban_command(target.as_deref(), file.as_deref(), asn.as_deref(), yes, io)?;
-            super::mutation::finish_change(application.mode(), changed, io, &mut |io| {
+            super::mutation::finish_change(application.mode(), change, io, &mut |io| {
                 run_sync_command(false, io)
             })
         }

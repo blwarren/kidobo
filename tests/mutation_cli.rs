@@ -1,6 +1,7 @@
 #![cfg(unix)]
 
 use std::fs;
+use std::os::unix::fs::MetadataExt;
 
 use kidobo_adapters::limited_io::read_to_string_with_limit;
 
@@ -42,6 +43,9 @@ fn asn_cleanup_only_prompts_and_preserves_overlapping_local_bans() {
         &[398_324],
         "# keep\n203.0.113.0/24\n203.0.113.7\n2001:db8:1::/48\n2001:db8::/32\n198.51.100.0/24\n",
     );
+    let config_path = fixture.root().join("config/config.toml");
+    let original = read_to_string_with_limit(&config_path, 65536).expect("original config");
+    let metadata = fs::metadata(&config_path).expect("original config metadata");
     let output = fixture
         .spawn(
             &["ban", "--asn", "AS398324"],
@@ -71,6 +75,13 @@ fn asn_cleanup_only_prompts_and_preserves_overlapping_local_bans() {
         "# keep\n203.0.113.7\n2001:db8::/32\n198.51.100.0/24\n"
     );
     assert_eq!(fixture.tool_log(), "");
+    let after = fs::metadata(&config_path).expect("config metadata after cleanup");
+    assert_eq!(
+        read_to_string_with_limit(&config_path, 65536).expect("config after cleanup"),
+        original
+    );
+    assert_eq!(after.ino(), metadata.ino());
+    assert_eq!(after.mode(), metadata.mode());
 
     for token in ["AS398324", "398324", "as398324"] {
         let repeated = fixture
@@ -204,6 +215,36 @@ fn asn_unban_reports_counts_and_omits_zero_cache_deletions() {
         assert_eq!(repeated.stdout, "No saved ASN bans matched the request.\n");
         assert_eq!(fixture.tool_log(), "");
     }
+}
+
+#[test]
+fn asn_unban_without_a_saved_match_still_cleans_its_cache() {
+    let fixture = asn_fixture(&[], "");
+    let config_path = fixture.root().join("config/config.toml");
+    let original = read_to_string_with_limit(&config_path, 65536).expect("original config");
+    let before = fs::metadata(&config_path).expect("original config metadata");
+    let output = fixture
+        .spawn(
+            &["unban", "--asn", "AS398324"],
+            100,
+            OutputDestination::Pipe,
+            &[],
+        )
+        .wait();
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(
+        output.stdout,
+        "No saved ASN bans matched the request.\nDeleted 1 ASN cache file.\n"
+    );
+    let after = fs::metadata(&config_path).expect("config metadata after cleanup");
+    assert_eq!(
+        read_to_string_with_limit(&config_path, 65536).expect("config after cleanup"),
+        original
+    );
+    assert_eq!(after.ino(), before.ino());
+    assert_eq!(after.mode(), before.mode());
+    assert!(!fixture.root().join("cache/asn/as398324.iplist").exists());
+    assert_eq!(fixture.tool_log(), "");
 }
 
 #[test]

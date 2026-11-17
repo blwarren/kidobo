@@ -1808,13 +1808,6 @@ fn runner_cleanup_preserves_legacy_results_and_ignores_stale_captures() {
     fs::create_dir(&root).expect("legacy run");
     fs::create_dir(root.join(".capture")).expect("capture left by a killed old runner");
     fs::write(root.join("0001.stdout"), "old raw evidence").expect("old log");
-    let original_result =
-        json!({"tag":"v1.2.3", "results":[{"distro":"debian-13","error":"original failure"}]});
-    fs::write(
-        root.join("results.json"),
-        serde_json::to_vec(&original_result).expect("serialize"),
-    )
-    .expect("legacy results");
     fs::write(
         root.join("ownership.json"),
         serde_json::to_vec(&Owned {
@@ -1825,16 +1818,45 @@ fn runner_cleanup_preserves_legacy_results_and_ignores_stale_captures() {
         .expect("serialize ownership"),
     )
     .expect("legacy ownership");
-    let (program, _) = fake_incus(&temp);
-    let mut runner = runner_with_incus(&root, &program);
-    clean(&mut runner, &setup_config()).expect("already deleted guest cleans successfully");
-    assert_eq!(
-        runner.report.document["results"],
-        original_result["results"]
+    let program = temp.path().join("fake-incus");
+    executable(
+        &program,
+        &format!(
+            r#"#!/bin/bash
+case "$1:$2:${{3:-}}" in
+    query:/1.0:) printf '%s\n' '{{"environment":{{"server_name":"{}"}}}}' ;;
+    --project:test-project:list) printf '[]\n' ;;
+    *) exit 91 ;;
+esac
+"#,
+            temp.path().display()
+        ),
     );
-    assert_eq!(
-        read_text(&root.join("0001.stdout")).expect("old evidence"),
-        "old raw evidence"
-    );
-    assert_eq!(runner.report.document["commands"][0]["code"], 0);
+    for original_wall_time in [None, Some(json!(123.45))] {
+        let mut original_result =
+            json!({"tag":"v1.2.3", "results":[{"distro":"debian-13","error":"original failure"}]});
+        if let Some(value) = &original_wall_time {
+            original_result["run_wall_seconds"] = value.clone();
+        }
+        fs::write(
+            root.join("results.json"),
+            serde_json::to_vec(&original_result).expect("serialize"),
+        )
+        .expect("legacy results");
+
+        let mut runner = runner_with_incus(&root, &program);
+        clean_after_run(&mut runner, &setup_config()).expect("already deleted guest cleans");
+        let report = Report::open(&root).expect("reopen results").document;
+        assert_eq!(report.get("run_wall_seconds"), original_wall_time.as_ref());
+        assert_eq!(report["results"], original_result["results"]);
+        assert_eq!(
+            read_text(&root.join("0001.stdout")).expect("old evidence"),
+            "old raw evidence"
+        );
+        assert_eq!(report["commands"][1]["code"], 0);
+        let stage = &report["stages"][0];
+        assert_eq!(stage["name"], "cleanup requested after run");
+        assert_eq!(stage["status"], "passed");
+        assert!(stage["active_seconds"].as_f64().expect("stage duration") > 0.0);
+    }
 }

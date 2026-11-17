@@ -4,6 +4,7 @@ use std::path::Path;
 use log::warn;
 
 use crate::cli::CliIo;
+use crate::cli::mutation::SourceChange;
 use crate::cli::presentation::format_utc;
 use crate::error::KidoboError;
 use kidobo_adapters::blocklist_file::FileBlocklistRepository;
@@ -15,9 +16,9 @@ use kidobo_adapters::temporary_bans::{FileTemporaryBanRepository, SystemClock};
 use kidobo_app::AppError;
 use kidobo_app::blocklist::BanDuration;
 use kidobo_app::blocklist::{
-    self, AsnBanDependencies, AsnBanRequest, AsnUnbanDependencies, AsnUnbanRequest, BanChange,
-    BanDependencies, BanOutcome, BanRequest, BlocklistInput, UnbanApplyDependencies, UnbanDecision,
-    UnbanPreparationDependencies, UnbanRequest,
+    self, AsnBanDependencies, AsnBanOutcome, AsnBanRequest, AsnUnbanDependencies, AsnUnbanOutcome,
+    AsnUnbanRequest, BanChange, BanDependencies, BanOutcome, BanRequest, BlocklistInput,
+    UnbanApplyDependencies, UnbanDecision, UnbanPreparationDependencies, UnbanRequest,
 };
 
 pub fn run_ban_command(
@@ -26,7 +27,7 @@ pub fn run_ban_command(
     asn: Option<&[String]>,
     duration: Option<BanDuration>,
     io: &mut CliIo<'_>,
-) -> Result<bool, KidoboError> {
+) -> Result<SourceChange, KidoboError> {
     let paths = path_resolution_input_from_process(None);
     if let Some(tokens) = asn {
         let outcome = blocklist::execute_ban_asn(
@@ -37,52 +38,15 @@ pub fn run_ban_command(
             },
             &asn_ban_dependencies(),
         )?;
-        for notice in &outcome.notices {
-            warn!("{}", notice.message);
-        }
-        if let Some(duration) = duration {
-            render_ban_changes(&outcome.temporary_changes, Some(duration), io)?;
-            return Ok(changes_saved(&outcome.temporary_changes));
-        }
-        if !outcome.added.is_empty() {
-            output(
-                io,
-                format_args!(
-                    "Added {} ASN {}: {}",
-                    outcome.added.len(),
-                    if outcome.added.len() == 1 {
-                        "ban"
-                    } else {
-                        "bans"
-                    },
-                    format_asn_list(&outcome.added)
-                ),
-            )?;
-        }
-        if !outcome.already_present.is_empty() {
-            output(
-                io,
-                format_args!(
-                    "Already permanently banned: {}",
-                    format_asn_list(&outcome.already_present)
-                ),
-            )?;
-        }
-        if outcome.removed_duplicate_entries > 0 {
-            output(
-                io,
-                format_args!(
-                    "Removed {} local {} matching ASN prefixes.",
-                    outcome.removed_duplicate_entries,
-                    if outcome.removed_duplicate_entries == 1 {
-                        "entry"
-                    } else {
-                        "entries"
-                    }
-                ),
-            )?;
-        }
-        return Ok(!outcome.added.is_empty() || outcome.removed_duplicate_entries > 0);
+        let changed = if duration.is_some() {
+            changes_saved(&outcome.temporary_changes)
+        } else {
+            !outcome.added.is_empty() || outcome.removed_duplicate_entries > 0
+        };
+        return Ok(SourceChange {
+            changed,
+            output: render_asn_ban(&outcome, duration, io),
+        });
     }
 
     let input = command_input(target, file)?;
@@ -98,19 +62,22 @@ pub fn run_ban_command(
         BanOutcome::Applied(changes) => (changes, Vec::new()),
         BanOutcome::TemporaryApplied { changes, notices } => (changes, notices),
         BanOutcome::InvalidTargets(targets) => {
-            return report_invalid_targets(&targets, io).map(|()| false);
+            return report_invalid_targets(&targets, io);
         }
         BanOutcome::EmptyFile => {
-            output(io, format_args!("no blocklist targets loaded from file"))?;
-            return Ok(false);
+            return Ok(SourceChange {
+                changed: false,
+                output: output(io, format_args!("no blocklist targets loaded from file")),
+            });
         }
     };
     for notice in notices {
         warn!("{}", notice.message);
     }
-    render_ban_changes(&changes, duration, io)?;
-
-    Ok(changes_saved(&changes))
+    Ok(SourceChange {
+        changed: changes_saved(&changes),
+        output: render_ban_changes(&changes, duration, io),
+    })
 }
 
 pub fn run_unban_command(
@@ -119,7 +86,7 @@ pub fn run_unban_command(
     asn: Option<&[String]>,
     yes: bool,
     io: &mut CliIo<'_>,
-) -> Result<bool, KidoboError> {
+) -> Result<SourceChange, KidoboError> {
     let paths = path_resolution_input_from_process(None);
     if let Some(tokens) = asn {
         let outcome = blocklist::execute_unban_asn(
@@ -129,41 +96,10 @@ pub fn run_unban_command(
             },
             &asn_unban_dependencies(),
         )?;
-        for notice in &outcome.notices {
-            warn!("{}", notice.message);
-        }
-        if outcome.removed.is_empty() {
-            output(io, format_args!("No saved ASN bans matched the request."))?;
-        } else {
-            output(
-                io,
-                format_args!(
-                    "Removed {} ASN {}: {}",
-                    outcome.removed.len(),
-                    if outcome.removed.len() == 1 {
-                        "ban"
-                    } else {
-                        "bans"
-                    },
-                    format_asn_list(&outcome.removed)
-                ),
-            )?;
-        }
-        if outcome.deleted_cache_files > 0 {
-            output(
-                io,
-                format_args!(
-                    "Deleted {} ASN cache {}.",
-                    outcome.deleted_cache_files,
-                    if outcome.deleted_cache_files == 1 {
-                        "file"
-                    } else {
-                        "files"
-                    }
-                ),
-            )?;
-        }
-        return Ok(!outcome.removed.is_empty());
+        return Ok(SourceChange {
+            changed: !outcome.removed.is_empty(),
+            output: render_asn_unban(&outcome, io),
+        });
     }
 
     let input = command_input(target, file)?;
@@ -173,29 +109,140 @@ pub fn run_unban_command(
     let preview = match preparation {
         blocklist::UnbanPreparation::Ready(preview) => preview,
         blocklist::UnbanPreparation::InvalidTargets(targets) => {
-            report_invalid_targets(&targets, io)?;
-            return Ok(false);
+            return report_invalid_targets(&targets, io);
         }
         blocklist::UnbanPreparation::EmptyFile => {
-            output(io, format_args!("no blocklist targets loaded from file"))?;
-            return Ok(false);
+            return Ok(SourceChange {
+                changed: false,
+                output: output(io, format_args!("no blocklist targets loaded from file")),
+            });
         }
     };
-    let remove_partial = confirm_partial_matches(&preview, file_mode, yes, io)?;
+    let (remove_partial, preview_output) = if preview.partial_entries.is_empty() {
+        (false, Ok(()))
+    } else if yes || !io.interactive() {
+        (
+            yes,
+            render_partial_matches(&preview, file_mode, io).and_then(|()| {
+                let message = if yes {
+                    "auto-approving removal of partial matches"
+                } else {
+                    "Keeping partial matches; use --yes to approve their removal."
+                };
+                output(io, format_args!("{message}"))
+            }),
+        )
+    } else {
+        render_partial_matches(&preview, file_mode, io)?;
+        (confirm_partial_matches(io)?, Ok(()))
+    };
     let outcome = blocklist::apply_unban(
         &request,
         &preview,
         &UnbanDecision { remove_partial },
         &unban_apply_dependencies(),
     )?;
-    render_unban_outcome(&outcome, file_mode, io)
+    Ok(SourceChange {
+        changed: outcome.total_removed() != 0,
+        output: preview_output.and_then(|()| render_unban_outcome(&outcome, file_mode, io)),
+    })
+}
+
+fn render_asn_ban(
+    outcome: &AsnBanOutcome,
+    duration: Option<BanDuration>,
+    io: &mut CliIo<'_>,
+) -> Result<(), KidoboError> {
+    for notice in &outcome.notices {
+        warn!("{}", notice.message);
+    }
+    if duration.is_some() {
+        return render_ban_changes(&outcome.temporary_changes, duration, io);
+    }
+    if !outcome.added.is_empty() {
+        output(
+            io,
+            format_args!(
+                "Added {} ASN {}: {}",
+                outcome.added.len(),
+                if outcome.added.len() == 1 {
+                    "ban"
+                } else {
+                    "bans"
+                },
+                format_asn_list(&outcome.added)
+            ),
+        )?;
+    }
+    if !outcome.already_present.is_empty() {
+        output(
+            io,
+            format_args!(
+                "Already permanently banned: {}",
+                format_asn_list(&outcome.already_present)
+            ),
+        )?;
+    }
+    if outcome.removed_duplicate_entries > 0 {
+        output(
+            io,
+            format_args!(
+                "Removed {} local {} matching ASN prefixes.",
+                outcome.removed_duplicate_entries,
+                if outcome.removed_duplicate_entries == 1 {
+                    "entry"
+                } else {
+                    "entries"
+                }
+            ),
+        )?;
+    }
+    Ok(())
+}
+
+fn render_asn_unban(outcome: &AsnUnbanOutcome, io: &mut CliIo<'_>) -> Result<(), KidoboError> {
+    for notice in &outcome.notices {
+        warn!("{}", notice.message);
+    }
+    if outcome.removed.is_empty() {
+        output(io, format_args!("No saved ASN bans matched the request."))?;
+    } else {
+        output(
+            io,
+            format_args!(
+                "Removed {} ASN {}: {}",
+                outcome.removed.len(),
+                if outcome.removed.len() == 1 {
+                    "ban"
+                } else {
+                    "bans"
+                },
+                format_asn_list(&outcome.removed)
+            ),
+        )?;
+    }
+    if outcome.deleted_cache_files > 0 {
+        output(
+            io,
+            format_args!(
+                "Deleted {} ASN cache {}.",
+                outcome.deleted_cache_files,
+                if outcome.deleted_cache_files == 1 {
+                    "file"
+                } else {
+                    "files"
+                }
+            ),
+        )?;
+    }
+    Ok(())
 }
 
 fn render_unban_outcome(
     outcome: &blocklist::UnbanOutcome,
     file_mode: bool,
     io: &mut CliIo<'_>,
-) -> Result<bool, KidoboError> {
+) -> Result<(), KidoboError> {
     if outcome.total_removed() == 0 {
         if file_mode {
             let action = if outcome.had_partial_matches {
@@ -213,7 +260,7 @@ fn render_unban_outcome(
                 format_args!("no blocklist entries match {}", outcome.target_label),
             )?;
         }
-        return Ok(false);
+        return Ok(());
     }
     output(
         io,
@@ -228,7 +275,7 @@ fn render_unban_outcome(
             outcome.target_label
         ),
     )?;
-    Ok(true)
+    Ok(())
 }
 
 fn ban_dependencies() -> BanDependencies<'static> {
@@ -337,7 +384,10 @@ fn render_ban_changes(
     Ok(())
 }
 
-fn report_invalid_targets(targets: &[String], io: &mut CliIo<'_>) -> Result<(), KidoboError> {
+fn report_invalid_targets(
+    targets: &[String],
+    io: &mut CliIo<'_>,
+) -> Result<SourceChange, KidoboError> {
     for target in targets {
         writeln!(
             io.stderr,
@@ -345,25 +395,17 @@ fn report_invalid_targets(targets: &[String], io: &mut CliIo<'_>) -> Result<(), 
             crate::cli::presentation::escape(target)
         )?;
     }
-    if targets.is_empty() {
-        Ok(())
-    } else {
-        Err(AppError::BlocklistInvalidTargets {
-            count: targets.len(),
-        }
-        .into())
+    Err(AppError::BlocklistInvalidTargets {
+        count: targets.len(),
     }
+    .into())
 }
 
-fn confirm_partial_matches(
+fn render_partial_matches(
     preview: &blocklist::UnbanPreview,
     file_mode: bool,
-    yes: bool,
     io: &mut CliIo<'_>,
-) -> Result<bool, KidoboError> {
-    if preview.partial_entries.is_empty() {
-        return Ok(false);
-    }
+) -> Result<(), KidoboError> {
     if file_mode {
         output(
             io,
@@ -381,20 +423,10 @@ fn confirm_partial_matches(
     for entry in &preview.partial_entries {
         output(io, format_args!("  - {entry}"))?;
     }
-    if yes {
-        output(
-            io,
-            format_args!("auto-approving removal of partial matches"),
-        )?;
-        return Ok(true);
-    }
-    if !io.interactive() {
-        output(
-            io,
-            format_args!("Keeping partial matches; use --yes to approve their removal."),
-        )?;
-        return Ok(false);
-    }
+    Ok(())
+}
+
+fn confirm_partial_matches(io: &mut CliIo<'_>) -> Result<bool, KidoboError> {
     write!(io.stdout, "Remove these entries as well? [y/N]: ")?;
     io.stdout
         .flush()

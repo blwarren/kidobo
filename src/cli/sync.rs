@@ -61,15 +61,20 @@ pub fn run_sync_command(timer: bool, io: &mut CliIo<'_>) -> Result<(), KidoboErr
             return Err(error.into());
         }
     };
-    if human {
-        render_summary(view, io.stdout, &outcome, started.elapsed())?;
-    }
-    if crate::cli::interrupt::was_interrupted() {
-        info!("sync enforcement completed after SIGINT");
-        return Err(KidoboError::Interrupted);
+    let output = if human {
+        render_summary(view, io.stdout, &outcome, started.elapsed())
+    } else {
+        Ok(())
+    };
+    let interrupted = crate::cli::interrupt::was_interrupted();
+    output.map_err(|source| KidoboError::SyncOutputFailed {
+        source,
+        interrupted,
+    })?;
+    if interrupted {
+        return Err(KidoboError::SyncInterruptedAfterCompletion);
     }
     observer.stage_completed("sync_pipeline_complete");
-
     if !human {
         log_summary(&outcome);
     }
@@ -98,7 +103,7 @@ fn render_summary(
     output: &mut dyn Write,
     outcome: &sync::SyncOutcome,
     elapsed: Duration,
-) -> Result<(), KidoboError> {
+) -> std::io::Result<()> {
     let observations = outcome
         .sources
         .iter()

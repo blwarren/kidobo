@@ -12,13 +12,13 @@ pub enum ConditionalFetchResult {
     Network(HttpResponse),
     /// HTTP 304 with a usable validated cache.
     CacheNotModified,
-    /// Request failure or unusable 304; caller should attempt cache fallback.
+    /// Request failure or partial response; caller should attempt cache fallback.
     FallbackCache,
 }
 
 /// Applies conditional validators and retries an unusable 304 without validators.
 ///
-/// Network errors are logged and represented as [`ConditionalFetchResult::FallbackCache`].
+/// Network errors and unsolicited partial responses use [`ConditionalFetchResult::FallbackCache`].
 pub fn fetch_with_conditional_cache(
     client: &dyn HttpClient,
     url: &str,
@@ -43,27 +43,32 @@ pub fn fetch_with_conditional_cache(
         }
     };
 
-    if response.status != StatusCode::NOT_MODIFIED {
-        return ConditionalFetchResult::Network(response);
-    }
-
-    if has_usable_cache {
-        return ConditionalFetchResult::CacheNotModified;
-    }
-
-    let unconditional_request = HttpRequest {
-        url: url.to_string(),
-        if_none_match: None,
-        if_modified_since: None,
-        max_body_bytes,
+    let response = if response.status == StatusCode::NOT_MODIFIED {
+        if has_usable_cache {
+            return ConditionalFetchResult::CacheNotModified;
+        }
+        let unconditional_request = HttpRequest {
+            url: url.to_string(),
+            if_none_match: None,
+            if_modified_since: None,
+            max_body_bytes,
+        };
+        match client.fetch(unconditional_request) {
+            Ok(response) => response,
+            Err(err) => {
+                warn!("{log_subject} refetch failed for {url} after 304: {err}");
+                return ConditionalFetchResult::FallbackCache;
+            }
+        }
+    } else {
+        response
     };
 
-    match client.fetch(unconditional_request) {
-        Ok(response) => ConditionalFetchResult::Network(response),
-        Err(err) => {
-            warn!("{log_subject} refetch failed for {url} after 304: {err}");
-            ConditionalFetchResult::FallbackCache
-        }
+    if response.status == StatusCode::PARTIAL_CONTENT {
+        warn!("{log_subject} fetch failed for {url}: unexpected partial response (HTTP 206)");
+        ConditionalFetchResult::FallbackCache
+    } else {
+        ConditionalFetchResult::Network(response)
     }
 }
 
@@ -239,5 +244,44 @@ mod tests {
             client.requests(),
             [expected_request(false), expected_request(false)]
         );
+    }
+
+    #[test]
+    fn rejects_partial_content_on_the_first_request_and_on_refetch() {
+        for retry in [false, true] {
+            let mut responses = Vec::new();
+            if retry {
+                responses.push(Ok(HttpResponse {
+                    status: StatusCode::NOT_MODIFIED,
+                    body: Vec::new(),
+                    etag: None,
+                    last_modified: None,
+                }));
+            }
+            responses.push(Ok(HttpResponse {
+                status: StatusCode::PARTIAL_CONTENT,
+                body: b"192.0.2.0/24".to_vec(),
+                etag: None,
+                last_modified: None,
+            }));
+            let client = MockHttpClient::new(responses);
+
+            let result = fetch_with_conditional_cache(
+                &client,
+                "https://example.com/feed.txt",
+                1024,
+                Some("etag-1".to_string()),
+                Some("Mon, 01 Jan 2024 00:00:00 GMT".to_string()),
+                !retry,
+                "remote source",
+            );
+
+            assert_eq!(result, ConditionalFetchResult::FallbackCache);
+            let mut expected = vec![expected_request(true)];
+            if retry {
+                expected.push(expected_request(false));
+            }
+            assert_eq!(client.requests(), expected);
+        }
     }
 }

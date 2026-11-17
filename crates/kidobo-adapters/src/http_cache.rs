@@ -10,8 +10,7 @@ use thiserror::Error;
 
 use crate::cache_generation::{
     GenerationCandidate, GenerationFile, GenerationFileLimit, StagedGeneration,
-    cleanup_unselected_generations, generation_candidates, generation_contents_match,
-    stage_generation,
+    generation_candidates, generation_contents_match, prepare_online_generations, stage_generation,
 };
 use crate::cached_fetch::{read_optional_json_lossy, read_validated_bytes_lossy};
 use crate::hash::sha256_hex;
@@ -109,7 +108,7 @@ struct ValidatedRemoteResponse {
     normalized: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 struct LoadedRemoteCache {
     networks: Option<Vec<CanonicalCidr>>,
     metadata: Option<RemoteCacheMetadata>,
@@ -144,6 +143,16 @@ pub(crate) struct OfflineRemoteGeneration {
 /// Failure to read legacy cache data or commit a validated v2 generation.
 #[derive(Debug, Error)]
 pub enum HttpCacheError {
+    /// The selected manifest could not be made durable before reuse.
+    #[error("failed to synchronize remote cache manifest directory {path}: {source}")]
+    SyncManifestDirectory {
+        /// Cache generation store path.
+        path: PathBuf,
+        /// Filesystem diagnostic.
+        #[source]
+        source: std::io::Error,
+    },
+
     /// Cache metadata or v2 manifest write failed.
     #[error("failed to write metadata cache {path}: {source}")]
     WriteMetadata {
@@ -350,7 +359,13 @@ fn prepare_iplist_with_cache_limit(
     let max_bytes = max_http_body_bytes(env);
     let feed_limits = RemoteFeedLimits::from_maxelem(maxelem);
     let cache_paths = cache_paths_for_url(cache_dir, url);
-    cleanup_unselected_generations(&remote_generation_store(cache_dir, url));
+    let generation_store = remote_generation_store(cache_dir, url);
+    prepare_online_generations(&generation_store).map_err(|source| {
+        HttpCacheError::SyncManifestDirectory {
+            path: generation_store,
+            source,
+        }
+    })?;
     let cached = read_remote_cache(
         cache_dir,
         url,
@@ -613,6 +628,16 @@ fn read_remote_cache(
     }
 
     let metadata = read_optional_metadata_lossy(legacy_paths);
+    if metadata
+        .as_ref()
+        .is_some_and(|metadata| !cache_url_matches(&metadata.url, Some(url)))
+    {
+        warn!(
+            "remote legacy cache URL is missing or differs from the configured URL: {}",
+            legacy_paths.meta_path.display()
+        );
+        return Ok(LoadedRemoteCache::default());
+    }
     let networks = read_optional_iplist_networks(legacy_paths, metadata.as_ref(), feed_limits)?;
     Ok(LoadedRemoteCache {
         networks,
@@ -648,13 +673,14 @@ pub(crate) fn remote_generation_store(cache_dir: &Path, url: &str) -> PathBuf {
         .join(url_hash_prefix(url))
 }
 
-pub(crate) fn collect_offline_remote_generations(
+pub(crate) fn visit_offline_remote_generations(
     cache_dir: &Path,
-) -> Result<Vec<OfflineRemoteGeneration>, std::io::Error> {
+    mut visit: impl FnMut(OfflineRemoteGeneration),
+) -> Result<(), std::io::Error> {
     let stores_root = cache_dir.join(V2_REMOTE_CACHE_DIRECTORY);
     let entries = match std::fs::read_dir(&stores_root) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error),
     };
     let mut stores = Vec::new();
@@ -676,7 +702,6 @@ pub(crate) fn collect_offline_remote_generations(
     }
     stores.sort_by(|left, right| left.0.cmp(&right.0));
 
-    let mut generations = Vec::new();
     for (url_hash, store) in stores {
         for candidate in generation_candidates(&store) {
             if !remote_generation_contents_match(&candidate, MAX_HTTP_BODY_BYTES) {
@@ -687,7 +712,7 @@ pub(crate) fn collect_offline_remote_generations(
             else {
                 continue;
             };
-            generations.push(OfflineRemoteGeneration {
+            visit(OfflineRemoteGeneration {
                 url_hash,
                 iplist_path: generation.iplist_path,
                 label: generation.metadata.url.trim().to_string(),
@@ -696,6 +721,15 @@ pub(crate) fn collect_offline_remote_generations(
             break;
         }
     }
+    Ok(())
+}
+
+#[cfg(test)]
+fn collect_offline_remote_generations(
+    cache_dir: &Path,
+) -> Result<Vec<OfflineRemoteGeneration>, std::io::Error> {
+    let mut generations = Vec::new();
+    visit_offline_remote_generations(cache_dir, |generation| generations.push(generation))?;
     Ok(generations)
 }
 
@@ -733,10 +767,7 @@ fn read_validated_remote_generation(
         raw_path: directory.join(GENERATION_RAW_FILE),
     };
     let metadata = read_optional_metadata_lossy(&paths)?;
-    let normalized_url = metadata.url.trim();
-    if normalized_url.is_empty()
-        || expected_url.is_some_and(|expected| normalized_url != expected.trim())
-    {
+    if !cache_url_matches(&metadata.url, expected_url) {
         warn!(
             "remote cache generation URL is missing or differs from the configured URL: {}",
             directory.display()
@@ -773,6 +804,11 @@ fn read_validated_remote_generation(
         iplist,
         metadata,
     })
+}
+
+fn cache_url_matches(cached_url: &str, expected_url: Option<&str>) -> bool {
+    let cached_url = cached_url.trim();
+    !cached_url.is_empty() && expected_url.is_none_or(|expected| cached_url == expected.trim())
 }
 
 fn is_url_hash(value: &str) -> bool {
@@ -1962,6 +1998,135 @@ mod tests {
             .filter(|entry| entry.path().is_dir())
             .collect::<Vec<_>>();
         assert_eq!(generation_directories.len(), 2);
+    }
+
+    #[test]
+    fn partial_response_uses_complete_selected_generation_in_sync_and_preview() {
+        let temp = TempDir::new().expect("root");
+        let url = "https://example.test/feed";
+        let env = BTreeMap::new();
+        let complete = b"192.0.2.0/24\n203.0.113.0/24";
+        let seed = MockHttpClient::new(vec![Ok(network_response_for_test(complete))]);
+        let expected = fetch_iplist_with_cache(&seed, url, temp.path(), &env)
+            .expect("seed cache")
+            .networks;
+        assert_eq!(expected.len(), 2);
+        let before = snapshot(temp.path());
+        let mut partial = network_response_for_test(b"192.0.2.0/24");
+        partial.status = StatusCode::PARTIAL_CONTENT;
+
+        let client = MockHttpClient::new(vec![Ok(partial.clone())]);
+        let sync = prepare_iplist_with_cache(&client, url, temp.path(), &env, 100)
+            .expect("sync source fallback");
+        assert_eq!(sync.loaded.source, CacheSource::FallbackCache);
+        assert_eq!(sync.loaded.networks, expected);
+        assert!(sync.pending_promotion.is_none());
+
+        let client = MockHttpClient::new(vec![Ok(partial)]);
+        let preview = read_iplist_for_preview(Some(&client), url, temp.path(), &env, 100)
+            .expect("preview fallback");
+        assert_eq!(preview.provenance, SourceProvenance::FallbackCache);
+        assert_eq!(preview.networks, expected);
+        assert_eq!(snapshot(temp.path()), before);
+    }
+
+    #[test]
+    fn online_retry_confirms_manifest_durability_before_pruning_or_accepting_304() {
+        use crate::limited_io::directory_sync_test::fail_once_at;
+
+        let temp = TempDir::new().expect("root");
+        let url = "https://example.test/feed";
+        let env = BTreeMap::new();
+        let store = remote_generation_store(temp.path(), url);
+        let client = MockHttpClient::new(vec![Ok(network_response_for_test(b"192.0.2.0/24"))]);
+        let staged = prepare_iplist_with_cache(&client, url, temp.path(), &env, 100)
+            .expect("stage first refresh")
+            .pending_promotion
+            .expect("pending generation");
+        let error = fail_once_at(
+            &store,
+            std::io::Error::from_raw_os_error(nix::libc::EIO),
+            || staged.promote(),
+        )
+        .expect_err("publication visible but directory sync failed");
+        assert_eq!(error.raw_os_error(), Some(nix::libc::EIO));
+
+        let unselected = store.join("generations").join(".staging-unselected");
+        fs::create_dir(&unselected).expect("unselected generation");
+        let response = HttpResponse {
+            status: StatusCode::NOT_MODIFIED,
+            body: Vec::new(),
+            etag: None,
+            last_modified: None,
+        };
+        let client = MockHttpClient::new(vec![Ok(response)]);
+        let before = snapshot(temp.path());
+        let failed = fail_once_at(
+            &store,
+            std::io::Error::from_raw_os_error(nix::libc::EIO),
+            || prepare_iplist_with_cache(&client, url, temp.path(), &env, 100),
+        );
+        assert!(matches!(
+            failed,
+            Err(super::HttpCacheError::SyncManifestDirectory { source, .. })
+                if source.raw_os_error() == Some(nix::libc::EIO)
+        ));
+        assert_eq!(client.requests(), [] as [HttpRequest; 0]);
+        assert_eq!(snapshot(temp.path()), before);
+
+        let prepared = prepare_iplist_with_cache(&client, url, temp.path(), &env, 100)
+            .expect("retry with durable manifest");
+        assert_eq!(prepared.loaded.source, CacheSource::CacheNotModified);
+        assert_eq!(prepared.loaded.networks.len(), 1);
+        assert!(prepared.pending_promotion.is_none());
+        assert!(!unselected.exists());
+    }
+
+    #[test]
+    fn legacy_cache_url_must_match_when_metadata_is_available() {
+        let url = "https://example.test/feed";
+        let env = BTreeMap::new();
+        for (recorded_url, usable) in [
+            (None, true),
+            (Some(url), true),
+            (Some("https://example.test/other"), false),
+        ] {
+            let temp = TempDir::new().expect("root");
+            let paths = cache_paths_for_url(temp.path(), url);
+            let iplist = b"192.0.2.0/24\n";
+            fs::write(&paths.iplist_path, iplist).expect("legacy list");
+            if let Some(recorded_url) = recorded_url {
+                let meta = RemoteCacheMetadata {
+                    url: recorded_url.to_string(),
+                    etag: Some("legacy-etag".to_string()),
+                    last_modified: Some("Mon, 01 Jan 2024 00:00:00 GMT".to_string()),
+                    sha256_raw: sha256_hex(iplist),
+                    sha256_iplist: sha256_hex(iplist),
+                };
+                fs::write(
+                    &paths.meta_path,
+                    serde_json::to_vec(&meta).expect("metadata JSON"),
+                )
+                .expect("legacy metadata");
+            }
+            assert_eq!(
+                super::inspect_cached_source(temp.path(), url, 100).expect("source inspection"),
+                usable.then_some("compatible legacy cache")
+            );
+            let preview = read_iplist_for_preview(None, url, temp.path(), &env, 100)
+                .expect("offline preview");
+            assert_eq!(preview.networks.len(), usize::from(usable));
+            let client = MockHttpClient::new(vec![Err(HttpClientError::Request {
+                reason: "offline".to_string(),
+            })]);
+            let result = prepare_iplist_with_cache(&client, url, temp.path(), &env, 100)
+                .expect("refresh fallback");
+            assert_eq!(result.loaded.networks, preview.networks);
+            let requests = client.requests();
+            let matching_metadata = recorded_url == Some(url);
+            assert_eq!(requests[0].if_none_match.is_some(), matching_metadata);
+            assert_eq!(requests[0].if_modified_since.is_some(), matching_metadata);
+        }
     }
 
     #[test]

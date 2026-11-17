@@ -106,6 +106,49 @@ fn source_listing_is_offline_and_reports_unknown_freshness_without_ansi() {
 }
 
 #[test]
+fn source_listing_rejects_a_legacy_cache_with_a_different_recorded_url() {
+    use kidobo_adapters::hash::sha256_hex;
+    use kidobo_adapters::http_cache::{RemoteCacheMetadata, cache_paths_for_url};
+
+    let fixture = Fixture::new(INLINE_CONFIG, "");
+    let url = "https://feed.example/list";
+    let paths = cache_paths_for_url(&fixture.root().join("cache/remote"), url);
+    let iplist = b"192.0.2.0/24\n";
+    fs::write(paths.iplist_path, iplist).expect("legacy list");
+    for (recorded_url, expected) in [
+        (url, "Available"),
+        ("https://other.example/list", "Unavailable"),
+    ] {
+        let meta = RemoteCacheMetadata {
+            url: recorded_url.to_string(),
+            etag: None,
+            last_modified: None,
+            sha256_raw: sha256_hex(iplist),
+            sha256_iplist: sha256_hex(iplist),
+        };
+        fs::write(
+            &paths.meta_path,
+            serde_json::to_vec(&meta).expect("metadata JSON"),
+        )
+        .expect("legacy metadata");
+        let output = fixture
+            .spawn(&["sources", "list"], 80, OutputDestination::Pipe, &[])
+            .wait();
+        assert!(output.status.success(), "{}", output.stderr);
+        assert!(
+            output.stdout.lines().any(|line| {
+                line.trim_start()
+                    .strip_prefix("Cache:")
+                    .is_some_and(|value| value.trim() == expected)
+            }),
+            "{}",
+            output.stdout
+        );
+    }
+    assert_eq!(fixture.tool_log(), "");
+}
+
+#[test]
 fn source_add_preserves_comments_inline_tables_and_unrelated_configuration() {
     let fixture = Fixture::new(INLINE_CONFIG, "");
     let output = fixture

@@ -9,6 +9,7 @@ use kidobo_app::init::{
     ProvisionState,
 };
 
+use crate::command_common::is_executable_file;
 use crate::command_runner::{
     CommandExecutor, CommandResult, CommandRunnerError, SudoCommandRunner, SystemCommandExecutor,
 };
@@ -57,7 +58,7 @@ impl<R: InitCommandRunner> InitProvisioner for FileInitProvisioner<R> {
     fn resolve_installed_executable(&self, candidates: &[PathBuf]) -> Result<PathBuf, AppError> {
         candidates
             .iter()
-            .find(|candidate| candidate.is_file())
+            .find(|candidate| is_executable_file(candidate))
             .cloned()
             .ok_or_else(|| AppError::InitBinaryPathUnavailable {
                 candidates: candidates
@@ -266,6 +267,38 @@ mod tests {
                 stderr: String::new(),
             })
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installed_executable_selection_skips_regular_files_without_execute_bits() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().expect("tempdir");
+        let preferred = temp.path().join("preferred");
+        let fallback = temp.path().join("fallback");
+        fs::write(&preferred, "").expect("write preferred candidate");
+        fs::write(&fallback, "").expect("write fallback candidate");
+        fs::set_permissions(&preferred, fs::Permissions::from_mode(0o644)).expect("nonexecutable");
+        fs::set_permissions(&fallback, fs::Permissions::from_mode(0o755)).expect("executable");
+
+        let provisioner = FileInitProvisioner::new(Runner {
+            calls: RefCell::new(Vec::new()),
+            failure: None,
+        });
+        let candidates = [preferred, fallback.clone()];
+        assert_eq!(
+            provisioner
+                .resolve_installed_executable(&candidates)
+                .expect("select executable fallback"),
+            fallback
+        );
+
+        fs::set_permissions(&fallback, fs::Permissions::from_mode(0o644)).expect("nonexecutable");
+        assert!(matches!(
+            provisioner.resolve_installed_executable(&candidates),
+            Err(kidobo_app::AppError::InitBinaryPathUnavailable { .. })
+        ));
     }
 
     #[test]

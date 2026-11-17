@@ -660,7 +660,7 @@ fn uninstall_accepts_absent_timer_and_service_without_changing_scheduling() {
 fn installer_validates_checksum_and_installs_the_verified_binary() {
     let temp = TempDir::new().expect("tempdir");
     let install_dir = temp.path().join("bin");
-    fs::create_dir_all(&install_dir).expect("mkdir install");
+    install_old_binary(&install_dir);
     let release_dir = prepare_release_fixture(
         &temp,
         "#!/usr/bin/env bash\n[[ \"${1:-}\" == \"--version\" ]]\nprintf 'kidobo 9.8.7\\n'\n",
@@ -681,6 +681,61 @@ fn installer_validates_checksum_and_installs_the_verified_binary() {
         .expect("run installed binary");
     assert!(installed_version.status.success());
     assert_eq!(installed_version.stdout, b"kidobo 9.8.7\n");
+}
+
+#[test]
+fn installer_refuses_to_place_staged_binary_inside_destination_directory() {
+    let temp = TempDir::new().expect("tempdir");
+    let install_dir = temp.path().join("bin");
+    let destination = install_dir.join("kidobo");
+    fs::create_dir_all(&destination).expect("create destination directory");
+    fs::write(destination.join("sentinel"), "existing contents").expect("write sentinel");
+    let release_dir =
+        prepare_release_fixture(&temp, "#!/usr/bin/env bash\nprintf 'kidobo 9.8.7\\n'\n");
+    write_executable(&temp.path().join("fake-bin/sudo"), "#!/bin/sh\nexit 1\n");
+
+    let output = installer_command(&temp, &release_dir, &install_dir)
+        .output()
+        .expect("run installer");
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("failed to atomically install"));
+    assert_eq!(fs::read_dir(&install_dir).expect("install dir").count(), 1);
+    assert_eq!(fs::read_dir(&destination).expect("destination").count(), 1);
+    assert_eq!(
+        read_to_string_with_limit(&destination.join("sentinel"), FIXTURE_FILE_READ_LIMIT),
+        "existing contents"
+    );
+}
+
+#[test]
+fn installer_replaces_destination_symlink_without_writing_into_referent() {
+    let temp = TempDir::new().expect("tempdir");
+    let install_dir = temp.path().join("bin");
+    let destination = install_dir.join("kidobo");
+    let referent = temp.path().join("outside");
+    fs::create_dir(&install_dir).expect("create install dir");
+    fs::create_dir(&referent).expect("create symlink referent");
+    std::os::unix::fs::symlink(&referent, &destination).expect("link destination");
+    let binary_script = "#!/usr/bin/env bash\nprintf 'kidobo 9.8.7\\n'\n";
+    let release_dir = prepare_release_fixture(&temp, binary_script);
+
+    let output = installer_command(&temp, &release_dir, &install_dir)
+        .output()
+        .expect("run installer");
+
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        fs::symlink_metadata(&destination)
+            .expect("destination metadata")
+            .is_file()
+    );
+    assert_eq!(
+        read_to_string_with_limit(&destination, FIXTURE_FILE_READ_LIMIT),
+        binary_script
+    );
+    assert_eq!(fs::read_dir(&referent).expect("referent").count(), 0);
+    assert_eq!(fs::read_dir(&install_dir).expect("install dir").count(), 1);
 }
 
 #[test]
@@ -927,6 +982,63 @@ fn run_init_after_install_propagates_target_failure_status() {
 }
 
 #[test]
+fn init_recovery_waits_for_a_successful_log_capture() {
+    let temp = TempDir::new().expect("tempdir");
+    let install_dir = temp.path().join("bin");
+    let init_log = temp.path().join("init.log");
+    let recovery_log = temp.path().join("recovery.log");
+    write_executable(
+        &install_dir.join("kidobo"),
+        r#"#!/bin/bash
+echo 'systemctl reset-failed kidobo-sync.service'
+echo 'Unit kidobo-sync.service not loaded' >&2
+exit "$INIT_STATUS"
+"#,
+    );
+    let fixture = r#"
+source "$INSTALLER"
+sudo() { "$@"; }
+systemctl() { printf '%s\n' "$*" >> "$RECOVERY_LOG"; }
+tee() {
+    local captured
+    captured="$(cat)"
+    sleep 0.1
+    printf '%s\n' "$captured" >> "$INIT_LOG"
+    return "$TEE_STATUS"
+}
+run_init_after_install "$INIT_LOG"
+"#;
+
+    for (init_status, tee_status, expected_status) in
+        [("23", "0", 0), ("23", "42", 23), ("0", "42", 42)]
+    {
+        let output = Command::new("bash")
+            .args(["-c", fixture])
+            .env("INSTALLER", installer_path())
+            .env("INIT_LOG", &init_log)
+            .env("RECOVERY_LOG", &recovery_log)
+            .env("INIT_STATUS", init_status)
+            .env("TEE_STATUS", tee_status)
+            .env("KIDOBO_INSTALL_DIR", &install_dir)
+            .env_remove("KIDOBO_ROOT")
+            .output()
+            .expect("run bash");
+
+        assert_eq!(output.status.code(), Some(expected_status), "{output:?}");
+        if tee_status == "0" {
+            assert!(
+                read_to_string_with_limit(&recovery_log, FIXTURE_FILE_READ_LIMIT)
+                    .contains("enable --now kidobo-sync.timer")
+            );
+            fs::remove_file(&recovery_log).expect("remove first attempt's recovery log");
+        } else {
+            assert!(String::from_utf8_lossy(&output.stderr).contains("failed to capture"));
+            assert!(!recovery_log.exists());
+        }
+    }
+}
+
+#[test]
 fn custom_root_init_uses_direct_path_without_sudo() {
     let temp = TempDir::new().expect("tempdir");
     let install_dir = temp.path().join("bin");
@@ -971,7 +1083,7 @@ fn custom_root_init_preserves_exact_value_through_sudo_env() {
     let observed_root = temp.path().join("observed-root");
     write_executable(
         &install_dir.join("kidobo"),
-        "#!/usr/bin/env bash\nset -euo pipefail\nif [[ \"${KIDOBO_TEST_ELEVATED:-0}\" != \"1\" ]]; then exit 23; fi\n[[ \"${1:-}\" == \"init\" ]]\nprintf '%s' \"${KIDOBO_ROOT-}\" > \"${KIDOBO_TEST_OBSERVED_ROOT}\"\n",
+        "#!/usr/bin/env bash\nset -euo pipefail\nif [[ \"${KIDOBO_TEST_ELEVATED:-0}\" != \"1\" ]]; then echo direct >&2; exit 23; fi\necho elevated\n[[ \"${1:-}\" == \"init\" ]]\nprintf '%s' \"${KIDOBO_ROOT-}\" > \"${KIDOBO_TEST_OBSERVED_ROOT}\"\n",
     );
     let init_log = temp.path().join("init.log");
 
@@ -994,6 +1106,10 @@ fn custom_root_init_preserves_exact_value_through_sudo_env() {
     assert_eq!(
         read_to_string_with_limit(&observed_root, FIXTURE_FILE_READ_LIMIT),
         root.display().to_string()
+    );
+    assert_eq!(
+        read_to_string_with_limit(&init_log, FIXTURE_FILE_READ_LIMIT),
+        "direct\nelevated\n"
     );
 }
 

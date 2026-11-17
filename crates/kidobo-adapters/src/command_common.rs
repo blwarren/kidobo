@@ -31,7 +31,7 @@ pub fn find_executable_in_path(binary: &str, path: Option<OsString>) -> Option<P
         .find(|candidate| is_executable_file(candidate))
 }
 
-fn is_executable_file(path: &Path) -> bool {
+pub(crate) fn is_executable_file(path: &Path) -> bool {
     let Ok(metadata) = fs::metadata(path) else {
         return false;
     };

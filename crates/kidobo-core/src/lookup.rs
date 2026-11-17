@@ -4,10 +4,7 @@ use std::sync::Arc;
 
 use thiserror::Error;
 
-use crate::network::{
-    CanonicalCidr, IntervalU32, IntervalU128, ipv4_to_interval, ipv6_to_interval,
-    parse_ip_cidr_strict,
-};
+use crate::network::{CanonicalCidr, ipv4_to_interval, ipv6_to_interval, parse_ip_cidr_strict};
 
 /// One canonical CIDR retained with its operator-visible source context.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,118 +66,79 @@ pub fn parse_target_strict(input: &str) -> Result<CanonicalCidr, LookupTargetPar
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct IndexedSourceV4 {
-    interval: IntervalU32,
+struct IndexedSource<T> {
+    start: T,
+    end: T,
     source_idx: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct IndexedSourceV6 {
-    interval: IntervalU128,
-    source_idx: usize,
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IntervalIndex<T> {
+    entries: Vec<IndexedSource<T>>,
+    subtree_max_ends: Vec<T>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-struct IntervalIndexV4 {
-    entries: Vec<IndexedSourceV4>,
-    prefix_max_end: Vec<u32>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-struct IntervalIndexV6 {
-    entries: Vec<IndexedSourceV6>,
-    prefix_max_end: Vec<u128>,
-}
-
-impl IntervalIndexV4 {
-    fn from_sources(sources: &[LookupSourceEntry]) -> Self {
-        let mut entries = sources
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, source)| match source.cidr {
-                CanonicalCidr::V4(cidr) => Some(IndexedSourceV4 {
-                    interval: ipv4_to_interval(cidr),
-                    source_idx: idx,
-                }),
-                CanonicalCidr::V6(_) => None,
-            })
-            .collect::<Vec<_>>();
-        entries.sort_unstable_by_key(|entry| (entry.interval.start, entry.interval.end));
-
-        let mut prefix_max_end = Vec::with_capacity(entries.len());
-        let mut running_max = 0_u32;
-        for entry in &entries {
-            running_max = running_max.max(entry.interval.end);
-            prefix_max_end.push(running_max);
-        }
-
+impl<T: Copy + Ord + Default> IntervalIndex<T> {
+    fn new(entries: impl Iterator<Item = IndexedSource<T>>) -> Self {
+        let mut entries = entries.collect::<Vec<_>>();
+        entries.sort_unstable_by_key(|entry| (entry.start, entry.end));
+        let mut subtree_max_ends = vec![T::default(); entries.len()];
+        Self::set_subtree_max_ends(&entries, &mut subtree_max_ends);
         Self {
             entries,
-            prefix_max_end,
+            subtree_max_ends,
         }
     }
 
-    fn overlapping_source_indices(&self, target: IntervalU32) -> impl Iterator<Item = usize> + '_ {
-        let upper = self
-            .entries
-            .partition_point(|entry| entry.interval.start <= target.end);
-        let lower = self
-            .prefix_max_end
-            .partition_point(|max_end| *max_end < target.start);
-        let start = lower.min(upper);
+    // The median of each sorted slice is its subtree root. Parallel arrays keep the
+    // maximum end per root without padding each IPv4 entry to the index's alignment.
+    fn set_subtree_max_ends(entries: &[IndexedSource<T>], max_ends: &mut [T]) -> Option<T> {
+        let median = entries.len() / 2;
+        let (left, rest) = entries.split_at(median);
+        let (root, right) = rest.split_first()?;
+        let (left_max_ends, rest) = max_ends.split_at_mut(median);
+        let (root_max, right_max_ends) = rest.split_first_mut()?;
 
-        self.entries
-            .get(start..upper)
-            .into_iter()
-            .flatten()
-            .filter(move |entry| entry.interval.end >= target.start)
-            .map(|entry| entry.source_idx)
-    }
-}
-
-impl IntervalIndexV6 {
-    fn from_sources(sources: &[LookupSourceEntry]) -> Self {
-        let mut entries = sources
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, source)| match source.cidr {
-                CanonicalCidr::V4(_) => None,
-                CanonicalCidr::V6(cidr) => Some(IndexedSourceV6 {
-                    interval: ipv6_to_interval(cidr),
-                    source_idx: idx,
-                }),
-            })
-            .collect::<Vec<_>>();
-        entries.sort_unstable_by_key(|entry| (entry.interval.start, entry.interval.end));
-
-        let mut prefix_max_end = Vec::with_capacity(entries.len());
-        let mut running_max = 0_u128;
-        for entry in &entries {
-            running_max = running_max.max(entry.interval.end);
-            prefix_max_end.push(running_max);
-        }
-
-        Self {
-            entries,
-            prefix_max_end,
-        }
+        *root_max = root
+            .end
+            .max(Self::set_subtree_max_ends(left, left_max_ends).unwrap_or(root.end))
+            .max(Self::set_subtree_max_ends(right, right_max_ends).unwrap_or(root.end));
+        Some(*root_max)
     }
 
-    fn overlapping_source_indices(&self, target: IntervalU128) -> impl Iterator<Item = usize> + '_ {
-        let upper = self
-            .entries
-            .partition_point(|entry| entry.interval.start <= target.end);
-        let lower = self
-            .prefix_max_end
-            .partition_point(|max_end| *max_end < target.start);
-        let start = lower.min(upper);
+    fn visit_overlaps(&self, start: T, end: T, mut emit: impl FnMut(usize)) -> usize {
+        Self::visit_subtree(&self.entries, &self.subtree_max_ends, start, end, &mut emit)
+    }
 
-        self.entries
-            .get(start..upper)
-            .into_iter()
-            .flatten()
-            .filter(move |entry| entry.interval.end >= target.start)
-            .map(|entry| entry.source_idx)
+    // Returns the number of nodes examined so tests can assert the pruning behavior.
+    fn visit_subtree(
+        entries: &[IndexedSource<T>],
+        max_ends: &[T],
+        start: T,
+        end: T,
+        emit: &mut impl FnMut(usize),
+    ) -> usize {
+        let median = entries.len() / 2;
+        let (left_max_ends, rest) = max_ends.split_at(median);
+        let Some((&root_max, right_max_ends)) = rest.split_first() else {
+            return 0;
+        };
+        if root_max < start {
+            return 1;
+        }
+
+        let (left, rest) = entries.split_at(median);
+        let Some((root, right)) = rest.split_first() else {
+            return 1;
+        };
+        let mut visited = 1 + Self::visit_subtree(left, left_max_ends, start, end, emit);
+        if root.start <= end {
+            if root.end >= start {
+                emit(root.source_idx);
+            }
+            visited += Self::visit_subtree(right, right_max_ends, start, end, emit);
+        }
+        visited
     }
 }
 
@@ -229,25 +187,24 @@ fn prepare_targets<S: AsRef<str>>(targets: &[S]) -> (Vec<PreparedTarget<'_>>, Ve
 fn target_matches<'a>(
     target: PreparedTarget<'_>,
     sources: &'a [LookupSourceEntry],
-    v4_index: &IntervalIndexV4,
-    v6_index: &IntervalIndexV6,
+    v4_index: &IntervalIndex<u32>,
+    v6_index: &IntervalIndex<u128>,
 ) -> Vec<&'a LookupSourceEntry> {
     let mut matched_sources = Vec::new();
+    let mut emit = |source_idx| {
+        if let Some(source) = sources.get(source_idx) {
+            matched_sources.push(source);
+        }
+    };
 
     match target.parsed {
         CanonicalCidr::V4(cidr) => {
-            for source_idx in v4_index.overlapping_source_indices(ipv4_to_interval(cidr)) {
-                if let Some(source) = sources.get(source_idx) {
-                    matched_sources.push(source);
-                }
-            }
+            let interval = ipv4_to_interval(cidr);
+            v4_index.visit_overlaps(interval.start, interval.end, &mut emit);
         }
         CanonicalCidr::V6(cidr) => {
-            for source_idx in v6_index.overlapping_source_indices(ipv6_to_interval(cidr)) {
-                if let Some(source) = sources.get(source_idx) {
-                    matched_sources.push(source);
-                }
-            }
+            let interval = ipv6_to_interval(cidr);
+            v6_index.visit_overlaps(interval.start, interval.end, emit);
         }
     }
 
@@ -294,8 +251,32 @@ where
     S: AsRef<str>,
     F: FnMut(&str, &[&LookupSourceEntry]) -> Result<(), E>,
 {
-    let v4_index = IntervalIndexV4::from_sources(sources);
-    let v6_index = IntervalIndexV6::from_sources(sources);
+    let v4_index = IntervalIndex::new(sources.iter().enumerate().filter_map(
+        |(source_idx, source)| {
+            let CanonicalCidr::V4(cidr) = source.cidr else {
+                return None;
+            };
+            let interval = ipv4_to_interval(cidr);
+            Some(IndexedSource {
+                start: interval.start,
+                end: interval.end,
+                source_idx,
+            })
+        },
+    ));
+    let v6_index = IntervalIndex::new(sources.iter().enumerate().filter_map(
+        |(source_idx, source)| {
+            let CanonicalCidr::V6(cidr) = source.cidr else {
+                return None;
+            };
+            let interval = ipv6_to_interval(cidr);
+            Some(IndexedSource {
+                start: interval.start,
+                end: interval.end,
+                source_idx,
+            })
+        },
+    ));
     let (prepared_targets, invalid_targets) = prepare_targets(targets);
 
     for target in prepared_targets {
@@ -730,6 +711,89 @@ mod tests {
             .map(|m| m.target.clone())
             .collect::<Vec<_>>();
         assert_eq!(targets, vec!["203.0.113.7", "203.0.113.7/32"]);
+    }
+
+    #[test]
+    fn indexed_matches_agree_with_brute_force_for_both_families() {
+        let source_text = [
+            "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+            "0.0.0.0/0",
+            "10.0.0.128/25",
+            "2001:db8::80/121",
+            "::/0",
+            "10.0.0.64/26",
+            "10.0.0.0/24",
+            "2001:db8::40/122",
+            "2001:db8::/120",
+            "10.0.0.0/24",
+            "255.255.255.255",
+        ];
+        let sources = source_text.map(|line| LookupSourceEntry {
+            source_label: "fixture".into(),
+            source_line: line.to_string(),
+            cidr: parse_target_strict(line).expect("source"),
+        });
+        let targets = [
+            "255.255.255.255",
+            "10.0.0.127",
+            "10.0.0.128",
+            "10.0.0.0/23",
+            "10.0.1.0",
+            "2001:db8::7f",
+            "2001:db8::80",
+            "2001:db8::/119",
+            "2001:db8::100",
+            "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+            "0.0.0.0/0",
+            "::/0",
+        ];
+        let invalid = run_lookup_by_target(&targets, &sources, |target, matches| {
+            let cidr = parse_target_strict(target).expect("target");
+            let mut expected = sources
+                .iter()
+                .filter(|source| cidr_overlaps(source.cidr, cidr))
+                .collect::<Vec<_>>();
+            expected.sort_unstable_by_key(|source| source.source_line.as_str());
+            expected.dedup();
+            assert_eq!(matches, expected, "{target}");
+        });
+        assert_eq!(invalid.len(), 0);
+    }
+
+    #[test]
+    fn broad_prefix_does_not_force_scanning_narrow_misses() {
+        use super::{IndexedSource, IntervalIndex};
+
+        const NARROW_COUNT: u32 = 65_536;
+        let ipv4 = IntervalIndex::new(
+            std::iter::once(IndexedSource {
+                start: 0,
+                end: u32::MAX,
+                source_idx: 0,
+            })
+            .chain((1..=NARROW_COUNT).map(|host| IndexedSource {
+                start: host,
+                end: host,
+                source_idx: usize::try_from(host).expect("host index"),
+            })),
+        );
+        let ipv6 = IntervalIndex::new(ipv4.entries.iter().map(|entry| IndexedSource {
+            start: u128::from(entry.start),
+            end: if entry.source_idx == 0 {
+                u128::MAX
+            } else {
+                u128::from(entry.end)
+            },
+            source_idx: entry.source_idx,
+        }));
+        let mut matches = Vec::new();
+        let v4_visited = ipv4.visit_overlaps(u32::MAX, u32::MAX, |idx| matches.push(idx));
+        assert_eq!(matches, [0]);
+        matches.clear();
+        let v6_visited = ipv6.visit_overlaps(u128::MAX, u128::MAX, |idx| matches.push(idx));
+        assert_eq!(matches, [0]);
+        assert!(v4_visited < 40, "visited {v4_visited} IPv4 entries");
+        assert!(v6_visited < 40, "visited {v6_visited} IPv6 entries");
     }
 
     #[test]

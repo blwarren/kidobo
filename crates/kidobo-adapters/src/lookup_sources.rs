@@ -7,7 +7,7 @@ use log::warn;
 use thiserror::Error;
 
 use crate::asn::{AsnError, load_cached_asn_prefixes};
-use crate::cached_sources::load_remote_sources;
+use crate::cached_sources::visit_remote_sources;
 use crate::github_meta::load_cached_github_meta_safelist;
 use crate::limited_io::read_to_string_with_limit;
 use crate::source_files::{SOURCE_FILE_READ_LIMIT, parse_cidr_source_line};
@@ -101,23 +101,14 @@ impl OfflineLookupProvider for RemoteCacheLookupProvider {
         context: &OfflineLookupContext<'_>,
         entries: &mut Vec<LookupSourceEntry>,
     ) -> Result<(), AppError> {
-        let remote_sources = load_remote_sources(&context.paths.remote_cache_dir)
-            .map_err(|error| map_lookup_error(LookupSourceLoadError::from(error)))?;
-        entries.reserve(
-            remote_sources
-                .iter()
-                .map(|source| source.entries.len())
-                .sum(),
-        );
-        for source in remote_sources {
-            let source_label: Arc<str> = Arc::from(source.label);
-            entries.extend(source.entries.into_iter().map(|entry| LookupSourceEntry {
-                source_label: Arc::clone(&source_label),
-                source_line: entry.source_line,
-                cidr: entry.cidr,
-            }));
+        let original_len = entries.len();
+        let result = visit_remote_sources(&context.paths.remote_cache_dir, |_, label, contents| {
+            append_source_lines(contents, &Arc::from(label), entries);
+        });
+        if result.is_err() {
+            entries.truncate(original_len);
         }
-        Ok(())
+        result.map_err(|error| map_lookup_error(LookupSourceLoadError::from(error)))
     }
 }
 
@@ -256,18 +247,25 @@ fn append_source_file(
         })
     })?;
 
-    let source_label: Arc<str> = Arc::from(source_label);
+    append_source_lines(&contents, &Arc::from(source_label), entries);
+    Ok(())
+}
+
+fn append_source_lines(
+    contents: &str,
+    source_label: &Arc<str>,
+    entries: &mut Vec<LookupSourceEntry>,
+) {
     entries.extend(
         contents
             .lines()
             .filter_map(parse_cidr_source_line)
             .map(|(cidr, token)| LookupSourceEntry {
-                source_label: Arc::clone(&source_label),
+                source_label: Arc::clone(source_label),
                 source_line: token.to_string(),
                 cidr,
             }),
     );
-    Ok(())
 }
 
 #[cfg(test)]
@@ -459,6 +457,86 @@ mod tests {
             ]
         );
         assert_eq!(lines, vec!["2001:db8::/64", "10.0.0.0/24", "198.51.100.7"]);
+    }
+
+    #[test]
+    fn lookup_loads_previous_v2_and_legacy_feeds_with_original_tokens() {
+        use crate::cache_generation::{GenerationFile, commit_generation, generation_candidates};
+        use crate::http_cache::{RemoteCacheMetadata, remote_generation_store, url_hash_prefix};
+
+        let temp = TempDir::new().expect("tempdir");
+        let paths = test_paths(temp.path());
+        let cache = &paths.remote_cache_dir;
+        let url = "https://example.com/v2";
+        let store = remote_generation_store(cache, url);
+        let commit = |iplist: &str, previous: Option<&str>| {
+            let metadata = serde_json::to_vec(&RemoteCacheMetadata {
+                url: url.to_string(),
+                etag: None,
+                last_modified: None,
+                sha256_raw: sha256_hex(iplist.as_bytes()),
+                sha256_iplist: sha256_hex(iplist.as_bytes()),
+            })
+            .expect("metadata");
+            commit_generation(
+                &store,
+                &[
+                    GenerationFile {
+                        name: "raw",
+                        contents: iplist.as_bytes(),
+                    },
+                    GenerationFile {
+                        name: "iplist",
+                        contents: iplist.as_bytes(),
+                    },
+                    GenerationFile {
+                        name: "meta.json",
+                        contents: &metadata,
+                    },
+                ],
+                previous,
+            )
+            .expect("generation")
+        };
+        let previous = commit("203.0.113.9/24 # previous\n", None);
+        commit("192.0.2.0/24\n", Some(&previous));
+        fs::write(
+            generation_candidates(&store)[0].directory.join("iplist"),
+            "2001:db8:ffff::/64\n",
+        )
+        .expect("corrupt current");
+        let legacy_name = format!("{}.iplist", url_hash_prefix(url));
+        fs::write(cache.join(&legacy_name), "198.51.100.0/24\n").expect("shadowed legacy");
+        fs::write(
+            cache.join("legacy.iplist"),
+            "invalid\n2001:0db8::1/64 # legacy\n",
+        )
+        .expect("unshadowed legacy");
+
+        let entries = load_registry_sources(&paths, None).expect("lookup sources");
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| (entry.source_label.as_ref(), entry.source_line.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                (url, "203.0.113.9/24"),
+                ("remote:legacy.iplist", "2001:0db8::1/64"),
+            ]
+        );
+        assert_eq!(entries[0].cidr.to_string(), "203.0.113.0/24");
+        assert_eq!(entries[1].cidr.to_string(), "2001:db8::/64");
+
+        fs::remove_dir_all(&generation_candidates(&store)[1].directory)
+            .expect("remove previous generation");
+        let fallback = load_registry_sources(&paths, None).expect("legacy fallback");
+        assert_eq!(fallback.len(), 2);
+        assert_eq!(
+            fallback[0].source_label.as_ref(),
+            format!("remote:{legacy_name}")
+        );
+        assert_eq!(fallback[0].source_line, "198.51.100.0/24");
+        assert_eq!(fallback[1], entries[1]);
     }
 
     #[test]

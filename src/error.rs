@@ -39,6 +39,10 @@ pub enum KidoboError {
     #[error("operation interrupted by SIGINT")]
     Interrupted,
 
+    /// SIGINT arrived during synchronization, and enforcement ran to completion.
+    #[error("Live firewall update completed after SIGINT")]
+    SyncInterruptedAfterCompletion,
+
     /// Doctor completed with one or more failed checks.
     #[error("doctor checks failed")]
     DoctorFailed,
@@ -65,6 +69,38 @@ pub enum KidoboError {
         /// Original synchronization failure, preserving interruption and cause information.
         #[source]
         source: Box<KidoboError>,
+    },
+
+    /// Synchronization completed but its success report could not be written.
+    #[error("Live firewall update completed; sync output failed: {source}")]
+    SyncOutputFailed {
+        /// Original writer failure.
+        #[source]
+        source: std::io::Error,
+        /// SIGINT arrived after enforcement began.
+        interrupted: bool,
+    },
+
+    /// The source workflow completed but its report could not be written.
+    #[error("{source_state}; {apply_state}; source output failed: {source}")]
+    SourceOutputFailed {
+        /// Saved-state context.
+        source_state: &'static str,
+        /// Whether the applied synchronization completed or remained pending.
+        apply_state: &'static str,
+        /// Original writer failure.
+        #[source]
+        source: Box<KidoboError>,
+    },
+
+    /// An independent output failure accompanied the primary workflow failure.
+    #[error("{source}; output also failed: {output}")]
+    AdditionalOutputFailure {
+        /// Original workflow failure or completion report failure.
+        #[source]
+        source: Box<KidoboError>,
+        /// Additional writer failure.
+        output: Box<KidoboError>,
     },
 
     /// A source change was saved before confirmation input or output failed.
@@ -119,10 +155,16 @@ impl KidoboError {
     pub fn exit_code(&self) -> u8 {
         match self {
             Self::Interrupted
+            | Self::SyncInterruptedAfterCompletion
+            | Self::SyncOutputFailed {
+                interrupted: true, ..
+            }
             | Self::Application {
                 source: AppError::Interrupted,
             } => 130,
             Self::SourceApplyFailed { source, .. }
+            | Self::AdditionalOutputFailure { source, .. }
+            | Self::SourceOutputFailed { source, .. }
             | Self::SavedConfirmationFailed { source }
             | Self::SetupAfterSave { source, .. } => source.exit_code(),
             Self::Usage { .. } => 2,

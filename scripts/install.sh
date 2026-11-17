@@ -75,10 +75,7 @@ run_with_init_privileges() {
     return 1
 }
 
-run_init_after_install() {
-    local init_log="$1"
-    : > "${init_log}"
-
+invoke_installed_init() {
     if [[ -n "${KIDOBO_ROOT_WAS_SET}" ]]; then
         if [[ -z "${KIDOBO_ROOT_OVERRIDE}" ]]; then
             echo "KIDOBO_ROOT must not be empty when --init is requested" >&2
@@ -86,40 +83,51 @@ run_init_after_install() {
         fi
 
         local direct_status
-        if KIDOBO_ROOT="${KIDOBO_ROOT_OVERRIDE}" "${TARGET_PATH}" init > >(tee "${init_log}") 2>&1; then
+        if KIDOBO_ROOT="${KIDOBO_ROOT_OVERRIDE}" "${TARGET_PATH}" init; then
             return 0
         else
             direct_status=$?
         fi
 
         if [[ "${EUID}" -ne 0 ]] && has_cmd sudo; then
-            if sudo env "KIDOBO_ROOT=${KIDOBO_ROOT_OVERRIDE}" "${TARGET_PATH}" init \
-                > >(tee -a "${init_log}") 2>&1; then
-                return 0
-            else
-                return $?
-            fi
+            sudo env "KIDOBO_ROOT=${KIDOBO_ROOT_OVERRIDE}" "${TARGET_PATH}" init
+            return $?
         fi
         return "${direct_status}"
     fi
 
     if [[ -w /etc || -w /var || -w /usr ]]; then
-        if "${TARGET_PATH}" init > >(tee "${init_log}") 2>&1; then
-            return 0
-        else
-            local status=$?
-            return "${status}"
-        fi
+        "${TARGET_PATH}" init
     elif has_cmd sudo; then
-        if sudo "${TARGET_PATH}" init > >(tee "${init_log}") 2>&1; then
-            return 0
-        else
-            local status=$?
-            return "${status}"
-        fi
+        sudo "${TARGET_PATH}" init
     else
         echo "skipping init: insufficient privileges and sudo unavailable" >&2
         return 1
+    fi
+}
+
+run_init_after_install() {
+    local init_log="$1"
+    local -a statuses=(0 0)
+    if ! : > "${init_log}"; then
+        echo "failed to initialize ${BINARY_NAME} init log" >&2
+        return 1
+    fi
+
+    invoke_installed_init 2>&1 | tee -a -- "${init_log}" ||
+        statuses=("${PIPESTATUS[@]}")
+    if (( statuses[1] != 0 )); then
+        echo "failed to capture ${BINARY_NAME} init output (tee exited ${statuses[1]})" >&2
+        if (( statuses[0] != 0 )); then
+            return "${statuses[0]}"
+        fi
+        return "${statuses[1]}"
+    fi
+    if (( statuses[0] != 0 )); then
+        if recover_known_init_systemd_reset_failed_case "${init_log}"; then
+            return 0
+        fi
+        return "${statuses[0]}"
     fi
 }
 
@@ -204,7 +212,7 @@ stage_install_file() {
 
 activate_staged_install() {
     local target_file="$1"
-    if ! run_with_optional_sudo mv -f -- "${STAGED_INSTALL_PATH}" "${target_file}"; then
+    if ! run_with_optional_sudo mv -fT -- "${STAGED_INSTALL_PATH}" "${target_file}"; then
         echo "failed to atomically install ${BINARY_NAME} at ${target_file}" >&2
         exit 1
     fi
@@ -606,10 +614,8 @@ if [[ "${INIT_AFTER_INSTALL}" -eq 1 ]]; then
     echo "running ${BINARY_NAME} init"
     init_log_path="${workdir}/init.log"
     if ! run_init_after_install "${init_log_path}"; then
-        if ! recover_known_init_systemd_reset_failed_case "${init_log_path}"; then
-            echo "${BINARY_NAME} init failed" >&2
-            exit 1
-        fi
+        echo "${BINARY_NAME} init failed" >&2
+        exit 1
     fi
 fi
 }

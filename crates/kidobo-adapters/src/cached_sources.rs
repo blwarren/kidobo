@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use crate::http_cache::collect_offline_remote_generations;
+use crate::http_cache::visit_offline_remote_generations;
 use crate::source_files::{
     REMOTE_META_READ_LIMIT, RemoteCacheFilesError, SOURCE_FILE_READ_LIMIT,
     collect_remote_cache_files, parse_cidr_source_line, read_remote_cache_iplist_text,
@@ -41,12 +41,31 @@ pub struct CachedRemoteSource {
 pub fn load_remote_sources(
     remote_cache_dir: &Path,
 ) -> Result<Vec<CachedRemoteSource>, SourceLoadError> {
+    let mut sources = Vec::new();
+    visit_remote_sources(remote_cache_dir, |path, label, contents| {
+        sources.push(CachedRemoteSource {
+            path,
+            label,
+            entries: parse_cached_entries(contents),
+        });
+    })?;
+    sources.sort_by(|left, right| {
+        (left.label.as_str(), left.path.as_os_str())
+            .cmp(&(right.label.as_str(), right.path.as_os_str()))
+    });
+    Ok(sources)
+}
+
+pub(crate) fn visit_remote_sources(
+    remote_cache_dir: &Path,
+    mut visit: impl FnMut(PathBuf, String, &str),
+) -> Result<(), SourceLoadError> {
     let mut remote_files = match collect_remote_cache_files(remote_cache_dir) {
         Ok(files) => files,
         Err(RemoteCacheFilesError::ReadDir(error))
             if error.kind() == std::io::ErrorKind::NotFound =>
         {
-            return Ok(Vec::new());
+            return Ok(());
         }
         Err(RemoteCacheFilesError::ReadDir(source)) => {
             return Err(SourceLoadError::CacheDir {
@@ -62,28 +81,17 @@ pub fn load_remote_sources(
         }
     };
 
-    let generation_sources =
-        collect_offline_remote_generations(remote_cache_dir).map_err(|source| {
-            SourceLoadError::CacheDir {
-                path: remote_cache_dir.join("v2/remote"),
-                source,
-            }
-        })?;
-    let generation_hashes = generation_sources
-        .iter()
-        .map(|source| source.url_hash.clone())
-        .collect::<BTreeSet<_>>();
+    let mut generation_hashes = BTreeSet::new();
+    visit_offline_remote_generations(remote_cache_dir, |source| {
+        generation_hashes.insert(source.url_hash);
+        visit(source.iplist_path, source.label, &source.iplist);
+    })
+    .map_err(|source| SourceLoadError::CacheDir {
+        path: remote_cache_dir.join("v2/remote"),
+        source,
+    })?;
 
     remote_files.sort();
-
-    let mut sources = Vec::with_capacity(remote_files.len() + generation_sources.len());
-    for source in generation_sources {
-        sources.push(CachedRemoteSource {
-            path: source.iplist_path,
-            label: source.label,
-            entries: parse_cached_entries(&source.iplist),
-        });
-    }
     for path in remote_files {
         if path
             .file_stem()
@@ -99,19 +107,10 @@ pub fn load_remote_sources(
                     source: err,
                 })?;
 
-        sources.push(CachedRemoteSource {
-            label: resolve_remote_source_label(&path, REMOTE_META_READ_LIMIT),
-            path,
-            entries: parse_cached_entries(&contents),
-        });
+        let label = resolve_remote_source_label(&path, REMOTE_META_READ_LIMIT);
+        visit(path, label, &contents);
     }
-
-    sources.sort_by(|left, right| {
-        (left.label.as_str(), left.path.as_os_str())
-            .cmp(&(right.label.as_str(), right.path.as_os_str()))
-    });
-
-    Ok(sources)
+    Ok(())
 }
 
 fn parse_cached_entries(contents: &str) -> Vec<CachedRemoteEntry> {

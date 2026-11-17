@@ -1580,6 +1580,117 @@ fn sync_full_families_emit_supported_restore_entries() {
 
 #[cfg(unix)]
 #[test]
+fn explicit_apply_reaches_the_fake_backend_even_when_stdout_is_closed() {
+    for (args, changed, blocklist, banned) in [
+        (&["ban", "203.0.113.7"][..], true, "", "[]"),
+        (&["ban", "203.0.113.7"][..], false, "203.0.113.7/32\n", "[]"),
+        (
+            &["unban", "203.0.113.7"][..],
+            true,
+            "203.0.113.7/32\n",
+            "[]",
+        ),
+        (&["unban", "203.0.113.7"][..], false, "", "[]"),
+        (&["ban", "--asn", "AS398324"][..], true, "", "[]"),
+        (&["ban", "--asn", "AS398324"][..], false, "", "[398324]"),
+        (&["unban", "--asn", "AS398324"][..], true, "", "[398324]"),
+        (&["unban", "--asn", "AS398324"][..], false, "", "[]"),
+    ] {
+        let root = create_root(
+            &format!(
+                "[ipset]\nset_name='kidobo'\nenable_ipv6=false\n[safe]\ninclude_github_meta=false\n[asn]\nbanned={banned}\n"
+            ),
+            blocklist,
+        );
+        let cache = root.path().join("cache/asn");
+        fs::create_dir_all(&cache).expect("ASN cache directory");
+        fs::write(cache.join("as398324.iplist"), "198.51.100.0/24\n").expect("ASN cache");
+        let fake_sudo = write_fake_sudo_script(&root);
+        let sudo_log = root.path().join("sudo.log");
+        let (reader, writer) = io::pipe().expect("stdout pipe");
+        drop(reader);
+        let output = kidobo_with_root_command(root.path(), args)
+            .arg("--apply")
+            .env(
+                "PATH",
+                path_with_bin_prefix(fake_sudo.parent().expect("bin")),
+            )
+            .env("KIDOBO_TEST_SUDO_LOG", &sudo_log)
+            .stdout(writer)
+            .output()
+            .expect("ban/unban with closed stdout");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{args:?}: {stderr}");
+        let source_state = if changed {
+            "Source change saved"
+        } else {
+            "Source state unchanged"
+        };
+        assert!(
+            stderr.contains(&format!("{source_state}; live firewall update completed")),
+            "{args:?}: {stderr}"
+        );
+        assert!(stderr.contains("Broken pipe"), "{args:?}: {stderr}");
+        let log = read_to_string_with_limit(&sudo_log, 65536)
+            .expect("fake backend ran after lock release");
+        assert_eq!(log.matches("ipset restore ").count(), 1, "{args:?}: {log}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn explicit_apply_preserves_sync_failure_and_sigint_with_closed_stdout() {
+    for (fail, interrupted, exit, message) in [
+        (true, false, 1, "injected sudo failure"),
+        (true, true, 130, "injected interrupted restore failure"),
+        (
+            false,
+            true,
+            130,
+            "Live firewall update completed after SIGINT",
+        ),
+    ] {
+        let root = create_root(
+            "[ipset]\nset_name='kidobo'\nenable_ipv6=false\n[safe]\ninclude_github_meta=false\n",
+            "",
+        );
+        let fake_sudo = write_fake_sudo_script(&root);
+        let (reader, writer) = io::pipe().expect("stdout pipe");
+        drop(reader);
+        let output = kidobo_with_root_command(root.path(), &["ban", "203.0.113.7", "--apply"])
+            .env(
+                "PATH",
+                path_with_bin_prefix(fake_sudo.parent().expect("bin")),
+            )
+            .env(
+                "KIDOBO_TEST_FAIL_SUDO",
+                if fail && !interrupted { "1" } else { "0" },
+            )
+            .env(
+                "KIDOBO_TEST_INTERRUPT_AT_RESTORE",
+                if interrupted { "1" } else { "0" },
+            )
+            .env(
+                "KIDOBO_TEST_FAIL_INTERRUPTED_RESTORE",
+                if fail { "1" } else { "0" },
+            )
+            .stdout(writer)
+            .output()
+            .expect("ban with closed stdout");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(exit), "{stderr}");
+        assert!(stderr.contains(message), "{stderr}");
+        assert!(stderr.contains("Broken pipe"), "{stderr}");
+        assert_eq!(
+            stderr.contains("live firewall update failed"),
+            fail,
+            "{stderr}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn sync_preserves_non_unicode_restore_paths() {
     use std::ffi::OsString;
     use std::os::unix::ffi::OsStringExt;
