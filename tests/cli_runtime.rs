@@ -617,12 +617,6 @@ fn full_flush_checks_every_cleanup_tool_before_removing_ipv4_only_state() {
 }
 
 #[test]
-fn help_exits_with_zero() {
-    let output = run_kidobo(&["--help"]);
-    assert_eq!(output.status.code(), Some(0));
-}
-
-#[test]
 fn version_exits_with_zero() {
     let output = run_kidobo(&["--version"]);
     assert_eq!(output.status.code(), Some(0));

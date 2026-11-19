@@ -733,7 +733,7 @@ mod tests {
             source_line: line.to_string(),
             cidr: parse_target_strict(line).expect("source"),
         });
-        let targets = [
+        let valid_targets = [
             "255.255.255.255",
             "10.0.0.127",
             "10.0.0.128",
@@ -747,17 +747,38 @@ mod tests {
             "0.0.0.0/0",
             "::/0",
         ];
+        let expected = std::collections::BTreeSet::from(valid_targets)
+            .into_iter()
+            .map(|target| {
+                let cidr = parse_target_strict(target).expect("target");
+                let mut matches = sources
+                    .iter()
+                    .filter(|source| cidr_overlaps(source.cidr, cidr))
+                    .collect::<Vec<_>>();
+                matches.sort_unstable_by_key(|source| source.source_line.as_str());
+                matches.dedup();
+                (
+                    target.to_string(),
+                    matches.into_iter().cloned().collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let targets = valid_targets
+            .into_iter()
+            .chain(["invalid-z", "invalid-a", "10.0.0.127", "invalid-z"])
+            .collect::<Vec<_>>();
+        let mut actual = Vec::new();
         let invalid = run_lookup_by_target(&targets, &sources, |target, matches| {
-            let cidr = parse_target_strict(target).expect("target");
-            let mut expected = sources
-                .iter()
-                .filter(|source| cidr_overlaps(source.cidr, cidr))
-                .collect::<Vec<_>>();
-            expected.sort_unstable_by_key(|source| source.source_line.as_str());
-            expected.dedup();
-            assert_eq!(matches, expected, "{target}");
+            actual.push((
+                target.to_string(),
+                matches
+                    .iter()
+                    .map(|&source| source.clone())
+                    .collect::<Vec<_>>(),
+            ));
         });
-        assert_eq!(invalid.len(), 0);
+        assert_eq!(actual, expected);
+        assert_eq!(invalid, ["invalid-a", "invalid-z"]);
     }
 
     #[test]

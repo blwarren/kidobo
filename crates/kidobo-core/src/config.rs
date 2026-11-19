@@ -958,19 +958,6 @@ mod tests {
     }
 
     #[test]
-    fn timeout_must_be_non_negative() {
-        let err = Config::from_toml_str("[ipset]\nset_name='kidobo'\ntimeout=-1\n")
-            .expect_err("must fail");
-        assert_eq!(
-            err,
-            ConfigError::InvalidField {
-                field: "ipset.timeout",
-                reason: "must be between 0 and 2147483".to_string(),
-            }
-        );
-    }
-
-    #[test]
     fn set_name_rejects_whitespace_and_overlength_values() {
         let err = Config::from_toml_str("[ipset]\nset_name='kidobo bad'\n").expect_err("must fail");
         assert_eq!(

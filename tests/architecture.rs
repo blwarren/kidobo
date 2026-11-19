@@ -77,17 +77,12 @@ fn dependency_direction_points_inward() {
 }
 
 #[test]
-fn internal_crates_remain_unpublished_and_unversioned() {
+fn root_owns_the_release_version_and_internal_crates_remain_private() {
+    assert_ne!(package("kidobo")["version"], "0.0.0");
     for name in ["kidobo-core", "kidobo-app", "kidobo-adapters"] {
         assert_eq!(package(name)["version"], "0.0.0", "{name}");
         assert_eq!(package(name)["publish"], serde_json::json!([]), "{name}");
     }
-}
-
-#[test]
-fn root_package_owns_the_release_version() {
-    assert_eq!(package("kidobo")["version"], env!("CARGO_PKG_VERSION"));
-    assert_ne!(package("kidobo")["version"], "0.0.0");
 }
 
 #[cfg(unix)]

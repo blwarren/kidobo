@@ -337,14 +337,15 @@ fn escape_systemd_path(path: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
 
     use kidobo_core::config::Config;
 
     use super::{
-        DEFAULT_CONFIG_TEMPLATE, DEFAULT_SYSTEMD_TIMER_TEMPLATE, InitDependencies, InitProvisioner,
-        InitRequest, ProvisionState, build_systemd_service_template, execute,
+        ArtifactAccess, DEFAULT_CONFIG_TEMPLATE, DEFAULT_SYSTEMD_TIMER_TEMPLATE, InitDependencies,
+        InitProvisioner, InitRequest, ProvisionState, build_systemd_service_template, execute,
     };
     use crate::AppError;
     use crate::paths::{ConfigRequirement, PathResolutionInput, ResolvedPaths};
@@ -370,9 +371,16 @@ mod tests {
         }
     }
 
+    #[derive(Debug, PartialEq, Eq)]
+    enum ProvisionEvent {
+        Directory(PathBuf, ArtifactAccess),
+        File(PathBuf, String, ArtifactAccess),
+        EnableTimer,
+    }
+
     #[derive(Default)]
     struct Provisioner {
-        events: Mutex<Vec<String>>,
+        events: Mutex<Vec<ProvisionEvent>>,
     }
     impl InitProvisioner for Provisioner {
         fn resolve_installed_executable(
@@ -385,25 +393,29 @@ mod tests {
         fn ensure_dir(
             &self,
             path: &Path,
-            _access: super::ArtifactAccess,
+            access: ArtifactAccess,
         ) -> Result<ProvisionState, AppError> {
             self.events
                 .lock()
                 .expect("events")
-                .push(format!("dir:{}", path.display()));
+                .push(ProvisionEvent::Directory(path.to_path_buf(), access));
             Ok(ProvisionState::Created)
         }
 
         fn ensure_file(
             &self,
             path: &Path,
-            _contents: &str,
-            _access: super::ArtifactAccess,
+            contents: &str,
+            access: ArtifactAccess,
         ) -> Result<ProvisionState, AppError> {
             self.events
                 .lock()
                 .expect("events")
-                .push(format!("file:{}", path.display()));
+                .push(ProvisionEvent::File(
+                    path.to_path_buf(),
+                    contents.to_string(),
+                    access,
+                ));
             Ok(ProvisionState::Preserved)
         }
 
@@ -411,7 +423,7 @@ mod tests {
             self.events
                 .lock()
                 .expect("events")
-                .push("systemd".to_string());
+                .push(ProvisionEvent::EnableTimer);
             Ok(())
         }
     }
@@ -440,18 +452,75 @@ mod tests {
         )
         .expect("init");
         assert_eq!(outcome.artifacts.len(), 10);
-        assert!(
-            provisioner
-                .events
-                .lock()
-                .expect("events")
-                .contains(&"file:/root/data/temporary-bans.toml".to_string())
-        );
         assert!(outcome.systemd_enabled);
+        let events = provisioner.events.lock().expect("events");
+        assert_eq!(events.len(), 11);
+        assert_eq!(events.last(), Some(&ProvisionEvent::EnableTimer));
+
+        let mut directories = BTreeMap::new();
+        let mut files = BTreeMap::new();
+        for event in &*events {
+            match event {
+                ProvisionEvent::Directory(path, access) => {
+                    assert!(directories.insert(path.as_path(), *access).is_none());
+                }
+                ProvisionEvent::File(path, contents, access) => {
+                    assert!(files.insert(path.as_path(), (contents, *access)).is_none());
+                }
+                ProvisionEvent::EnableTimer => {}
+            }
+        }
         assert_eq!(
-            provisioner.events.lock().expect("events").last(),
-            Some(&"systemd".to_string())
+            directories,
+            BTreeMap::from([
+                (Path::new("/etc/systemd/system"), ArtifactAccess::Default),
+                (Path::new("/root/config"), ArtifactAccess::Default),
+                (Path::new("/root/data"), ArtifactAccess::Default),
+                (Path::new("/root/cache/remote"), ArtifactAccess::OwnerOnly),
+            ])
         );
+        let service = Path::new("/etc/systemd/system/kidobo-sync.service");
+        let timer = Path::new("/etc/systemd/system/kidobo-sync.timer");
+        let config = Path::new("/root/config/config.toml");
+        assert_eq!(
+            files
+                .iter()
+                .map(|(&path, &(_, access))| (path, access))
+                .collect::<BTreeMap<_, _>>(),
+            BTreeMap::from([
+                (config, ArtifactAccess::OwnerOnly),
+                (
+                    Path::new("/root/data/blocklist.txt"),
+                    ArtifactAccess::Default
+                ),
+                (Path::new("/root/cache/sync.lock"), ArtifactAccess::Default),
+                (
+                    Path::new("/root/data/temporary-bans.toml"),
+                    ArtifactAccess::Default
+                ),
+                (service, ArtifactAccess::Default),
+                (timer, ArtifactAccess::Default),
+            ])
+        );
+        let config = Config::from_toml_str(files[config].0).expect("provisioned config");
+        assert_eq!(config.ipset.set_name, "kidobo");
+        assert!(
+            files[service]
+                .0
+                .lines()
+                .any(|line| line == r#"ExecStart="/usr/local/bin/kidobo" sync"#)
+        );
+        for setting in [
+            "OnBootSec=2min",
+            "OnUnitActiveSec=1h",
+            "Persistent=true",
+            "Unit=kidobo-sync.service",
+        ] {
+            assert!(
+                files[timer].0.lines().any(|line| line == setting),
+                "{setting}"
+            );
+        }
     }
 
     #[test]
@@ -472,7 +541,7 @@ mod tests {
                 .events
                 .lock()
                 .expect("events")
-                .contains(&"systemd".to_string())
+                .contains(&ProvisionEvent::EnableTimer)
         );
     }
 
@@ -494,12 +563,12 @@ mod tests {
                 .events
                 .lock()
                 .expect("events")
-                .contains(&"systemd".to_string())
+                .contains(&ProvisionEvent::EnableTimer)
         );
         assert!(super::activate_timer(&request(), &dependencies).expect("explicit scheduling"));
         assert_eq!(
             provisioner.events.lock().expect("events").last(),
-            Some(&"systemd".to_string())
+            Some(&ProvisionEvent::EnableTimer)
         );
     }
 

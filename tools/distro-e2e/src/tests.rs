@@ -65,9 +65,12 @@ fn command_output(dir: &Path, id: usize, stream: &str) -> Result<String> {
         })
         .collect())
 }
-fn lifecycle_reporting_helpers() -> String {
+pub(super) fn lifecycle_reporting_helpers() -> String {
+    let (preamble, _) = include_str!("../../../scripts/e2e/lifecycle.sh")
+        .split_once("\nreadonly ROOT=")
+        .expect("lifecycle preamble ends before the guest root declarations");
     format!(
-        "set -euo pipefail\nexec 9>&2\nBASH_XTRACEFD=9\nPS4='+ TRACE ${{BASH_SOURCE:-main}}:${{LINENO}}:${{FUNCNAME[0]:-main}}: '\nset -x\ne2e_checks=()\ne2e_failure_reason='command failed or guest interrupted before assertion completion'\n{}\ntrap 'e2e_report_exit \"$?\"' EXIT\n",
+        "{preamble}\n{}\ntrap 'e2e_report_exit \"$?\"' EXIT\n",
         include_str!("../../../scripts/e2e/lib/reporting.sh")
     )
 }

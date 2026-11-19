@@ -143,7 +143,7 @@ fn release_compatibility_gate_checks_both_container_baselines() {
     let temp = TempDir::new().expect("tempdir");
     let fake_bin = temp.path().join("fake-bin");
     let docker_log = temp.path().join("docker.log");
-    let binary = temp.path().join("kidobo");
+    let binary = temp.path().join("release build/kidobo");
     write_executable(&binary, "#!/usr/bin/env bash\nexit 0\n");
     write_executable(
         &fake_bin.join("readelf"),
@@ -153,9 +153,16 @@ fn release_compatibility_gate_checks_both_container_baselines() {
         &fake_bin.join("docker"),
         r#"#!/usr/bin/env bash
 set -euo pipefail
-printf '%s\n' "$*" >> "${KIDOBO_TEST_DOCKER_LOG}"
-if [[ " $* " == *" lookup 203.0.113.7 --format tsv "* ]]; then
-  printf '203.0.113.7\tinternal:blocklist\t203.0.113.0/24\n'
+printf '%s\0' "$@" '' >> "${KIDOBO_TEST_DOCKER_LOG}"
+if [[ "${@: -4:1}" == lookup ]]; then
+  for arg in "$@"; do
+    if [[ "$arg" == *:/fixture:ro ]]; then
+      read -r entry < "${arg%:/fixture:ro}/root/data/blocklist.txt"
+      printf '203.0.113.7\tinternal:blocklist\t%s\n' "$entry"
+      exit 0
+    fi
+  done
+  exit 1
 fi
 "#,
     );
@@ -169,11 +176,56 @@ fi
 
     assert_success(&output, "release compatibility gate");
     let log = read_to_string_with_limit(&docker_log, FIXTURE_LOG_READ_LIMIT);
-    assert_eq!(log.lines().count(), 6);
-    assert!(log.contains("debian:11-slim"));
-    assert!(log.contains("alpine:3.22"));
-    assert!(log.contains("--network none"));
-    assert!(log.contains("--read-only"));
+    let calls: Vec<_> = log
+        .split_terminator("\0\0")
+        .map(|call| call.split('\0').collect::<Vec<_>>())
+        .collect();
+    assert_eq!(calls.len(), 6, "Docker calls: {calls:?}");
+    let executable = "/usr/local/bin/kidobo";
+    let source = binary.canonicalize().expect("canonical binary path");
+    let binary_mount = format!("{}:{executable}:ro", source.display());
+    for image in ["debian:11-slim", "alpine:3.22"] {
+        for command in [
+            &[image, executable, "--version"][..],
+            &[image, executable, "--help"],
+            &[
+                image,
+                executable,
+                "lookup",
+                "203.0.113.7",
+                "--format",
+                "tsv",
+            ],
+        ] {
+            let options = calls
+                .iter()
+                .find_map(|call| call.strip_suffix(command))
+                .unwrap_or_else(|| panic!("missing Docker call for {command:?}: {calls:?}"));
+            assert_eq!(options.first(), Some(&"run"));
+            assert!(options.contains(&"--rm"), "{command:?}: {options:?}");
+            assert!(options.contains(&"--read-only"), "{command:?}: {options:?}");
+            for pair in [["--network", "none"], ["--volume", &binary_mount]] {
+                assert!(
+                    options.windows(2).any(|args| args == pair),
+                    "{command:?}: {options:?}"
+                );
+            }
+            if command[2] == "lookup" {
+                assert!(
+                    options
+                        .windows(2)
+                        .any(|args| args == ["--env", "KIDOBO_ROOT=/fixture/root"]),
+                    "{command:?}: {options:?}"
+                );
+                assert!(
+                    options
+                        .windows(2)
+                        .any(|args| args[0] == "--volume" && args[1].ends_with(":/fixture:ro")),
+                    "{command:?}: {options:?}"
+                );
+            }
+        }
+    }
 }
 
 #[test]

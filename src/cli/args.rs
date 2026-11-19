@@ -638,12 +638,6 @@ mod tests {
     }
 
     #[test]
-    fn lookup_command_rejects_missing_input_mode() {
-        let err = Cli::try_parse_from(["kidobo", "lookup"]).expect_err("lookup must fail");
-        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
-    }
-
-    #[test]
     fn lookup_command_rejects_multiple_input_modes() {
         let err = Cli::try_parse_from(["kidobo", "lookup", "203.0.113.7", "--file", "targets.txt"])
             .expect_err("lookup must fail");

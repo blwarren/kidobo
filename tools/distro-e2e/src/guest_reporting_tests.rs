@@ -1,12 +1,7 @@
 use std::fmt::Write as _;
 use std::process::{Command, Output};
 
-fn reporting_header() -> String {
-    format!(
-        "set -euo pipefail\nexec 9>&2\nBASH_XTRACEFD=9\nPS4='+ TRACE ${{BASH_SOURCE:-main}}:${{LINENO}}:${{FUNCNAME[0]:-main}}: '\nset -x\ne2e_checks=()\ne2e_failure_reason='command failed or guest interrupted before assertion completion'\n{}\ntrap 'e2e_report_exit \"$?\"' EXIT\n",
-        include_str!("../../../scripts/e2e/lib/reporting.sh")
-    )
-}
+use super::tests::lifecycle_reporting_helpers;
 
 fn fixture(body: &str) -> Output {
     Command::new("bash")
@@ -14,7 +9,7 @@ fn fixture(body: &str) -> Output {
             "E2E_CHECK_MANIFEST",
             concat!(env!("CARGO_MANIFEST_DIR"), "/../../scripts/e2e/checks.json"),
         )
-        .args(["-c", &format!("{}\n{body}", reporting_header())])
+        .args(["-c", &format!("{}\n{body}", lifecycle_reporting_helpers())])
         .output()
         .expect("run guest reporting with shell builtins only")
 }
@@ -190,7 +185,7 @@ esac
             "-c",
             &format!(
                 "set -eu\n{}\n{helper}\ndefer_timer_until_configuration_is_ready",
-                reporting_header()
+                lifecycle_reporting_helpers()
             ),
         ])
         .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))

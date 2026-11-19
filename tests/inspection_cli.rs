@@ -223,7 +223,10 @@ fn status_json_separates_kernel_header_counts_from_configured_feed_count() {
     assert_eq!(report["configured_feeds"], 2);
     assert_eq!(report["ipv4"]["entries"], 7);
     assert_eq!(report["ipv6"]["entries"], 9);
-    assert_eq!(report["last_successful_sync"], serde_json::Value::Null);
+    assert_eq!(
+        report.get("last_successful_sync"),
+        Some(&serde_json::Value::Null)
+    );
     let tool_log = fixture.tool_log();
     assert!(tool_log.contains("ipset list -name\n"), "{tool_log}");
     assert!(
@@ -485,7 +488,10 @@ fn unrelated_set_names_do_not_hide_managed_set_absence() {
     for family in ["ipv4", "ipv6"] {
         assert_eq!(report[family]["set_state"], "absent");
         assert_eq!(report[family]["enforcement"], "absent");
-        assert_eq!(report[family]["entries"], serde_json::Value::Null);
+        assert_eq!(
+            report[family].get("entries"),
+            Some(&serde_json::Value::Null)
+        );
     }
     for address in ["203.0.113.7", "2001:db8::7"] {
         let output = fixture.run(&["check", address, "--format", "json"], &environment);

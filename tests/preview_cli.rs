@@ -765,7 +765,7 @@ fn online_preview_uses_only_the_loopback_feed_and_in_memory_bgpq_result() {
     )
     .expect("write fast-state sentinel");
     let before = inventory(&fixture.root);
-    let server = serve_http_once(listener, "200 OK", "198.51.100.0/24\n");
+    let server = serve_http_once(listener, "200 OK", "198.51.100.0/25\n198.51.100.192/26\n");
 
     let output = fixture.run(&["sync", "--dry-run", "--allow-network"]);
     server.join().expect("join loopback server");
@@ -778,8 +778,19 @@ fn online_preview_uses_only_the_loopback_feed_and_in_memory_bgpq_result() {
         "{stdout}\n{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(stdout.contains("IPv4"));
-    assert!(stdout.contains("IPv6"));
+    for expected in [
+        &["IPv4", "4", "4"][..],
+        &["IPv6", "1", "1"],
+        &[url.as_str(), "Fresh", "network", "read"],
+        &["AS64512", "Fresh", "network", "read"],
+    ] {
+        assert!(
+            stdout
+                .lines()
+                .any(|line| line.split_whitespace().eq(expected.iter().copied())),
+            "missing preview row {expected:?} in:\n{stdout}"
+        );
+    }
     assert_eq!(
         before, after,
         "network-enabled preview persisted fetched data or changed files"

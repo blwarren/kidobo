@@ -410,6 +410,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::sync::mpsc::{self, RecvTimeoutError};
     use std::thread;
     use std::time::Duration;
 
@@ -418,36 +419,81 @@ mod tests {
     use super::test_support::CrossOriginRedirectFixture;
     use super::{
         DEFAULT_MAX_HTTP_BODY_BYTES, ENV_KIDOBO_MAX_HTTP_BODY_BYTES, HttpClient, HttpClientError,
-        HttpRequest, MAX_HTTP_BODY_BYTES, MAX_HTTP_REDIRECTS, ReqwestHttpClient,
-        has_same_http_origin, max_http_body_bytes,
+        HttpRequest, MAX_HTTP_BODY_BYTES, ReqwestHttpClient, has_same_http_origin,
+        max_http_body_bytes,
     };
 
-    fn spawn_same_origin_redirect_chain(
+    fn fetch_same_origin_redirect_chain(
         redirect_count: usize,
-        final_response: bool,
-    ) -> (String, thread::JoinHandle<()>) {
+    ) -> (Result<super::HttpResponse, HttpClientError>, usize) {
+        use std::io::{BufRead, BufReader};
+
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
         let addr = listener.local_addr().expect("listener addr");
-        let request_count = redirect_count + usize::from(final_response);
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
+        let (stop, stopped) = mpsc::channel();
         let server = thread::spawn(move || {
-            for index in 0..request_count {
-                let (mut socket, _) = listener.accept().expect("accept");
-                let mut request_buf = [0_u8; 1024];
-                let _ = socket.read(&mut request_buf).expect("read request");
-                let response = if final_response && index == redirect_count {
+            let mut requests = 0;
+            let mut stopping = false;
+            loop {
+                let mut socket = match listener.accept() {
+                    Ok((socket, _)) => socket,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if stopping {
+                            break;
+                        }
+                        stopping = !matches!(
+                            stopped.recv_timeout(Duration::from_millis(5)),
+                            Err(RecvTimeoutError::Timeout)
+                        );
+                        continue;
+                    }
+                    Err(error) => panic!("accept: {error}"),
+                };
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .expect("read timeout");
+                socket
+                    .set_write_timeout(Some(Duration::from_secs(2)))
+                    .expect("write timeout");
+                let mut request_line = String::new();
+                BufReader::new((&socket).take(4096))
+                    .read_line(&mut request_line)
+                    .expect("read redirect request line");
+                let expected_path = if requests == 0 {
+                    "/start".to_owned()
+                } else {
+                    format!("/redirect-{requests}")
+                };
+                assert_eq!(
+                    request_line.split_whitespace().nth(1),
+                    Some(expected_path.as_str())
+                );
+                requests += 1;
+                let response = if requests > redirect_count {
                     "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
                 } else {
                     format!(
-                        "HTTP/1.1 302 Found\r\nLocation: /redirect-{}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                        index + 1
+                        "HTTP/1.1 302 Found\r\nLocation: /redirect-{requests}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                     )
                 };
                 socket
                     .write_all(response.as_bytes())
                     .expect("write response");
             }
+            requests
         });
-        (format!("http://{addr}/start"), server)
+        let result = ReqwestHttpClient::with_timeout(Duration::from_secs(2)).fetch(HttpRequest {
+            validator_scope: None,
+            url: format!("http://{addr}/start"),
+            if_none_match: None,
+            if_modified_since: None,
+            max_body_bytes: 1024,
+        });
+        stop.send(()).expect("stop server thread");
+        (result, server.join().expect("server thread"))
     }
 
     #[test]
@@ -710,38 +756,27 @@ mod tests {
 
     #[test]
     fn reqwest_http_client_allows_ten_same_origin_redirects() {
-        let (url, server) = spawn_same_origin_redirect_chain(MAX_HTTP_REDIRECTS, true);
-        let client = ReqwestHttpClient::default();
-
-        let response = client
-            .fetch(HttpRequest {
-                validator_scope: None,
-                url,
-                if_none_match: None,
-                if_modified_since: None,
-                max_body_bytes: 1024,
-            })
-            .expect("ten redirects should succeed");
-
-        assert_eq!(response.status, StatusCode::OK);
-        server.join().expect("server thread");
+        let (result, requests) = fetch_same_origin_redirect_chain(10);
+        assert_eq!(
+            result.expect("ten redirects should succeed").status,
+            StatusCode::OK
+        );
+        assert_eq!(requests, 11);
     }
 
     #[test]
     fn reqwest_http_client_rejects_eleventh_same_origin_redirect() {
-        let (url, server) = spawn_same_origin_redirect_chain(MAX_HTTP_REDIRECTS + 1, false);
-        let client = ReqwestHttpClient::default();
-
-        let result = client.fetch(HttpRequest {
-            validator_scope: None,
-            url,
-            if_none_match: None,
-            if_modified_since: None,
-            max_body_bytes: 1024,
-        });
-
-        assert!(result.is_err(), "eleventh redirect should fail");
-        server.join().expect("server thread");
+        let (result, requests) = fetch_same_origin_redirect_chain(11);
+        assert_eq!(
+            requests, 11,
+            "the final redirect target must not be contacted"
+        );
+        assert_eq!(
+            result.expect_err("eleventh redirect should fail"),
+            HttpClientError::Request {
+                reason: "too many redirects".to_string(),
+            }
+        );
     }
 
     #[test]
