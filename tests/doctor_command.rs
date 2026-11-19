@@ -96,6 +96,7 @@ fn assert_doctor_redacts_configuration_error(arguments: &[&str], json_output: bo
     let output = Command::new(env!("CARGO_BIN_EXE_kidobo"))
         .args(arguments)
         .env_clear()
+        .envs(std::env::var_os("LLVM_PROFILE_FILE").map(|value| ("LLVM_PROFILE_FILE", value)))
         .env("KIDOBO_ROOT", &root)
         .env("PATH", &bin)
         .output()
