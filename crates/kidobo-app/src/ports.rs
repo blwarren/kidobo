@@ -82,6 +82,16 @@ pub trait LockManager {
     fn acquire(&self, path: &Path) -> Result<Box<dyn LockGuard>, AppError>;
 }
 
+/// Acquires the exclusive firewall transaction lock for the current network namespace.
+pub trait FirewallTransactionLock {
+    /// Acquires the lock without blocking.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the lock cannot be securely acquired or is already held.
+    fn acquire_firewall(&self) -> Result<Box<dyn LockGuard>, AppError>;
+}
+
 /// Reads operator-provided line-oriented target files through a bounded adapter.
 pub trait TargetFileReader {
     /// Reads bounded line-oriented targets from `path`.

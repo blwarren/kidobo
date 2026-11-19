@@ -3,12 +3,16 @@
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::sync::Once;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use reqwest::header::{ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED, USER_AGENT};
+use reqwest::header::{
+    ETAG, HeaderValue, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED, LOCATION, REFERER,
+    USER_AGENT,
+};
 use reqwest::{StatusCode, Url, redirect};
 use thiserror::Error;
 
+use crate::hash::sha256_hex;
 use crate::limited_io::read_to_end_with_limit;
 
 /// Default maximum accepted HTTP response body size.
@@ -33,6 +37,8 @@ pub struct HttpRequest {
     pub if_none_match: Option<String>,
     /// Optional `If-Modified-Since` validator.
     pub if_modified_since: Option<String>,
+    /// SHA-256 of the resource URL to which the validators belong.
+    pub validator_scope: Option<String>,
     /// Maximum accepted response body bytes.
     pub max_body_bytes: usize,
 }
@@ -44,6 +50,8 @@ pub struct HttpResponse {
     pub status: StatusCode,
     /// Response body constrained by the request bound.
     pub body: Vec<u8>,
+    /// SHA-256 of the resource URL that returned this response.
+    pub validator_scope: Option<String>,
     /// Optional response entity tag.
     pub etag: Option<String>,
     /// Optional response last-modified value.
@@ -111,7 +119,7 @@ impl ReqwestHttpClient {
     fn new_with_timeout(user_agent: impl Into<String>, request_timeout: Duration) -> Self {
         ensure_rustls_provider_installed();
         let client = reqwest::blocking::Client::builder()
-            .redirect(same_origin_redirect_policy())
+            .redirect(redirect::Policy::none())
             .build()
             .map_err(|error| HttpClientError::Initialization {
                 reason: error.to_string(),
@@ -122,21 +130,6 @@ impl ReqwestHttpClient {
             request_timeout,
         }
     }
-}
-
-fn same_origin_redirect_policy() -> redirect::Policy {
-    redirect::Policy::custom(|attempt| {
-        if attempt.previous().len() > MAX_HTTP_REDIRECTS {
-            return attempt.error("too many redirects");
-        }
-        let Some(initial_url) = attempt.previous().first() else {
-            return attempt.error("redirect chain is missing its initial URL");
-        };
-        if !has_same_http_origin(initial_url, attempt.url()) {
-            return attempt.error("redirect target has a different origin");
-        }
-        attempt.follow()
-    })
 }
 
 fn has_same_http_origin(initial_url: &Url, redirect_url: &Url) -> bool {
@@ -154,44 +147,128 @@ fn ensure_rustls_provider_installed() {
 impl HttpClient for ReqwestHttpClient {
     fn fetch(&self, request: HttpRequest) -> Result<HttpResponse, HttpClientError> {
         let client = self.client.as_ref().map_err(Clone::clone)?;
-        let mut builder = client
+        let start = Instant::now();
+        let initial = client
             .get(&request.url)
             .header(USER_AGENT, &self.user_agent)
-            .timeout(self.request_timeout);
-
-        if let Some(etag) = &request.if_none_match {
-            builder = builder.header(IF_NONE_MATCH, etag);
-        }
-        if let Some(last_modified) = &request.if_modified_since {
-            builder = builder.header(IF_MODIFIED_SINCE, last_modified);
-        }
-
-        let mut response = builder.send().map_err(|err| HttpClientError::Request {
-            reason: err.to_string(),
-        })?;
-
-        let status = response.status();
-        let headers = response.headers().clone();
-        let body = if status.is_success() {
-            if response.content_length().is_some_and(|length| {
-                length > u64::try_from(request.max_body_bytes).unwrap_or(u64::MAX)
-            }) {
-                return Err(HttpClientError::Request {
-                    reason: format!("response body exceeds max {} bytes", request.max_body_bytes),
-                });
+            .build()
+            .map_err(|error| request_error(error.to_string()))?;
+        let mut url = initial.url().clone();
+        let mut referer: Option<HeaderValue> = None;
+        for hops in 0..=MAX_HTTP_REDIRECTS {
+            let mut outgoing = initial
+                .try_clone()
+                .ok_or_else(|| request_error("cannot clone a bodyless HTTP request"))?;
+            *outgoing.url_mut() = url.clone();
+            *outgoing.timeout_mut() = Some(
+                self.request_timeout
+                    .checked_sub(start.elapsed())
+                    .ok_or_else(|| request_error("request timed out"))?,
+            );
+            if let Some(value) = referer.take() {
+                outgoing.headers_mut().insert(REFERER, value);
             }
-            read_response_body_capped(&mut response, request.max_body_bytes)?
-        } else {
-            Vec::new()
-        };
+            let scope = validator_scope(&url);
+            if request.validator_scope.as_deref() == Some(scope.as_str()) {
+                for (name, value) in [
+                    (IF_NONE_MATCH, request.if_none_match.as_deref()),
+                    (IF_MODIFIED_SINCE, request.if_modified_since.as_deref()),
+                ] {
+                    if let Some(value) = value {
+                        outgoing.headers_mut().insert(
+                            name,
+                            value
+                                .parse::<HeaderValue>()
+                                .map_err(|error| request_error(error.to_string()))?,
+                        );
+                    }
+                }
+            }
 
-        Ok(HttpResponse {
-            status,
-            body,
-            etag: header_to_string(&headers, ETAG),
-            last_modified: header_to_string(&headers, LAST_MODIFIED),
-        })
+            let mut response = client
+                .execute(outgoing)
+                .map_err(|error| request_error(error.to_string()))?;
+            if let Some(mut next_url) = redirect_target(&response, &url)? {
+                if !has_same_http_origin(initial.url(), &next_url) {
+                    return Err(request_error("redirect target has a different origin"));
+                }
+                if hops == MAX_HTTP_REDIRECTS {
+                    return Err(request_error("too many redirects"));
+                }
+                next_url
+                    .set_username("")
+                    .and_then(|()| next_url.set_password(None))
+                    .map_err(|()| request_error("invalid redirect authority"))?;
+                url.set_fragment(None);
+                referer = url.as_str().parse().ok();
+                url = next_url;
+                continue;
+            }
+
+            let status = response.status();
+            let headers = response.headers().clone();
+            let body = if status == StatusCode::OK {
+                if response.content_length().is_some_and(|length| {
+                    length > u64::try_from(request.max_body_bytes).unwrap_or(u64::MAX)
+                }) {
+                    return Err(request_error(format!(
+                        "response body exceeds max {} bytes",
+                        request.max_body_bytes
+                    )));
+                }
+                read_response_body_capped(&mut response, request.max_body_bytes)?
+            } else {
+                Vec::new()
+            };
+            return Ok(HttpResponse {
+                status,
+                body,
+                validator_scope: Some(scope),
+                etag: header_to_string(&headers, ETAG),
+                last_modified: header_to_string(&headers, LAST_MODIFIED),
+            });
+        }
+        Err(request_error("too many redirects"))
     }
+}
+
+fn request_error(reason: impl Into<String>) -> HttpClientError {
+    HttpClientError::Request {
+        reason: reason.into(),
+    }
+}
+
+fn redirect_target(
+    response: &reqwest::blocking::Response,
+    url: &Url,
+) -> Result<Option<Url>, HttpClientError> {
+    if !matches!(
+        response.status(),
+        StatusCode::MOVED_PERMANENTLY
+            | StatusCode::FOUND
+            | StatusCode::SEE_OTHER
+            | StatusCode::TEMPORARY_REDIRECT
+            | StatusCode::PERMANENT_REDIRECT
+    ) {
+        return Ok(None);
+    }
+    response
+        .headers()
+        .get(LOCATION)
+        .map(|location| {
+            let target = location
+                .to_str()
+                .map_err(|error| request_error(error.to_string()))?;
+            url.join(target)
+                .map_err(|error| request_error(error.to_string()))
+        })
+        .transpose()
+}
+
+fn validator_scope(url: &Url) -> String {
+    let mut resource = url.clone();
+    resource.set_fragment(None);
+    sha256_hex(resource.as_str().as_bytes())
 }
 
 fn default_user_agent() -> String {
@@ -336,7 +413,7 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
-    use reqwest::StatusCode;
+    use reqwest::{StatusCode, Url};
 
     use super::test_support::CrossOriginRedirectFixture;
     use super::{
@@ -430,6 +507,7 @@ mod tests {
         let client = ReqwestHttpClient::default();
         let err = client
             .fetch(HttpRequest {
+                validator_scope: None,
                 url: format!("http://{addr}/feed"),
                 if_none_match: None,
                 if_modified_since: None,
@@ -477,6 +555,7 @@ mod tests {
                 .expect("write response without content length");
         });
         let result = ReqwestHttpClient::with_timeout(Duration::from_secs(2)).fetch(HttpRequest {
+            validator_scope: None,
             url: format!("http://{addr}/feed"),
             if_none_match: None,
             if_modified_since: None,
@@ -489,6 +568,69 @@ mod tests {
             panic!("expected request error");
         };
         assert_eq!(reason, "response body exceeds max 4 bytes");
+    }
+
+    #[test]
+    fn redirect_sends_validators_only_to_the_cached_resource() {
+        use std::io::{BufRead, BufReader};
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let alias = format!("http://{addr}/feed");
+        let cached = Url::parse(&format!("http://{addr}/current")).expect("cached resource URL");
+        let replacement =
+            Url::parse(&format!("http://{addr}/replacement")).expect("replacement resource URL");
+        let server = thread::spawn(move || {
+            for (request_path, conditional, response) in [
+                ("/feed", false, "302 Found\r\nLocation: /current"),
+                ("/current", true, "304 Not Modified"),
+                ("/feed", false, "302 Found\r\nLocation: /replacement"),
+                ("/replacement", false, "200 OK"),
+            ] {
+                let (mut socket, _) = listener.accept().expect("accept");
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .expect("read timeout");
+                let mut request = String::new();
+                let mut stream = BufReader::new(&mut socket);
+                loop {
+                    let mut line = String::new();
+                    assert_ne!(stream.read_line(&mut line).expect("request header"), 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    request.push_str(&line);
+                }
+                let request = request.to_ascii_lowercase();
+                assert!(request.starts_with(&format!("get {request_path} ")));
+                assert_eq!(request.contains("if-none-match: \"shared\""), conditional);
+                assert_eq!(request.contains("if-modified-since: "), conditional);
+                let reply = format!(
+                    "HTTP/1.1 {response}\r\nETag: \"shared\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                socket.write_all(reply.as_bytes()).expect("response");
+            }
+        });
+
+        let scope = super::validator_scope(&cached);
+        let request = HttpRequest {
+            url: alias,
+            if_none_match: Some(r#""shared""#.into()),
+            if_modified_since: Some("Mon, 01 Jan 2024 00:00:00 GMT".into()),
+            validator_scope: Some(scope.clone()),
+            max_body_bytes: 1024,
+        };
+        let client = ReqwestHttpClient::with_timeout(Duration::from_secs(2));
+        let unchanged = client.fetch(request.clone()).expect("same redirect target");
+        assert_eq!(unchanged.status, StatusCode::NOT_MODIFIED);
+        assert_eq!(unchanged.validator_scope.as_deref(), Some(scope.as_str()));
+        let changed = client.fetch(request).expect("changed redirect target");
+        assert_eq!(changed.status, StatusCode::OK);
+        assert_eq!(
+            changed.validator_scope,
+            Some(super::validator_scope(&replacement))
+        );
+        server.join().expect("redirect fixture");
     }
 
     #[test]
@@ -515,6 +657,7 @@ mod tests {
         let client = ReqwestHttpClient::default();
         let response = client
             .fetch(HttpRequest {
+                validator_scope: None,
                 url: format!("http://{addr}/start"),
                 if_none_match: None,
                 if_modified_since: None,
@@ -532,6 +675,7 @@ mod tests {
         let fixture = CrossOriginRedirectFixture::new();
         let client = ReqwestHttpClient::with_timeout(Duration::from_secs(1));
         let result = client.fetch(HttpRequest {
+            validator_scope: None,
             url: fixture.source_url().to_string(),
             if_none_match: None,
             if_modified_since: None,
@@ -571,6 +715,7 @@ mod tests {
 
         let response = client
             .fetch(HttpRequest {
+                validator_scope: None,
                 url,
                 if_none_match: None,
                 if_modified_since: None,
@@ -588,6 +733,7 @@ mod tests {
         let client = ReqwestHttpClient::default();
 
         let result = client.fetch(HttpRequest {
+            validator_scope: None,
             url,
             if_none_match: None,
             if_modified_since: None,
@@ -611,6 +757,7 @@ mod tests {
 
         let error = client
             .fetch(HttpRequest {
+                validator_scope: None,
                 url: "https://example.com/feed".to_string(),
                 if_none_match: None,
                 if_modified_since: None,

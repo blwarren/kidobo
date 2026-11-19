@@ -230,7 +230,7 @@ pub(crate) fn generation_candidates(store_root: &Path) -> Vec<GenerationCandidat
 }
 
 /// Confirms the selected manifest's durability before pruning or online reuse.
-pub(crate) fn prepare_online_generations(store_root: &Path) -> io::Result<()> {
+pub(crate) fn prepare_online_generations(store_root: &Path, cache_root: &Path) -> io::Result<()> {
     let manifest_path = store_root.join(MANIFEST_FILE_NAME);
     let candidates = generation_candidates(store_root);
     if candidates.is_empty() {
@@ -249,6 +249,9 @@ pub(crate) fn prepare_online_generations(store_root: &Path) -> io::Result<()> {
         let Ok(entries) = fs::read_dir(&generations_root) else {
             return Ok(());
         };
+        sync_directory(&generations_root)?;
+        sync_directory(store_root)?;
+        sync_store_ancestors(store_root, cache_root)?;
         for entry in entries.flatten() {
             let metadata = match fs::metadata(entry.path()) {
                 Ok(metadata) => metadata,
@@ -272,13 +275,44 @@ pub(crate) fn prepare_online_generations(store_root: &Path) -> io::Result<()> {
     let Some(current) = candidates.first() else {
         return Ok(());
     };
+    for candidate in &candidates {
+        sync_directory_if_present(&candidate.directory)?;
+    }
+    sync_directory_if_present(&store_root.join(GENERATIONS_DIRECTORY))?;
     sync_directory(store_root)?;
+    sync_store_ancestors(store_root, cache_root)?;
     let manifest = GenerationManifest {
         version: CACHE_SCHEMA_VERSION,
         current: current.id.clone(),
         previous: candidates.get(1).map(|candidate| candidate.id.clone()),
     };
     prune_generations(store_root, &manifest);
+    Ok(())
+}
+
+fn sync_directory_if_present(path: &Path) -> io::Result<()> {
+    match sync_directory(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        result => result,
+    }
+}
+
+// The manifest sync covers the store itself. Persist the entries that lead to
+// the store, including the remote-cache root when it was just created.
+fn sync_store_ancestors(store_root: &Path, cache_root: &Path) -> io::Result<()> {
+    let containing_directory = cache_root.parent().unwrap_or(cache_root);
+    for directory in store_root
+        .ancestors()
+        .skip(1)
+        .take_while(|directory| directory.starts_with(containing_directory))
+    {
+        let directory = if directory.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            directory
+        };
+        sync_directory(directory)?;
+    }
     Ok(())
 }
 
@@ -329,10 +363,11 @@ pub(crate) fn commit_generation(
 
 pub(crate) fn stage_generation(
     store_root: &Path,
+    cache_root: &Path,
     files: &[GenerationFile<'_>],
     previous: Option<&str>,
 ) -> io::Result<StagedGeneration> {
-    stage_generation_with_hook(store_root, files, previous, |_| Ok(()))
+    stage_generation_with_hook(store_root, cache_root, files, previous, |_| Ok(()))
 }
 
 #[cfg(test)]
@@ -345,13 +380,15 @@ fn commit_generation_with_hook<F>(
 where
     F: FnMut(CommitStage) -> io::Result<()>,
 {
-    let mut staged = stage_generation_with_hook(store_root, files, previous, &mut hook)?;
+    let mut staged =
+        stage_generation_with_hook(store_root, store_root, files, previous, &mut hook)?;
     staged.promote_with_hook(&mut hook)?;
     Ok(staged.generation_id.clone())
 }
 
 fn stage_generation_with_hook<F>(
     store_root: &Path,
+    cache_root: &Path,
     files: &[GenerationFile<'_>],
     previous: Option<&str>,
     mut hook: F,
@@ -408,10 +445,11 @@ where
             if generation_contents_match(
                 &GenerationCandidate {
                     id: generation_id.clone(),
-                    directory: generation_directory,
+                    directory: generation_directory.clone(),
                 },
                 &files,
             ) {
+                sync_directory(&generation_directory)?;
                 fs::remove_dir_all(&staging_directory)?;
             } else {
                 repair = Some(GenerationRepair {
@@ -422,9 +460,10 @@ where
             false
         } else {
             fs::rename(&staging_directory, &generation_directory)?;
-            sync_directory(&generations_root)?;
             true
         };
+        sync_directory(&generations_root)?;
+        sync_store_ancestors(store_root, cache_root)?;
         let selected = generation_candidates(store_root);
         let previous = if previous == Some(generation_id.as_str()) {
             selected.get(1).map(|candidate| candidate.id.as_str())
@@ -563,7 +602,7 @@ mod tests {
         std::fs::remove_file(&manifest).expect("remove manifest");
         std::os::unix::fs::symlink(super::MANIFEST_FILE_NAME, &manifest).expect("manifest loop");
 
-        prepare_online_generations(temp.path()).expect("prepare generations");
+        prepare_online_generations(temp.path(), temp.path()).expect("prepare generations");
 
         let payload = temp
             .path()
@@ -623,7 +662,8 @@ mod tests {
                 name: "payload",
                 contents: b"current",
             }];
-            let stage = stage_generation(temp.path(), &files, Some(&previous)).expect("stage");
+            let stage =
+                stage_generation(temp.path(), temp.path(), &files, Some(&previous)).expect("stage");
             assert_ne!(
                 read_bytes_with_limit(&payload, 64).ok().as_deref(),
                 Some(b"current".as_slice())
@@ -638,7 +678,7 @@ mod tests {
                     .expect("previous"),
                 b"previous"
             );
-            stage_generation(temp.path(), &files, Some(&previous))
+            stage_generation(temp.path(), temp.path(), &files, Some(&previous))
                 .expect("stage")
                 .promote()
                 .expect("repair");
@@ -667,6 +707,7 @@ mod tests {
         std::fs::remove_file(&payload).expect("remove");
         std::fs::create_dir(&payload).expect("block atomic replacement");
         stage_generation(
+            temp.path(),
             temp.path(),
             &[GenerationFile {
                 name: "payload",
@@ -739,6 +780,7 @@ mod tests {
         let selected = generation_candidates(temp.path());
         let staged = stage_generation(
             temp.path(),
+            temp.path(),
             &[GenerationFile {
                 name: "payload",
                 contents: b"new",
@@ -788,6 +830,7 @@ mod tests {
             .map(|previous| commit(temp.path(), b"old", Some(previous)));
         let staged = stage_generation(
             temp.path(),
+            temp.path(),
             &[GenerationFile {
                 name: "payload",
                 contents: b"new",
@@ -832,6 +875,7 @@ mod tests {
 
         let retry = stage_generation(
             temp.path(),
+            temp.path(),
             &[GenerationFile {
                 name: "payload",
                 contents: b"new",
@@ -856,6 +900,38 @@ mod tests {
                 .expect("retried payload remains readable"),
             b"new"
         );
+    }
+
+    #[test]
+    fn new_store_ancestry_and_retry_generation_entry_must_be_synced() {
+        use crate::limited_io::directory_sync_test::fail_once_at;
+
+        let temp = TempDir::new().expect("tempdir");
+        let cache_root = temp.path().join("remote-cache");
+        let parent = cache_root.join("v2/remote");
+        let store = parent.join("source");
+        let generations = store.join(GENERATIONS_DIRECTORY);
+        let files = [GenerationFile {
+            name: "payload",
+            contents: b"new",
+        }];
+
+        for directory in [&parent, &generations] {
+            let error = fail_once_at(
+                directory,
+                io::Error::from_raw_os_error(nix::libc::EIO),
+                || stage_generation(&store, &cache_root, &files, None),
+            )
+            .expect_err("new and reused generation entries require durable parent links");
+            assert_eq!(error.raw_os_error(), Some(nix::libc::EIO));
+            assert_eq!(generation_candidates(&store), Vec::new());
+        }
+
+        let id = stage_generation(&store, &cache_root, &files, None)
+            .expect("durable generation after retry")
+            .promote()
+            .expect("durable selection");
+        assert_eq!(generation_candidates(&store)[0].id, id);
     }
 
     #[test]
@@ -940,10 +1016,35 @@ mod tests {
     }
 
     #[test]
+    fn online_cleanup_confirms_manifest_absence_before_removing_orphans() {
+        use crate::limited_io::directory_sync_test::fail_once_at;
+
+        let temp = TempDir::new().expect("tempdir");
+        let cache_root = temp.path().join("remote");
+        let store = cache_root.join("v2/remote/url");
+        let orphan = store.join(GENERATIONS_DIRECTORY).join(".abandoned");
+        std::fs::create_dir_all(&orphan).expect("orphan state");
+        for directory in [&store, &cache_root] {
+            let error = fail_once_at(
+                directory,
+                io::Error::from_raw_os_error(nix::libc::EIO),
+                || prepare_online_generations(&store, &cache_root),
+            )
+            .expect_err("manifest absence must be durable before pruning");
+            assert_eq!(error.raw_os_error(), Some(nix::libc::EIO));
+            assert!(orphan.exists());
+        }
+
+        prepare_online_generations(&store, &cache_root).expect("durable absent manifest");
+        assert!(!orphan.exists());
+    }
+
+    #[test]
     fn online_cleanup_removes_unselected_crash_generation() {
         let temp = TempDir::new().expect("tempdir");
         let selected = commit(temp.path(), b"selected", None);
         let staged = stage_generation(
+            temp.path(),
             temp.path(),
             &[GenerationFile {
                 name: "payload",
@@ -954,7 +1055,7 @@ mod tests {
         .expect("stage generation");
         std::mem::forget(staged);
 
-        prepare_online_generations(temp.path()).expect("prepare generations");
+        prepare_online_generations(temp.path(), temp.path()).expect("prepare generations");
 
         let directories = std::fs::read_dir(temp.path().join(GENERATIONS_DIRECTORY))
             .expect("read generations")

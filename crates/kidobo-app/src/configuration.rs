@@ -173,6 +173,7 @@ pub struct ConfigurationPreview {
     after: Config,
     changed_fields: Vec<&'static str>,
     expands_exemption: bool,
+    revalidate_unchanged: bool,
 }
 
 impl fmt::Debug for ConfigurationPreview {
@@ -456,6 +457,7 @@ pub fn prepare(
         after,
         changed_fields,
         expands_exemption,
+        revalidate_unchanged: matches!(request.edit, ConfigurationEdit::SetBasic { .. }),
     })
 }
 
@@ -474,18 +476,25 @@ pub fn apply(
     if preview.expands_exemption && !decision.approve_exemption {
         return Err(AppError::ConfirmationRequired);
     }
-    if !preview.changed() {
+    let changed = preview.changed();
+    let _lock = if changed || preview.revalidate_unchanged {
+        let lock = dependencies.locks.acquire(&preview.paths.lock_file)?;
+        dependencies.cancellation.check()?;
+        let current = dependencies.reader.read(&preview.paths.config_file)?;
+        if current.as_ref().map(|document| &document.contents) != preview.original.as_ref() {
+            return Err(AppError::ConfigurationChanged);
+        }
+        dependencies.cancellation.check()?;
+        Some(lock)
+    } else {
+        None
+    };
+    if !changed {
         return Ok(ConfigurationOutcome {
             changed: false,
             created: false,
             changed_fields: Vec::new(),
         });
-    }
-    let _lock = dependencies.locks.acquire(&preview.paths.lock_file)?;
-    dependencies.cancellation.check()?;
-    let current = dependencies.reader.read(&preview.paths.config_file)?;
-    if current.as_ref().map(|document| &document.contents) != preview.original.as_ref() {
-        return Err(AppError::ConfigurationChanged);
     }
     Config::from_toml_str(&preview.candidate)?;
     dependencies.cancellation.check()?;

@@ -6,7 +6,7 @@ use std::path::Path;
 use toml_edit::{Array, DocumentMut, Item, Table, Value, value};
 
 use crate::config::CONFIG_READ_LIMIT;
-use crate::config_management::append_value;
+use crate::config_management::{append_value, retain_array_values};
 use crate::limited_io::{read_to_string_with_limit, write_private_string_atomic_with_limit};
 use kidobo_app::AppError;
 use kidobo_core::config::{ConfigError, DEFAULT_ASN_CACHE_STALE_AFTER_SECS};
@@ -48,7 +48,7 @@ pub fn update_asn_bans(
         .unwrap_or_default();
 
     let mut before = BTreeSet::new();
-    before.extend(existing.iter().copied());
+    before.extend(existing);
     let mut after = before.clone();
     for asn in add {
         after.insert(*asn);
@@ -64,11 +64,12 @@ pub fn update_asn_bans(
     }
     let values = asn_table.entry("banned").or_insert(value(Array::new()));
     if let Some(values) = values.as_array_mut() {
-        for (index, asn) in existing.into_iter().enumerate().rev() {
-            if !after.contains(&asn) {
-                remove_asn_value(values, index);
-            }
-        }
+        retain_array_values(values, |value| {
+            value
+                .as_integer()
+                .and_then(|asn| u32::try_from(asn).ok())
+                .is_some_and(|asn| after.contains(&asn))
+        });
         for asn in &added {
             append_value(values, Value::from(i64::from(*asn)));
         }
@@ -88,33 +89,6 @@ pub fn update_asn_bans(
         },
     )?;
     Ok(AsnBanUpdateResult { added, removed })
-}
-
-fn remove_asn_value(values: &mut Array, index: usize) {
-    let removed = values.remove(index);
-    // A comment after the previous element's comma belongs to this value's prefix in TOML.
-    if let Some(prefix) = removed
-        .decor()
-        .prefix()
-        .and_then(toml_edit::RawString::as_str)
-        .filter(|prefix| prefix.contains('#'))
-    {
-        if let Some(next) = values.get_mut(index) {
-            let next_prefix = next
-                .decor()
-                .prefix()
-                .and_then(toml_edit::RawString::as_str)
-                .unwrap_or_default();
-            let prefix = format!("{}{next_prefix}", prefix.trim_end_matches([' ', '\t']));
-            next.decor_mut().set_prefix(prefix);
-        } else {
-            let trailing = values.trailing().as_str().unwrap_or_default();
-            values.set_trailing(format!(
-                "{}{trailing}",
-                prefix.trim_end_matches([' ', '\t'])
-            ));
-        }
-    }
 }
 
 fn load_config_document(path: &Path) -> Result<DocumentMut, AppError> {
@@ -288,6 +262,75 @@ mod tests {
             .expect("valid TOML");
             assert_eq!(config.asn.banned, [64512, 64514, 64515]);
         }
+    }
+
+    #[test]
+    fn removing_asns_preserves_only_comments_for_retained_values() {
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("config.toml");
+        let original = "[ipset]\nset_name='kidobo'\n[asn]\nbanned = [ # array header\n  # before first\n  64_512, # description for first\n  # before middle\n  64513, # description for middle\n  # before duplicate\n  64512, # description for duplicate\n  # before last\n  64514 # description for last\n  # array footer\n]\ncache_stale_after_secs=60\n";
+        let values = [
+            (64512, "64_512", "first"),
+            (64513, "64513", "middle"),
+            (64514, "64514", "last"),
+        ];
+        for (removed, _, removed_name) in values {
+            std::fs::write(&path, original).expect("ASN configuration");
+            assert_eq!(
+                update_asn_bans(&path, &[], &[removed])
+                    .expect("remove")
+                    .removed,
+                [removed]
+            );
+            let candidate = read_to_string_with_limit(&path, 65536).expect("read");
+            let config =
+                kidobo_core::config::Config::from_toml_str(&candidate).expect("valid candidate");
+            assert_eq!(
+                config.asn.banned,
+                values
+                    .iter()
+                    .map(|(asn, _, _)| *asn)
+                    .filter(|asn| *asn != removed)
+                    .collect::<Vec<_>>()
+            );
+            assert!(
+                !candidate.contains(&format!("# before {removed_name}")),
+                "{candidate}"
+            );
+            assert!(
+                !candidate.contains(&format!("# description for {removed_name}")),
+                "{candidate}"
+            );
+            for (asn, value, name) in values {
+                if asn != removed {
+                    let delimiter = if name == "last" { "" } else { "," };
+                    assert!(
+                        candidate.contains(&format!(
+                            "# before {name}\n  {value}{delimiter} # description for {name}"
+                        )),
+                        "{candidate}"
+                    );
+                }
+            }
+            assert_eq!(
+                candidate.contains("# before duplicate\n  64512, # description for duplicate"),
+                removed != 64512,
+                "{candidate}"
+            );
+            assert!(candidate.contains("[ # array header\n"), "{candidate}");
+            assert!(candidate.contains("# array footer\n]"), "{candidate}");
+        }
+        std::fs::write(&path, original).expect("ASN configuration");
+        assert_eq!(
+            update_asn_bans(&path, &[], &[64515])
+                .expect("no-op")
+                .removed,
+            [] as [u32; 0]
+        );
+        assert_eq!(
+            read_to_string_with_limit(&path, 65536).expect("read"),
+            original
+        );
     }
 
     #[test]

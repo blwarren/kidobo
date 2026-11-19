@@ -4,6 +4,14 @@
 
 ### Fixed
 
+- Keep reply traffic flowing during firewall rule replacement, coordinate sync and full flush
+  across storage roots, and preserve operator-authored references to Kidobo chains.
+- Recover from corrupt legacy feeds, revalidate only the resource that supplied a cached body,
+  and retain admissible GitHub safelist fallbacks and durable first-time cache publications.
+- Recheck the reviewed configuration before setup proceeds and preserve comments on retained
+  entries when removing configured sources or exemptions.
+- Enforce local blocklist syntax during offline lookup and return complete status JSON for
+  Unix paths containing invalid UTF-8.
 - Preserve selected remote-feed and GitHub metadata cache generations when manifest replacement
   succeeds but directory synchronization fails. Confirm directory durability on retry before using
   the selection or pruning generations.

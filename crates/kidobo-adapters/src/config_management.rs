@@ -255,7 +255,7 @@ fn edit_source(
     if add {
         append_value(array, Value::from(input.trim()));
     } else {
-        array.retain(|value| {
+        retain_array_values(array, |value| {
             value
                 .as_str()
                 .and_then(|url| normalized_url(url).ok())
@@ -280,7 +280,9 @@ fn edit_allow(
     if add {
         append_value(array, Value::from(identity.to_string()));
     } else {
-        array.retain(|value| value.as_str().and_then(parse_ip_cidr_strict) != Some(identity));
+        retain_array_values(array, |value| {
+            value.as_str().and_then(parse_ip_cidr_strict) != Some(identity)
+        });
     }
     Ok(())
 }
@@ -386,6 +388,77 @@ fn replace_allow(
         }
     }
     Ok(())
+}
+
+pub(crate) fn retain_array_values(array: &mut Array, mut retain: impl FnMut(&Value) -> bool) {
+    for index in (0..array.len()).rev() {
+        if array.get(index).is_some_and(&mut retain) {
+            continue;
+        }
+        let removed = array.remove(index);
+        let prefix = removed
+            .decor()
+            .prefix()
+            .and_then(toml_edit::RawString::as_str)
+            .unwrap_or_default();
+        let trailing = array.trailing().as_str().unwrap_or_default();
+        let next = array.get(index);
+        let trivia = if let Some(next) = next {
+            next.decor()
+                .prefix()
+                .and_then(toml_edit::RawString::as_str)
+                .unwrap_or_default()
+        } else if array.trailing_comma() || !trailing.is_empty() {
+            trailing
+        } else {
+            removed
+                .decor()
+                .suffix()
+                .and_then(toml_edit::RawString::as_str)
+                .unwrap_or_default()
+        };
+
+        // A same-line comment after a comma is stored in the next value's prefix.
+        // Keep the comment from before the removed value, and discard its own inline comment.
+        let retained_comment = split_inline_comment(prefix);
+        let trivia = split_inline_comment(trivia).map_or(trivia, |(_, rest)| rest);
+        let replacement = if let Some((comment, rest)) = retained_comment {
+            if let Some(newline) = trivia.find(['\r', '\n']) {
+                format!("{comment}{}", &trivia[newline..])
+            } else {
+                let newline = if rest.starts_with("\r\n") {
+                    "\r\n"
+                } else {
+                    "\n"
+                };
+                let indent = if next.is_some() {
+                    prefix.rsplit('\n').next().unwrap_or_default()
+                } else {
+                    ""
+                };
+                format!("{comment}{newline}{indent}")
+            }
+        } else {
+            trivia.to_owned()
+        };
+        if let Some(next) = array.get_mut(index) {
+            next.decor_mut().set_prefix(replacement);
+        } else {
+            if retained_comment.is_some() && index > 0 {
+                array.set_trailing_comma(true);
+            }
+            array.set_trailing(replacement);
+        }
+    }
+}
+
+fn split_inline_comment(trivia: &str) -> Option<(&str, &str)> {
+    let end = trivia.find(['\r', '\n']).unwrap_or(trivia.len());
+    let (first_line, rest) = trivia.split_at(end);
+    first_line
+        .trim_start()
+        .starts_with('#')
+        .then_some((first_line, rest))
 }
 
 pub(crate) fn append_value(array: &mut Array, mut value: Value) {
@@ -510,6 +583,77 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    #[test]
+    fn source_and_allow_removals_keep_comments_with_their_retained_values() {
+        for (section, key, edit, values, duplicate, missing) in [
+            (
+                "remote",
+                "urls",
+                ConfigurationEdit::RemoveSource as fn(String) -> ConfigurationEdit,
+                ["https://a.test", "https://b.test", "https://c.test"],
+                "HTTPS://A.test:443/",
+                "https://missing.test",
+            ),
+            (
+                "safe",
+                "ips",
+                ConfigurationEdit::RemoveAllow,
+                ["203.0.113.1", "203.0.113.2", "203.0.113.3"],
+                "203.0.113.1/32",
+                "203.0.113.4",
+            ),
+        ] {
+            let [first, middle, last] = values;
+            let original = format!(
+                "[ipset]\nset_name='kidobo'\n[{section}]\n{key} = [ # array header\n  # before first\n  '{first}', # description for first\n  # before middle\n  '{middle}', # description for middle\n  # before last\n  '{last}' # description for last\n  # array footer\n]\n"
+            );
+            let manager = FileConfigurationManager;
+            assert_eq!(
+                manager
+                    .render(&original, &edit(missing.into()))
+                    .expect("no-op"),
+                original
+            );
+
+            for (removed, removed_name) in values.into_iter().zip(["first", "middle", "last"]) {
+                let candidate = manager
+                    .render(&original, &edit(removed.into()))
+                    .expect("remove");
+                assert!(!candidate.contains(&format!("'{removed}'")), "{candidate}");
+                assert!(
+                    !candidate.contains(&format!("# before {removed_name}")),
+                    "{candidate}"
+                );
+                assert!(
+                    !candidate.contains(&format!("# description for {removed_name}")),
+                    "{candidate}"
+                );
+                for (value, name) in values.into_iter().zip(["first", "middle", "last"]) {
+                    if name != removed_name {
+                        let delimiter = if name == "last" { "" } else { "," };
+                        assert!(
+                            candidate.contains(&format!(
+                                "# before {name}\n  '{value}'{delimiter} # description for {name}"
+                            )),
+                            "{candidate}"
+                        );
+                    }
+                }
+                assert!(candidate.contains("[ # array header\n"), "{candidate}");
+                assert!(candidate.contains("# array footer\n]"), "{candidate}");
+            }
+
+            let duplicates = original.replace("  # before last", &format!("  # before duplicate\n  '{duplicate}', # description for duplicate\n  # before last"));
+            let candidate = manager
+                .render(&duplicates, &edit(first.into()))
+                .expect("remove duplicates");
+            let expected = manager
+                .render(&original, &edit(first.into()))
+                .expect("remove once");
+            assert_eq!(candidate, expected);
+        }
     }
 
     #[test]
@@ -882,6 +1026,7 @@ mod tests {
             ) -> Result<crate::http_client::HttpResponse, crate::http_client::HttpClientError>
             {
                 Ok(crate::http_client::HttpResponse {
+                    validator_scope: None,
                     status: reqwest::StatusCode::OK,
                     body: b"203.0.113.0/24\n".to_vec(),
                     etag: Some("fixture-etag".to_string()),

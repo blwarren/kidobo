@@ -47,7 +47,9 @@ Running `kidobo` without a subcommand is compatible with `kidobo status` and
 opens the read-only status view. `status` and `check` use versioned JSON when
 `--format json` is selected; their reports identify `schema_version: 1`. Status
 separates configured feed count from validated live `ipset` header entry
-counts. `last_successful_sync` remains `null` until Kidobo has a persisted
+counts. On Unix, a configuration path containing invalid UTF-8 uses a display string in
+`configuration_path` and includes the exact native bytes in `configuration_path_bytes`.
+Paths representable as UTF-8 omit the byte array. `last_successful_sync` remains `null` until Kidobo has a persisted
 success receipt. Missing observations remain null or `unknown`; they are not
 reported as zero or inferred from configuration.
 

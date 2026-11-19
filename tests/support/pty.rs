@@ -93,12 +93,12 @@ impl PtyCommand {
         reason = "Prompt-free waiting is used by CLI terminal tests."
     )]
     pub fn wait(mut self) -> CapturedOutput {
-        self.collect(&[], |_, _| {})
+        self.collect(&[], |_, _, _| {})
     }
 
     #[allow(dead_code, reason = "Used by single-prompt integration test binaries.")]
     pub fn respond_after(mut self, prompt: &str, response: &str) -> CapturedOutput {
-        self.collect(&[(prompt, response)], |_, _| {})
+        self.collect(&[(prompt, response)], |_, _, _| {})
     }
 
     #[allow(
@@ -112,7 +112,7 @@ impl PtyCommand {
         action: impl FnOnce(&mut Child, &mut File),
     ) -> CapturedOutput {
         let mut action = Some(action);
-        self.collect(&[(prompt, response)], |child, terminal| {
+        self.collect(&[(prompt, response)], |_, child, terminal| {
             if let Some(action) = action.take() {
                 action(child, terminal);
             }
@@ -124,13 +124,22 @@ impl PtyCommand {
         reason = "Used by the multi-prompt setup integration test binary."
     )]
     pub fn respond_to_all(mut self, interactions: &[(&str, &str)]) -> CapturedOutput {
-        self.collect(interactions, |_, _| {})
+        self.collect(interactions, |_, _, _| {})
+    }
+
+    #[allow(dead_code, reason = "Used by the setup revision revalidation test.")]
+    pub fn respond_to_all_with(
+        mut self,
+        interactions: &[(&str, &str)],
+        mut before_response: impl FnMut(&str),
+    ) -> CapturedOutput {
+        self.collect(interactions, |prompt, _, _| before_response(prompt))
     }
 
     fn collect(
         &mut self,
         interactions: &[(&str, &str)],
-        mut after_prompt: impl FnMut(&mut Child, &mut File),
+        mut after_prompt: impl FnMut(&str, &mut Child, &mut File),
     ) -> CapturedOutput {
         let deadline = Instant::now() + DEADLINE;
         let mut terminal = Vec::new();
@@ -185,7 +194,7 @@ impl PtyCommand {
                     .iter()
                     .any(|bytes| String::from_utf8_lossy(bytes).contains(prompt))
                 {
-                    after_prompt(&mut self.child, &mut self.master);
+                    after_prompt(prompt, &mut self.child, &mut self.master);
                     self.master
                         .write_all(response.as_bytes())
                         .expect("terminal response");

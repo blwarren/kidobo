@@ -1844,8 +1844,38 @@ esac
         )
         .expect("legacy results");
 
-        let mut runner = runner_with_incus(&root, &program);
-        clean_after_run(&mut runner, &setup_config()).expect("already deleted guest cleans");
+        let transcript = root.join("transcript.log");
+        fs::write(&transcript, "trailing bytes").expect("seed transcript");
+        let before = read_text(&root.join("results.json")).expect("read original");
+        let cleanup = || {
+            clean_after_run(
+                root.clone(),
+                &setup_config(),
+                program.clone(),
+                Arc::new(AtomicBool::new(false)),
+            )
+        };
+        let active_run = coordination::lock_evidence(&root).expect("active writer");
+        assert!(cleanup().is_err());
+        drop(active_run);
+        let active_project = coordination::lock_for_cleanup(
+            temp.path(),
+            "test-project",
+            &program,
+            &AtomicBool::new(false),
+        )
+        .expect("active project");
+        assert!(cleanup().is_err());
+        assert_eq!(
+            read_text(&root.join("results.json")).expect("preserved result"),
+            before
+        );
+        assert_eq!(
+            read_text(&transcript).expect("preserved transcript"),
+            "trailing bytes"
+        );
+        drop(active_project);
+        cleanup().expect("already deleted guest cleans");
         let report = Report::open(&root).expect("reopen results").document;
         assert_eq!(report.get("run_wall_seconds"), original_wall_time.as_ref());
         assert_eq!(report["results"], original_result["results"]);
@@ -1853,7 +1883,7 @@ esac
             read_text(&root.join("0001.stdout")).expect("old evidence"),
             "old raw evidence"
         );
-        assert_eq!(report["commands"][1]["code"], 0);
+        assert_eq!(report["commands"][0]["code"], 0);
         let stage = &report["stages"][0];
         assert_eq!(stage["name"], "cleanup requested after run");
         assert_eq!(stage["status"], "passed");

@@ -9,12 +9,48 @@ use std::path::Path;
 
 pub(super) fn lock(runner: &mut Runner) -> Result<File> {
     let info: Value = serde_json::from_str(&runner.incus(&strings(&["query", "/1.0"]), 30)?)?;
-    let info = info.get("metadata").unwrap_or(&info);
+    lock_server(&info, &runner.project)
+}
+
+pub(super) fn lock_for_cleanup(
+    directory: &Path,
+    project: &str,
+    program: &Path,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> Result<File> {
+    let request = super::process::Request {
+        directory,
+        program: program.to_str().ok_or("invalid Incus program path")?,
+        args: &strings(&["query", "/1.0"]),
+        seconds: 30,
+        cancelled,
+        ignore_cancellation: false,
+        poll_interval: std::time::Duration::from_millis(100),
+    };
+    let outcome = super::process::capture(&request, |_| Ok(()))?;
+    if let Some(error) = outcome.error {
+        return Err(format!("Incus server identity query failed: {error}").into());
+    }
+    lock_server(&serde_json::from_str(&outcome.output)?, project)
+}
+
+pub(super) fn lock_evidence(directory: &Path) -> Result<File> {
+    let file = File::options()
+        .read(true)
+        .custom_flags((nix::fcntl::OFlag::O_NOFOLLOW | nix::fcntl::OFlag::O_DIRECTORY).bits())
+        .open(directory)?;
+    file.try_lock()
+        .map_err(|error| format!("cannot lock E2E evidence {}: {error}", directory.display()))?;
+    Ok(file)
+}
+
+fn lock_server(info: &Value, project: &str) -> Result<File> {
+    let info = info.get("metadata").unwrap_or(info);
     let server = info["environment"]["server_name"]
         .as_str()
         .ok_or("Incus server identity missing")?;
     let mut key = String::with_capacity(64);
-    for byte in Sha256::digest(format!("{server}\n{}", runner.project)) {
+    for byte in Sha256::digest(format!("{server}\n{project}")) {
         write!(&mut key, "{byte:02x}")?;
     }
     acquire(Path::new("/tmp"), &key)

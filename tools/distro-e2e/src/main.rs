@@ -133,6 +133,23 @@ fn safe_name(value: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
 }
 impl Runner {
+    fn open(
+        dir: PathBuf,
+        config: &Config,
+        incus_program: PathBuf,
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<Self> {
+        let report = Report::open(&dir)?;
+        Ok(Self {
+            project: config.project.clone(),
+            dir,
+            incus_program,
+            cancelled,
+            report,
+            command_poll_interval: Duration::from_millis(100),
+            ignore_cancellation: false,
+        })
+    }
     fn worker(
         &self,
         target: &str,
@@ -795,12 +812,19 @@ fn application(
     )?;
     Ok(())
 }
-fn clean_after_run(runner: &mut Runner, config: &Config) -> Result<()> {
+fn clean_after_run(
+    dir: PathBuf,
+    config: &Config,
+    program: PathBuf,
+    cancelled: Arc<AtomicBool>,
+) -> Result<()> {
+    let _evidence_lock = coordination::lock_evidence(&dir)?;
+    let _operation_lock =
+        coordination::lock_for_cleanup(&dir, &config.project, &program, &cancelled)?;
+    let mut runner = Runner::open(dir, config, program, cancelled)?;
     runner.stage("cleanup requested after run")?;
-    let outcome = coordination::lock(runner).and_then(|_operation_lock| {
-        runner.ignore_cancellation = true;
-        clean(runner, config)
-    });
+    runner.ignore_cancellation = true;
+    let outcome = clean(&mut runner, config);
     runner
         .report
         .finish_stage(if outcome.is_err() { "failed" } else { "passed" })?;
@@ -892,20 +916,12 @@ fn run(cli: Cli) -> Result<()> {
     let dir = std::env::var_os("KIDOBO_E2E_RESULTS_DIR")
         .map_or_else(|| PathBuf::from("target/e2e"), PathBuf::from)
         .join(&run_id);
-    fs::create_dir_all(&dir)?;
-    let report = Report::open(&dir)?;
-    let mut runner = Runner {
-        project: config.project.clone(),
-        dir,
-        incus_program: PathBuf::from("incus"),
-        cancelled,
-        report,
-        command_poll_interval: Duration::from_millis(100),
-        ignore_cancellation: false,
-    };
     if matches!(&cli.action, Action::Clean { .. }) {
-        return clean_after_run(&mut runner, &config);
+        return clean_after_run(dir, &config, PathBuf::from("incus"), cancelled);
     }
+    fs::create_dir_all(&dir)?;
+    let _evidence_lock = coordination::lock_evidence(&dir)?;
+    let mut runner = Runner::open(dir, &config, PathBuf::from("incus"), cancelled)?;
     let is_images = matches!(&cli.action, Action::Images { .. });
     let (tag, archive, targets) = match &cli.action {
         Action::Run {

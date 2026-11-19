@@ -21,7 +21,8 @@ sudo kidobo setup
 
 Setup starts from your existing configuration, reviews choices before saving,
 provisions missing files and units, then runs `doctor`. A doctor failure stops
-setup before it offers an initial sync or timer activation.
+setup before it offers an initial sync or timer activation. If the reviewed configuration changes
+while you confirm, restart setup to review the new contents.
 
 The initial sync and scheduled timer have separate confirmations. Declining
 the initial sync skips that immediate application, but enabling the timer can
@@ -76,6 +77,13 @@ requests can continue even when the remote address becomes banned. The exemption
 returns packets to the host's remaining firewall rules; those rules can still
 block them. Incoming traffic on connections initiated by banned clients remains
 blocked on all ports, including existing sessions.
+
+Sync and full flush share a firewall lock across storage roots on the same host and network namespace.
+Run these commands with the privileges needed for the root-owned lock directory `/run/kidobo`.
+Processes sharing a firewall must also share that directory if they have separate mounts. If the
+lock is held, wait for the active operation to finish. Kidobo reports custom jumps or references to
+its chains so you can review and remove them before retrying. Full flush preserves the affected
+chain and sets while continuing independent cleanup.
 
 After upgrading from source-only blocking, run `sudo kidobo sync` to install
 this policy. Upgrading the binary alone does not change live rules. Until sync
@@ -247,7 +255,8 @@ ASN resolution, or firewall changes. Lookup reports raw source overlaps,
 including safelist exemptions; it does not read the live ipset or calculate
 the final enforced set. An invalid or missing configuration limits lookup to
 the local blocklist, active temporary entries, and cached remote sources and
-produces warnings for unavailable coverage.
+produces warnings for unavailable coverage. A malformed local blocklist line
+stops lookup before it prints results and reports the line number.
 Use `--format tsv` for scripts; see the [compatibility contract](compatibility.md)
 for its record format. Results stream as targets are processed, so a large
 number of overlaps does not require retaining all matches. Targets, source
@@ -397,7 +406,10 @@ asks for confirmation and leaves firewall and ipset state unchanged.
   response, or rejected redirect does not replace good cache data. Redirects
   are limited to ten hops and the configured URL's origin. Kidobo
   warns and uses a compatible validated cache when available. A whitespace-
-  or comment-only remote response is an intentional empty feed. If cache
+  or comment-only HTTP 200 feed is an intentional empty feed. Other success statuses, including
+  HTTP 202 and 204, cannot publish an empty replacement. Conditional requests apply to the
+  effective resource that supplied the cached representation. Old caches without that identity
+  remain eligible for fallback during a full refresh. If cache
   staging fails and no validated fallback exists, sync stops before replacing
   either set. Remote HTTP bodies default to an 8 MiB limit; the
   `KIDOBO_MAX_HTTP_BODY_BYTES` override is capped at 32 MiB, while GitHub

@@ -28,7 +28,9 @@ just ci
 just release-notes-check
 ```
 
-The tests use injected runners, fake privileged commands, temporary roots, and loopback services.
+Run the fixture suite as an unprivileged user. Firewall CLI fixtures use a temporary lock directory
+and disable privilege gains before invoking fake commands. The suite also uses injected runners,
+temporary storage roots, and loopback services.
 Use the separate [E2E guide](e2e.md) for disposable-VM setup; ordinary local checks do not require
 running the VM matrix.
 

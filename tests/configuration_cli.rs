@@ -120,6 +120,7 @@ fn source_listing_rejects_a_legacy_cache_with_a_different_recorded_url() {
         ("https://other.example/list", "Unavailable"),
     ] {
         let meta = RemoteCacheMetadata {
+            validator_scope: None,
             url: recorded_url.to_string(),
             etag: None,
             last_modified: None,

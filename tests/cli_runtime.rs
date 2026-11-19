@@ -34,7 +34,8 @@ fn kidobo_with_root_command(root: &Path, args: &[&str]) -> Command {
     command
         .args(args)
         .env("KIDOBO_ROOT", root)
-        .env_remove("KIDOBO_TEST_SANDBOX")
+        .env("KIDOBO_TEST_SANDBOX", "1")
+        .env("TMPDIR", root)
         .env_remove("KIDOBO_DISABLE_TEST_SANDBOX");
     command
 }
@@ -280,6 +281,17 @@ case "${cmd}" in
     mkdir -p "${state_dir}"
     case "${1:-}" in
       -S)
+        if [[ $# == 1 ]]; then
+          printf '%s\n' '-P INPUT ACCEPT'
+          for chain_state in "${state_dir}"/*; do
+            [[ -f "${chain_state}" ]] || continue
+            if [[ "${chain_state##*/}" != INPUT ]]; then
+              printf '%s\n' "-N ${chain_state##*/}"
+            fi
+            cat "${chain_state}"
+          done
+          exit 0
+        fi
         if [[ "${2:-}" == "INPUT" ]]; then
           if [[ -f "${input_state}" ]]; then
             cat "${input_state}"
@@ -305,16 +317,20 @@ case "${cmd}" in
         exit 0
         ;;
       -I)
-        if [[ "${2:-}" == "INPUT" && "${3:-}" == "1" && "${4:-}" == "-j" ]]; then
-          temporary="${input_state}.tmp"
-          printf '%s\n' "-A INPUT -j ${5}" > "${temporary}"
-          if [[ -f "${input_state}" ]]; then
-            cat "${input_state}" >> "${temporary}"
-          fi
-          mv "${temporary}" "${input_state}"
-          exit 0
-        fi
-        exit 2
+        [[ "$3" == 1 ]] || exit 2
+        chain="$2"
+        shift 3
+        chain_state="${state_dir}/${chain}"
+        temporary="${chain_state}.tmp"
+        printf '%s\n' "-A ${chain} $*" > "${temporary}"
+        if [[ -f "${chain_state}" ]]; then cat "${chain_state}" >> "${temporary}"; fi
+        mv "${temporary}" "${chain_state}"
+        ;;
+      -R)
+        chain="$2"
+        position="$3"
+        shift 3
+        sed -i "${position}c\-A ${chain} $*" "${state_dir}/${chain}"
         ;;
       -F)
         chain_state="${state_dir}/${2}"
@@ -338,10 +354,8 @@ case "${cmd}" in
             mv "${temporary}" "${input_state}"
             exit 0
           fi
-        elif [[ "${3:-}" == "1" && -s "${state_dir}/${2}" ]]; then
-          temporary="${state_dir}/${2}.tmp"
-          tail -n +2 "${state_dir}/${2}" > "${temporary}"
-          mv "${temporary}" "${state_dir}/${2}"
+        elif [[ "${3:-}" =~ ^[1-9][0-9]*$ && -s "${state_dir}/${2}" ]]; then
+          sed -i "${3}d" "${state_dir}/${2}"
           exit 0
         fi
         echo "Bad rule (does a matching rule exist in that chain?)." >&2
@@ -754,6 +768,19 @@ fn lookup_source_loading_failure_emits_no_human_table() {
     assert_eq!(output.stdout, b"");
 }
 
+#[test]
+fn lookup_rejects_invalid_local_lines_before_emitting_any_matches() {
+    let root = create_lookup_root("# blocklist\n203.0.113.7\n203.0.113.8 # invalid suffix\n");
+    for format in ["human", "tsv"] {
+        let output =
+            run_kidobo_with_root(root.path(), &["lookup", "203.0.113.7", "--format", format]);
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert_eq!(output.stdout, b"", "{output:?}");
+        let stderr = String::from_utf8(output.stderr).expect("UTF-8 error message");
+        assert!(stderr.contains("blocklist.txt at line 3"), "{stderr}");
+    }
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn lookup_streams_two_million_matches_within_192_mib() {
@@ -762,6 +789,8 @@ fn lookup_streams_two_million_matches_within_192_mib() {
     for index in 0..1_000 {
         writeln!(entries, "10.0.{}.{}/32", index / 256, index % 256).expect("entry");
     }
+    let blank_lines = kidobo_adapters::blocklist_file::BLOCKLIST_READ_LIMIT - entries.len();
+    entries.extend(std::iter::repeat_n('\n', blank_lines));
     let root = create_lookup_root(&entries);
     let mut targets = String::new();
     for index in 0..2_000 {
@@ -815,16 +844,16 @@ fn lookup_streams_two_million_matches_within_192_mib() {
         .recv_timeout(deadline.saturating_duration_since(Instant::now()))
         .expect("stdout must finish before the test deadline");
     rows.join().expect("stream reader");
-    assert_eq!(matches, 2_000_000);
-    assert_eq!(
-        summary.as_deref(),
-        Some("summary: total_ips=2000 matched_ips=2000 matched_pct=100%")
-    );
     let output = child.wait_with_output().expect("wait capped lookup");
     assert!(
         output.status.success(),
         "capped lookup failed: {}",
         String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(matches, 2_000_000);
+    assert_eq!(
+        summary.as_deref(),
+        Some("summary: total_ips=2000 matched_ips=2000 matched_pct=100%")
     );
 }
 
@@ -1795,6 +1824,58 @@ fn sigint_during_first_replacement_finishes_enforcement_and_preserves_failures()
             }
         }
     }
+}
+
+#[test]
+fn independent_storage_roots_serialize_operations_on_one_firewall() {
+    let config =
+        "[ipset]\nset_name='kidobo'\nenable_ipv6=false\n[safe]\ninclude_github_meta=false\n";
+    let first = create_sync_root(config);
+    let second = create_sync_root(config);
+    let namespace = TempDir::new().expect("fake firewall namespace");
+    let fake_sudo = write_fake_sudo_script(&first);
+    let path = path_with_bin_prefix(fake_sudo.parent().expect("fixture bin"));
+    let marker = first.path().join("entered");
+    let release = first.path().join("resume");
+    let command = |root: &Path, args: &[&str]| {
+        let mut command = kidobo_with_root_command(root, args);
+        command.env("TMPDIR", namespace.path()).env("PATH", &path);
+        command
+    };
+    let child = command(first.path(), &["sync"])
+        .env("KIDOBO_TEST_SLEEP_ONCE", "1")
+        .env("KIDOBO_TEST_SLEEP_MARKER", &marker)
+        .env("KIDOBO_TEST_SUDO_RELEASE", &release)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start sync");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !marker.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "first sync did not enter fake firewall"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    let touched = second.path().join("firewall-touched");
+    for args in [&["sync"][..], &["flush", "--yes"]] {
+        let output = command(second.path(), args)
+            .env("KIDOBO_TEST_SUDO_TOUCHED", &touched)
+            .output()
+            .expect("attempt concurrent operation");
+        assert!(!output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("lock"),
+            "{output:?}"
+        );
+        assert!(!touched.exists(), "contender reached firewall");
+    }
+    fs::write(&release, "").expect("resume sync");
+    let result = child.wait_with_output().expect("finish sync");
+    assert!(result.status.success(), "{result:?}");
+    let result = command(second.path(), &["sync"]).output().expect("retry");
+    assert!(result.status.success(), "{result:?}");
 }
 
 #[test]

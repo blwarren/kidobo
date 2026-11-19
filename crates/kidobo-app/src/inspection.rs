@@ -1,10 +1,10 @@
 //! Read-only operational status, live address checks, and inspection capabilities.
 
 use std::net::IpAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use kidobo_core::config::FirewallAction;
-use serde::Serialize;
+use serde::{Serialize, Serializer};
 
 use crate::AppError;
 use crate::paths::{ConfigRequirement, PathResolutionInput, ResolvedPaths};
@@ -177,7 +177,12 @@ pub struct StatusReport {
     /// Configuration observation or recovery explanation.
     pub configuration_detail: String,
     /// Exact resolved configuration filename.
+    #[serde(serialize_with = "serialize_display_path")]
     pub configuration_path: PathBuf,
+    /// Unix filename bytes when the display path contains UTF-8 replacements.
+    #[cfg(unix)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub configuration_path_bytes: Option<Vec<u8>>,
     /// IPv4 state observed through read-only probes.
     pub ipv4: FamilyInspection,
     /// IPv6 state, including residual artifacts when disabled in configuration.
@@ -192,6 +197,19 @@ pub struct StatusReport {
     pub last_successful_sync: Option<String>,
     /// Inspection limitations and next steps.
     pub notices: Vec<String>,
+}
+
+fn serialize_display_path<S: Serializer>(path: &Path, serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(&path.to_string_lossy())
+}
+
+#[cfg(unix)]
+fn non_utf8_path_bytes(path: &Path) -> Option<Vec<u8>> {
+    use std::os::unix::ffi::OsStrExt;
+
+    path.to_str()
+        .is_none()
+        .then(|| path.as_os_str().as_bytes().to_vec())
 }
 
 /// Capabilities used to collect a partial read-only dashboard.
@@ -348,6 +366,8 @@ pub fn status(
         configuration,
         configuration_detail,
         configuration_path: paths.config_file.clone(),
+        #[cfg(unix)]
+        configuration_path_bytes: non_utf8_path_bytes(&paths.config_file),
         ipv4,
         ipv6,
         configured_feeds: config.as_ref().map(|config| config.remote.urls.len()),
@@ -361,23 +381,24 @@ pub fn status(
         match dependencies.configs.load(&paths.config_file) {
             Ok(current) if current == *config => {}
             Err(AppError::Interrupted) => return Err(AppError::Interrupted),
-            _ => {
-                report.initialized = None;
-                report.configuration = Verification::Unknown;
-                report.configuration_detail =
-                    "Configuration changed or became unreadable during inspection; retry status"
-                        .to_string();
-                report.configured_feeds = None;
-                report.saved_bans.permanent_asns = None;
-                report.ipv4.configured_enabled = None;
-                report.ipv6.configured_enabled = None;
-                invalidate_family(&mut report.ipv4, &report.configuration_detail);
-                invalidate_family(&mut report.ipv6, &report.configuration_detail);
-            }
+            _ => invalidate_status_configuration(&mut report),
         }
     }
     dependencies.cancellation.check()?;
     Ok(report)
+}
+
+fn invalidate_status_configuration(report: &mut StatusReport) {
+    report.initialized = None;
+    report.configuration = Verification::Unknown;
+    report.configuration_detail =
+        "Configuration changed or became unreadable during inspection; retry status".to_string();
+    report.configured_feeds = None;
+    report.saved_bans.permanent_asns = None;
+    for family in [&mut report.ipv4, &mut report.ipv6] {
+        family.configured_enabled = None;
+        invalidate_family(family, &report.configuration_detail);
+    }
 }
 
 /// Assesses a single address using live managed state only.

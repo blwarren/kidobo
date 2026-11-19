@@ -20,11 +20,14 @@ use crate::blocklist_file::load_blocklist_document;
 use crate::command_runner::{
     CommandExecutor, CommandRequest, CommandResult, SystemCommandExecutor,
 };
-use crate::iptables::KIDOBO_CHAIN_NAME;
+use crate::iptables::{
+    ChainAction, FirewallFamily, KIDOBO_CHAIN_NAME, KIDOBO_STAGING_CHAIN_NAME,
+    is_supported_managed_reference, managed_block_rule, matches_reply_exemption,
+    refers_to_managed_chain, rule_body, staging_chain_present,
+};
 use crate::temporary_bans::FileTemporaryBanRepository;
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
-const STAGING_CHAIN: &str = "kidobo-input-stage";
 
 /// Counts only bounded operator-managed files; it never reads remote or ASN cache contents.
 #[derive(Debug, Default, Clone, Copy)]
@@ -399,34 +402,16 @@ fn family_binary(family: AddressFamily) -> &'static str {
     }
 }
 
-fn refers_to_managed_chain(line: &str) -> bool {
-    let tokens = line.split_whitespace().collect::<Vec<_>>();
-    tokens.windows(2).any(|pair| {
-        matches!(
-            pair,
-            [
-                "-j" | "--jump" | "-g" | "--goto",
-                KIDOBO_CHAIN_NAME | STAGING_CHAIN
-            ]
-        )
-    })
-}
-
 fn matches_block_rule(spec: &ManagedSetSpec, action: FirewallAction, rule: &str) -> bool {
-    let target = match action {
-        FirewallAction::Drop => "DROP",
-        FirewallAction::Reject => "REJECT",
+    let action = match action {
+        FirewallAction::Drop => ChainAction::Drop,
+        FirewallAction::Reject => ChainAction::Reject,
     };
-    let expected = format!(
-        "-A kidobo-input -m set --match-set {} src -j {target}",
-        spec.set_name
-    );
-    let reject_suffix = match spec.family {
-        AddressFamily::Ipv4 => " --reject-with icmp-port-unreachable",
-        AddressFamily::Ipv6 => " --reject-with icmp6-port-unreachable",
+    let family = match spec.family {
+        AddressFamily::Ipv4 => FirewallFamily::Ipv4,
+        AddressFamily::Ipv6 => FirewallFamily::Ipv6,
     };
-    rule == expected
-        || (action == FirewallAction::Reject && rule.strip_prefix(&expected) == Some(reject_suffix))
+    managed_block_rule(family, rule) == Some((spec.set_name.as_str(), action))
 }
 
 fn parse_wiring(spec: &ManagedSetSpec, action: FirewallAction, contents: &str) -> WiringSnapshot {
@@ -447,23 +432,36 @@ fn parse_wiring(spec: &ManagedSetSpec, action: FirewallAction, contents: &str) -
             "Firewall rule output is malformed or lacks an authoritative INPUT policy",
         );
     }
-    let references = lines
-        .iter()
-        .copied()
-        .filter(|line| refers_to_managed_chain(line))
-        .collect::<Vec<_>>();
-    let signature = lines
-        .iter()
-        .copied()
-        .filter(|line| {
-            line.starts_with("-P INPUT ")
-                || line.starts_with("-A INPUT ")
-                || line.starts_with("-A kidobo-input ")
-                || line.starts_with("-A kidobo-input-stage ")
-                || refers_to_managed_chain(line)
-        })
-        .map(ToString::to_string)
-        .collect();
+    let mut references = Vec::new();
+    let mut signature = Vec::new();
+    for &line in &lines {
+        let reference = if line.starts_with("-A ") {
+            let Some(reference) = refers_to_managed_chain(line) else {
+                return WiringSnapshot::unknown(
+                    "Firewall rule listing contains an unparseable rule",
+                );
+            };
+            reference
+        } else {
+            false
+        };
+        if reference {
+            if !is_supported_managed_reference(line) {
+                return WiringSnapshot::unknown(format!(
+                    "Managed firewall wiring contains unsupported reference {line:?}; remove or relocate the reference before running sync"
+                ));
+            }
+            references.push(line);
+        }
+        if reference
+            || line.starts_with("-P INPUT ")
+            || rule_body(line, "INPUT").is_some()
+            || rule_body(line, KIDOBO_CHAIN_NAME).is_some()
+            || rule_body(line, KIDOBO_STAGING_CHAIN_NAME).is_some()
+        {
+            signature.push(line.to_string());
+        }
+    }
     if references.is_empty() {
         return WiringSnapshot {
             state: Verification::Absent,
@@ -475,15 +473,13 @@ fn parse_wiring(spec: &ManagedSetSpec, action: FirewallAction, contents: &str) -
     let input_first = lines
         .iter()
         .copied()
-        .find(|line| line.starts_with("-A INPUT "));
+        .find(|line| rule_body(line, "INPUT").is_some());
     let managed_rules = lines
         .iter()
         .copied()
-        .filter(|line| line.starts_with("-A kidobo-input "))
+        .filter_map(|line| rule_body(line, KIDOBO_CHAIN_NAME))
         .collect::<Vec<_>>();
-    let staging = lines
-        .iter()
-        .any(|line| *line == "-N kidobo-input-stage" || line.starts_with("-A kidobo-input-stage "));
+    let staging = staging_chain_present(contents);
     let canonical_input = references == ["-A INPUT -j kidobo-input"]
         && input_first == Some("-A INPUT -j kidobo-input")
         && !staging;
@@ -493,11 +489,7 @@ fn parse_wiring(spec: &ManagedSetSpec, action: FirewallAction, contents: &str) -
         ),
         [exemption, block]
             if canonical_input
-                && matches!(
-                    *exemption,
-                    "-A kidobo-input -m conntrack --ctstate RELATED,ESTABLISHED --ctdir REPLY -j RETURN"
-                        | "-A kidobo-input -m conntrack --ctstate ESTABLISHED,RELATED --ctdir REPLY -j RETURN"
-                )
+                && matches_reply_exemption(exemption)
                 && matches_block_rule(spec, action, block) =>
         {
             WiringSnapshot {
@@ -882,6 +874,7 @@ mod tests {
             canonical.replace("-A INPUT -j kidobo-input", "-A INPUT -j other\n-A other -j kidobo-input"),
             canonical.replace("-A INPUT -j kidobo-input", "-N kidobo-input-stage\n-A INPUT -j kidobo-input-stage\n-A kidobo-input-stage -j kidobo-input"),
             canonical.replace("-A INPUT -j kidobo-input", "-A INPUT -j ACCEPT\n-A INPUT -j kidobo-input"),
+            canonical.replace("-A INPUT -j kidobo-input", "-A INPUT\n-A INPUT -j kidobo-input"),
             canonical.replace("--match-set kidobo src", "--match-set other src"),
             canonical.replace("-j DROP", "-j ACCEPT"),
         ] {
@@ -891,6 +884,26 @@ mod tests {
         assert_eq!(
             parse_wiring(&spec, FirewallAction::Reject, &reject).state,
             Verification::Verified
+        );
+    }
+
+    #[test]
+    fn quoted_comment_text_does_not_count_as_a_managed_reference() {
+        let spec = spec(false);
+        let mut canonical = wiring(&spec);
+        canonical.push_str(
+            "-A OUTPUT -m comment --comment \"quoted \\\" -j kidobo-input \\\" text\" -j ACCEPT\n",
+        );
+        assert_eq!(
+            parse_wiring(&spec, FirewallAction::Drop, &canonical).state,
+            Verification::Verified
+        );
+        canonical.push_str(
+            "-A OUTPUT -m comment --comment \"same rule, actual reference\" -g kidobo-input\n",
+        );
+        assert_eq!(
+            parse_wiring(&spec, FirewallAction::Drop, &canonical).state,
+            Verification::Unknown
         );
     }
 

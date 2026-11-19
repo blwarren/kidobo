@@ -90,6 +90,8 @@ pub struct FlushDependencies<'a> {
     pub configs: &'a dyn ConfigRepository,
     /// Nonblocking process lock manager.
     pub locks: &'a dyn LockManager,
+    /// Exclusive transaction lock shared by workflows that modify the live firewall.
+    pub firewall_lock: &'a dyn crate::ports::FirewallTransactionLock,
     /// Managed-artifact cleanup backend.
     pub backend: &'a dyn FlushBackend,
 }
@@ -130,25 +132,29 @@ pub fn execute(
 
     let config = dependencies.configs.load(&paths.config_file)?;
     dependencies.cancellation.check()?;
-    // After cleanup starts, every scoped step is attempted even when cancellation arrives.
+    let firewall_lock = dependencies.firewall_lock.acquire_firewall()?;
+    // Once cleanup starts, continue independent steps even if cancellation arrives.
     let mut outcome = FlushOutcome::default();
-    attempt(
+    let ipv4_clean = attempt(
         &mut outcome,
         "IPv4 firewall",
         dependencies.backend.cleanup_firewall(FirewallFamily::Ipv4),
     );
-    attempt(
+    let ipv6_clean = attempt(
         &mut outcome,
         "IPv6 firewall",
         dependencies.backend.cleanup_firewall(FirewallFamily::Ipv6),
     );
-    attempt(
-        &mut outcome,
-        format!("ipset `{}`", config.ipset.set_name),
-        dependencies.backend.destroy_ipset(&config.ipset.set_name),
-    );
+    if ipv4_clean {
+        attempt(
+            &mut outcome,
+            format!("ipset `{}`", config.ipset.set_name),
+            dependencies.backend.destroy_ipset(&config.ipset.set_name),
+        );
+    }
     // Disabled IPv6 permits an overlong derived name, which cannot exist in ipset.
-    if config.ipset.set_name_v6 != config.ipset.set_name
+    if ipv6_clean
+        && config.ipset.set_name_v6 != config.ipset.set_name
         && (config.ipset.enable_ipv6 || config.ipset.set_name_v6.len() <= IPSET_NAME_MAX_LEN)
     {
         attempt(
@@ -159,6 +165,7 @@ pub fn execute(
                 .destroy_ipset(&config.ipset.set_name_v6),
         );
     }
+    drop(firewall_lock);
     attempt(
         &mut outcome,
         "remote cache",
@@ -175,11 +182,21 @@ pub fn execute(
     Ok(outcome)
 }
 
-fn attempt(outcome: &mut FlushOutcome, operation: impl Into<String>, result: Result<(), String>) {
+fn attempt(
+    outcome: &mut FlushOutcome,
+    operation: impl Into<String>,
+    result: Result<(), String>,
+) -> bool {
     let operation = operation.into();
     match result {
-        Ok(()) => outcome.completed.push(operation),
-        Err(reason) => outcome.failed.push(CleanupFailure { operation, reason }),
+        Ok(()) => {
+            outcome.completed.push(operation);
+            true
+        }
+        Err(reason) => {
+            outcome.failed.push(CleanupFailure { operation, reason });
+            false
+        }
     }
 }
 
@@ -251,9 +268,22 @@ mod tests {
         }
     }
 
+    impl crate::ports::FirewallTransactionLock for Locks {
+        fn acquire_firewall(&self) -> Result<Box<dyn LockGuard>, AppError> {
+            Ok(Box::new(Guard))
+        }
+    }
+
+    struct UnusedFirewallLock;
+    impl crate::ports::FirewallTransactionLock for UnusedFirewallLock {
+        fn acquire_firewall(&self) -> Result<Box<dyn LockGuard>, AppError> {
+            panic!("cache-only flush must not acquire the firewall lock")
+        }
+    }
+
     struct Backend {
         events: Mutex<Vec<String>>,
-        fail: bool,
+        fail: fn(&str) -> bool,
     }
 
     impl FlushBackend for Backend {
@@ -274,7 +304,7 @@ mod tests {
     impl Backend {
         fn run(&self, event: &str) -> Result<(), String> {
             self.events.lock().expect("events").push(event.to_string());
-            if self.fail {
+            if (self.fail)(event) {
                 Err(format!("{event} failed"))
             } else {
                 Ok(())
@@ -333,7 +363,7 @@ mod tests {
             );
             let backend = Backend {
                 events: Mutex::new(Vec::new()),
-                fail: false,
+                fail: |_| false,
             };
             let outcome = execute(
                 &request(false),
@@ -342,6 +372,7 @@ mod tests {
                     paths: &Paths(ConfigRequirement::Required),
                     configs: &configs,
                     locks: &Locks,
+                    firewall_lock: &Locks,
                     backend: &backend,
                 },
             )
@@ -369,7 +400,10 @@ mod tests {
     }
 
     fn assert_failed_cleanup(outcome: &FlushOutcome, backend: &Backend) {
-        assert_eq!(*backend.events.lock().expect("events"), CLEANUP_EVENTS);
+        assert_eq!(
+            *backend.events.lock().expect("events"),
+            ["firewall:Ipv4", "firewall:Ipv6", "cache"]
+        );
         assert_eq!(outcome.completed, [] as [String; 0]);
         assert_eq!(
             outcome
@@ -380,8 +414,6 @@ mod tests {
             [
                 ("IPv4 firewall", "firewall:Ipv4 failed"),
                 ("IPv6 firewall", "firewall:Ipv6 failed"),
-                ("ipset `kidobo`", "ipset:kidobo failed"),
-                ("ipset `kidobo-v6`", "ipset:kidobo-v6 failed"),
                 (
                     "remote cache",
                     "failed to clear remote cache at /root/cache/remote: cache failed"
@@ -394,7 +426,7 @@ mod tests {
     fn cancellation_during_flush_does_not_skip_remaining_cleanup() {
         let backend = Backend {
             events: Mutex::new(Vec::new()),
-            fail: true,
+            fail: |_| true,
         };
         let outcome = execute(
             &request(false),
@@ -403,6 +435,7 @@ mod tests {
                 paths: &Paths(ConfigRequirement::Required),
                 configs: &Configs,
                 locks: &Locks,
+                firewall_lock: &Locks,
                 backend: &backend,
             },
         )
@@ -416,19 +449,23 @@ mod tests {
                     paths: &Paths(ConfigRequirement::Required),
                     configs: &Configs,
                     locks: &Locks,
+                    firewall_lock: &Locks,
                     backend: &backend
                 }
             ),
             Err(AppError::Interrupted)
         ));
-        assert_eq!(*backend.events.lock().expect("events"), CLEANUP_EVENTS);
+        assert_eq!(
+            *backend.events.lock().expect("events"),
+            ["firewall:Ipv4", "firewall:Ipv6", "cache"]
+        );
     }
 
     #[test]
     fn full_flush_attempts_every_cleanup_in_order() {
         let backend = Backend {
             events: Mutex::new(Vec::new()),
-            fail: false,
+            fail: |_| false,
         };
         let outcome = execute(
             &request(false),
@@ -437,6 +474,7 @@ mod tests {
                 paths: &Paths(ConfigRequirement::Required),
                 configs: &Configs,
                 locks: &Locks,
+                firewall_lock: &Locks,
                 backend: &backend,
             },
         )
@@ -457,10 +495,10 @@ mod tests {
     }
 
     #[test]
-    fn full_flush_records_every_failure_without_stopping() {
+    fn failed_firewall_cleanup_retains_that_set_and_continues_independent_cleanup() {
         let backend = Backend {
             events: Mutex::new(Vec::new()),
-            fail: true,
+            fail: |event| event == "firewall:Ipv4",
         };
         let outcome = execute(
             &request(false),
@@ -469,6 +507,34 @@ mod tests {
                 paths: &Paths(ConfigRequirement::Required),
                 configs: &Configs,
                 locks: &Locks,
+                firewall_lock: &Locks,
+                backend: &backend,
+            },
+        )
+        .expect("cleanup ledger");
+
+        assert_eq!(
+            *backend.events.lock().expect("events"),
+            ["firewall:Ipv4", "firewall:Ipv6", "ipset:kidobo-v6", "cache"]
+        );
+        assert_eq!(outcome.failed.len(), 1);
+        assert_eq!(outcome.failed[0].operation, "IPv4 firewall");
+    }
+
+    #[test]
+    fn full_flush_records_every_failure_without_stopping() {
+        let backend = Backend {
+            events: Mutex::new(Vec::new()),
+            fail: |_| true,
+        };
+        let outcome = execute(
+            &request(false),
+            &FlushDependencies {
+                cancellation: &crate::ports::NoCancellation,
+                paths: &Paths(ConfigRequirement::Required),
+                configs: &Configs,
+                locks: &Locks,
+                firewall_lock: &Locks,
                 backend: &backend,
             },
         )
@@ -481,7 +547,7 @@ mod tests {
     fn cache_only_flush_does_not_run_firewall_or_load_config() {
         let backend = Backend {
             events: Mutex::new(Vec::new()),
-            fail: false,
+            fail: |_| false,
         };
         execute(
             &request(true),
@@ -490,6 +556,7 @@ mod tests {
                 paths: &Paths(ConfigRequirement::Optional),
                 configs: &UnusedConfigs,
                 locks: &Locks,
+                firewall_lock: &UnusedFirewallLock,
                 backend: &backend,
             },
         )

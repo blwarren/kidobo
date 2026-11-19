@@ -1,19 +1,20 @@
 //! Offline lookup source adapter.
 
-use std::path::Path;
 use std::sync::Arc;
 
 use log::warn;
 use thiserror::Error;
 
 use crate::asn::{AsnError, load_cached_asn_prefixes};
+use crate::blocklist_file::{BLOCKLIST_READ_LIMIT, map_invalid_blocklist_line};
 use crate::cached_sources::visit_remote_sources;
 use crate::github_meta::load_cached_github_meta_safelist;
 use crate::limited_io::read_to_string_with_limit;
-use crate::source_files::{SOURCE_FILE_READ_LIMIT, parse_cidr_source_line};
+use crate::source_files::parse_cidr_source_line;
 use crate::source_load::SourceLoadError;
 use kidobo_app::AppError;
 use kidobo_app::source::{OfflineLookupContext, OfflineLookupProvider, OfflineLookupRegistry};
+use kidobo_core::blocklist::parse_blocklist_entry;
 use kidobo_core::lookup::LookupSourceEntry;
 use kidobo_core::network::CanonicalCidr;
 
@@ -40,14 +41,37 @@ impl OfflineLookupProvider for LocalBlocklistLookupProvider {
         context: &OfflineLookupContext<'_>,
         entries: &mut Vec<LookupSourceEntry>,
     ) -> Result<(), AppError> {
-        match append_source_file(&context.paths.blocklist_file, "internal:blocklist", entries) {
-            Err(LookupSourceLoadError::Source(SourceLoadError::Source { source, .. }))
-                if source.kind() == std::io::ErrorKind::NotFound =>
-            {
-                Ok(())
+        let path = &context.paths.blocklist_file;
+        let contents = match read_to_string_with_limit(path, BLOCKLIST_READ_LIMIT) {
+            Ok(contents) => contents,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(source) => {
+                return Err(map_lookup_error(
+                    SourceLoadError::Source {
+                        path: path.clone(),
+                        source,
+                    }
+                    .into(),
+                ));
             }
-            result => result.map_err(map_lookup_error),
+        };
+        let source_label: Arc<str> = Arc::from("internal:blocklist");
+        let original_len = entries.len();
+        for (index, line) in contents.lines().enumerate() {
+            match parse_blocklist_entry(line, index + 1) {
+                Ok(Some(cidr)) => entries.push(LookupSourceEntry {
+                    source_label: Arc::clone(&source_label),
+                    source_line: line.trim().to_owned(),
+                    cidr,
+                }),
+                Ok(None) => {}
+                Err(error) => {
+                    entries.truncate(original_len);
+                    return Err(map_invalid_blocklist_line(path, error));
+                }
+            }
         }
+        Ok(())
     }
 }
 
@@ -235,22 +259,6 @@ where
     }));
 }
 
-fn append_source_file(
-    path: &Path,
-    source_label: &str,
-    entries: &mut Vec<LookupSourceEntry>,
-) -> Result<(), LookupSourceLoadError> {
-    let contents = read_to_string_with_limit(path, SOURCE_FILE_READ_LIMIT).map_err(|err| {
-        LookupSourceLoadError::from(SourceLoadError::Source {
-            path: path.to_path_buf(),
-            source: err,
-        })
-    })?;
-
-    append_source_lines(&contents, &Arc::from(source_label), entries);
-    Ok(())
-}
-
 fn append_source_lines(
     contents: &str,
     source_label: &Arc<str>,
@@ -424,7 +432,7 @@ mod tests {
 
         fs::write(
             &paths.blocklist_file,
-            "10.0.0.0/24\ninvalid\n198.51.100.7 trailing\n",
+            "10.0.0.0/24\n# full-line comment\n\n  198.51.100.7 \n",
         )
         .expect("write blocklist");
 
@@ -460,6 +468,46 @@ mod tests {
     }
 
     #[test]
+    fn invalid_local_line_rolls_back_only_this_providers_entries() {
+        use super::{LocalBlocklistLookupProvider, LookupSourceEntry, OfflineLookupProvider};
+        use kidobo_core::network::parse_ip_cidr_strict;
+
+        let temp = TempDir::new().expect("tempdir");
+        let paths = test_paths(temp.path());
+        fs::create_dir_all(&paths.data_dir).expect("data directory");
+        let invalid = "198.51.100.8 trailing junk";
+        fs::write(
+            &paths.blocklist_file,
+            format!("\n198.51.100.7\n{invalid}\n"),
+        )
+        .expect("write blocklist");
+        let prior = LookupSourceEntry {
+            source_label: "prior".into(),
+            source_line: "192.0.2.0/24".into(),
+            cidr: parse_ip_cidr_strict("192.0.2.0/24").expect("valid range"),
+        };
+        let mut entries = vec![prior.clone()];
+
+        let error = LocalBlocklistLookupProvider
+            .append_offline(
+                &OfflineLookupContext {
+                    temporary_bans: &kidobo_core::temporary_bans::TemporaryBans::default(),
+                    cutoff: 100,
+                    paths: &paths,
+                    config: None,
+                    cancellation: &kidobo_app::ports::NoCancellation,
+                },
+                &mut entries,
+            )
+            .expect_err("reject trailing junk");
+        assert!(
+            matches!(error, AppError::BlocklistParseLine { path, line: 3, content }
+            if path == paths.blocklist_file && content == invalid)
+        );
+        assert_eq!(entries, [prior]);
+    }
+
+    #[test]
     fn lookup_loads_previous_v2_and_legacy_feeds_with_original_tokens() {
         use crate::cache_generation::{GenerationFile, commit_generation, generation_candidates};
         use crate::http_cache::{RemoteCacheMetadata, remote_generation_store, url_hash_prefix};
@@ -471,6 +519,7 @@ mod tests {
         let store = remote_generation_store(cache, url);
         let commit = |iplist: &str, previous: Option<&str>| {
             let metadata = serde_json::to_vec(&RemoteCacheMetadata {
+                validator_scope: None,
                 url: url.to_string(),
                 etag: None,
                 last_modified: None,
@@ -800,7 +849,7 @@ mod tests {
         fs::create_dir_all(&paths.remote_cache_dir).expect("mkdir remote");
         fs::write(
             paths.remote_cache_dir.join("a.iplist"),
-            "1".repeat(super::SOURCE_FILE_READ_LIMIT + 1),
+            "1".repeat(crate::source_files::SOURCE_FILE_READ_LIMIT + 1),
         )
         .expect("write oversized iplist");
 

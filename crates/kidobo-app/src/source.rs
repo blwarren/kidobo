@@ -162,16 +162,16 @@ pub trait PendingCachePromotion: Send {
     fn promote(self: Box<Self>) -> std::io::Result<()>;
 }
 
-/// Primary source data, an optional validated fallback, and deferred cache selections.
+/// Primary source data, ordered validated fallbacks, and deferred cache selections.
 #[derive(Default)]
 pub struct SyncSourceLoad {
     /// Preferred batch for this synchronization attempt.
     pub primary: SyncSourceBatch,
-    /// Previously selected compatible batch, when distinct from the primary.
-    pub fallback: Option<SyncSourceBatch>,
+    /// Previously selected compatible batches, ordered newest first.
+    pub fallback: Vec<SyncSourceBatch>,
     /// Cache manifests selected only after semantic and capacity preflight succeeds.
     pub pending_promotions: Vec<Box<dyn PendingCachePromotion>>,
-    /// Persistence failure that must abort sync if neither cached batch passes admission.
+    /// Persistence failure that must abort sync if no cached batch passes admission.
     pub fallback_failure: Option<AppError>,
     /// Load evidence for individual sources, in deterministic evaluation order.
     pub observations: Vec<SourceObservation>,
@@ -183,7 +183,7 @@ impl SyncSourceLoad {
     pub fn ready(primary: SyncSourceBatch) -> Self {
         Self {
             primary,
-            fallback: None,
+            fallback: Vec::new(),
             pending_promotions: Vec::new(),
             fallback_failure: None,
             observations: Vec::new(),

@@ -82,6 +82,8 @@ impl Fixture {
             // Keep instrumentation output outside the state whose immutability is tested.
             .envs(std::env::var_os("LLVM_PROFILE_FILE").map(|value| ("LLVM_PROFILE_FILE", value)))
             .env("KIDOBO_ROOT", self.root())
+            .env("TMPDIR", self.root())
+            .env("KIDOBO_TEST_SANDBOX", "1")
             .env("PATH", self.root().join("bin"))
             .env("KIDOBO_TEST_TOOL_LOG", self.root().join("tool.log"))
             .env("TERM", "xterm")

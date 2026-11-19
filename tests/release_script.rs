@@ -478,8 +478,9 @@ fn publisher_atomically_pushes_then_verifies_and_publishes_local_artifacts() {
     assert!(fixture.tag_exists());
     assert!(fixture.remote_tag_exists(RELEASE_TAG));
     let log = read_to_string_with_limit(&fixture.git_log, FIXTURE_LOG_READ_LIMIT);
+    let tag = fixture.object_id(RELEASE_TAG);
     let expected_push = format!(
-        "-c core.hooksPath=/dev/null push --atomic origin {release_head}:refs/heads/main refs/tags/{RELEASE_TAG}:refs/tags/{RELEASE_TAG}"
+        "-c core.hooksPath=/dev/null push --atomic origin {release_head}:refs/heads/main {tag}:refs/tags/{RELEASE_TAG}"
     );
     assert!(
         log.lines().any(|line| line == expected_push),
@@ -594,6 +595,35 @@ fn publisher_marks_suffixed_versions_as_prereleases_without_changing_latest() {
         .expect("prerelease publication");
     assert!(edit.contains("--draft=false"));
     assert!(!edit.contains("--latest"));
+}
+
+#[test]
+fn publisher_reconciles_lost_atomic_push_reply() {
+    for (reply, confirmed) in [("lost", true), ("unreadable", false)] {
+        let fixture = ReleaseFixture::new();
+        let output = run_with_confirmation(
+            fixture
+                .publisher_command()
+                .env("KIDOBO_TEST_PUSH_REPLY", reply),
+            "y\n",
+        );
+        assert_eq!(output.status.success(), confirmed, "{output:?}");
+        assert!(fixture.tag_exists() && fixture.remote_tag_exists(RELEASE_TAG));
+        let artifacts = fixture.artifact_root(RELEASE_TAG);
+        for name in [
+            format!("kidobo-{RELEASE_TAG}-linux-x86_64.tar.gz"),
+            "SHA256SUMS".into(),
+            "release-notes.md".into(),
+        ] {
+            assert!(artifacts.join(name).is_file());
+        }
+        assert_eq!(fixture.gh_release_dir.join("published").exists(), confirmed);
+        if !confirmed {
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("Atomic push outcome uncertain")
+            );
+        }
+    }
 }
 
 #[test]

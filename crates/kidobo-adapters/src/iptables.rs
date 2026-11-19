@@ -9,8 +9,18 @@ use crate::command_runner::{
 
 /// Stable Kidobo-owned enforcement chain name.
 pub const KIDOBO_CHAIN_NAME: &str = "kidobo-input";
-const KIDOBO_STAGING_CHAIN_NAME: &str = "kidobo-input-stage";
+pub(crate) const KIDOBO_STAGING_CHAIN_NAME: &str = "kidobo-input-stage";
 const XTABLES_LOCK_WAIT_SECS: &str = "5";
+const REPLY_EXEMPTION_ARGS: &[&str] = &[
+    "-m",
+    "conntrack",
+    "--ctstate",
+    "RELATED,ESTABLISHED",
+    "--ctdir",
+    "REPLY",
+    "-j",
+    "RETURN",
+];
 
 /// Firewall verdict used by the Kidobo-owned chain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,7 +82,7 @@ pub enum FirewallError {
 
     /// Final INPUT wiring violated the exact one-stable-jump invariant.
     #[error(
-        "firewall INPUT wiring validation failed for {family:?}: stable={stable_positions:?}, staging={staging_positions:?}"
+        "firewall INPUT wiring validation failed for {family:?}: stable={stable_positions:?}, staging={staging_positions:?}, staging_chain_present={staging_chain_present}"
     )]
     UnexpectedInputWiring {
         /// Affected firewall family.
@@ -81,6 +91,28 @@ pub enum FirewallError {
         stable_positions: Vec<usize>,
         /// One-based INPUT positions jumping to the transient staging chain.
         staging_positions: Vec<usize>,
+        /// Whether the transient staging chain still exists.
+        staging_chain_present: bool,
+    },
+
+    /// A rule outside Kidobo's supported wiring refers to a managed chain.
+    #[error(
+        "unsupported firewall reference for {family:?}: {rule:?}; remove or relocate the reference before changing Kidobo enforcement"
+    )]
+    UnsupportedManagedReference {
+        /// Affected firewall family.
+        family: FirewallFamily,
+        /// Rule listing entry containing the foreign reference.
+        rule: String,
+    },
+
+    /// A rule could not be parsed well enough to verify ownership.
+    #[error("could not parse firewall rule listing for {family:?}: {rule:?}")]
+    InvalidRuleListing {
+        /// Affected firewall family.
+        family: FirewallFamily,
+        /// Unrecognized rule listing entry.
+        rule: String,
     },
 }
 
@@ -154,14 +186,9 @@ pub fn ensure_firewall_wiring(
     set_name: &str,
     chain_action: ChainAction,
 ) -> Result<(), FirewallError> {
+    verify_managed_references(runner, family)?;
     ensure_chain_exists(runner, family, KIDOBO_CHAIN_NAME)?;
-    replace_chain_rule_fail_closed(
-        runner,
-        family,
-        KIDOBO_CHAIN_NAME,
-        set_name,
-        chain_action.as_target(),
-    )?;
+    replace_chain_rule_fail_closed(runner, family, set_name, chain_action)?;
     normalize_input_jump_fail_closed(runner, family, KIDOBO_CHAIN_NAME)?;
     Ok(())
 }
@@ -196,6 +223,10 @@ pub fn ensure_firewall_artifacts_for_families(
     runner: &dyn FirewallCommandRunner,
     enable_ipv6: bool,
 ) -> Result<(), FirewallError> {
+    verify_managed_references(runner, FirewallFamily::Ipv4)?;
+    if enable_ipv6 {
+        verify_managed_references(runner, FirewallFamily::Ipv6)?;
+    }
     ensure_chain_exists(runner, FirewallFamily::Ipv4, KIDOBO_CHAIN_NAME)?;
     if enable_ipv6 {
         ensure_chain_exists(runner, FirewallFamily::Ipv6, KIDOBO_CHAIN_NAME)?;
@@ -213,9 +244,12 @@ pub fn cleanup_firewall_wiring(
     runner: &dyn FirewallCommandRunner,
     family: FirewallFamily,
 ) -> Result<(), FirewallError> {
+    verify_managed_references(runner, family)?;
     let staging_jump_result =
         remove_all_input_jumps_for_chain(runner, family, KIDOBO_STAGING_CHAIN_NAME);
     let stable_jump_result = remove_all_input_jumps_for_chain(runner, family, KIDOBO_CHAIN_NAME);
+    staging_jump_result?;
+    stable_jump_result?;
     let staging_flush_result = run_checked_allow_missing_chain(
         runner,
         family.binary(),
@@ -231,8 +265,6 @@ pub fn cleanup_firewall_wiring(
     let stable_delete_result =
         run_checked_allow_missing_chain(runner, family.binary(), &["-X", KIDOBO_CHAIN_NAME]);
 
-    staging_jump_result?;
-    stable_jump_result?;
     staging_flush_result?;
     staging_delete_result?;
     stable_flush_result?;
@@ -265,6 +297,7 @@ pub fn remove_all_input_jumps_for_chain(
 
     loop {
         let input = run_checked(runner, binary, &["-S", "INPUT"])?;
+        check_managed_references(family, &input.stdout)?;
         if exact_jump_positions(&input.stdout, chain_name).is_empty() {
             return Ok(());
         }
@@ -289,6 +322,15 @@ fn normalize_input_jump_fail_closed(
     chain_name: &str,
 ) -> Result<(), FirewallError> {
     let binary = family.binary();
+    let current = run_checked(runner, binary, &["-S"])?;
+    check_managed_references(family, &current.stdout)?;
+    if exact_jump_positions(&current.stdout, chain_name) == [1]
+        && exact_jump_positions(&current.stdout, KIDOBO_STAGING_CHAIN_NAME).is_empty()
+        && !staging_chain_present(&current.stdout)
+    {
+        return Ok(());
+    }
+
     ensure_chain_exists(runner, family, KIDOBO_STAGING_CHAIN_NAME)?;
     replace_chain_jump_fail_closed(runner, family, KIDOBO_STAGING_CHAIN_NAME, chain_name)?;
 
@@ -303,14 +345,17 @@ fn normalize_input_jump_fail_closed(
     run_checked_allow_missing_chain(runner, binary, &["-F", KIDOBO_STAGING_CHAIN_NAME])?;
     run_checked_allow_missing_chain(runner, binary, &["-X", KIDOBO_STAGING_CHAIN_NAME])?;
 
-    let final_input = run_checked(runner, binary, &["-S", "INPUT"])?;
+    let final_input = run_checked(runner, binary, &["-S"])?;
+    check_managed_references(family, &final_input.stdout)?;
     let stable_positions = exact_jump_positions(&final_input.stdout, chain_name);
     let staging_positions = exact_jump_positions(&final_input.stdout, KIDOBO_STAGING_CHAIN_NAME);
-    if stable_positions != [1] || !staging_positions.is_empty() {
+    let staging_chain_present = staging_chain_present(&final_input.stdout);
+    if stable_positions != [1] || !staging_positions.is_empty() || staging_chain_present {
         return Err(FirewallError::UnexpectedInputWiring {
             family,
             stable_positions,
             staging_positions,
+            staging_chain_present,
         });
     }
     Ok(())
@@ -335,68 +380,199 @@ fn replace_chain_jump_fail_closed(
 fn replace_chain_rule_fail_closed(
     runner: &dyn FirewallCommandRunner,
     family: FirewallFamily,
-    chain_name: &str,
     set_name: &str,
-    target: &str,
+    action: ChainAction,
 ) -> Result<(), FirewallError> {
     let binary = family.binary();
+    let chain_name = KIDOBO_CHAIN_NAME;
     let current = run_checked(runner, binary, &["-S", chain_name])?;
-    let old_rule_count = chain_rule_count(&current.stdout, chain_name);
-    run_checked(
-        runner,
-        binary,
-        &[
-            "-A",
-            chain_name,
-            "-m",
-            "conntrack",
-            "--ctstate",
-            "RELATED,ESTABLISHED",
-            "--ctdir",
-            "REPLY",
-            "-j",
-            "RETURN",
-        ],
-    )?;
-    run_checked(
-        runner,
-        binary,
-        &[
-            "-A",
-            chain_name,
-            "-m",
-            "set",
-            "--match-set",
-            set_name,
-            "src",
-            "-j",
-            target,
-        ],
-    )?;
+    let rules = current
+        .stdout
+        .lines()
+        .filter_map(|line| rule_body(line, chain_name))
+        .collect::<Vec<_>>();
+    let target = action.as_target();
+    let block = ["-m", "set", "--match-set", set_name, "src", "-j", target];
+    if rules.is_empty() {
+        let append_exemption = [&["-A", chain_name][..], REPLY_EXEMPTION_ARGS].concat();
+        run_checked(runner, binary, &append_exemption)?;
+        let append_block = [&["-A", chain_name][..], &block].concat();
+        return run_checked(runner, binary, &append_block).map(|_| ());
+    }
+    if let [exemption, existing_block] = rules.as_slice()
+        && matches_reply_exemption(exemption)
+        && let Some((existing_set, existing_action)) = managed_block_rule(family, existing_block)
+    {
+        if existing_set != set_name || existing_action != action {
+            let args = [&["-R", chain_name, "2"][..], &block].concat();
+            run_checked(runner, binary, &args)?;
+        }
+        return Ok(());
+    }
 
-    for _ in 0..old_rule_count {
-        run_checked(runner, binary, &["-D", chain_name, "1"])?;
+    // Establish the new blocking rule first. Retain the new exemption at position one
+    // throughout cleanup, including when a deletion fails.
+    let append = [&["-A", chain_name][..], &block].concat();
+    run_checked(runner, binary, &append)?;
+    let insert = [&["-I", chain_name, "1"][..], REPLY_EXEMPTION_ARGS].concat();
+    run_checked(runner, binary, &insert)?;
+
+    // Removing from the tail keeps old terminal rules from exposing an old broad exemption.
+    for position in (2..=rules.len() + 1).rev() {
+        let position = position.to_string();
+        run_checked(runner, binary, &["-D", chain_name, &position])?;
     }
 
     Ok(())
 }
 
+pub(crate) fn matches_reply_exemption(rule: &str) -> bool {
+    matches!(
+        rule,
+        "-m conntrack --ctstate RELATED,ESTABLISHED --ctdir REPLY -j RETURN"
+            | "-m conntrack --ctstate ESTABLISHED,RELATED --ctdir REPLY -j RETURN"
+    )
+}
+
+pub(crate) fn managed_block_rule(
+    family: FirewallFamily,
+    rule: &str,
+) -> Option<(&str, ChainAction)> {
+    let rule = rule.strip_prefix("-m set --match-set ")?;
+    let (name, action) = rule.split_once(" src -j ")?;
+    if name.is_empty() || name.contains(char::is_whitespace) {
+        return None;
+    }
+    let reject = match family {
+        FirewallFamily::Ipv4 => "REJECT --reject-with icmp-port-unreachable",
+        FirewallFamily::Ipv6 => "REJECT --reject-with icmp6-port-unreachable",
+    };
+    match action {
+        "DROP" => Some((name, ChainAction::Drop)),
+        "REJECT" => Some((name, ChainAction::Reject)),
+        _ if action == reject => Some((name, ChainAction::Reject)),
+        _ => None,
+    }
+}
+
 fn chain_rule_count(stdout: &str, chain_name: &str) -> usize {
-    let prefix = format!("-A {chain_name} ");
     stdout
         .lines()
-        .filter(|line| line.starts_with(&prefix))
+        .filter(|line| rule_body(line, chain_name).is_some())
         .count()
+}
+
+pub(crate) fn rule_body<'a>(line: &'a str, chain: &str) -> Option<&'a str> {
+    let suffix = line.strip_prefix("-A ")?.strip_prefix(chain)?;
+    if suffix.is_empty() {
+        Some(suffix)
+    } else {
+        suffix.strip_prefix(' ')
+    }
+}
+
+pub(crate) fn staging_chain_present(listing: &str) -> bool {
+    listing.lines().any(|line| {
+        line == "-N kidobo-input-stage" || rule_body(line, KIDOBO_STAGING_CHAIN_NAME).is_some()
+    })
 }
 
 fn exact_jump_positions(stdout: &str, chain_name: &str) -> Vec<usize> {
     let expected = format!("-A INPUT -j {chain_name}");
     stdout
         .lines()
-        .filter(|line| line.starts_with("-A INPUT "))
+        .filter(|line| rule_body(line, "INPUT").is_some())
         .enumerate()
         .filter_map(|(idx, line)| (line.trim() == expected).then_some(idx + 1))
         .collect()
+}
+
+fn verify_managed_references(
+    runner: &dyn FirewallCommandRunner,
+    family: FirewallFamily,
+) -> Result<(), FirewallError> {
+    let listing = run_checked(runner, family.binary(), &["-S"])?;
+    check_managed_references(family, &listing.stdout)
+}
+
+fn check_managed_references(family: FirewallFamily, listing: &str) -> Result<(), FirewallError> {
+    for rule in listing.lines().filter(|line| !line.is_empty()) {
+        if rule.starts_with("-P ") || rule.starts_with("-N ") {
+            continue;
+        }
+        let refers = rule
+            .starts_with("-A ")
+            .then(|| refers_to_managed_chain(rule))
+            .flatten()
+            .ok_or_else(|| FirewallError::InvalidRuleListing {
+                family,
+                rule: rule.to_string(),
+            })?;
+        if refers && !is_supported_managed_reference(rule) {
+            return Err(FirewallError::UnsupportedManagedReference {
+                family,
+                rule: rule.to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn is_supported_managed_reference(rule: &str) -> bool {
+    matches!(
+        rule,
+        "-A INPUT -j kidobo-input"
+            | "-A INPUT -j kidobo-input-stage"
+            | "-A kidobo-input-stage -j kidobo-input"
+    )
+}
+
+pub(crate) fn refers_to_managed_chain(rule: &str) -> Option<bool> {
+    let tokens = rule_tokens(rule)?;
+    Some(tokens.windows(2).any(|pair| {
+        matches!(
+            pair,
+            ["-j" | "--jump" | "-g" | "--goto", target]
+            if matches!(target.trim_matches(['"', '\'']), KIDOBO_CHAIN_NAME | KIDOBO_STAGING_CHAIN_NAME)
+        )
+    }))
+}
+
+// Rule listings quote and escape arguments such as comments. Preserve those argument
+// boundaries so text that looks like a jump inside an argument cannot be a target.
+fn rule_tokens(rule: &str) -> Option<Vec<&str>> {
+    let mut tokens = Vec::new();
+    let mut start = None;
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, character) in rule.char_indices() {
+        if escaped {
+            escaped = false;
+        } else if character == '\\' {
+            start.get_or_insert(index);
+            escaped = true;
+        } else if let Some(delimiter) = quote {
+            if character == delimiter {
+                quote = None;
+            }
+        } else if matches!(character, '"' | '\'') {
+            start.get_or_insert(index);
+            quote = Some(character);
+        } else if character.is_ascii_whitespace() {
+            if let Some(offset) = start.take() {
+                tokens.push(rule.get(offset..index)?);
+            }
+        } else {
+            start.get_or_insert(index);
+        }
+    }
+    if escaped || quote.is_some() {
+        return None;
+    }
+    if let Some(offset) = start {
+        tokens.push(rule.get(offset..)?);
+    }
+    Some(tokens)
 }
 
 fn with_lock_wait<'a>(args: &[&'a str]) -> Vec<&'a str> {
@@ -581,11 +757,23 @@ mod tests {
         }
 
         fn set_fail_stage_activation(&self) {
+            self.with_residual_staging_chain();
             self.control.borrow_mut().fail_stage_activation = true;
         }
 
         fn set_fail_post_stage_command(&self, command_number: usize) {
+            self.with_residual_staging_chain();
             self.control.borrow_mut().fail_post_stage_command = Some(command_number);
+        }
+
+        fn with_residual_staging_chain(&self) {
+            self.control
+                .borrow_mut()
+                .tables
+                .entry("iptables".to_string())
+                .or_default()
+                .chains
+                .insert(KIDOBO_STAGING_CHAIN_NAME.to_string(), Vec::new());
         }
 
         fn set_fail_command(&self, command_number: usize) {
@@ -698,6 +886,17 @@ mod tests {
     ) -> CommandResult {
         let table = control.tables.entry(command.to_string()).or_default();
         match operation {
+            ["-S"] => {
+                use std::fmt::Write as _;
+
+                let mut listing = String::from("-P INPUT ACCEPT\n");
+                listing.push_str(&render_rules("INPUT", &table.input_rules));
+                for (chain, rules) in &table.chains {
+                    writeln!(listing, "-N {chain}").expect("render chain declaration");
+                    listing.push_str(&render_rules(chain, rules));
+                }
+                listed_rules(&listing)
+            }
             ["-S", "INPUT"] => CommandResult {
                 status: ProcessStatus::Exited(0),
                 stdout: render_rules("INPUT", &table.input_rules),
@@ -729,6 +928,18 @@ mod tests {
                 table.input_rules.insert(0, format!("-j {chain_name}"));
                 ok(0)
             }
+            ["-I", chain_name, "1", rule @ ..] => {
+                table
+                    .chains
+                    .get_mut(*chain_name)
+                    .expect("insert into chain")
+                    .insert(0, rule.join(" "));
+                ok(0)
+            }
+            ["-R", chain_name, "2", rule @ ..] => {
+                table.chains.get_mut(*chain_name).expect("replace in chain")[1] = rule.join(" ");
+                ok(0)
+            }
             ["-D", "INPUT", "-j", chain_name] => {
                 if !table.chains.contains_key(*chain_name) {
                     return missing_target_chain(chain_name);
@@ -743,14 +954,17 @@ mod tests {
                         ok(0)
                     })
             }
-            ["-D", chain_name, "1"] => table
-                .chains
-                .get_mut(*chain_name)
-                .filter(|rules| !rules.is_empty())
-                .map_or_else(missing_rule, |rules| {
-                    rules.remove(0);
-                    ok(0)
-                }),
+            ["-D", chain_name, position] => {
+                let index = position.parse::<usize>().expect("valid rule position") - 1;
+                table
+                    .chains
+                    .get_mut(*chain_name)
+                    .filter(|rules| index < rules.len())
+                    .map_or_else(missing_rule, |rules| {
+                        rules.remove(index);
+                        ok(0)
+                    })
+            }
             ["-F", chain_name] => {
                 table
                     .chains
@@ -963,6 +1177,7 @@ mod tests {
     #[test]
     fn chain_creation_failure_after_confirmed_nft_absence_is_fatal() {
         let runner = MockRunner::new(vec![
+            Ok(listed_rules("-P INPUT ACCEPT\n")),
             Ok(nft_incompatible_chain("ip6tables", KIDOBO_CHAIN_NAME)),
             Ok(listed_rules("-P INPUT ACCEPT\n")),
             Ok(command_failure("chain appeared concurrently")),
@@ -976,9 +1191,9 @@ mod tests {
         )
         .expect_err("failed creation must stop activation");
         assert!(error.to_string().contains("chain appeared concurrently"));
-        assert_eq!(runner.invocations().len(), 3);
+        assert_eq!(runner.invocations().len(), 4);
         assert_eq!(
-            runner.invocations()[2].1,
+            runner.invocations()[3].1,
             vec!["-w", "5", "-N", KIDOBO_CHAIN_NAME]
         );
     }
@@ -987,6 +1202,7 @@ mod tests {
     fn cleanup_does_not_ignore_ambiguous_nft_errors() {
         for family in [FirewallFamily::Ipv4, FirewallFamily::Ipv6] {
             let runner = MockRunner::new(vec![
+                Ok(listed_rules("-P INPUT ACCEPT\n")),
                 Ok(listed_rules("")),
                 Ok(listed_rules("")),
                 Ok(nft_incompatible_chain(
@@ -1001,7 +1217,7 @@ mod tests {
             let error = cleanup_firewall_wiring(&runner, family)
                 .expect_err("cleanup cannot assume an incompatible chain is absent");
             assert!(error.to_string().contains("incompatible, use 'nft' tool"));
-            assert_eq!(runner.invocations().len(), 6);
+            assert_eq!(runner.invocations().len(), 7);
         }
     }
 
@@ -1189,11 +1405,12 @@ mod tests {
 
         let invocations = runner.invocations();
         assert_eq!(invocations[0].0, "iptables");
-        assert_eq!(invocations[0].1, vec!["-w", "5", "-S", KIDOBO_CHAIN_NAME]);
-        assert_eq!(invocations[1].1, vec!["-w", "5", "-N", KIDOBO_CHAIN_NAME]);
-        assert_eq!(invocations[2].1, vec!["-w", "5", "-S", KIDOBO_CHAIN_NAME]);
+        assert_eq!(invocations[0].1, vec!["-w", "5", "-S"]);
+        assert_eq!(invocations[1].1, vec!["-w", "5", "-S", KIDOBO_CHAIN_NAME]);
+        assert_eq!(invocations[2].1, vec!["-w", "5", "-N", KIDOBO_CHAIN_NAME]);
+        assert_eq!(invocations[3].1, vec!["-w", "5", "-S", KIDOBO_CHAIN_NAME]);
         assert_eq!(
-            invocations[3].1,
+            invocations[4].1,
             [
                 "-w",
                 "5",
@@ -1210,7 +1427,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            invocations[4].1,
+            invocations[5].1,
             vec![
                 "-w",
                 "5",
@@ -1227,9 +1444,9 @@ mod tests {
         );
         let first_input_insert = invocations
             .iter()
-            .position(|(_, args)| args.get(2).is_some_and(|arg| arg == "-I"))
+            .position(|(_, args)| args.get(2..4).is_some_and(|arg| arg == ["-I", "INPUT"]))
             .expect("INPUT insertion");
-        assert!(first_input_insert > 4);
+        assert!(first_input_insert > 5);
         assert_eq!(
             runner.input_rules("iptables"),
             [format!("-j {KIDOBO_CHAIN_NAME}")]
@@ -1303,6 +1520,7 @@ mod tests {
     #[test]
     fn append_failure_leaves_old_chain_rule_and_input_jump_untouched() {
         let runner = MockRunner::new(vec![
+            Ok(listed_rules("-P INPUT ACCEPT\n")),
             Ok(CommandResult {
                 status: ProcessStatus::Exited(0),
                 stdout: "-N kidobo-input\n-A kidobo-input -j DROP\n".to_string(),
@@ -1330,7 +1548,7 @@ mod tests {
 
         assert!(matches!(err, FirewallError::CommandFailed { .. }));
         let invocations = runner.invocations();
-        assert_eq!(invocations.len(), 3);
+        assert_eq!(invocations.len(), 4);
         assert!(
             invocations
                 .iter()
@@ -1346,6 +1564,7 @@ mod tests {
     #[test]
     fn old_rule_delete_failure_leaves_new_rule_in_place() {
         let runner = MockRunner::new(vec![
+            Ok(listed_rules("-P INPUT ACCEPT\n")),
             Ok(CommandResult {
                 status: ProcessStatus::Exited(0),
                 stdout: "-A kidobo-input -j DROP\n".to_string(),
@@ -1356,8 +1575,8 @@ mod tests {
                 stdout: "-A kidobo-input -j DROP\n".to_string(),
                 stderr: String::new(),
             }), // query rules
-            Ok(ok(0)), // append exemption
             Ok(ok(0)), // append desired block
+            Ok(ok(0)), // insert exemption
             Ok(CommandResult {
                 status: ProcessStatus::Exited(2),
                 stdout: String::new(),
@@ -1375,12 +1594,120 @@ mod tests {
 
         assert!(matches!(err, FirewallError::CommandFailed { .. }));
         let invocations = runner.invocations();
-        assert_eq!(invocations.len(), 5);
-        assert!(invocations[2].1.contains(&"-A".to_string()));
+        assert_eq!(invocations.len(), 6);
+        assert!(invocations[3].1.contains(&"-A".to_string()));
+        assert!(invocations[4].1.contains(&"-I".to_string()));
         assert_eq!(
-            invocations[4].1,
-            vec!["-w", "5", "-D", KIDOBO_CHAIN_NAME, "1"]
+            invocations[5].1,
+            vec!["-w", "5", "-D", KIDOBO_CHAIN_NAME, "2"]
         );
+    }
+
+    #[test]
+    fn canonical_wiring_skips_rewrites_and_updates_only_a_changed_block_rule() {
+        let runner = StatefulRunner::with_existing_wiring(1);
+        let family = FirewallFamily::Ipv4;
+        ensure_firewall_wiring(&runner, family, "canonical", ChainAction::Drop)
+            .expect("initial sync");
+
+        let before = runner.invocations().len();
+        ensure_firewall_wiring(&runner, family, "canonical", ChainAction::Drop)
+            .expect("repeat sync");
+        assert!(
+            runner.invocations()[before..]
+                .iter()
+                .all(|(_, args)| args[2] == "-S")
+        );
+
+        let before = runner.invocations().len();
+        ensure_firewall_wiring(&runner, family, "new-set", ChainAction::Reject)
+            .expect("change set and action");
+        let invocations = runner.invocations();
+        let mutations = invocations[before..]
+            .iter()
+            .filter(|(_, args)| args[2] != "-S")
+            .collect::<Vec<_>>();
+        assert_eq!(mutations.len(), 1);
+        assert_eq!(
+            &mutations[0].1[2..],
+            [
+                "-R",
+                KIDOBO_CHAIN_NAME,
+                "2",
+                "-m",
+                "set",
+                "--match-set",
+                "new-set",
+                "src",
+                "-j",
+                "REJECT"
+            ]
+        );
+    }
+
+    #[test]
+    fn interrupted_recovery_keeps_replies_and_blocking_during_each_old_rule_deletion() {
+        for failed_deletion in [6, 7, 8] {
+            let runner = StatefulRunner::with_existing_wiring(1);
+            runner
+                .control
+                .borrow_mut()
+                .tables
+                .get_mut("iptables")
+                .expect("table")
+                .chains
+                .insert(
+                    KIDOBO_CHAIN_NAME.to_string(),
+                    vec![
+                        super::REPLY_EXEMPTION_ARGS.join(" "),
+                        "-m set --match-set old-set src -j DROP".to_string(),
+                        "-m conntrack --ctstate RELATED,ESTABLISHED -j RETURN".to_string(),
+                    ],
+                );
+            runner.set_fail_command(failed_deletion);
+            ensure_firewall_wiring(&runner, FirewallFamily::Ipv4, "new-set", ChainAction::Drop)
+                .expect_err("old rule deletion should fail");
+            assert_eq!(runner.invocations()[failed_deletion - 1].1[2], "-D");
+            let rules = runner.chain_rules("iptables", KIDOBO_CHAIN_NAME);
+            assert_eq!(
+                chain_verdict(&rules, "ESTABLISHED", "REPLY", true),
+                Some("RETURN")
+            );
+            assert_eq!(
+                chain_verdict(&rules, "ESTABLISHED", "ORIGINAL", true),
+                Some("DROP")
+            );
+            ensure_firewall_wiring(&runner, FirewallFamily::Ipv4, "new-set", ChainAction::Drop)
+                .expect("retry recovery");
+            assert_eq!(runner.chain_rules("iptables", KIDOBO_CHAIN_NAME).len(), 2);
+        }
+    }
+
+    #[test]
+    fn unsupported_references_stop_sync_and_flush_before_mutating_the_family() {
+        for rule in [
+            "-A INPUT -s 192.0.2.0/24 -j kidobo-input",
+            "-A INPUT -m comment --comment \"managed with operator options\" -j kidobo-input",
+            "-A INPUT -g kidobo-input",
+            "-A INPUT -j \"kidobo-input\"",
+            "-A OUTPUT -j kidobo-input-stage",
+        ] {
+            let listing = format!("-P INPUT ACCEPT\n{rule}\n");
+            for flush in [false, true] {
+                let runner = MockRunner::new(vec![Ok(listed_rules(&listing))]);
+                let error = if flush {
+                    cleanup_firewall_wiring(&runner, FirewallFamily::Ipv4)
+                } else {
+                    super::ensure_firewall_artifacts_for_families(&runner, true)
+                }
+                .expect_err("preserve operator reference");
+                assert!(
+                    matches!(error, FirewallError::UnsupportedManagedReference { rule: observed, .. } if observed == rule)
+                );
+                assert_eq!(runner.invocations().len(), 1);
+                assert_eq!(runner.invocations()[0].1, ["-w", "5", "-S"]);
+            }
+        }
     }
 
     #[test]

@@ -10,7 +10,7 @@ use crate::cli::presentation::{Presentation, Status};
 use crate::error::KidoboError;
 use kidobo_adapters::config::FileConfigRepository;
 use kidobo_adapters::enforcement::SystemEnforcementBackend;
-use kidobo_adapters::lock::FileLockManager;
+use kidobo_adapters::lock::{FileLockManager, SystemFirewallTransactionLock};
 use kidobo_adapters::path::{SystemPathResolver, path_resolution_input_from_process};
 use kidobo_adapters::storage::FileSyncStorage;
 use kidobo_adapters::sync_observer::LoggingSyncObserver;
@@ -27,6 +27,7 @@ pub fn run_sync_command(timer: bool, io: &mut CliIo<'_>) -> Result<(), KidoboErr
     let paths = SystemPathResolver;
     let configs = FileConfigRepository;
     let locks = FileLockManager;
+    let firewall_lock = SystemFirewallTransactionLock::new(&request);
     let sources = build_sync_source_registry(env!("CARGO_PKG_VERSION"))?;
     let enforcement = SystemEnforcementBackend::default();
     let observer = CliSyncObserver {
@@ -43,6 +44,7 @@ pub fn run_sync_command(timer: bool, io: &mut CliIo<'_>) -> Result<(), KidoboErr
             paths: &paths,
             configs: &configs,
             locks: &locks,
+            firewall_lock: &firewall_lock,
             storage: &FileSyncStorage,
             clock: &SystemClock,
             temporary_bans: &FileTemporaryBanRepository,

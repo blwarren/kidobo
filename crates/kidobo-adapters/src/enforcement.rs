@@ -79,8 +79,9 @@ where
         let mut notices = Vec::new();
         if let Err(error) = cleanup_firewall_wiring(&self.runner, FirewallFamily::Ipv6) {
             notices.push(Notice::warning(format!(
-                "disabled IPv6 firewall cleanup failed softly: {error}"
+                "disabled IPv6 firewall cleanup failed softly; retained the configured IPv6 set: {error}"
             )));
+            return notices;
         }
 
         // Disabled IPv6 permits an overlong derived name, which cannot exist in ipset.
@@ -266,7 +267,7 @@ mod tests {
     }
 
     #[test]
-    fn disabled_ipv6_cleanup_reports_unsuccessful_destroy_and_continues_after_firewall_error() {
+    fn disabled_ipv6_cleanup_reports_unsuccessful_destroy_and_preserves_set_on_firewall_error() {
         let output = |status, stderr: &str| {
             Ok(CommandResult {
                 status,
@@ -313,10 +314,17 @@ mod tests {
                     enable_ipv6: false,
                     chain_action: FirewallAction::Drop,
                 });
-                assert_eq!(
-                    notices.len(),
-                    usize::from(diagnostic.is_some()) + usize::from(fail_firewall)
-                );
+                if fail_firewall {
+                    assert_eq!(notices.len(), 1);
+                    assert!(
+                        notices[0]
+                            .message
+                            .contains("retained the configured IPv6 set")
+                    );
+                    assert!(backend.runner.result.borrow().is_some());
+                    continue;
+                }
+                assert_eq!(notices.len(), usize::from(diagnostic.is_some()));
                 assert!(
                     notices
                         .iter()

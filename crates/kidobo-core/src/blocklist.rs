@@ -279,7 +279,14 @@ fn canonical_entry_lines(entries: &[CanonicalCidr]) -> Vec<String> {
     canonical
 }
 
-fn parse_blocklist_entry(
+/// Parses a saved blocklist line using its one-based position for diagnostics.
+///
+/// Blank lines and full-line comments return `Ok(None)`.
+///
+/// # Errors
+///
+/// Returns [`InvalidBlocklistLine`] when the line is not exactly one valid IP or CIDR.
+pub fn parse_blocklist_entry(
     line: &str,
     line_number: usize,
 ) -> Result<Option<CanonicalCidr>, InvalidBlocklistLine> {

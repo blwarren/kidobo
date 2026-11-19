@@ -16,7 +16,9 @@ use crate::cache_generation::{
 use crate::cached_fetch::{read_optional_json_lossy, read_validated_bytes_lossy};
 use crate::hash::sha256_hex;
 use crate::http_client::{HttpClient, HttpResponse, max_http_body_bytes};
-use crate::http_fetch::{ConditionalFetchResult, fetch_with_conditional_cache};
+use crate::http_fetch::{
+    CachedHttpValidators, ConditionalFetchResult, fetch_with_conditional_cache,
+};
 use kidobo_app::source::{Notice, SourceProvenance};
 use kidobo_core::config::{
     DEFAULT_GITHUB_META_CATEGORIES, DEFAULT_GITHUB_META_URL, GithubMetaCategoryMode,
@@ -47,6 +49,9 @@ const GITHUB_META_IPV6_COVERAGE_LIMIT: u128 = 1_u128 << 124;
 pub struct GithubMetaCacheMetadata {
     /// Configured endpoint URL whose response was cached.
     pub url: String,
+    /// SHA-256 of the effective HTTP resource URL, when recorded by the transport.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validator_scope: Option<String>,
     /// Optional HTTP entity tag.
     pub etag: Option<String>,
     /// Optional HTTP last-modified validator.
@@ -90,7 +95,7 @@ pub struct GithubMetaLoadResult {
 
 pub(crate) struct PreparedGithubMetaLoad {
     pub(crate) primary: GithubMetaLoadResult,
-    pub(crate) fallback: Option<GithubMetaLoadResult>,
+    pub(crate) fallback: Vec<GithubMetaLoadResult>,
     pub(crate) pending_promotion: Option<StagedGeneration>,
     pub(crate) staging_failure: Option<GithubMetaLoadError>,
 }
@@ -106,7 +111,7 @@ pub(crate) struct ReadOnlyGithubBatch {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ReadOnlyGithubMeta {
     pub(crate) primary: ReadOnlyGithubBatch,
-    pub(crate) fallback: Option<Vec<CanonicalCidr>>,
+    pub(crate) fallback: Vec<Vec<CanonicalCidr>>,
     pub(crate) notices: Vec<Notice>,
 }
 
@@ -146,6 +151,7 @@ struct CachePaths {
     metadata: PathBuf,
     category_sidecar: PathBuf,
     generation_store: PathBuf,
+    cache_root: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -153,7 +159,7 @@ struct GithubMetaCache {
     networks: Option<Vec<CanonicalCidr>>,
     meta: Option<GithubMetaCacheMetadata>,
     generation_id: Option<String>,
-    previous: Option<GithubMetaLoadResult>,
+    previous: Vec<GithubMetaLoadResult>,
 }
 
 impl CachePaths {
@@ -163,6 +169,7 @@ impl CachePaths {
             metadata: cache_dir.join(GITHUB_META_META_CACHE_FILE),
             category_sidecar: cache_dir.join(GITHUB_META_CATEGORY_CACHE_FILE),
             generation_store: cache_dir.join(GITHUB_META_V2_STORE),
+            cache_root: cache_dir.to_path_buf(),
         }
     }
 }
@@ -207,21 +214,19 @@ pub(crate) fn prepare_github_meta_safelist(
     let selection = CategorySelection::from_mode(category_mode);
     let max_bytes = max_http_body_bytes(env).min(GITHUB_META_CACHE_READ_LIMIT);
     let paths = CachePaths::from_cache_dir(cache_dir);
-    prepare_online_generations(&paths.generation_store).map_err(|source| {
+    prepare_online_generations(&paths.generation_store, cache_dir).map_err(|source| {
         GithubMetaLoadError::SyncManifestDirectory {
             path: paths.generation_store.clone(),
             source,
         }
     })?;
     let cache = read_github_meta_cache(&paths, &selection, github_meta_url);
-    let (cached_etag, cached_last_modified) = cache.http_validators();
 
     match fetch_with_conditional_cache(
         client,
         github_meta_url,
         max_bytes,
-        cached_etag,
-        cached_last_modified,
+        cache.http_validators(),
         cache.networks.is_some(),
         "github meta",
     ) {
@@ -288,13 +293,11 @@ pub(crate) fn read_github_meta_for_preview(
         return read_only_github_cached(cache, SourceProvenance::Cache, true);
     };
     let max_bytes = max_http_body_bytes(env).min(GITHUB_META_CACHE_READ_LIMIT);
-    let (etag, modified) = cache.http_validators();
     match fetch_with_conditional_cache(
         client,
         github_meta_url,
         max_bytes,
-        etag,
-        modified,
+        cache.http_validators(),
         cache.networks.is_some(),
         "github meta",
     ) {
@@ -314,8 +317,10 @@ pub(crate) fn read_github_meta_for_preview(
                     provenance: SourceProvenance::Network,
                 },
                 fallback: cache
-                    .into_fallback_result()
-                    .map(|fallback| fallback.networks),
+                    .into_fallback_results()
+                    .into_iter()
+                    .map(|fallback| fallback.networks)
+                    .collect(),
                 notices: Vec::new(),
             }
         }
@@ -330,7 +335,10 @@ fn read_only_github_cached(
     let GithubMetaCache {
         networks, previous, ..
     } = cache;
-    let fallback = previous.map(|fallback| fallback.networks);
+    let fallback = previous
+        .into_iter()
+        .map(|fallback| fallback.networks)
+        .collect();
     let Some(networks) = networks else {
         return ReadOnlyGithubMeta {
             primary: ReadOnlyGithubBatch {
@@ -395,22 +403,23 @@ fn read_github_meta_cache(
             metadata: candidate.directory.join(GENERATION_META_FILE),
             category_sidecar: candidate.directory.join(GENERATION_CATEGORY_FILE),
             generation_store: paths.generation_store.clone(),
+            cache_root: paths.cache_root.clone(),
         };
         let mut cache =
             read_github_meta_cache_files(&generation_paths, selection, github_meta_url, true);
         if cache.networks.is_some() {
-            if let Some(mut primary) = selected {
-                primary.previous = cache.into_fallback_result();
-                return primary;
+            if let Some(primary) = &mut selected {
+                primary.previous.extend(cache.into_fallback_results());
+            } else {
+                cache.generation_id = Some(candidate.id);
+                selected = Some(cache);
             }
-            cache.generation_id = Some(candidate.id);
-            selected = Some(cache);
         }
     }
 
     let legacy = read_github_meta_cache_files(paths, selection, github_meta_url, false);
     if let Some(mut primary) = selected {
-        primary.previous = legacy.into_fallback_result();
+        primary.previous.extend(legacy.into_fallback_results());
         primary
     } else {
         legacy
@@ -484,23 +493,31 @@ fn read_github_meta_cache_files(
         networks,
         meta,
         generation_id: None,
-        previous: None,
+        previous: Vec::new(),
     }
 }
 
 impl GithubMetaCache {
-    fn http_validators(&self) -> (Option<String>, Option<String>) {
-        self.meta.as_ref().map_or((None, None), |meta| {
-            (meta.etag.clone(), meta.last_modified.clone())
-        })
+    fn http_validators(&self) -> CachedHttpValidators {
+        self.meta
+            .as_ref()
+            .map_or_else(CachedHttpValidators::default, |meta| CachedHttpValidators {
+                scope: meta.validator_scope.clone(),
+                etag: meta.etag.clone(),
+                last_modified: meta.last_modified.clone(),
+            })
     }
 
-    fn into_fallback_result(self) -> Option<GithubMetaLoadResult> {
-        self.networks.map(|networks| GithubMetaLoadResult {
-            networks,
-            source: GithubMetaSource::FallbackCache,
-            metadata: self.meta,
-        })
+    fn into_fallback_results(self) -> Vec<GithubMetaLoadResult> {
+        self.networks
+            .map(|networks| GithubMetaLoadResult {
+                networks,
+                source: GithubMetaSource::FallbackCache,
+                metadata: self.meta,
+            })
+            .into_iter()
+            .chain(self.previous)
+            .collect()
     }
 }
 
@@ -517,6 +534,7 @@ fn handle_network_response(
     };
     let metadata = GithubMetaCacheMetadata {
         url: github_meta_url.to_string(),
+        validator_scope: response.validator_scope,
         etag: response.etag,
         last_modified: response.last_modified,
         sha256_raw: sha256_hex(&response.body),
@@ -541,7 +559,7 @@ fn handle_network_response(
         }
     };
 
-    let fallback = cached.into_fallback_result();
+    let fallback = cached.into_fallback_results();
     Ok(PreparedGithubMetaLoad {
         primary: GithubMetaLoadResult {
             networks,
@@ -559,7 +577,7 @@ fn validate_github_response(
     max_bytes: usize,
     selection: &CategorySelection,
 ) -> Option<Vec<CanonicalCidr>> {
-    if !response.status.is_success() {
+    if response.status != reqwest::StatusCode::OK {
         warn!(
             "github meta fetch failed: unexpected status {}",
             response.status
@@ -603,6 +621,7 @@ fn stage_cache(
         })?;
     stage_generation(
         &paths.generation_store,
+        &paths.cache_root,
         &[
             GenerationFile {
                 name: GENERATION_RAW_FILE,
@@ -893,6 +912,7 @@ mod tests {
 
     fn network_response(body: &[u8]) -> HttpResponse {
         HttpResponse {
+            validator_scope: Some("test-resource-scope".into()),
             status: StatusCode::OK,
             body: body.to_vec(),
             etag: Some("etag-1".to_string()),
@@ -915,9 +935,13 @@ mod tests {
     #[test]
     fn preview_keeps_current_previous_legacy_and_unselected_git_cache_state_unchanged() {
         for (corrupt, expected, fallback) in [
-            (0, "203.0.113.0/24", Some("198.51.100.0/24")),
-            (1, "198.51.100.0/24", Some("192.0.2.0/24")),
-            (2, "192.0.2.0/24", None),
+            (
+                0,
+                "203.0.113.0/24",
+                &["198.51.100.0/24", "192.0.2.0/24"][..],
+            ),
+            (1, "198.51.100.0/24", &["192.0.2.0/24"][..]),
+            (2, "192.0.2.0/24", &[][..]),
         ] {
             let temp = TempDir::new().expect("root");
             fs::write(
@@ -975,9 +999,13 @@ mod tests {
             assert_eq!(
                 loaded
                     .fallback
-                    .as_ref()
-                    .map(|networks| networks.iter().map(ToString::to_string).collect::<Vec<_>>()),
-                fallback.map(|target| vec![target.to_string()])
+                    .iter()
+                    .map(|networks| networks.iter().map(ToString::to_string).collect::<Vec<_>>())
+                    .collect::<Vec<_>>(),
+                fallback
+                    .iter()
+                    .map(|target| vec![target.to_string()])
+                    .collect::<Vec<_>>()
             );
             assert_eq!(snapshot(temp.path()), before);
         }
@@ -1064,6 +1092,7 @@ mod tests {
             ),
             (
                 Ok(HttpResponse {
+                    validator_scope: Some("test-resource-scope".into()),
                     status: StatusCode::NOT_MODIFIED,
                     body: Vec::new(),
                     etag: None,
@@ -1095,6 +1124,7 @@ mod tests {
                 assert_eq!(
                     loaded
                         .fallback
+                        .first()
                         .expect("fresh candidate cache fallback")
                         .iter()
                         .map(ToString::to_string)
@@ -1129,6 +1159,7 @@ mod tests {
         assert_eq!(offline.primary.networks, []);
         let client = MockHttpClient::new(vec![
             Ok(HttpResponse {
+                validator_scope: None,
                 status: StatusCode::NOT_MODIFIED,
                 body: Vec::new(),
                 etag: None,
@@ -1689,52 +1720,163 @@ mod tests {
     }
 
     #[test]
-    fn network_failure_exposes_previous_generation_for_application_admission() {
+    fn first_github_store_and_304_retry_require_durable_directory_entries() {
+        use crate::limited_io::directory_sync_test::fail_once_at;
+
         let temp = TempDir::new().expect("tempdir");
+        let cache_root = temp.path().join("remote");
+        let store = CachePaths::from_cache_dir(&cache_root).generation_store;
+        let mode = GithubMetaCategoryMode::All;
+        let env = BTreeMap::new();
+        let response = network_response(br#"{"api":["192.0.2.0/25"]}"#);
+        let client = MockHttpClient::new(vec![Ok(response.clone())]);
+        let failed = fail_once_at(
+            store.parent().expect("GitHub store parent"),
+            std::io::Error::from_raw_os_error(nix::libc::EIO),
+            || {
+                prepare_github_meta_safelist(
+                    &client,
+                    &cache_root,
+                    TEST_GITHUB_META_URL,
+                    &mode,
+                    &env,
+                )
+            },
+        );
+        assert!(matches!(
+            failed,
+            Err(super::GithubMetaLoadError::WriteCacheFile { .. })
+        ));
+        assert_eq!(client.requests().len(), 1);
+        assert!(!store.join("current.json").exists());
+
+        let client = MockHttpClient::new(vec![Ok(response.clone())]);
+        let pending =
+            prepare_github_meta_safelist(&client, &cache_root, TEST_GITHUB_META_URL, &mode, &env)
+                .expect("retry first-store sync")
+                .pending_promotion
+                .expect("staged generation");
+        let error = fail_once_at(
+            &store,
+            std::io::Error::from_raw_os_error(nix::libc::EIO),
+            || pending.promote(),
+        )
+        .expect_err("published manifest directory sync failed");
+        assert_eq!(error.raw_os_error(), Some(nix::libc::EIO));
+        let selected = current_generation_dir(&cache_root);
+        let orphan = store.join("generations/.unselected");
+        fs::create_dir(&orphan).expect("unselected staging directory");
+        let client = MockHttpClient::new(vec![Ok(HttpResponse {
+            status: StatusCode::NOT_MODIFIED,
+            body: Vec::new(),
+            ..response
+        })]);
+        for directory in [&selected, &store, &cache_root] {
+            let failed = fail_once_at(
+                directory,
+                std::io::Error::from_raw_os_error(nix::libc::EIO),
+                || {
+                    prepare_github_meta_safelist(
+                        &client,
+                        &cache_root,
+                        TEST_GITHUB_META_URL,
+                        &mode,
+                        &env,
+                    )
+                },
+            );
+            assert!(matches!(
+                failed,
+                Err(super::GithubMetaLoadError::SyncManifestDirectory { source, .. })
+                    if source.raw_os_error() == Some(nix::libc::EIO)
+            ));
+            assert_eq!(client.requests().len(), 0);
+            assert!(orphan.exists());
+        }
+        let retry =
+            prepare_github_meta_safelist(&client, &cache_root, TEST_GITHUB_META_URL, &mode, &env)
+                .expect("directories are now durable");
+        assert_eq!(retry.primary.source, GithubMetaSource::CacheNotModified);
+        assert!(!orphan.exists());
+    }
+
+    #[test]
+    fn refresh_passes_compatible_cache_batches_in_admission_order() {
+        let temp = TempDir::new().expect("tempdir");
+        let mode = GithubMetaCategoryMode::All;
+        let env = BTreeMap::new();
+        fs::write(
+            temp.path().join(GITHUB_META_RAW_CACHE_FILE),
+            br#"{"api":["203.0.113.0/25"]}"#,
+        )
+        .expect("legacy cache");
         for body in [
-            br#"{"api":["192.0.2.0/25"],"git":[],"hooks":[],"packages":[]}"#.as_slice(),
-            br#"{"api":["198.51.100.0/25"],"git":[],"hooks":[],"packages":[]}"#.as_slice(),
+            br#"{"api":["192.0.2.0/25"]}"#.as_slice(),
+            br#"{"api":["198.51.100.0/25"]}"#.as_slice(),
         ] {
             load_github_meta_safelist(
                 &MockHttpClient::new(vec![Ok(network_response(body))]),
                 temp.path(),
                 TEST_GITHUB_META_URL,
-                &GithubMetaCategoryMode::Default,
-                &BTreeMap::new(),
+                &mode,
+                &env,
             )
             .expect("populate generation");
         }
 
-        let prepared = prepare_github_meta_safelist(
-            &MockHttpClient::new(vec![Err(HttpClientError::Request {
-                reason: "offline".to_string(),
-            })]),
-            temp.path(),
-            TEST_GITHUB_META_URL,
-            &GithubMetaCategoryMode::Default,
-            &BTreeMap::new(),
-        )
-        .expect("prepare fallback");
-
-        assert_eq!(
-            prepared
-                .primary
-                .networks
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>(),
-            ["198.51.100.0/25"]
-        );
-        assert_eq!(
-            prepared
-                .fallback
-                .expect("previous generation")
-                .networks
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>(),
-            ["192.0.2.0/25"]
-        );
+        for (response, expected, expected_fallbacks) in [
+            (
+                Ok(network_response(br#"{"api":["198.51.100.128/25"]}"#)),
+                "198.51.100.128/25",
+                &["198.51.100.0/25", "192.0.2.0/25", "203.0.113.0/25"][..],
+            ),
+            (
+                Err(HttpClientError::Request {
+                    reason: "offline".to_string(),
+                }),
+                "198.51.100.0/25",
+                &["192.0.2.0/25", "203.0.113.0/25"][..],
+            ),
+        ] {
+            let client = MockHttpClient::new(vec![response.clone()]);
+            let prepared = prepare_github_meta_safelist(
+                &client,
+                temp.path(),
+                TEST_GITHUB_META_URL,
+                &mode,
+                &env,
+            )
+            .expect("prepare admission candidates");
+            assert_eq!(prepared.primary.networks[0].to_string(), expected);
+            assert_eq!(
+                prepared
+                    .fallback
+                    .iter()
+                    .map(|batch| batch.networks[0].to_string())
+                    .collect::<Vec<_>>(),
+                expected_fallbacks
+            );
+            drop(prepared);
+            let before = snapshot(temp.path());
+            let client = MockHttpClient::new(vec![response]);
+            let preview = read_github_meta_for_preview(
+                Some(&client),
+                temp.path(),
+                TEST_GITHUB_META_URL,
+                &mode,
+                &env,
+            );
+            assert_eq!(preview.primary.networks[0].to_string(), expected);
+            assert_eq!(
+                preview
+                    .fallback
+                    .iter()
+                    .map(|batch| batch[0].to_string())
+                    .collect::<Vec<_>>(),
+                expected_fallbacks
+            );
+            assert_eq!(snapshot(temp.path()), before);
+        }
     }
 
     #[test]
@@ -1788,6 +1930,7 @@ mod tests {
         fs::write(
             temp.path().join(GITHUB_META_META_CACHE_FILE),
             serde_json::to_vec_pretty(&GithubMetaCacheMetadata {
+                validator_scope: None,
                 url: fixture.source_url().to_string(),
                 etag: None,
                 last_modified: None,
@@ -1843,6 +1986,7 @@ mod tests {
         fs::write(
             temp.path().join(GITHUB_META_META_CACHE_FILE),
             serde_json::to_vec_pretty(&GithubMetaCacheMetadata {
+                validator_scope: None,
                 url: "https://example.com/old-meta".to_string(),
                 etag: Some("old-etag".to_string()),
                 last_modified: Some("Mon, 01 Jan 2024 00:00:00 GMT".to_string()),
@@ -2122,6 +2266,7 @@ mod tests {
         fs::write(
             temp.path().join(GITHUB_META_META_CACHE_FILE),
             serde_json::to_vec_pretty(&GithubMetaCacheMetadata {
+                validator_scope: Some("test-resource-scope".into()),
                 url: TEST_GITHUB_META_URL.to_string(),
                 etag: Some("etag-1".to_string()),
                 last_modified: Some("Mon, 01 Jan 2024 00:00:00 GMT".to_string()),
@@ -2147,6 +2292,7 @@ mod tests {
         .expect("write sidecar");
 
         let client = MockHttpClient::new(vec![Ok(HttpResponse {
+            validator_scope: Some("test-resource-scope".into()),
             status: StatusCode::NOT_MODIFIED,
             body: Vec::new(),
             etag: None,
@@ -2185,6 +2331,7 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let client = MockHttpClient::new(vec![
             Ok(HttpResponse {
+                validator_scope: None,
                 status: StatusCode::NOT_MODIFIED,
                 body: Vec::new(),
                 etag: None,
@@ -2233,6 +2380,7 @@ mod tests {
             read_bytes_with_limit(&store.join("current.json"), 16 * 1024).expect("manifest");
         let prepared = prepare_github_meta_safelist(
             &MockHttpClient::new(vec![Ok(HttpResponse {
+                validator_scope: Some("test-resource-scope".into()),
                 status: StatusCode::NOT_MODIFIED,
                 body: Vec::new(),
                 etag: None,
@@ -2249,6 +2397,7 @@ mod tests {
         assert_eq!(
             prepared
                 .fallback
+                .first()
                 .expect("previous generation")
                 .networks
                 .iter()
@@ -2272,13 +2421,14 @@ mod tests {
     }
 
     #[test]
-    fn cached_state_keeps_validators_when_invalid_payload_requires_refetch() {
+    fn invalid_cached_payload_requires_an_unconditional_refresh() {
         let temp = TempDir::new().expect("tempdir");
         let raw = b"invalid JSON";
         fs::write(temp.path().join(GITHUB_META_RAW_CACHE_FILE), raw).expect("raw cache");
         fs::write(
             temp.path().join(GITHUB_META_META_CACHE_FILE),
             serde_json::to_vec(&GithubMetaCacheMetadata {
+                validator_scope: None,
                 url: TEST_GITHUB_META_URL.to_string(),
                 etag: Some("cached-etag".to_string()),
                 last_modified: None,
@@ -2289,6 +2439,7 @@ mod tests {
         .expect("metadata cache");
         let client = MockHttpClient::new(vec![
             Ok(HttpResponse {
+                validator_scope: None,
                 status: StatusCode::NOT_MODIFIED,
                 body: Vec::new(),
                 etag: None,
@@ -2315,7 +2466,7 @@ mod tests {
         );
         let requests = client.requests();
         assert_eq!(requests.len(), 2);
-        assert_eq!(requests[0].if_none_match.as_deref(), Some("cached-etag"));
+        assert_eq!(requests[0].if_none_match, None);
         assert_eq!(requests[1].if_none_match, None);
         assert_eq!(requests[1].if_modified_since, None);
     }
@@ -2331,6 +2482,7 @@ mod tests {
         fs::write(
             temp.path().join(GITHUB_META_META_CACHE_FILE),
             serde_json::to_vec_pretty(&GithubMetaCacheMetadata {
+                validator_scope: None,
                 url: TEST_GITHUB_META_URL.to_string(),
                 etag: Some("etag-1".to_string()),
                 last_modified: Some("Mon, 01 Jan 2024 00:00:00 GMT".to_string()),
@@ -2425,6 +2577,7 @@ mod tests {
         fs::write(
             temp.path().join(GITHUB_META_META_CACHE_FILE),
             serde_json::to_vec_pretty(&GithubMetaCacheMetadata {
+                validator_scope: None,
                 url: TEST_GITHUB_META_URL.to_string(),
                 etag: None,
                 last_modified: None,

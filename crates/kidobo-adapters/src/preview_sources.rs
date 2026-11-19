@@ -249,7 +249,7 @@ fn remote(
             networks: aggregate.into_iter().collect(),
             notices,
         },
-        fallback: None,
+        fallback: Vec::new(),
         observations,
     })
 }
@@ -343,10 +343,14 @@ fn github(
             networks: loaded.primary.networks,
             notices: loaded.notices,
         },
-        fallback: loaded.fallback.map(|networks| SyncSourceBatch {
-            networks,
-            notices: Vec::new(),
-        }),
+        fallback: loaded
+            .fallback
+            .into_iter()
+            .map(|networks| SyncSourceBatch {
+                networks,
+                notices: Vec::new(),
+            })
+            .collect(),
         observations: vec![SourceObservation {
             label: "github-metadata".to_string(),
             provenance: loaded.primary.provenance,
@@ -401,7 +405,7 @@ fn asns(context: &PreviewSourceContext<'_>) -> Result<PreviewSourceLoad, AppErro
             networks: networks.into_iter().collect(),
             notices,
         },
-        fallback: None,
+        fallback: Vec::new(),
         observations,
     })
 }
@@ -457,6 +461,7 @@ mod tests {
     impl HttpClient for FixtureHttp {
         fn fetch(&self, _: HttpRequest) -> Result<HttpResponse, HttpClientError> {
             Ok(HttpResponse {
+                validator_scope: None,
                 status: reqwest::StatusCode::OK,
                 body: self.0.clone(),
                 etag: None,

@@ -156,7 +156,9 @@ including packets on existing sessions.
 Exactly one `INPUT` jump remains at position 1 per managed family. Never modify unrelated firewall
 chains.
 
-Append both replacement rules before removing old rules. A failed append must retain the old rules
+Preserve a canonical rule pair on repeat sync. Replace only the block rule when its set or action
+changes. During migration establish the desired block and put the reply exemption first before
+removing old rules from the tail. A failed replacement must retain working enforcement
 and must not activate incomplete wiring. Missing conntrack support is an enforcement failure, with
 no fallback to strict source-only blocking. Existing one-rule wiring and two-rule wiring without the
 reply-direction restriction are reported as unknown by live inspection until a successful sync
@@ -219,7 +221,7 @@ so extra unselected directories can remain after success. Incomplete or unselect
 never selected and are removed opportunistically by online cache work. Normal cache flush removes the
 containing remote-cache directory and therefore both layouts.
 
-Online loads sync the manifest directory before using an existing selection or pruning generations.
+Online loads confirm the parent directory entries linking a new store to its cache root and sync the manifest directory before using an existing selection or pruning generations.
 A failure aborts sync before set replacement. An unchanged promotion syncs the directory while
 retaining the existing manifest and its previous generation.
 Existing same-ID content is verified before reuse. Corrupt or missing members are repaired from retained
@@ -240,7 +242,9 @@ GitHub metadata is an externally controlled safelist. Fresh and cached batches
 share the same 4,096-entry, IPv4 `/8`, IPv6 `/16`, and one-sixteenth-per-family
 coverage envelope. The application separately rejects an otherwise valid batch
 when it would empty an enabled family that remains nonempty after applying only
-the operator's `safe.ips` baseline.
+the operator's `safe.ips` baseline. Try admissible data in order from the fresh response, current
+generation, previous generation, then compatible legacy cache. Only an admitted fresh response
+qualifies for promotion.
 
 ## Validation and release
 

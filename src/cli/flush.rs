@@ -4,7 +4,7 @@ use crate::cli::presentation::Status;
 use crate::error::KidoboError;
 use kidobo_adapters::config::FileConfigRepository;
 use kidobo_adapters::flush::SystemFlushBackend;
-use kidobo_adapters::lock::FileLockManager;
+use kidobo_adapters::lock::{FileLockManager, SystemFirewallTransactionLock};
 use kidobo_adapters::path::{SystemPathResolver, path_resolution_input_from_process};
 use kidobo_app::AppError;
 use kidobo_app::flush::{self, FlushDependencies, FlushOutcome, FlushRequest};
@@ -18,20 +18,23 @@ pub fn run_flush_command(
 }
 
 fn execute_flush(cache_only: bool) -> Result<FlushOutcome, KidoboError> {
+    let request = FlushRequest {
+        paths: path_resolution_input_from_process(None),
+        cache_only,
+    };
     let paths = SystemPathResolver;
     let configs = FileConfigRepository;
     let locks = FileLockManager;
+    let firewall_lock = SystemFirewallTransactionLock::new(&request.paths);
     let backend = SystemFlushBackend::default();
     flush::execute(
-        &FlushRequest {
-            paths: path_resolution_input_from_process(None),
-            cache_only,
-        },
+        &request,
         &FlushDependencies {
             cancellation: &crate::cli::interrupt::SigintCancellation,
             paths: &paths,
             configs: &configs,
             locks: &locks,
+            firewall_lock: &firewall_lock,
             backend: &backend,
         },
     )

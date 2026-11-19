@@ -218,6 +218,7 @@ mod tests {
         for (url, iplist) in sources {
             let raw = iplist.as_bytes();
             let metadata = serde_json::to_vec_pretty(&RemoteCacheMetadata {
+                validator_scope: None,
                 url: url.to_string(),
                 etag: None,
                 last_modified: None,

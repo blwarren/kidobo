@@ -235,10 +235,14 @@ impl SyncSourceProvider for GithubMetadataSyncProvider {
             provider: "github-metadata",
             source: Box::new(error),
         })?;
-        let fallback = loaded.fallback.map(|fallback| SyncSourceBatch {
-            networks: fallback.networks,
-            notices: Vec::new(),
-        });
+        let fallback = loaded
+            .fallback
+            .into_iter()
+            .map(|fallback| SyncSourceBatch {
+                networks: fallback.networks,
+                notices: Vec::new(),
+            })
+            .collect();
         let pending_promotions = loaded
             .pending_promotion
             .map(|promotion| -> Box<dyn PendingCachePromotion> {
@@ -369,10 +373,6 @@ pub fn build_sync_source_registry(product_version: &str) -> Result<SyncSourceReg
     Ok(registry)
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "keep bounded worker collection, ordered provenance, and aggregate admission together"
-)]
 fn prepare_remote_networks_in_chunks<S, C>(
     urls: &[S],
     http_client: &C,
@@ -397,7 +397,6 @@ where
         .filter(|url| seen_urls.insert(*url))
         .collect::<Vec<_>>();
     let mut aggregate = BTreeSet::new();
-    let mut notices = Vec::new();
     let mut pending_promotions: Vec<Box<dyn PendingCachePromotion>> = Vec::new();
     let mut observations = Vec::new();
     if unique_urls.is_empty() {
@@ -426,23 +425,12 @@ where
                         let url = *url;
                         let result =
                             prepare_iplist_with_cache(&http_client, url, cache_dir, env, maxelem)
-                                .map_err(|error| match error {
-                                    error @ crate::http_cache::HttpCacheError::ReadIplist {
-                                        ..
-                                    } => AppError::Source {
-                                        provider: "remote-feeds",
-                                        source: Box::new(RemoteFeedError {
-                                            url: url.to_string(),
-                                            source: error,
-                                        }),
-                                    },
-                                    error => AppError::CacheStaging {
-                                        provider: "remote-feeds",
-                                        source: Box::new(RemoteFeedError {
-                                            url: url.to_string(),
-                                            source: error,
-                                        }),
-                                    },
+                                .map_err(|error| AppError::CacheStaging {
+                                    provider: "remote-feeds",
+                                    source: Box::new(RemoteFeedError {
+                                        url: url.to_string(),
+                                        source: error,
+                                    }),
                                 });
                         results
                             .lock()
@@ -460,20 +448,7 @@ where
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         chunk_results.sort_unstable_by_key(|(index, _, _)| *index);
         for (_, label, result) in chunk_results {
-            let prepared = match result {
-                Ok(prepared) => prepared,
-                Err(error @ AppError::Source { .. }) => {
-                    observations.push(SourceObservation {
-                        label,
-                        provenance: SourceProvenance::Unavailable,
-                    });
-                    notices.push(Notice::warning(format!(
-                        "remote source fetch failed softly: {error}"
-                    )));
-                    continue;
-                }
-                Err(error) => return Err(error),
-            };
+            let prepared = result?;
             observations.push(SourceObservation {
                 label,
                 provenance: remote_provenance(prepared.loaded.source),
@@ -496,9 +471,9 @@ where
     Ok(SyncSourceLoad {
         primary: SyncSourceBatch {
             networks: aggregate.into_iter().collect(),
-            notices,
+            notices: Vec::new(),
         },
-        fallback: None,
+        fallback: Vec::new(),
         pending_promotions,
         fallback_failure: None,
         observations,
@@ -570,6 +545,7 @@ mod tests {
                 _ => b"12.0.0.1\n".to_vec(),
             };
             Ok(HttpResponse {
+                validator_scope: None,
                 status: StatusCode::OK,
                 body,
                 etag: None,
@@ -588,6 +564,7 @@ mod tests {
             self.in_flight.fetch_sub(1, Ordering::SeqCst);
             let final_octet = request.url.rsplit('/').next().unwrap_or("1");
             Ok(HttpResponse {
+                validator_scope: None,
                 status: StatusCode::OK,
                 body: format!("198.51.100.{final_octet}\n").into_bytes(),
                 etag: None,
@@ -605,6 +582,7 @@ mod tests {
                 b"198.51.100.1\n".to_vec()
             };
             Ok(HttpResponse {
+                validator_scope: None,
                 status: StatusCode::OK,
                 body,
                 etag: None,
@@ -970,6 +948,7 @@ mod tests {
                 self.cancellation.store(true, Ordering::SeqCst);
                 self.finished.fetch_add(1, Ordering::SeqCst);
                 Ok(HttpResponse {
+                    validator_scope: None,
                     status: StatusCode::OK,
                     body: b"203.0.113.0/24".to_vec(),
                     etag: None,

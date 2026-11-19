@@ -234,6 +234,13 @@ printf 'git %s\n' "$*" >> "${KIDOBO_TEST_EVENT_LOG}"
 if [[ -n "${KIDOBO_TEST_READY_MARKER:-}" && "$*" == '--no-pager diff --cached' ]]; then
   : > "${KIDOBO_TEST_READY_MARKER}"
 fi
+if [[ "${KIDOBO_TEST_PUSH_REPLY:-}" && "$*" == *" push --atomic "* ]]; then
+  "${KIDOBO_TEST_REAL_GIT}" "$@"
+  exit 74
+fi
+if [[ "${KIDOBO_TEST_PUSH_REPLY:-}" == unreadable && "$1" == ls-remote && "$2" == -- ]]; then
+  exit 75
+fi
 exec "${KIDOBO_TEST_REAL_GIT}" "$@"
 "#,
         );
@@ -375,10 +382,14 @@ fi
     }
 
     pub(crate) fn head(&self) -> String {
-        let output = self.git(&["rev-parse", "HEAD"]);
-        assert_success(&output, "read HEAD");
+        self.object_id("HEAD")
+    }
+
+    pub(crate) fn object_id(&self, name: &str) -> String {
+        let output = self.git(&["rev-parse", name]);
+        assert_success(&output, "read Git object ID");
         String::from_utf8(output.stdout)
-            .expect("UTF-8 HEAD")
+            .expect("UTF-8 object ID")
             .trim()
             .to_string()
     }

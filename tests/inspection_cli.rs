@@ -2,6 +2,7 @@
 
 use std::fmt::Write as _;
 use std::fs;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::{Command, Output};
@@ -170,6 +171,38 @@ fn bare_uninitialized_status_succeeds_without_creating_files_or_running_tools() 
 }
 
 #[test]
+fn status_supports_native_non_utf8_configuration_paths() {
+    let mut fixture = Fixture::new(None, None, None);
+    let root = fixture
+        .temp
+        .path()
+        .join(std::ffi::OsString::from_vec(b"root-\xff".to_vec()));
+    fs::rename(&fixture.root, &root).expect("non-UTF-8 runtime root");
+    fixture.root = root;
+    let configuration_path = fixture.root.join("config/config.toml");
+
+    let output = fixture.run(&["status", "--format", "json"], &[]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let report = json_output(&output);
+    assert_eq!(report["schema_version"], 1);
+    assert_eq!(
+        report["configuration_path"],
+        configuration_path.to_string_lossy().as_ref()
+    );
+    assert_eq!(
+        report["configuration_path_bytes"],
+        serde_json::json!(configuration_path.as_os_str().as_bytes())
+    );
+    assert!(output.stdout.ends_with(b"}\n"), "{output:?}");
+
+    let bare = fixture.run(&[], &[]);
+    let explicit = fixture.run(&["status"], &[]);
+    assert_eq!(bare.status.code(), Some(0));
+    assert_eq!(explicit.status.code(), Some(0));
+    assert_eq!(bare.stdout, explicit.stdout);
+}
+
+#[test]
 fn status_json_separates_kernel_header_counts_from_configured_feed_count() {
     let fixture = Fixture::new(Some(&config(true)), Some(""), Some("version = 1\n"));
 
@@ -178,6 +211,15 @@ fn status_json_separates_kernel_header_counts_from_configured_feed_count() {
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     let report = json_output(&output);
     assert_eq!(report["schema_version"], 1);
+    assert_eq!(
+        report["configuration_path"],
+        fixture
+            .root
+            .join("config/config.toml")
+            .to_string_lossy()
+            .as_ref(),
+    );
+    assert!(report.get("configuration_path_bytes").is_none());
     assert_eq!(report["configured_feeds"], 2);
     assert_eq!(report["ipv4"]["entries"], 7);
     assert_eq!(report["ipv6"]["entries"], 9);

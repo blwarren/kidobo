@@ -307,6 +307,8 @@ printf 'flush-complete\n' >> "$KIDOBO_TEST_EVENTS"
         let mut command = self.command();
         command
             .env("KIDOBO_TEST_BINARY", env!("CARGO_BIN_EXE_kidobo"))
+            .env("KIDOBO_TEST_SANDBOX", "1")
+            .env("TMPDIR", self.temp.path())
             .env("KIDOBO_TEST_CLEANUP_LOG", &self.log)
             .env_remove("INVOCATION_ID")
             .env_remove("JOURNAL_STREAM");
@@ -1182,6 +1184,8 @@ fi
         .arg("source \"$INSTALLER\"; uninstall_artifacts")
         .env("INSTALLER", installer_path())
         .env("KIDOBO_ROOT", &root)
+        .env("KIDOBO_TEST_SANDBOX", "1")
+        .env("TMPDIR", temp.path())
         .env("KIDOBO_INSTALL_DIR", &install_dir)
         .env("KIDOBO_TEST_CLEANUP_LOG", &cleanup_log)
         .env("PATH", path_with_prefix(&fake_bin))

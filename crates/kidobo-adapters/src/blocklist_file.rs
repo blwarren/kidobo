@@ -313,7 +313,7 @@ pub fn load_blocklist_document(path: &Path) -> Result<CoreBlocklistDocument, App
     CoreBlocklistDocument::parse(&contents).map_err(|err| map_invalid_blocklist_line(path, err))
 }
 
-fn map_invalid_blocklist_line(path: &Path, err: InvalidBlocklistLine) -> AppError {
+pub(crate) fn map_invalid_blocklist_line(path: &Path, err: InvalidBlocklistLine) -> AppError {
     AppError::BlocklistParseLine {
         path: path.to_path_buf(),
         line: err.line_number,

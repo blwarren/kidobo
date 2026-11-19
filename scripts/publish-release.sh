@@ -113,8 +113,8 @@ archive_path="${artifact_root}/${archive_name}"
 checksums_path="${artifact_root}/SHA256SUMS"
 release_notes_copy="${artifact_root}/release-notes.md"
 artifacts_created=false
-tag_created=false
-refs_pushed=false
+tag_object=""
+push_state=unattempted
 release_published=false
 is_prerelease=false
 if [[ ! "${release_version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -160,8 +160,8 @@ print_recovery() {
 cleanup() {
     status=$?
     trap - EXIT
-    if [[ "${tag_created}" == true && "${refs_pushed}" == false ]]; then
-        git -C "${repo_root}" tag --delete "${release_tag}" >/dev/null 2>&1 || true
+    if [[ -n "${tag_object}" && "${push_state}" == unattempted ]]; then
+        git -C "${repo_root}" update-ref -d "refs/tags/${release_tag}" "${tag_object}" >/dev/null 2>&1 || true
     fi
     if [[ -n "${release_worktree}" ]]; then
         git -C "${repo_root}" worktree remove --force "${release_worktree}" >/dev/null 2>&1 || true
@@ -169,18 +169,22 @@ cleanup() {
     if [[ -n "${temporary_root}" ]]; then
         rm -rf "${temporary_root}"
     fi
-    if [[ "${artifacts_created}" == true && "${refs_pushed}" == false ]]; then
+    if [[ "${artifacts_created}" == true && "${push_state}" == unattempted ]]; then
         rm -rf "${artifact_root}"
     fi
-    if [[ "${switched_to_main}" == true && "${refs_pushed}" == false ]]; then
+    if [[ "${switched_to_main}" == true && "${push_state}" == unattempted ]]; then
         if [[ -n "${original_branch}" ]]; then
             git -C "${repo_root}" switch --quiet "${original_branch}" >/dev/null 2>&1 || true
         else
             git -C "${repo_root}" switch --quiet --detach "${original_head}" >/dev/null 2>&1 || true
         fi
     fi
-    if [[ "${refs_pushed}" == true && "${release_published}" == false ]]; then
+    if [[ "${push_state}" == confirmed && "${release_published}" == false ]]; then
         print_recovery
+    elif [[ "${push_state}" == attempted ]]; then
+        echo "Atomic push outcome uncertain. Local recovery artifacts were retained at: ${artifact_root}" >&2
+        printf 'Verify origin/main (%s) and refs/tags/%s (%s) before retrying publication.\n' \
+            "${release_commit}" "${release_tag}" "${tag_object}" >&2
     fi
     exit "${status}"
 }
@@ -360,7 +364,12 @@ fi
 git -c core.hooksPath=/dev/null commit -m "Prepare ${release_tag} release"
 release_commit="$(git rev-parse HEAD)"
 git tag -a "${release_tag}" -m "Release ${release_tag}"
-tag_created=true
+captured_tag="$(git rev-parse --verify "refs/tags/${release_tag}^{tag}")"
+if [[ "$(git rev-parse "${captured_tag}^{commit}")" != "${release_commit}" ]]; then
+    echo "local tag target changed before publication; preserving the tag" >&2
+    exit 1
+fi
+tag_object="${captured_tag}"
 
 if [[ "$(git -C "${repo_root}" branch --show-current)" != "main" ]] \
     || [[ "$(git -C "${repo_root}" rev-parse HEAD)" != "${base_commit}" ]] \
@@ -377,10 +386,23 @@ if [[ "$(git rev-parse refs/remotes/origin/main)" != "${remote_main}" ]]; then
 fi
 
 echo "[release] atomically pushing main and ${release_tag}"
-git -c core.hooksPath=/dev/null push --atomic origin \
+push_destinations="$(git remote get-url --push --all origin)"
+push_state=attempted
+if ! git -c core.hooksPath=/dev/null push --atomic origin \
     "${release_commit}:refs/heads/main" \
-    "refs/tags/${release_tag}:refs/tags/${release_tag}"
-refs_pushed=true
+    "${tag_object}:refs/tags/${release_tag}"; then
+    while IFS= read -r destination; do
+        [[ -n "${destination}" ]] || exit 1
+        remote_refs="$(git ls-remote -- "${destination}" refs/heads/main "refs/tags/${release_tag}" "refs/tags/${release_tag}^{}")" || exit 1
+        for expected in "${release_commit}"$'\trefs/heads/main' \
+            "${tag_object}"$'\t'"refs/tags/${release_tag}" \
+            "${release_commit}"$'\t'"refs/tags/${release_tag}^{}"; do
+            grep -Fxq -- "${expected}" <<< "${remote_refs}" || exit 1
+        done
+    done <<< "${push_destinations}"
+    echo "[release] confirmed the atomic push by reading the remote refs"
+fi
+push_state=confirmed
 
 git -C "${repo_root}" merge --ff-only "${release_commit}"
 

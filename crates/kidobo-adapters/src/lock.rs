@@ -6,12 +6,22 @@ use std::path::{Path, PathBuf};
 
 use fs2::FileExt;
 use kidobo_app::AppError;
-use kidobo_app::ports::{LockGuard, LockManager};
+use kidobo_app::paths::PathResolutionInput;
+use kidobo_app::ports::{FirewallTransactionLock, LockGuard, LockManager};
 use thiserror::Error;
 
 /// Failure while securely creating or acquiring the process lock.
 #[derive(Debug, Error)]
 pub enum LockError {
+    /// The fixture lock would let a privileged process bypass firewall coordination.
+    #[error(
+        "firewall test sandbox requires unprivileged credentials and no new privileges: {source}"
+    )]
+    UnsafeTestSandbox {
+        /// Credential verification or privilege restriction failure.
+        #[source]
+        source: io::Error,
+    },
     /// The lock file's parent directory could not be created.
     #[error("failed to create lock parent directory {path}: {source}")]
     CreateParentDir {
@@ -74,6 +84,138 @@ impl LockGuard for FileLock {}
 /// Production nonblocking lock manager.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct FileLockManager;
+
+/// Acquires the Linux firewall transaction lock shared by all ordinary runtime roots.
+#[derive(Debug)]
+pub struct SystemFirewallTransactionLock<'a> {
+    input: &'a PathResolutionInput,
+}
+
+impl<'a> SystemFirewallTransactionLock<'a> {
+    /// Captures the runtime input, including the existing internal fixture sandbox selection.
+    #[must_use]
+    pub fn new(input: &'a PathResolutionInput) -> Self {
+        Self { input }
+    }
+}
+
+impl FirewallTransactionLock for SystemFirewallTransactionLock<'_> {
+    fn acquire_firewall(&self) -> Result<Box<dyn LockGuard>, AppError> {
+        let lock = if crate::path::test_sandbox_enabled(self.input) {
+            acquire_test_firewall_lock(&self.input.temp_dir)
+        } else {
+            acquire_system_firewall_lock()
+        };
+        lock.map(|guard| -> Box<dyn LockGuard> { Box::new(guard) })
+            .map_err(|source| AppError::Lock {
+                source: Box::new(source),
+            })
+    }
+}
+
+fn acquire_test_firewall_lock(directory: &Path) -> Result<FileLock, LockError> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let status = crate::limited_io::read_to_string_with_limit(
+        Path::new("/proc/thread-self/status"),
+        64 * 1024,
+    )
+    .map_err(|source| LockError::UnsafeTestSandbox { source })?;
+    if !unprivileged_status(&status) {
+        return Err(LockError::UnsafeTestSandbox {
+            source: io::Error::new(io::ErrorKind::PermissionDenied, "privileged credentials"),
+        });
+    }
+    // Every command spawned by this thread inherits this irreversible restriction.
+    nix::sys::prctl::set_no_new_privs().map_err(|source| LockError::UnsafeTestSandbox {
+        source: source.into(),
+    })?;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW)
+        .open(directory)
+        .map_err(|source| LockError::OpenFile {
+            path: directory.to_path_buf(),
+            source,
+        })?;
+    try_lock_file(file, directory)
+}
+
+fn unprivileged_status(status: &str) -> bool {
+    let entry = |key| status.lines().find_map(|line| line.strip_prefix(key));
+    let regular_uids = entry("Uid:").is_some_and(|uids| {
+        uids.split_whitespace().count() == 4
+            && uids
+                .split_whitespace()
+                .all(|uid| uid.parse::<std::num::NonZeroU32>().is_ok())
+    });
+    regular_uids
+        && ["CapPrm:", "CapEff:", "CapAmb:"].into_iter().all(|key| {
+            entry(key).and_then(|mask| u64::from_str_radix(mask.trim(), 16).ok()) == Some(0)
+        })
+}
+
+fn acquire_system_firewall_lock() -> Result<FileLock, LockError> {
+    use nix::fcntl::{OFlag, openat};
+    use nix::sys::stat::Mode;
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+
+    let netns_path = Path::new("/proc/self/ns/net");
+    let namespace = fs::metadata(netns_path).map_err(|source| LockError::OpenFile {
+        path: netns_path.to_path_buf(),
+        source,
+    })?;
+    let directory_path = Path::new("/run/kidobo");
+    match fs::DirBuilder::new().mode(0o700).create(directory_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(source) => {
+            return Err(LockError::CreateParentDir {
+                path: directory_path.to_path_buf(),
+                source,
+            });
+        }
+    }
+    let directory_error = |source| LockError::OpenFile {
+        path: directory_path.to_path_buf(),
+        source,
+    };
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW)
+        .open(directory_path)
+        .map_err(directory_error)?;
+    let metadata = directory.metadata().map_err(directory_error)?;
+    if metadata.uid() != 0 || metadata.mode() & 0o077 != 0 {
+        return Err(directory_error(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "firewall lock directory must be root-owned and owner-only",
+        )));
+    }
+
+    let name = format!("firewall-{}-{}.lock", namespace.dev(), namespace.ino());
+    let path = directory_path.join(&name);
+    let open_error = |source| LockError::OpenFile {
+        path: path.clone(),
+        source,
+    };
+    let fd = openat(
+        &directory,
+        Path::new(&name),
+        OFlag::O_RDWR | OFlag::O_CREAT | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_NONBLOCK,
+        Mode::S_IRUSR | Mode::S_IWUSR,
+    )
+    .map_err(|source| open_error(source.into()))?;
+    let file = File::from(fd);
+    let metadata = file.metadata().map_err(open_error)?;
+    if !metadata.is_file() || metadata.uid() != 0 || metadata.mode() & 0o077 != 0 {
+        return Err(open_error(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "firewall lock must be a root-owned, owner-only regular file",
+        )));
+    }
+    try_lock_file(file, &path)
+}
 
 /// Opens only an existing regular lock file, without creating or hardening filesystem state.
 #[derive(Debug, Default, Clone, Copy)]
@@ -179,6 +321,10 @@ pub fn acquire_non_blocking(path: &Path) -> Result<FileLock, LockError> {
 
     enforce_mode_0600(&file, path)?;
 
+    try_lock_file(file, path)
+}
+
+fn try_lock_file(file: File, path: &Path) -> Result<FileLock, LockError> {
     match file.try_lock_exclusive() {
         Ok(()) => Ok(FileLock { file }),
         Err(err) if err.kind() == io::ErrorKind::WouldBlock => Err(LockError::AlreadyHeld {
@@ -219,7 +365,22 @@ mod tests {
 
     use crate::limited_io::read_bytes_with_limit;
 
-    use super::{LockError, acquire_non_blocking};
+    use super::{LockError, acquire_non_blocking, unprivileged_status};
+
+    #[test]
+    fn fixture_lock_rejects_root_capable_and_unreadable_credentials() {
+        let regular = "Uid:\t1000\t1000\t1000\t1000\nCapPrm:\t0\nCapEff:\t0\nCapAmb:\t0\n";
+        assert!(unprivileged_status(regular));
+        for privileged in [
+            regular.replace("1000\t1000\t1000\t1000", "1000\t1000\t0\t1000"),
+            regular.replace("CapPrm:\t0", "CapPrm:\t1000"),
+            regular.replace("CapEff:\t0", "CapEff:\t1000"),
+            regular.replace("CapAmb:\t0", "CapAmb:\t1000"),
+            regular.replace("CapAmb:\t0\n", ""),
+        ] {
+            assert!(!unprivileged_status(&privileged), "{privileged}");
+        }
+    }
 
     #[test]
     fn second_acquire_fails_when_held() {

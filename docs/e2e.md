@@ -346,6 +346,10 @@ Logs and evidence remain on disk. Explicit cleanup is also available:
 just e2e-clean RUN_ID
 ```
 
+The run owns its evidence directory through final reporting and archiving. Cleanup requires
+exclusive access to that directory and the Incus server/project before it opens the report.
+If another operation holds either lock, wait for it to finish and retry.
+
 Use the same results root and active Incus group membership. Cleanup validates suite ownership and
 run identity; never remove the shared project, bridge, or pool to clean one run.
 

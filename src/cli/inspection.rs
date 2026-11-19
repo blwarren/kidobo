@@ -41,8 +41,9 @@ pub fn status(format: ReportFormat, io: &mut CliIo<'_>) -> Result<(), KidoboErro
         *notice = redact_urls(notice);
     }
     if format == ReportFormat::Json {
-        serde_json::to_writer_pretty(&mut *io.stdout, &report)?;
-        writeln!(io.stdout)?;
+        let mut output = serde_json::to_vec_pretty(&report)?;
+        output.push(b'\n');
+        io.stdout.write_all(&output)?;
         return Ok(());
     }
     let view = io.presentation();

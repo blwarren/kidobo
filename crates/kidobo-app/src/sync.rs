@@ -7,7 +7,7 @@ use kidobo_core::sync::compute_effective_blocklists;
 
 use crate::AppError;
 use crate::paths::{ConfigRequirement, PathResolutionInput};
-use crate::ports::{ConfigRepository, LockManager, PathResolver};
+use crate::ports::{ConfigRepository, FirewallTransactionLock, LockManager, PathResolver};
 use crate::source::{
     Notice, SourceFailureDisposition, SourceRole, SyncSourceContext, SyncSourceRegistry,
     classify_source_failure,
@@ -269,6 +269,8 @@ pub struct SyncDependencies<'a> {
     pub configs: &'a dyn ConfigRepository,
     /// Nonblocking process lock manager.
     pub locks: &'a dyn LockManager,
+    /// Exclusive transaction lock shared by workflows that modify the live firewall.
+    pub firewall_lock: &'a dyn FirewallTransactionLock,
     /// Required preparation of owner-only remote cache storage.
     pub storage: &'a dyn SyncStoragePreparer,
     /// Time source for one consistent expiry decision per sync.
@@ -294,7 +296,7 @@ struct LoadedSources {
 struct LoadedExternalSafelist {
     provider: &'static str,
     primary: SyncSourceBatch,
-    fallback: Option<SyncSourceBatch>,
+    fallback: Vec<SyncSourceBatch>,
     pending_promotions: Vec<Box<dyn PendingCachePromotion>>,
     summary_index: usize,
     fallback_failure: Option<AppError>,
@@ -356,6 +358,7 @@ pub fn execute(
     }
 
     let enforcement_plan = EnforcementPlan::from_config(&config);
+    let firewall_lock = dependencies.firewall_lock.acquire_firewall()?;
     start_stage(dependencies.observer, SyncStage::PrepareArtifacts);
     dependencies
         .enforcement
@@ -415,6 +418,7 @@ pub fn execute(
         &entries.ipv6,
         dependencies,
     )?;
+    drop(firewall_lock);
 
     if temporary_bans.prune_expired(cutoff)
         && let Err(error) = dependencies
@@ -673,14 +677,11 @@ fn admit_external_safelists(
             candidates,
             safelist,
             &external.primary.networks,
-            external
-                .fallback
-                .as_ref()
-                .map(|batch| batch.networks.as_slice()),
+            &external.fallback,
             enable_ipv6,
             &baseline,
         );
-        if selection == ExternalSafelistSelection::Primary {
+        if matches!(selection, ExternalSafelistSelection::Primary) {
             safelist.extend(external.primary.networks.iter().copied());
             pending_promotions.extend(external.pending_promotions.into_iter().map(|promotion| {
                 PendingPromotion {
@@ -695,10 +696,7 @@ fn admit_external_safelists(
             "externally controlled safelist `{}` was rejected because it would empty an enabled address family",
             external.provider
         )));
-        if let Some(fallback) = external
-            .fallback
-            .filter(|_| selection == ExternalSafelistSelection::Fallback)
-        {
+        if let ExternalSafelistSelection::Fallback(fallback) = selection {
             for notice in &fallback.notices {
                 observer.notice(notice);
             }
@@ -732,21 +730,20 @@ fn admit_external_safelists(
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ExternalSafelistSelection {
+pub(crate) enum ExternalSafelistSelection<'a> {
     Primary,
-    Fallback,
+    Fallback(&'a SyncSourceBatch),
     Unavailable,
 }
 
-pub(crate) fn select_external_safelist(
+pub(crate) fn select_external_safelist<'a>(
     candidates: &[CanonicalCidr],
     operator_and_admitted_safelist: &[CanonicalCidr],
     primary: &[CanonicalCidr],
-    fallback: Option<&[CanonicalCidr]>,
+    fallback: &'a [SyncSourceBatch],
     enable_ipv6: bool,
     baseline: &kidobo_core::sync::EffectiveBlocklists,
-) -> ExternalSafelistSelection {
+) -> ExternalSafelistSelection<'a> {
     if external_safelist_preserves_baseline(
         candidates,
         operator_and_admitted_safelist,
@@ -755,16 +752,16 @@ pub(crate) fn select_external_safelist(
         baseline,
     ) {
         ExternalSafelistSelection::Primary
-    } else if fallback.is_some_and(|fallback| {
+    } else if let Some(fallback) = fallback.iter().find(|fallback| {
         external_safelist_preserves_baseline(
             candidates,
             operator_and_admitted_safelist,
-            fallback,
+            &fallback.networks,
             enable_ipv6,
             baseline,
         )
     }) {
-        ExternalSafelistSelection::Fallback
+        ExternalSafelistSelection::Fallback(fallback)
     } else {
         ExternalSafelistSelection::Unavailable
     }
@@ -919,6 +916,16 @@ mod tests {
 
     struct FakeLocks(Ledger);
 
+    struct FakeFirewallLock;
+
+    impl crate::ports::LockGuard for FakeFirewallLock {}
+
+    impl crate::ports::FirewallTransactionLock for FakeFirewallLock {
+        fn acquire_firewall(&self) -> Result<Box<dyn LockGuard>, AppError> {
+            Ok(Box::new(Self))
+        }
+    }
+
     struct FakeStorage;
 
     impl super::SyncStoragePreparer for FakeStorage {
@@ -984,6 +991,7 @@ mod tests {
                         config: config(true, 10),
                     },
                     locks: &FakeLocks(Arc::clone(&ledger)),
+                    firewall_lock: &FakeFirewallLock,
                     storage: &storage,
                     clock: &temporary,
                     temporary_bans: &temporary,
@@ -1089,7 +1097,7 @@ mod tests {
         ledger: Ledger,
         descriptor: SyncSourceDescriptor,
         primary: Vec<CanonicalCidr>,
-        fallback: Option<Vec<CanonicalCidr>>,
+        fallback: Vec<Vec<CanonicalCidr>>,
         fail_promotion: bool,
     }
 
@@ -1106,10 +1114,14 @@ mod tests {
                     networks: self.primary.clone(),
                     notices: Vec::new(),
                 },
-                fallback: self.fallback.as_ref().map(|networks| SyncSourceBatch {
-                    networks: networks.clone(),
-                    notices: Vec::new(),
-                }),
+                fallback: self
+                    .fallback
+                    .iter()
+                    .map(|networks| SyncSourceBatch {
+                        networks: networks.clone(),
+                        notices: Vec::new(),
+                    })
+                    .collect(),
                 pending_promotions: vec![Box::new(RecordingPromotion {
                     ledger: Arc::clone(&self.ledger),
                     fail: self.fail_promotion,
@@ -1426,6 +1438,7 @@ mod tests {
                 paths: &paths,
                 configs: &configs,
                 locks: &locks,
+                firewall_lock: &FakeFirewallLock,
                 storage: &FakeStorage,
                 clock: temporary,
                 temporary_bans: temporary,
@@ -1479,6 +1492,7 @@ mod tests {
                     },
                     configs: self,
                     locks: self,
+                    firewall_lock: &FakeFirewallLock,
                     storage: &FakeStorage,
                     clock: &temporary,
                     temporary_bans: &temporary,
@@ -1567,7 +1581,7 @@ mod tests {
                         failure_policy: FailurePolicy::Required,
                     },
                     primary: vec![cidr("203.0.113.7")],
-                    fallback: None,
+                    fallback: Vec::new(),
                     fail_promotion: false,
                 })
                 .expect("remote source");
@@ -2474,7 +2488,7 @@ mod tests {
                         failure_policy: FailurePolicy::Required,
                     },
                     primary: networks,
-                    fallback: None,
+                    fallback: Vec::new(),
                     fail_promotion: false,
                 })
                 .expect("source");
@@ -2578,7 +2592,7 @@ mod tests {
                     failure_policy: FailurePolicy::Required,
                 },
                 primary: vec![cidr("192.0.2.0/24"), cidr("198.51.100.0/24")],
-                fallback: None,
+                fallback: Vec::new(),
                 fail_promotion: false,
             })
             .expect("register source");
@@ -2618,7 +2632,7 @@ mod tests {
                     failure_policy: FailurePolicy::Required,
                 },
                 primary: vec![cidr("192.0.2.0/24"), cidr("2001:db8::/64")],
-                fallback: None,
+                fallback: Vec::new(),
                 fail_promotion: true,
             })
             .expect("register source");
@@ -2667,7 +2681,11 @@ mod tests {
                     failure_policy: FailurePolicy::BestEffort,
                 },
                 primary: vec![cidr("192.0.2.0/24")],
-                fallback: Some(vec![cidr("192.0.2.0/25")]),
+                fallback: vec![
+                    vec![cidr("192.0.2.0/24")],
+                    vec![cidr("192.0.2.0/25")],
+                    vec![cidr("192.0.2.128/25")],
+                ],
                 fail_promotion: false,
             })
             .expect("register external safelist");
@@ -2730,7 +2748,7 @@ mod tests {
                     failure_policy: FailurePolicy::BestEffort,
                 },
                 primary: vec![cidr("192.0.2.0/25")],
-                fallback: None,
+                fallback: Vec::new(),
                 fail_promotion: false,
             })
             .expect("register external safelist");
@@ -2790,10 +2808,14 @@ mod tests {
                         networks: self.primary.clone(),
                         notices: Vec::new(),
                     },
-                    fallback: self.fallback.as_ref().map(|networks| SyncSourceBatch {
-                        networks: networks.clone(),
-                        notices: Vec::new(),
-                    }),
+                    fallback: self
+                        .fallback
+                        .iter()
+                        .map(|networks| SyncSourceBatch {
+                            networks: networks.clone(),
+                            notices: Vec::new(),
+                        })
+                        .collect(),
                     observations: Vec::new(),
                 }
             }

@@ -180,15 +180,17 @@ fn derive_base_paths(input: &PathResolutionInput) -> BasePaths {
         return BasePaths::from_root(Path::new(root));
     }
 
-    let sandbox_enabled = env_truthy(&input.env, ENV_KIDOBO_TEST_SANDBOX)
-        && !env_present(&input.env, ENV_KIDOBO_DISABLE_TEST_SANDBOX);
-
-    if sandbox_enabled {
+    if test_sandbox_enabled(input) {
         let sandbox_root = input.temp_dir.join("kidobo-tests");
         return BasePaths::from_root(&sandbox_root);
     }
 
     BasePaths::system()
+}
+
+pub(crate) fn test_sandbox_enabled(input: &PathResolutionInput) -> bool {
+    env_truthy(&input.env, ENV_KIDOBO_TEST_SANDBOX)
+        && !env_present(&input.env, ENV_KIDOBO_DISABLE_TEST_SANDBOX)
 }
 
 fn select_config_path(

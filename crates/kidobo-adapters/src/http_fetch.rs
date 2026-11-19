@@ -16,26 +16,39 @@ pub enum ConditionalFetchResult {
     FallbackCache,
 }
 
-/// Applies conditional validators and retries an unusable 304 without validators.
-///
-/// Network errors and unsolicited partial responses use [`ConditionalFetchResult::FallbackCache`].
-pub fn fetch_with_conditional_cache(
+/// Validators and cached data available for one source.
+#[derive(Default)]
+pub(crate) struct CachedHttpValidators {
+    pub(crate) scope: Option<String>,
+    pub(crate) etag: Option<String>,
+    pub(crate) last_modified: Option<String>,
+}
+
+impl CachedHttpValidators {
+    fn has_scoped_validator(&self) -> bool {
+        self.scope.is_some() && (self.etag.is_some() || self.last_modified.is_some())
+    }
+}
+
+/// Gets a complete response or reuses a validated body after a matching 304.
+pub(crate) fn fetch_with_conditional_cache(
     client: &dyn HttpClient,
     url: &str,
     max_body_bytes: usize,
-    etag: Option<String>,
-    last_modified: Option<String>,
+    validators: CachedHttpValidators,
     has_usable_cache: bool,
     log_subject: &str,
 ) -> ConditionalFetchResult {
-    let conditional_request = HttpRequest {
+    let conditional = has_usable_cache && validators.has_scoped_validator();
+    let scope = validators.scope.filter(|_| conditional);
+    let request = HttpRequest {
         url: url.to_string(),
-        if_none_match: etag,
-        if_modified_since: last_modified,
+        validator_scope: scope.clone(),
+        if_none_match: validators.etag.filter(|_| conditional),
+        if_modified_since: validators.last_modified.filter(|_| conditional),
         max_body_bytes,
     };
-
-    let response = match client.fetch(conditional_request) {
+    let mut response = match client.fetch(request) {
         Ok(response) => response,
         Err(err) => {
             warn!("{log_subject} fetch failed for {url}: {err}");
@@ -43,35 +56,35 @@ pub fn fetch_with_conditional_cache(
         }
     };
 
-    let response = if response.status == StatusCode::NOT_MODIFIED {
-        if has_usable_cache {
+    if response.status == StatusCode::NOT_MODIFIED {
+        if conditional && response.validator_scope == scope {
             return ConditionalFetchResult::CacheNotModified;
         }
-        let unconditional_request = HttpRequest {
+        response = match client.fetch(HttpRequest {
             url: url.to_string(),
+            validator_scope: None,
             if_none_match: None,
             if_modified_since: None,
             max_body_bytes,
-        };
-        match client.fetch(unconditional_request) {
+        }) {
             Ok(response) => response,
             Err(err) => {
                 warn!("{log_subject} refetch failed for {url} after 304: {err}");
                 return ConditionalFetchResult::FallbackCache;
             }
-        }
-    } else {
-        response
-    };
+        };
+    }
 
-    if response.status == StatusCode::PARTIAL_CONTENT {
-        warn!("{log_subject} fetch failed for {url}: unexpected partial response (HTTP 206)");
-        ConditionalFetchResult::FallbackCache
-    } else {
+    if response.status == StatusCode::OK {
         ConditionalFetchResult::Network(response)
+    } else {
+        warn!(
+            "{log_subject} fetch failed for {url}: unexpected status {}",
+            response.status
+        );
+        ConditionalFetchResult::FallbackCache
     }
 }
-
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
@@ -79,7 +92,7 @@ mod tests {
 
     use reqwest::StatusCode;
 
-    use super::{ConditionalFetchResult, fetch_with_conditional_cache};
+    use super::{CachedHttpValidators, ConditionalFetchResult, fetch_with_conditional_cache};
     use crate::http_client::{HttpClient, HttpClientError, HttpRequest, HttpResponse};
 
     struct MockHttpClient {
@@ -110,178 +123,134 @@ mod tests {
         }
     }
 
-    fn unwrap_network_result(result: ConditionalFetchResult) -> HttpResponse {
-        match result {
-            ConditionalFetchResult::Network(response) => response,
-            _ => panic!("response should exist"),
+    const URL: &str = "https://example.com/feed.txt";
+    const SCOPE: &str = "test-resource-scope";
+
+    fn validators(scope: Option<&str>) -> CachedHttpValidators {
+        CachedHttpValidators {
+            scope: scope.map(str::to_string),
+            etag: Some("etag-1".into()),
+            last_modified: Some("Mon, 01 Jan 2024 00:00:00 GMT".into()),
         }
     }
 
-    fn expected_request(conditional: bool) -> HttpRequest {
+    fn request(conditional: bool) -> HttpRequest {
         HttpRequest {
-            url: "https://example.com/feed.txt".into(),
-            max_body_bytes: 1024,
+            url: URL.into(),
+            validator_scope: conditional.then(|| SCOPE.into()),
             if_none_match: conditional.then(|| "etag-1".into()),
             if_modified_since: conditional.then(|| "Mon, 01 Jan 2024 00:00:00 GMT".into()),
+            max_body_bytes: 1024,
+        }
+    }
+
+    fn response(status: StatusCode, scope: &str) -> HttpResponse {
+        HttpResponse {
+            status,
+            body: if status == StatusCode::OK {
+                b"192.0.2.0/24".to_vec()
+            } else {
+                Vec::new()
+            },
+            validator_scope: Some(scope.into()),
+            etag: None,
+            last_modified: None,
         }
     }
 
     #[test]
-    fn returns_network_response_for_non_304_status() {
-        let expected = HttpResponse {
-            status: StatusCode::OK,
-            body: b"10.0.0.1".to_vec(),
-            etag: Some("new-etag".into()),
-            last_modified: Some("Tue, 02 Jan 2024 00:00:00 GMT".into()),
-        };
-        let client = MockHttpClient::new(vec![Ok(expected.clone())]);
-
-        let response = unwrap_network_result(fetch_with_conditional_cache(
-            &client,
-            "https://example.com/feed.txt",
-            1024,
-            None,
-            None,
-            false,
-            "remote source",
-        ));
-
-        assert_eq!(response, expected);
-        assert_eq!(client.requests(), [expected_request(false)]);
-    }
-
-    #[test]
-    fn returns_cache_not_modified_for_304_with_usable_cache() {
-        let client = MockHttpClient::new(vec![Ok(HttpResponse {
-            status: StatusCode::NOT_MODIFIED,
-            body: Vec::new(),
-            etag: None,
-            last_modified: None,
-        })]);
-
-        let result = fetch_with_conditional_cache(
-            &client,
-            "https://example.com/feed.txt",
-            1024,
-            Some("etag-1".to_string()),
-            Some("Mon, 01 Jan 2024 00:00:00 GMT".to_string()),
-            true,
-            "remote source",
-        );
-
-        assert_eq!(result, ConditionalFetchResult::CacheNotModified);
-        assert_eq!(client.requests(), [expected_request(true)]);
-    }
-
-    #[test]
-    fn refetches_unconditionally_for_304_without_cache() {
-        let client = MockHttpClient::new(vec![
-            Ok(HttpResponse {
-                status: StatusCode::NOT_MODIFIED,
-                body: Vec::new(),
-                etag: None,
-                last_modified: None,
-            }),
-            Ok(HttpResponse {
-                status: StatusCode::OK,
-                body: b"198.51.100.7".to_vec(),
-                etag: None,
-                last_modified: None,
-            }),
-        ]);
-
-        let response = unwrap_network_result(fetch_with_conditional_cache(
-            &client,
-            "https://example.com/feed.txt",
-            1024,
-            Some("etag-1".to_string()),
-            Some("Mon, 01 Jan 2024 00:00:00 GMT".to_string()),
-            false,
-            "remote source",
-        ));
-
-        assert_eq!(
-            response,
-            HttpResponse {
-                status: StatusCode::OK,
-                body: b"198.51.100.7".to_vec(),
-                etag: None,
-                last_modified: None,
+    fn accepts_304_only_for_a_scoped_validator_and_usable_cache() {
+        for (cached_scope, usable, response_scope) in [
+            (Some(SCOPE), true, SCOPE),
+            (Some(SCOPE), true, "other-resource"),
+            (Some(SCOPE), false, SCOPE),
+            (None, true, SCOPE),
+        ] {
+            let matches = cached_scope == Some(response_scope) && usable;
+            let mut responses = vec![Ok(response(StatusCode::NOT_MODIFIED, response_scope))];
+            let fresh = response(StatusCode::OK, response_scope);
+            if !matches {
+                responses.push(Ok(fresh.clone()));
             }
-        );
-        assert_eq!(
-            client.requests(),
-            [expected_request(true), expected_request(false)]
-        );
-    }
-
-    #[test]
-    fn falls_back_when_refetch_after_304_fails() {
-        let client = MockHttpClient::new(vec![
-            Ok(HttpResponse {
-                status: StatusCode::NOT_MODIFIED,
-                body: Vec::new(),
-                etag: None,
-                last_modified: None,
-            }),
-            Err(HttpClientError::Request {
-                reason: "offline".to_string(),
-            }),
-        ]);
-
-        let result = fetch_with_conditional_cache(
-            &client,
-            "https://example.com/feed.txt",
-            1024,
-            None,
-            None,
-            false,
-            "remote source",
-        );
-
-        assert_eq!(result, ConditionalFetchResult::FallbackCache);
-        assert_eq!(
-            client.requests(),
-            [expected_request(false), expected_request(false)]
-        );
-    }
-
-    #[test]
-    fn rejects_partial_content_on_the_first_request_and_on_refetch() {
-        for retry in [false, true] {
-            let mut responses = Vec::new();
-            if retry {
-                responses.push(Ok(HttpResponse {
-                    status: StatusCode::NOT_MODIFIED,
-                    body: Vec::new(),
-                    etag: None,
-                    last_modified: None,
-                }));
-            }
-            responses.push(Ok(HttpResponse {
-                status: StatusCode::PARTIAL_CONTENT,
-                body: b"192.0.2.0/24".to_vec(),
-                etag: None,
-                last_modified: None,
-            }));
             let client = MockHttpClient::new(responses);
 
             let result = fetch_with_conditional_cache(
                 &client,
-                "https://example.com/feed.txt",
+                URL,
                 1024,
-                Some("etag-1".to_string()),
-                Some("Mon, 01 Jan 2024 00:00:00 GMT".to_string()),
-                !retry,
+                validators(cached_scope),
+                usable,
                 "remote source",
             );
 
-            assert_eq!(result, ConditionalFetchResult::FallbackCache);
-            let mut expected = vec![expected_request(true)];
-            if retry {
-                expected.push(expected_request(false));
+            let mut expected_requests = vec![request(cached_scope.is_some() && usable)];
+            if matches {
+                assert_eq!(result, ConditionalFetchResult::CacheNotModified);
+            } else {
+                assert_eq!(result, ConditionalFetchResult::Network(fresh));
+                expected_requests.push(request(false));
             }
-            assert_eq!(client.requests(), expected);
+            assert_eq!(client.requests(), expected_requests);
+        }
+    }
+
+    #[test]
+    fn falls_back_when_unconditional_refetch_fails() {
+        let client = MockHttpClient::new(vec![
+            Ok(response(StatusCode::NOT_MODIFIED, "other-resource")),
+            Err(HttpClientError::Request {
+                reason: "offline".into(),
+            }),
+        ]);
+
+        let result = fetch_with_conditional_cache(
+            &client,
+            URL,
+            1024,
+            validators(Some(SCOPE)),
+            true,
+            "remote source",
+        );
+
+        assert_eq!(result, ConditionalFetchResult::FallbackCache);
+        assert_eq!(client.requests(), [request(true), request(false)]);
+    }
+
+    #[test]
+    fn rejects_non_200_success_responses_and_an_unconditional_304() {
+        for status in [
+            StatusCode::ACCEPTED,
+            StatusCode::NO_CONTENT,
+            StatusCode::PARTIAL_CONTENT,
+            StatusCode::NOT_MODIFIED,
+        ] {
+            for retry in [false, true] {
+                if !retry && status == StatusCode::NOT_MODIFIED {
+                    continue;
+                }
+                let mut responses = Vec::new();
+                if retry {
+                    responses.push(Ok(response(StatusCode::NOT_MODIFIED, "other-resource")));
+                }
+                responses.push(Ok(response(status, SCOPE)));
+                let client = MockHttpClient::new(responses);
+
+                let result = fetch_with_conditional_cache(
+                    &client,
+                    URL,
+                    1024,
+                    validators(Some(SCOPE)),
+                    true,
+                    "remote source",
+                );
+
+                assert_eq!(result, ConditionalFetchResult::FallbackCache);
+                let mut expected_requests = vec![request(true)];
+                if retry {
+                    expected_requests.push(request(false));
+                }
+                assert_eq!(client.requests(), expected_requests);
+            }
         }
     }
 }

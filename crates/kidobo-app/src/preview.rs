@@ -25,8 +25,8 @@ use crate::temporary_bans::{Clock, kernel_timeout_notice};
 pub struct PreviewSourceLoad {
     /// Preferred validated source batch.
     pub primary: SyncSourceBatch,
-    /// Optional compatible cache batch for external-safelist admission fallback.
-    pub fallback: Option<SyncSourceBatch>,
+    /// Compatible cache batches for external-safelist admission, in preference order.
+    pub fallback: Vec<SyncSourceBatch>,
     /// Typed provenance for each configured feed, ASN, or local source.
     pub observations: Vec<SourceObservation>,
 }
@@ -37,7 +37,7 @@ impl PreviewSourceLoad {
     pub fn ready(primary: SyncSourceBatch) -> Self {
         Self {
             primary,
-            fallback: None,
+            fallback: Vec::new(),
             observations: Vec::new(),
         }
     }
@@ -177,7 +177,7 @@ struct LoadedSources {
 struct ExternalSafelist {
     provider: &'static str,
     primary: SyncSourceBatch,
-    fallback: Option<SyncSourceBatch>,
+    fallback: Vec<SyncSourceBatch>,
     summary_index: usize,
 }
 
@@ -344,23 +344,17 @@ fn admit_external_safelists(
             candidates,
             safelist,
             &external.primary.networks,
-            external
-                .fallback
-                .as_ref()
-                .map(|batch| batch.networks.as_slice()),
+            &external.fallback,
             enable_ipv6,
             &baseline,
         );
-        if selection == ExternalSafelistSelection::Primary {
+        if matches!(selection, ExternalSafelistSelection::Primary) {
             safelist.extend(external.primary.networks);
             continue;
         }
         notices.push(Notice::warning(format!("externally controlled safelist `{}` was rejected because it would empty an enabled address family", external.provider)));
-        if let Some(fallback) = external
-            .fallback
-            .filter(|_| selection == ExternalSafelistSelection::Fallback)
-        {
-            notices.extend(fallback.notices);
+        if let ExternalSafelistSelection::Fallback(fallback) = selection {
+            notices.extend(fallback.notices.iter().cloned());
             safelist.extend(fallback.networks.iter().copied());
             if let Some(summary) = summaries.get_mut(external.summary_index) {
                 summary.entries = fallback.networks.len();
@@ -570,7 +564,7 @@ mod tests {
         descriptor: SyncSourceDescriptor,
         events: Events,
         primary: Vec<CanonicalCidr>,
-        fallback: Option<Vec<CanonicalCidr>>,
+        fallback: Vec<Vec<CanonicalCidr>>,
         failure: Failure,
         expected_network: bool,
         temporary: bool,
@@ -636,10 +630,14 @@ mod tests {
                     networks,
                     notices: Vec::new(),
                 },
-                fallback: self.fallback.as_ref().map(|networks| SyncSourceBatch {
-                    networks: networks.clone(),
-                    notices: vec![Notice::info("selected compatible fallback")],
-                }),
+                fallback: self
+                    .fallback
+                    .iter()
+                    .map(|networks| SyncSourceBatch {
+                        networks: networks.clone(),
+                        notices: vec![Notice::info("selected compatible fallback")],
+                    })
+                    .collect(),
                 observations: vec![SourceObservation {
                     label: self.descriptor.id.to_string(),
                     provenance: SourceProvenance::Network,
@@ -663,7 +661,7 @@ mod tests {
             },
             events: Arc::clone(&fixture.events),
             primary: networks.iter().map(|input| cidr(input)).collect(),
-            fallback: None,
+            fallback: Vec::new(),
             failure: Failure::None,
             expected_network: false,
             temporary: false,
@@ -764,19 +762,23 @@ mod tests {
         for (primary, fallback, expected, provenance) in [
             (
                 vec!["192.0.2.0/25"],
-                None,
+                vec![],
                 "192.0.2.128/25",
                 SourceProvenance::Network,
             ),
             (
                 vec!["192.0.2.0/24"],
-                Some(vec!["192.0.2.0/25"]),
+                vec![
+                    vec!["192.0.2.0/24"],
+                    vec!["192.0.2.0/25"],
+                    vec!["192.0.2.128/25"],
+                ],
                 "192.0.2.128/25",
                 SourceProvenance::FallbackCache,
             ),
             (
                 vec!["192.0.2.0/24"],
-                Some(vec!["192.0.2.0/24"]),
+                vec![vec!["192.0.2.0/24"]],
                 "192.0.2.0/24",
                 SourceProvenance::Unavailable,
             ),
@@ -799,8 +801,10 @@ mod tests {
                 FailurePolicy::BestEffort,
                 &primary,
             );
-            external.fallback =
-                fallback.map(|networks| networks.iter().map(|network| cidr(network)).collect());
+            external.fallback = fallback
+                .iter()
+                .map(|networks| networks.iter().map(|network| cidr(network)).collect())
+                .collect();
             registry.register(external).expect("external");
             let outcome = fixture.execute(&registry, false).expect("preview");
             assert_eq!(outcome.entries.ipv4, [cidr(expected)]);

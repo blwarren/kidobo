@@ -15,7 +15,9 @@ use crate::cache_generation::{
 use crate::cached_fetch::{read_optional_json_lossy, read_validated_bytes_lossy};
 use crate::hash::sha256_hex;
 use crate::http_client::{HttpClient, HttpResponse, MAX_HTTP_BODY_BYTES, max_http_body_bytes};
-use crate::http_fetch::{ConditionalFetchResult, fetch_with_conditional_cache};
+use crate::http_fetch::{
+    CachedHttpValidators, ConditionalFetchResult, fetch_with_conditional_cache,
+};
 use crate::limited_io::read_to_string_with_limit;
 use crate::remote_parse::{
     RemoteFeedLimits, RemoteParseBudget, format_normalized_cidrs, parse_cached_iplist_bounded,
@@ -47,6 +49,9 @@ pub struct CachePaths {
 pub struct RemoteCacheMetadata {
     /// Configured URL whose response was cached.
     pub url: String,
+    /// SHA-256 of the effective HTTP resource URL, when recorded by the transport.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validator_scope: Option<String>,
     /// Optional HTTP entity tag.
     pub etag: Option<String>,
     /// Optional HTTP last-modified validator.
@@ -262,20 +267,21 @@ fn read_iplist_for_preview_with_limit(
         &cache_paths_for_url(cache_dir, url),
         MAX_HTTP_BODY_BYTES,
         limits,
-    )?;
+    );
     let Some(client) = client else {
-        return Ok(read_only_cached(cached, SourceProvenance::Cache, true));
+        return Ok(read_only_cached(cached?, SourceProvenance::Cache, true));
     };
+    let cached = cached_for_refresh(cached);
     let max_bytes = max_http_body_bytes(env);
-    let (etag, modified) = cached.metadata.as_ref().map_or((None, None), |metadata| {
-        (metadata.etag.clone(), metadata.last_modified.clone())
-    });
+    let validators = cached.metadata.as_ref().map_or_else(
+        CachedHttpValidators::default,
+        RemoteCacheMetadata::http_validators,
+    );
     match fetch_with_conditional_cache(
         client,
         url,
         max_bytes,
-        etag,
-        modified,
+        validators,
         cached.networks.is_some(),
         "remote source",
     ) {
@@ -360,32 +366,32 @@ fn prepare_iplist_with_cache_limit(
     let feed_limits = RemoteFeedLimits::from_maxelem(maxelem);
     let cache_paths = cache_paths_for_url(cache_dir, url);
     let generation_store = remote_generation_store(cache_dir, url);
-    prepare_online_generations(&generation_store).map_err(|source| {
+    prepare_online_generations(&generation_store, cache_dir).map_err(|source| {
         HttpCacheError::SyncManifestDirectory {
             path: generation_store,
             source,
         }
     })?;
-    let cached = read_remote_cache(
+    let cached = cached_for_refresh(read_remote_cache(
         cache_dir,
         url,
         &cache_paths,
         MAX_HTTP_BODY_BYTES,
         feed_limits,
-    )?;
+    ));
     let cached_meta = cached.metadata;
     let cached_networks = cached.networks;
     let previous_generation = cached.generation_id;
-    let (cached_etag, cached_last_modified) = cached_meta.as_ref().map_or((None, None), |meta| {
-        (meta.etag.clone(), meta.last_modified.clone())
-    });
+    let validators = cached_meta.as_ref().map_or_else(
+        CachedHttpValidators::default,
+        RemoteCacheMetadata::http_validators,
+    );
 
     match fetch_with_conditional_cache(
         client,
         url,
         max_bytes,
-        cached_etag,
-        cached_last_modified,
+        validators,
         cached_networks.is_some(),
         "remote source",
     ) {
@@ -453,6 +459,7 @@ fn handle_network_response(
     };
     let metadata = RemoteCacheMetadata {
         url: url.to_string(),
+        validator_scope: response.validator_scope,
         etag: response.etag,
         last_modified: response.last_modified,
         sha256_raw: sha256_hex(&response.body),
@@ -492,7 +499,7 @@ fn validate_remote_response(
     max_bytes: usize,
     feed_limits: RemoteFeedLimits,
 ) -> Option<ValidatedRemoteResponse> {
-    if !response.status.is_success() {
+    if response.status != reqwest::StatusCode::OK {
         warn!(
             "remote fetch failed for {url}: unexpected status {}",
             response.status
@@ -575,6 +582,7 @@ fn stage_cache(
         })?;
     stage_generation(
         &store,
+        cache_dir,
         &[
             GenerationFile {
                 name: GENERATION_RAW_FILE,
@@ -595,6 +603,23 @@ fn stage_cache(
         path: store.join("current.json"),
         source: Box::new(err),
     })
+}
+
+fn cached_for_refresh(cached: Result<LoadedRemoteCache, HttpCacheError>) -> LoadedRemoteCache {
+    cached.unwrap_or_else(|error| {
+        warn!("{error}; attempting a fresh fetch");
+        LoadedRemoteCache::default()
+    })
+}
+
+impl RemoteCacheMetadata {
+    fn http_validators(&self) -> CachedHttpValidators {
+        CachedHttpValidators {
+            scope: self.validator_scope.clone(),
+            etag: self.etag.clone(),
+            last_modified: self.last_modified.clone(),
+        }
+    }
 }
 
 fn read_remote_cache(
@@ -1037,6 +1062,7 @@ mod tests {
 
     fn network_response_for_test(body: &[u8]) -> HttpResponse {
         HttpResponse {
+            validator_scope: None,
             status: StatusCode::OK,
             body: body.to_vec(),
             etag: None,
@@ -1121,6 +1147,7 @@ mod tests {
         let temp = TempDir::new().expect("root");
         let url = "https://example.test/feed";
         let mut seed = network_response_for_test(b"203.0.113.0/24");
+        seed.validator_scope = Some("test-resource-scope".into());
         seed.etag = Some("seed-etag".to_string());
         seed.last_modified = Some("Mon, 01 Jan 2024 00:00:00 GMT".to_string());
         fetch_iplist_with_cache(
@@ -1151,6 +1178,7 @@ mod tests {
             ),
             (
                 Ok(HttpResponse {
+                    validator_scope: Some("test-resource-scope".into()),
                     status: StatusCode::NOT_MODIFIED,
                     body: Vec::new(),
                     etag: None,
@@ -1193,6 +1221,7 @@ mod tests {
         assert_eq!(offline.networks, []);
         let client = MockHttpClient::new(vec![
             Ok(HttpResponse {
+                validator_scope: None,
                 status: StatusCode::NOT_MODIFIED,
                 body: Vec::new(),
                 etag: None,
@@ -1319,6 +1348,39 @@ mod tests {
     }
 
     #[test]
+    fn unreadable_legacy_remote_cache_does_not_block_a_healthy_origin() {
+        let temp = TempDir::new().expect("root");
+        let url = "https://example.test/feed";
+        let env = BTreeMap::new();
+        let legacy = cache_paths_for_url(temp.path(), url);
+        fs::write(&legacy.iplist_path, [0xff]).expect("invalid UTF-8 legacy cache");
+        let fresh = network_response_for_test(b"192.0.2.0/24");
+
+        let before = snapshot(temp.path());
+        let client = MockHttpClient::new(vec![Ok(fresh.clone())]);
+        let preview = read_iplist_for_preview(Some(&client), url, temp.path(), &env, 100)
+            .expect("read-only refresh");
+        assert_eq!(preview.provenance, SourceProvenance::Network);
+        assert_eq!(snapshot(temp.path()), before);
+        assert_eq!(client.requests()[0].validator_scope, None);
+
+        let client = MockHttpClient::new(vec![Ok(fresh)]);
+        let loaded = fetch_iplist_with_cache(&client, url, temp.path(), &env)
+            .expect("refresh and persist v2");
+        assert_eq!(loaded.source, CacheSource::Network);
+        assert_eq!(loaded.networks, preview.networks);
+        assert_eq!(client.requests()[0].validator_scope, None);
+        assert_eq!(
+            read_bytes_with_limit(&legacy.iplist_path, 1).expect("unmodified legacy"),
+            [0xff]
+        );
+        let cached = read_iplist_for_preview(None, url, temp.path(), &env, 100)
+            .expect("v2 generation after successful refresh");
+        assert_eq!(cached.provenance, SourceProvenance::Cache);
+        assert_eq!(cached.networks, loaded.networks);
+    }
+
+    #[test]
     fn production_iplist_limit_persists_readable_content_and_rejects_growth() {
         let temp = TempDir::new().expect("tempdir");
         let url = "https://example.test/feed";
@@ -1329,6 +1391,7 @@ mod tests {
         );
         assert_eq!(iplist.len(), 16 * 1024 * 1024);
         let metadata = RemoteCacheMetadata {
+            validator_scope: None,
             url: url.into(),
             etag: None,
             last_modified: None,
@@ -1727,6 +1790,7 @@ mod tests {
         fs::write(&paths.iplist_path, "10.0.0.0/24\n").expect("write cache");
 
         let metadata = RemoteCacheMetadata {
+            validator_scope: Some("test-resource-scope".into()),
             url: url.to_string(),
             etag: Some("etag-1".to_string()),
             last_modified: Some("Mon, 01 Jan 2024 00:00:00 GMT".to_string()),
@@ -1740,6 +1804,7 @@ mod tests {
         .expect("write meta");
 
         let client = MockHttpClient::new(vec![Ok(HttpResponse {
+            validator_scope: Some("test-resource-scope".into()),
             status: StatusCode::NOT_MODIFIED,
             body: Vec::new(),
             etag: None,
@@ -1768,12 +1833,14 @@ mod tests {
 
         let client = MockHttpClient::new(vec![
             Ok(HttpResponse {
+                validator_scope: None,
                 status: StatusCode::NOT_MODIFIED,
                 body: Vec::new(),
                 etag: None,
                 last_modified: None,
             }),
             Ok(HttpResponse {
+                validator_scope: None,
                 status: StatusCode::OK,
                 body: b"198.51.100.7".to_vec(),
                 etag: Some("etag-2".to_string()),
@@ -1829,6 +1896,7 @@ mod tests {
         fs::write(&paths.iplist_path, "10.0.0.0/24\n").expect("write cache");
 
         let client = MockHttpClient::new(vec![Ok(HttpResponse {
+            validator_scope: None,
             status: StatusCode::INTERNAL_SERVER_ERROR,
             body: b"198.51.100.7".to_vec(),
             etag: Some("etag-new".to_string()),
@@ -1854,6 +1922,7 @@ mod tests {
         let url = "https://example.com/feed.txt";
         let body = b"\xEF\xBB\xBF 10.0.0.5 \n# comment\ninvalid\n2001:db8::1 trailing\n";
         let client = MockHttpClient::new(vec![Ok(HttpResponse {
+            validator_scope: None,
             status: StatusCode::OK,
             body: body.to_vec(),
             etag: Some("etag-1".to_string()),
@@ -2038,7 +2107,23 @@ mod tests {
         let url = "https://example.test/feed";
         let env = BTreeMap::new();
         let store = remote_generation_store(temp.path(), url);
-        let client = MockHttpClient::new(vec![Ok(network_response_for_test(b"192.0.2.0/24"))]);
+        let mut seed = network_response_for_test(b"192.0.2.0/24");
+        seed.validator_scope = Some("test-resource-scope".into());
+        seed.etag = Some("seed-etag".into());
+        let client = MockHttpClient::new(vec![Ok(seed.clone())]);
+        let failed = fail_once_at(
+            store.parent().expect("remote source store parent"),
+            std::io::Error::from_raw_os_error(nix::libc::EIO),
+            || prepare_iplist_with_cache(&client, url, temp.path(), &env, 100),
+        );
+        assert!(matches!(
+            failed,
+            Err(super::HttpCacheError::WriteMetadata { .. })
+        ));
+        assert_eq!(client.requests().len(), 1);
+        assert!(!store.join("current.json").exists());
+
+        let client = MockHttpClient::new(vec![Ok(seed)]);
         let staged = prepare_iplist_with_cache(&client, url, temp.path(), &env, 100)
             .expect("stage first refresh")
             .pending_promotion
@@ -2054,6 +2139,7 @@ mod tests {
         let unselected = store.join("generations").join(".staging-unselected");
         fs::create_dir(&unselected).expect("unselected generation");
         let response = HttpResponse {
+            validator_scope: Some("test-resource-scope".into()),
             status: StatusCode::NOT_MODIFIED,
             body: Vec::new(),
             etag: None,
@@ -2061,18 +2147,28 @@ mod tests {
         };
         let client = MockHttpClient::new(vec![Ok(response)]);
         let before = snapshot(temp.path());
-        let failed = fail_once_at(
-            &store,
-            std::io::Error::from_raw_os_error(nix::libc::EIO),
-            || prepare_iplist_with_cache(&client, url, temp.path(), &env, 100),
-        );
-        assert!(matches!(
-            failed,
-            Err(super::HttpCacheError::SyncManifestDirectory { source, .. })
-                if source.raw_os_error() == Some(nix::libc::EIO)
-        ));
-        assert_eq!(client.requests(), [] as [HttpRequest; 0]);
-        assert_eq!(snapshot(temp.path()), before);
+        for unsynced_directory in [
+            store.clone(),
+            store.join("generations"),
+            current_generation_dir(temp.path(), url),
+        ] {
+            let failed = fail_once_at(
+                &unsynced_directory,
+                std::io::Error::from_raw_os_error(nix::libc::EIO),
+                || prepare_iplist_with_cache(&client, url, temp.path(), &env, 100),
+            );
+            assert!(
+                matches!(
+                    failed,
+                    Err(super::HttpCacheError::SyncManifestDirectory { source, .. })
+                        if source.raw_os_error() == Some(nix::libc::EIO)
+                ),
+                "failed to reject unsynced {}",
+                unsynced_directory.display()
+            );
+            assert_eq!(client.requests(), [] as [HttpRequest; 0]);
+            assert_eq!(snapshot(temp.path()), before);
+        }
 
         let prepared = prepare_iplist_with_cache(&client, url, temp.path(), &env, 100)
             .expect("retry with durable manifest");
@@ -2097,6 +2193,7 @@ mod tests {
             fs::write(&paths.iplist_path, iplist).expect("legacy list");
             if let Some(recorded_url) = recorded_url {
                 let meta = RemoteCacheMetadata {
+                    validator_scope: None,
                     url: recorded_url.to_string(),
                     etag: Some("legacy-etag".to_string()),
                     last_modified: Some("Mon, 01 Jan 2024 00:00:00 GMT".to_string()),
@@ -2123,9 +2220,8 @@ mod tests {
                 .expect("refresh fallback");
             assert_eq!(result.loaded.networks, preview.networks);
             let requests = client.requests();
-            let matching_metadata = recorded_url == Some(url);
-            assert_eq!(requests[0].if_none_match.is_some(), matching_metadata);
-            assert_eq!(requests[0].if_modified_since.is_some(), matching_metadata);
+            assert_eq!(requests[0].if_none_match, None);
+            assert_eq!(requests[0].if_modified_since, None);
         }
     }
 
@@ -2137,6 +2233,7 @@ mod tests {
         fs::write(&paths.iplist_path, "10.0.0.0/24\n").expect("write cache");
 
         let client = MockHttpClient::new(vec![Ok(HttpResponse {
+            validator_scope: None,
             status: StatusCode::OK,
             body: b"not-a-network\nalso-invalid\n".to_vec(),
             etag: Some("bad-etag".to_string()),
@@ -2219,6 +2316,7 @@ mod tests {
         fs::write(&paths.iplist_path, "10.0.0.0/24\n").expect("write cache");
 
         let client = MockHttpClient::new(vec![Ok(HttpResponse {
+            validator_scope: None,
             status: StatusCode::OK,
             body: b"10.0.0.1\n".to_vec(),
             etag: None,
@@ -2274,6 +2372,7 @@ mod tests {
         fs::write(
             &paths.meta_path,
             serde_json::to_vec_pretty(&RemoteCacheMetadata {
+                validator_scope: None,
                 url: url.to_string(),
                 etag: Some("etag-1".to_string()),
                 last_modified: Some("Mon, 01 Jan 2024 00:00:00 GMT".to_string()),
@@ -2302,6 +2401,7 @@ mod tests {
         let url = "https://example.com/feed.txt";
 
         let client = MockHttpClient::new(vec![Ok(HttpResponse {
+            validator_scope: None,
             status: StatusCode::OK,
             body: b"10.0.0.1\n".to_vec(),
             etag: None,

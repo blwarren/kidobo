@@ -136,9 +136,13 @@ candidate worktree; recovery artifacts retain the location below.
 
 Every publication attempt reruns its validation gates and builds/packages the candidate. The
 publisher checks the validated source tree and artifact hashes again before publishing; it does
-not reuse prior gates or E2E results. A failure or cancellation before refs are pushed removes
+not reuse prior gates or E2E results. A failure or cancellation before the push is attempted removes
 newly created release artifacts but preserves E2E logs and frozen evidence. Retry with the normal
 publication command after addressing the failure.
+
+After a failed push response, the publisher reads the remote main, annotated tag, and peeled tag.
+An exact match allows publication to continue. If it cannot confirm the refs, the publisher stops
+and retains the tag and artifacts. Verify the reported object IDs on the remote before retrying.
 
 A pre-existing `target/release-artifacts/<tag>/` directory is not deleted or overwritten. If it
 belongs to an older pre-push attempt, preserve it by moving it aside before starting again. If

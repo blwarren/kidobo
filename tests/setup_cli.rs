@@ -118,6 +118,38 @@ fn eof_at_final_review_is_a_safe_decline() {
 }
 
 #[test]
+fn unchanged_setup_rejects_a_comment_edit_made_after_review() {
+    let fixture = Fixture::new(EXISTING_CONFIG, "");
+    let edited = format!("# changed during confirmation\n{EXISTING_CONFIG}");
+    let output = fixture
+        .spawn(&["setup"], 100, OutputDestination::Terminal, &[])
+        .respond_to_all_with(
+            &[
+                (IPV6_PROMPT, "\n"),
+                (GITHUB_PROMPT, "\n"),
+                (FEED_PROMPT, "\n"),
+                (ALLOW_PROMPT, "\n"),
+                (SAVE_PROMPT, "y\n"),
+            ],
+            |prompt| {
+                if prompt == SAVE_PROMPT {
+                    fs::write(fixture.root().join("config/config.toml"), &edited)
+                        .expect("edit only the reviewed revision's bytes");
+                }
+            },
+        );
+
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(
+        output.stderr.contains("configuration changed"),
+        "{output:?}"
+    );
+    assert_eq!(config(&fixture), edited);
+    assert!(!fixture.root().join("systemd/system").exists());
+    assert_eq!(fixture.tool_log(), "");
+}
+
+#[test]
 fn setup_saves_reviewed_values_runs_doctor_then_allows_first_sync_decline() {
     let fixture = Fixture::new(EXISTING_CONFIG, "");
     let responses = setup_responses("y\n", Some("n\n"));
