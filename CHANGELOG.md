@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+
+## [0.15.4] - 2026-11-19
+
 ### Fixed
 
 - Keep reply traffic flowing during firewall rule replacement, coordinate sync and full flush
