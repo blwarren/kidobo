@@ -486,7 +486,7 @@ fn refresh_commit_replaces_all_verified_proposals_together() {
     fs::copy(&production, &path).unwrap();
     let original = read_text(&path).unwrap().into_bytes();
     let mut manifest = Manifest::load(&path).unwrap();
-    assert_eq!(manifest.images.len(), 3);
+    assert_eq!(manifest.images.len(), 4);
     for pin in manifest.images.values_mut() {
         pin.published_at += 1;
     }
@@ -558,13 +558,15 @@ fn valid_fedora_signature_cannot_authenticate_an_unsigned_artifact_digest() {
         &production.with_file_name("e2e.toml"),
     )
     .unwrap();
+    for id in ["fedora-44", "fedora-45"] {
+        let pin = &manifest.images[id];
+        let valid = temporary.path().join(id);
+        fs::create_dir(&valid).unwrap();
+        let signed_at = verify_signature(&mut runner, id, pin, &valid).unwrap();
+        assert!(signed_at > 0 && signed_at <= pin.published_at);
+        assert!(valid.join("verification.json").exists());
+    }
     let pin = &manifest.images["fedora-44"];
-    let valid = temporary.path().join("valid-fedora");
-    fs::create_dir(&valid).unwrap();
-    let signed_at = verify_signature(&mut runner, "fedora-44", pin, &valid).unwrap();
-    assert!(signed_at > 0);
-    assert!(signed_at <= pin.published_at);
-    assert!(valid.join("verification.json").exists());
 
     let filename = "Fedora-Cloud-Base-Generic-44-99.1.x86_64.qcow2";
     let mut changed = pin.clone();

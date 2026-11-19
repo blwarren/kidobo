@@ -41,6 +41,14 @@ packages = ["bash", "ca-certificates", "curl", "tar", "coreutils", "grep", "kmod
 
 [[distros]]
 required = false
+id = "fedora-45"
+vendor_image = "fedora-45"
+family = "dnf"
+selinux = "enforcing"
+packages = ["bash", "ca-certificates", "curl", "tar", "coreutils", "grep", "kmod", "sudo", "iproute", "python3", "ipset", "iptables", "bgpq4", "kernel-modules-extra"]
+
+[[distros]]
+required = false
 id = "almalinux-9"
 vendor_image = "almalinux-9"
 family = "dnf-epel"

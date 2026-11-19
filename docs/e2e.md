@@ -81,9 +81,9 @@ host's live firewall or systemd. Mutation-test execution also remains the user's
 ## Coverage and outcomes
 
 The required release targets are Debian 12/13 and Ubuntu 24.04/26.04. Publication and
-`just e2e-artifact` select those four targets. `just e2e` selects all seven configured targets,
-including advisory Fedora 44 and AlmaLinux 9/10. Advisory environment or application failures
-remain visible but do not fail the required release gate. Full seven-platform qualification
+`just e2e-artifact` select those four targets. `just e2e` selects all eight configured targets,
+including advisory Fedora 44/45 and AlmaLinux 9/10. Advisory environment or application failures
+remain visible but do not fail the required release gate. Full matrix qualification
 requires every selected target to pass. A filtered run does not qualify publication.
 Acceptance applies to the recorded environment; it does not establish compatibility with every
 kernel available for that distribution.
@@ -165,7 +165,7 @@ runs. Startup discovery has a 30-second total budget. Unavailable or unrecognize
 produces an “update status unknown” warning, not a qualification failure. Results are visible
 in progress output and retained evidence. No checks happen while E2E is idle.
 
-`e2e-images-refresh` processes one configured vendor target, or all three when omitted. It
+`e2e-images-refresh` processes one configured vendor target, or all configured vendor targets when omitted. It
 verifies vendor-signed checksums with explicitly trusted signing fingerprints in an isolated
 keyring, verifies disk hashes and format, generates metadata, and imports the source images.
 New pins must satisfy the seven-day publication-age rule; unknown age blocks adoption. Age

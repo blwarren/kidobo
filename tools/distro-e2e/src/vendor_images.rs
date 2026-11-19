@@ -75,6 +75,11 @@ fn trust(id: &str) -> Result<Trust> {
             "fedora-44.asc",
             "https://dl.fedoraproject.org/pub/fedora/linux/releases/44/Cloud/x86_64/images/".into(),
         ),
+        "fedora-45" => (
+            "4F50A6114CD5C6976A7F1179655A4B02F577861E",
+            "fedora-45.asc",
+            "https://dl.fedoraproject.org/pub/fedora/linux/releases/45/Cloud/x86_64/images/".into(),
+        ),
         "almalinux-9" => (
             "BF18AC2876178908D6E71267D36CB86CB86B3716",
             "almalinux-9.asc",
