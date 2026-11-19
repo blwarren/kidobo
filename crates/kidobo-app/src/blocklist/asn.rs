@@ -345,25 +345,11 @@ fn remove_exact_duplicates(
         return Ok(0);
     }
     let document = repository.load(path)?;
-    let line_canonicals = document
-        .lines
-        .iter()
-        .map(|line| line.canonical)
-        .collect::<Vec<_>>();
-    let removal_indexes = exact_match_indexes(&line_canonicals, duplicates)
+    let removal_indexes: HashSet<_> = exact_match_indexes(document.networks(), duplicates)
         .into_iter()
-        .collect::<HashSet<_>>();
-    let original_line_count = document.lines.len();
-    let kept_lines = document
-        .lines
-        .into_iter()
-        .enumerate()
-        .filter(|(index, _)| !removal_indexes.contains(index))
-        .map(|(_, line)| line.original)
-        .collect::<Vec<_>>();
-    let removed = original_line_count.saturating_sub(kept_lines.len());
-    if removed > 0 {
-        repository.write_lines(path, &kept_lines)?;
+        .collect();
+    if !removal_indexes.is_empty() {
+        repository.write(path, &document.without_entries(&removal_indexes))?;
     }
-    Ok(removed)
+    Ok(removal_indexes.len())
 }

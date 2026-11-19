@@ -394,6 +394,34 @@ fn explicit_apply_runs_sync_for_noop_changes_after_the_mutation_lock_is_released
 }
 
 #[test]
+fn explicit_apply_stops_when_the_saved_directory_cannot_be_synchronized() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = Fixture::new(CONFIG, "203.0.113.7\n");
+    let data = fixture.root().join("data");
+    let previous = fs::metadata(&data).expect("data directory").permissions();
+    fs::set_permissions(&data, fs::Permissions::from_mode(0o300)).expect("write and traverse only");
+    for (command, target) in [("ban", "203.0.113.7"), ("unban", "192.0.2.1")] {
+        let output = fixture
+            .spawn(
+                &[command, target, "--apply"],
+                80,
+                OutputDestination::Pipe,
+                &[],
+            )
+            .wait();
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert!(
+            output.stderr.contains("could not confirm durability"),
+            "{output:?}"
+        );
+        assert_eq!(fixture.tool_log(), "");
+    }
+    fs::set_permissions(&data, previous).expect("restore directory access");
+    assert_eq!(source(&fixture), "203.0.113.7\n");
+}
+
+#[test]
 fn explicit_apply_does_not_approve_partial_unban_removal() {
     let fixture = Fixture::new(CONFIG, "203.0.113.7\n203.0.113.0/24\n");
     fail_fake_sync(&fixture);

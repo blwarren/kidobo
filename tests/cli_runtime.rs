@@ -216,6 +216,10 @@ fi
 if [[ -n "${KIDOBO_TEST_SUDO_LOG:-}" ]]; then
   printf '%s\n' "$*" >> "${KIDOBO_TEST_SUDO_LOG}"
 fi
+if [[ -n "${KIDOBO_TEST_MISSING_TOOL:-}" && "${2:-}" == "$KIDOBO_TEST_MISSING_TOOL" ]]; then
+  echo "command not found: $2" >&2
+  exit 1
+fi
 
 if [[ "${KIDOBO_TEST_INTERRUPT_AT_RESTORE:-0}" == "1" && "${2:-}" == "ipset" && "${3:-}" == "restore" && ! -f "${KIDOBO_ROOT}/interrupted-restore" ]]; then
   : > "${KIDOBO_ROOT}/interrupted-restore"
@@ -226,7 +230,7 @@ if [[ "${KIDOBO_TEST_INTERRUPT_AT_RESTORE:-0}" == "1" && "${2:-}" == "ipset" && 
   fi
 fi
 
-if [[ "${KIDOBO_TEST_FAIL_SUDO:-0}" == "1" ]]; then
+if [[ "${KIDOBO_TEST_FAIL_SUDO:-0}" == "1" && "${3:-}" != "-V" && "${3:-}" != version ]]; then
   echo "injected sudo failure" >&2
   exit 9
 fi
@@ -582,6 +586,37 @@ fn flush_command_failure_maps_to_one_after_attempting_cache_cleanup() {
 }
 
 #[test]
+fn full_flush_checks_every_cleanup_tool_before_removing_ipv4_only_state() {
+    for missing in ["ipset", "iptables", "ip6tables"] {
+        let root = create_root("[ipset]\nset_name='kidobo'\nenable_ipv6=false\n", "");
+        let cached = root.path().join("cache/remote/preserved");
+        fs::write(&cached, "cached data").expect("cache fixture");
+        let fake = write_fake_sudo_script(&root);
+        let log = root.path().join("commands");
+        let output = kidobo_with_root_command(root.path(), &["flush", "--yes"])
+            .env(
+                "PATH",
+                path_with_bin_prefix(fake.parent().expect("fake bin")),
+            )
+            .env("KIDOBO_TEST_SUDO_LOG", &log)
+            .env("KIDOBO_TEST_MISSING_TOOL", missing)
+            .output()
+            .expect("fixture flush");
+        assert_eq!(output.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&output.stderr).contains(&format!("requires {missing}")));
+        let commands = read_to_string_with_limit(&log, 1024).expect("logged commands");
+        assert!(
+            commands.lines().all(|line| matches!(
+                line,
+                "-n ipset version" | "-n iptables -V" | "-n ip6tables -V"
+            )),
+            "{commands}"
+        );
+        assert!(cached.is_file());
+    }
+}
+
+#[test]
 fn help_exits_with_zero() {
     let output = run_kidobo(&["--help"]);
     assert_eq!(output.status.code(), Some(0));
@@ -699,9 +734,29 @@ fn lookup_escapes_legacy_cache_labels_in_both_formats() {
 
 #[test]
 fn lookup_escapes_validated_generation_labels_in_both_formats() {
-    use sha2::{Digest, Sha256};
     let root = create_lookup_root("");
-    let url = "https://feed.test/\t\u{1b}\\";
+    write_lookup_generation(root.path(), "https://feed.test/\t\u{1b}\\");
+    for format in ["tsv", "human"] {
+        let output =
+            run_kidobo_with_root(root.path(), &["lookup", "203.0.113.7", "--format", format]);
+        assert_eq!(output.status.code(), Some(0));
+        let stdout = String::from_utf8(output.stdout).expect("UTF-8");
+        assert!(
+            stdout.contains(r"https://feed.test/\t\x1B\\"),
+            "missing escaped generation label: {stdout:?}"
+        );
+        assert!(!stdout.contains('\u{1b}'));
+        if format == "tsv" {
+            assert_eq!(
+                stdout,
+                "203.0.113.7\thttps://feed.test/\\t\\x1B\\\\\t203.0.113.7/32\n"
+            );
+        }
+    }
+}
+
+fn write_lookup_generation(root: &Path, url: &str) {
+    use sha2::{Digest, Sha256};
     let payload = "203.0.113.7/32\n";
     let checksum = kidobo_adapters::hash::sha256_hex(payload.as_bytes());
     let metadata = serde_json::json!({
@@ -723,7 +778,6 @@ fn lookup_escapes_validated_generation_labels_in_both_formats() {
     }
     let generation = kidobo_adapters::hash::hex_lower(&hasher.finalize());
     let store = root
-        .path()
         .join("cache/remote/v2/remote")
         .join(kidobo_adapters::http_cache::url_hash_prefix(url));
     let directory = store.join("generations").join(&generation);
@@ -739,23 +793,31 @@ fn lookup_escapes_validated_generation_labels_in_both_formats() {
         .to_string(),
     )
     .expect("manifest");
-    for format in ["tsv", "human"] {
-        let output =
-            run_kidobo_with_root(root.path(), &["lookup", "203.0.113.7", "--format", format]);
-        assert_eq!(output.status.code(), Some(0));
-        let stdout = String::from_utf8(output.stdout).expect("UTF-8");
-        assert!(
-            stdout.contains(r"https://feed.test/\t\x1B\\"),
-            "missing escaped generation label: {stdout:?}"
-        );
-        assert!(!stdout.contains('\u{1b}'));
-        if format == "tsv" {
-            assert_eq!(
-                stdout,
-                "203.0.113.7\thttps://feed.test/\\t\\x1B\\\\\t203.0.113.7/32\n"
-            );
-        }
-    }
+}
+
+#[test]
+fn lookup_tsv_redacts_private_urls_for_both_cache_layouts() {
+    let root = create_lookup_root("");
+    let remote = root.path().join("cache/remote");
+    let legacy =
+        "https://name'USER_MARKER:private@legacy.test/feed?fixture'QUERY_MARKER#FRAGMENT_MARKER";
+    fs::write(remote.join("feed.iplist"), "203.0.113.7/32\n").expect("legacy list");
+    fs::write(
+        remote.join("feed.meta.json"),
+        serde_json::json!({"url":legacy}).to_string(),
+    )
+    .expect("legacy metadata");
+    write_lookup_generation(root.path(), &legacy.replace("legacy.test", "v2.test"));
+    let output = run_kidobo_with_root(root.path(), &["lookup", "203.0.113.7", "--format", "tsv"]);
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8(output.stdout).expect("UTF-8");
+    assert_eq!(
+        stdout,
+        concat!(
+            "203.0.113.7\thttps://REDACTED@legacy.test/feed?REDACTED#REDACTED\t203.0.113.7/32\n",
+            "203.0.113.7\thttps://REDACTED@v2.test/feed?REDACTED#REDACTED\t203.0.113.7/32\n"
+        )
+    );
 }
 
 #[test]
@@ -1978,7 +2040,7 @@ fn sync_remote_worker_warning_does_not_deadlock() {
          set_name='kidobo'\n\
          enable_ipv6=false\n\
          [remote]\n\
-         urls=['http://{address}/feed.csv']\n\
+         urls=[\"http://fixture'USER_MARKER:fixture'PASSWORD_MARKER@{address}/feed.csv?fixture'QUERY_MARKER#fixture'FRAGMENT_MARKER\"]\n\
          timeout_secs=5\n\
          [safe]\n\
          include_github_meta=false\n"
@@ -2027,6 +2089,17 @@ fn sync_remote_worker_warning_does_not_deadlock() {
         stderr.contains("ignored 1 invalid line"),
         "missing remote parser warning: {stderr}"
     );
+    for marker in [
+        "USER_MARKER",
+        "PASSWORD_MARKER",
+        "QUERY_MARKER",
+        "FRAGMENT_MARKER",
+    ] {
+        assert!(
+            !stderr.contains(marker),
+            "credential marker in feed warning"
+        );
+    }
     assert!(
         !stderr.contains("line(s)"),
         "incorrect warning grammar: {stderr}"
@@ -2053,85 +2126,93 @@ fn sync_remote_worker_warning_does_not_deadlock() {
 }
 
 #[test]
-fn sync_skips_local_blocklist_normalization_when_unchanged() {
+fn sync_preserves_operator_entries_for_subsequent_exact_unban() {
+    let original = "# header  \r\n192.0.2.4\r\n\r\n192.0.2.5\n# comments stay here\n192.0.2.4\n2001:db8::4\n2001:db8::5";
     let root = create_root(
-        "[ipset]\nset_name='kidobo'\nenable_ipv6=false\n[safe]\ninclude_github_meta=false\n",
-        "203.0.113.7\n203.0.113.0/24\n",
+        "[ipset]\nset_name='kidobo'\n[safe]\ninclude_github_meta=false\n",
+        original,
     );
     let fake_sudo = write_fake_sudo_script(&root);
-    let sidecar = root.path().join("cache/blocklist-normalize.fast-state");
     let blocklist = root.path().join("data/blocklist.txt");
-    let expected_canonical = "203.0.113.0/24\n";
+    let sidecar = root.path().join("cache/blocklist-normalize.fast-state");
+    let restore_log = root.path().join("restore.log");
 
-    let mut first = kidobo_with_root_command(root.path(), &["sync"]);
-    first.env(
-        "PATH",
-        path_with_bin_prefix(fake_sudo.parent().expect("sudo parent")),
-    );
-    let first_output = first.output().expect("run first sync");
+    let sync = || {
+        let output = kidobo_with_root_command(root.path(), &["sync"])
+            .env(
+                "PATH",
+                path_with_bin_prefix(fake_sudo.parent().expect("sudo parent")),
+            )
+            .env("KIDOBO_TEST_RESTORE_LOG", &restore_log)
+            .output()
+            .expect("sync");
+        assert!(output.status.success(), "{output:?}");
+    };
+    sync();
     assert_eq!(
-        first_output.status.code(),
-        Some(0),
-        "first sync failed: {}",
-        String::from_utf8_lossy(&first_output.stderr)
+        read_to_string_with_limit(&blocklist, BLOCKLIST_READ_LIMIT).expect("saved entries"),
+        original
     );
-    assert!(
-        sidecar.exists(),
-        "fast-state sidecar was not created at {}",
-        sidecar.display()
-    );
-    let first_blocklist = read_to_string_with_limit(&blocklist, BLOCKLIST_READ_LIMIT)
-        .expect("read canonicalized blocklist");
-    assert_eq!(first_blocklist, expected_canonical);
+    assert!(!sidecar.exists());
+    let kernel = read_to_string_with_limit(&restore_log, 65_536).expect("restore input");
+    assert!(kernel.contains("192.0.2.4/31"), "{kernel}");
+    assert!(kernel.contains("2001:db8::4/127"), "{kernel}");
 
-    let mut second = kidobo_with_root_command(root.path(), &["sync"]);
-    second.env(
-        "PATH",
-        path_with_bin_prefix(fake_sudo.parent().expect("sudo parent")),
-    );
-    let second_output = second.output().expect("run second sync");
+    fs::write(&sidecar, "obsolete state").expect("old state");
+    sync();
     assert_eq!(
-        second_output.status.code(),
-        Some(0),
-        "second sync failed: {}",
-        String::from_utf8_lossy(&second_output.stderr)
+        read_to_string_with_limit(&blocklist, BLOCKLIST_READ_LIMIT).expect("saved entries"),
+        original
     );
-    let second_stderr = String::from_utf8_lossy(&second_output.stderr);
-    assert!(
-        second_stderr.contains("sync blocklist normalization skipped: unchanged path="),
-        "missing unchanged-blocklist skip log in second sync stderr: {second_stderr}"
+    assert_eq!(
+        read_to_string_with_limit(&sidecar, 1024).expect("original sidecar"),
+        "obsolete state"
     );
 
-    let second_blocklist = read_to_string_with_limit(&blocklist, BLOCKLIST_READ_LIMIT)
-        .expect("read blocklist after second sync");
-    assert_eq!(second_blocklist, expected_canonical);
+    for host in ["192.0.2.4", "2001:db8::4"] {
+        let output = run_kidobo_with_root(root.path(), &["unban", host, "--no-apply"]);
+        assert!(output.status.success(), "{output:?}");
+    }
+    assert_eq!(
+        read_to_string_with_limit(&blocklist, BLOCKLIST_READ_LIMIT).expect("remaining entries"),
+        "# header  \r\n\r\n192.0.2.5\n# comments stay here\n2001:db8::5"
+    );
 }
 
+#[cfg(target_os = "linux")]
 #[test]
-fn sync_normalization_drops_non_header_comments() {
+fn blank_heavy_blocklist_stays_within_memory_budget_during_preview_and_edit() {
+    let entry = "192.0.2.4\n";
+    let original = format!("{}{entry}", "\n".repeat(4 * 1024 * 1024));
     let root = create_root(
-        "[ipset]\nset_name='kidobo'\nenable_ipv6=false\n[safe]\ninclude_github_meta=false\n",
-        "# header comment \n203.0.113.7\n# dropped comment\n203.0.113.0/24\n",
+        "[ipset]\nset_name='kidobo'\n[safe]\ninclude_github_meta=false\n",
+        &original,
     );
-    let fake_sudo = write_fake_sudo_script(&root);
-    let blocklist = root.path().join("data/blocklist.txt");
-
-    let mut command = kidobo_with_root_command(root.path(), &["sync"]);
-    command.env(
-        "PATH",
-        path_with_bin_prefix(fake_sudo.parent().expect("sudo parent")),
-    );
-    let output = command.output().expect("run sync");
+    fs::write(root.path().join("cache/sync.lock"), "").expect("existing preview lock");
+    for args in [
+        &["sync", "--dry-run"][..],
+        &["unban", "192.0.2.4", "--no-apply"],
+    ] {
+        let output = Command::new("bash")
+            .args([
+                "-c",
+                "ulimit -v 196608; exec \"$@\"",
+                "blocklist-memory-test",
+            ])
+            .arg(kidobo_binary())
+            .args(args)
+            .env("KIDOBO_ROOT", root.path())
+            .env("KIDOBO_TEST_SANDBOX", "1")
+            .output()
+            .expect("run bounded subprocess");
+        assert!(output.status.success(), "{args:?}: {output:?}");
+    }
     assert_eq!(
-        output.status.code(),
-        Some(0),
-        "sync failed: {}",
-        String::from_utf8_lossy(&output.stderr)
+        fs::metadata(root.path().join("data/blocklist.txt"))
+            .unwrap()
+            .len(),
+        4 * 1024 * 1024
     );
-
-    let normalized =
-        read_to_string_with_limit(&blocklist, BLOCKLIST_READ_LIMIT).expect("read blocklist");
-    assert_eq!(normalized, "# header comment\n\n203.0.113.0/24\n");
 }
 
 #[test]

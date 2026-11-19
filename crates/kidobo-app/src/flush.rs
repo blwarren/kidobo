@@ -58,6 +58,13 @@ impl FlushOutcome {
 
 /// Adapter boundary for Kidobo-owned firewall, ipset, and cache cleanup.
 pub trait FlushBackend {
+    /// Verifies that all three cleanup tools can run before removing any managed state.
+    ///
+    /// # Errors
+    ///
+    /// Returns a diagnostic naming the unavailable tool.
+    fn check_cleanup_tools(&self) -> Result<(), String>;
+
     /// Removes managed firewall wiring for one address family.
     ///
     /// # Errors
@@ -133,8 +140,16 @@ pub fn execute(
     let config = dependencies.configs.load(&paths.config_file)?;
     dependencies.cancellation.check()?;
     let firewall_lock = dependencies.firewall_lock.acquire_firewall()?;
-    // Once cleanup starts, continue independent steps even if cancellation arrives.
     let mut outcome = FlushOutcome::default();
+    if let Err(reason) = dependencies.backend.check_cleanup_tools() {
+        outcome.failed.push(CleanupFailure {
+            operation: "cleanup prerequisites".to_string(),
+            reason,
+        });
+        return Ok(outcome);
+    }
+    dependencies.cancellation.check()?;
+    // Once cleanup starts, continue independent steps even if cancellation arrives.
     let ipv4_clean = attempt(
         &mut outcome,
         "IPv4 firewall",
@@ -287,6 +302,10 @@ mod tests {
     }
 
     impl FlushBackend for Backend {
+        fn check_cleanup_tools(&self) -> Result<(), String> {
+            Ok(())
+        }
+
         fn cleanup_firewall(&self, family: FirewallFamily) -> Result<(), String> {
             let event = format!("firewall:{family:?}");
             self.run(&event)

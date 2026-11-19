@@ -219,6 +219,24 @@ activate_staged_install() {
     STAGED_INSTALL_PATH=""
 }
 
+# Host init chooses the first executable at its two trusted installation paths.
+# Compare parent directories because activation replaces the destination entry itself.
+check_host_init_destination() {
+    local target="$1" preferred="$2" fallback="$3"
+    if [[ "${target}" == "${preferred}" || "${target%/*}" -ef "${preferred%/*}" ]]; then
+        return 0
+    fi
+    if [[ "${target}" == "${fallback}" || "${target%/*}" -ef "${fallback%/*}" ]]; then
+        if [[ ! -f "${preferred}" || ! -x "${preferred}" ]]; then
+            return 0
+        fi
+        echo "host --init would schedule ${preferred} instead of ${target}; install at ${preferred} or omit --init" >&2
+        return 1
+    fi
+    echo "host --init requires installation at ${preferred} or ${fallback}; omit --init for a custom binary-only installation" >&2
+    return 1
+}
+
 cleanup_install_temporary_files() {
     local status=$?
     trap - EXIT
@@ -288,6 +306,10 @@ resolve_uninstall_paths() {
         DATA_DIR="/var/lib/kidobo"
         CACHE_DIR="/var/cache/kidobo"
         SYSTEMD_DIR="/etc/systemd/system"
+        RUNTIME_DIR="/run"
+        PID1_COMM="/proc/1/comm"
+        OFFLINE_UNIT_DIRS=("${SYSTEMD_DIR}" /run/systemd/system /usr/local/lib/systemd/system
+            /usr/lib/systemd/system /lib/systemd/system)
     fi
 
     SYSTEMD_SERVICE_PATH="${SYSTEMD_DIR}/kidobo-sync.service"
@@ -418,6 +440,45 @@ read_systemd_unit_state() {
     fi
 }
 
+host_booted_without_systemd() {
+    local init_name
+    [[ -x "${RUNTIME_DIR}" &&
+        ( ! -e "${RUNTIME_DIR}/systemd" || -x "${RUNTIME_DIR}/systemd" ) &&
+        ! -e "${RUNTIME_DIR}/systemd/system" && ! -L "${RUNTIME_DIR}/systemd/system" ]] &&
+        IFS= read -r init_name < "${PID1_COMM}" &&
+        [[ -n "${init_name}" && "${init_name}" != systemd ]]
+}
+
+check_offline_timer_enablement() {
+    local directory dependencies entry target
+    for directory in "$@"; do
+        [[ -e "${directory}" || -L "${directory}" ]] || continue
+        if [[ ! -d "${directory}" || ! -r "${directory}" || ! -x "${directory}" ]]; then
+            echo "uninstall aborted: cannot establish timer enablement in ${directory}" >&2
+            return 1
+        fi
+        for dependencies in "${directory}"/*.wants "${directory}"/*.requires "${directory}"/*.upholds; do
+            [[ -e "${dependencies}" || -L "${dependencies}" ]] || continue
+            if [[ ! -d "${dependencies}" || ! -r "${dependencies}" || ! -x "${dependencies}" ]]; then
+                echo "uninstall aborted: cannot establish timer enablement in ${dependencies}" >&2
+                return 1
+            fi
+            for entry in "${dependencies}"/*; do
+                target=""
+                if [[ -L "${entry}" ]] && ! target="$(readlink -- "${entry}")"; then
+                    echo "uninstall aborted: cannot inspect enablement link ${entry}" >&2
+                    return 1
+                fi
+                if [[ "${entry##*/}" == kidobo-sync.timer || "${target##*/}" == kidobo-sync.timer ||
+                    "${entry}" -ef "${SYSTEMD_TIMER_PATH}" ]]; then
+                    echo "uninstall aborted: disable kidobo-sync.timer or remove its enablement link ${entry} before uninstall" >&2
+                    return 1
+                fi
+            done
+        done
+    done
+}
+
 restore_uninstall_timer() {
     if [[ "$1" == 1 ]] && ! run_with_optional_sudo systemctl start kidobo-sync.timer; then
         echo "failed to restore previously active kidobo-sync.timer; runtime artifacts were preserved" >&2
@@ -448,9 +509,23 @@ uninstall_artifacts() {
         return $?
     fi
 
+    local tool version_argument
+    for tool in ipset iptables ip6tables; do
+        version_argument="-V"
+        if [[ "${tool}" == ipset ]]; then version_argument=version; fi
+        if ! run_with_optional_sudo "${tool}" "${version_argument}" >/dev/null; then
+            echo "uninstall aborted: full flush requires ${tool}; restore it before uninstall" >&2
+            return 1
+        fi
+    done
+
     local timer_was_active=0
     local timer_present=0
-    if [[ -z "${KIDOBO_ROOT_OVERRIDE}" ]]; then
+    local use_systemd=1
+    if host_booted_without_systemd; then
+        use_systemd=0
+        check_offline_timer_enablement "${OFFLINE_UNIT_DIRS[@]}" || return 1
+    else
         if ! has_cmd systemctl || ! read_systemd_unit_state kidobo-sync.timer; then
             echo "uninstall aborted: timer state could not be confirmed; runtime artifacts were preserved" >&2
             return 1
@@ -496,7 +571,9 @@ uninstall_artifacts() {
     fi
     remove_path "${SYSTEMD_TIMER_PATH}" "systemd timer"
     remove_path "${SYSTEMD_SERVICE_PATH}" "systemd service"
-    reload_systemd_best_effort
+    if [[ "${use_systemd}" == 1 ]]; then
+        reload_systemd_best_effort
+    fi
 
     remove_path "${CACHE_DIR}" "cache dir"
     remove_path "${DATA_DIR}" "data dir"
@@ -542,6 +619,11 @@ fi
 if [[ "${UNINSTALL_ONLY}" -eq 1 ]]; then
     uninstall_artifacts
     exit 0
+fi
+
+if [[ "${INIT_AFTER_INSTALL}" -eq 1 && -n "${KIDOBO_ROOT_WAS_SET}" && -z "${KIDOBO_ROOT_OVERRIDE}" ]]; then
+    echo "KIDOBO_ROOT must not be empty when --init is requested" >&2
+    exit 1
 fi
 
 require_cmd curl
@@ -593,6 +675,12 @@ curl -fsSL -o "${workdir}/SHA256SUMS" "${BASE_URL}/SHA256SUMS"
 )
 
 tar -xzf "${workdir}/${ARCHIVE}" -C "${workdir}"
+if [[ ! -d "${INSTALL_DIR}" ]]; then
+    if [[ "${INIT_AFTER_INSTALL}" -eq 1 && -z "${KIDOBO_ROOT_WAS_SET}" ]]; then
+        check_host_init_destination "${TARGET_PATH}" /usr/local/bin/kidobo /usr/bin/kidobo || exit 1
+    fi
+    run_with_optional_sudo mkdir -p -- "${INSTALL_DIR}"
+fi
 stage_install_file "${workdir}/kidobo-${VERSION}-linux-x86_64/${BINARY_NAME}" "${TARGET_PATH}"
 
 expected_version="${BINARY_NAME} ${VERSION#v}"
@@ -605,6 +693,9 @@ if [[ "${installed_version}" != "${expected_version}" ]]; then
     exit 1
 fi
 
+if [[ "${INIT_AFTER_INSTALL}" -eq 1 && -z "${KIDOBO_ROOT_WAS_SET}" ]]; then
+    check_host_init_destination "${TARGET_PATH}" /usr/local/bin/kidobo /usr/bin/kidobo || exit 1
+fi
 activate_staged_install "${TARGET_PATH}"
 
 echo "installed ${BINARY_NAME} to ${TARGET_PATH}"

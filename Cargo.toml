@@ -87,9 +87,9 @@ thiserror.workspace = true
 terminal_size.workspace = true
 unicode-width.workspace = true
 unicode-segmentation.workspace = true
-url.workspace = true
 
 [dev-dependencies]
+url.workspace = true
 criterion.workspace = true
 fs2.workspace = true
 kidobo-core.workspace = true

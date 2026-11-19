@@ -161,6 +161,18 @@ pub enum AppError {
         source: std::io::Error,
     },
 
+    /// The visible blocklist state could not be confirmed durable.
+    #[error(
+        "could not confirm durability of blocklist file {path}: {source}. Retry before applying."
+    )]
+    BlocklistDurability {
+        /// Blocklist path.
+        path: PathBuf,
+        /// Parent-directory synchronization failure.
+        #[source]
+        source: std::io::Error,
+    },
+
     /// One direct blocklist target was invalid.
     #[error("failed to parse blocklist target {input}")]
     BlocklistTargetParse {

@@ -81,7 +81,10 @@ collapsed coverage above one-sixteenth of either family's address space.
 
 The local blocklist lives at `/var/lib/kidobo/blocklist.txt` by default. It
 accepts one IP address or CIDR per line. Permanent IP/CIDR bans are recorded
-there; `asn.banned` is the configuration source for permanent ASN bans.
+there. Sync reads this file as written, preserving separate entries, order,
+comments, and whitespace. Only the effective firewall sets aggregate adjacent
+or overlapping CIDRs. A range already saved by an earlier release remains a
+single entry for unban. `asn.banned` is the configuration source for permanent ASN bans.
 Temporary entries live separately in `/var/lib/kidobo/temporary-bans.toml`.
 This versioned state file records canonical IP/CIDR or ASN entries with
 absolute Unix expiry times. `init` creates a valid empty file when absent and

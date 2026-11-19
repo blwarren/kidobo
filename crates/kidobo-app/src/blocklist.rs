@@ -70,25 +70,19 @@ pub trait BlocklistRepository {
     /// Returns an error when the file cannot be read or contains an invalid entry.
     fn load(&self, path: &Path) -> Result<BlocklistDocument, AppError>;
 
-    /// Appends canonical entries while preserving the document's newline structure.
+    /// Publishes the complete updated document and synchronizes its directory.
     ///
     /// # Errors
     ///
-    /// Returns an error when the blocklist cannot be updated atomically.
-    fn append_entries(
-        &self,
-        path: &Path,
-        entries: &[String],
-        has_content: bool,
-        trailing_newline: bool,
-    ) -> Result<(), AppError>;
+    /// Returns an error if publication fails or the new directory entry is not confirmed durable.
+    fn write(&self, path: &Path, contents: &str) -> Result<(), AppError>;
 
-    /// Replaces the blocklist with the supplied lines.
+    /// Confirms a previous publication when an idempotent retry sees the desired state.
     ///
     /// # Errors
     ///
-    /// Returns an error when the blocklist cannot be written atomically.
-    fn write_lines(&self, path: &Path, lines: &[String]) -> Result<(), AppError>;
+    /// Returns an error if an existing parent directory cannot be synchronized.
+    fn confirm_durable(&self, path: &Path) -> Result<(), AppError>;
 
     /// Reads operator-supplied blocklist targets from a file.
     ///
@@ -304,45 +298,27 @@ mod tests {
 
     impl BlocklistRepository for Repository {
         fn load(&self, _path: &Path) -> Result<BlocklistDocument, AppError> {
-            BlocklistDocument::parse(&self.contents.lock().expect("contents")).map_err(|error| {
-                AppError::BlocklistParseLine {
+            BlocklistDocument::parse(self.contents.lock().expect("contents").clone()).map_err(
+                |error| AppError::BlocklistParseLine {
                     path: PathBuf::from("/root/data/blocklist.txt"),
                     line: error.line_number,
                     content: error.content,
-                }
-            })
+                },
+            )
         }
 
-        fn append_entries(
-            &self,
-            _path: &Path,
-            entries: &[String],
-            has_content: bool,
-            trailing_newline: bool,
-        ) -> Result<(), AppError> {
-            let mut contents = self.contents.lock().expect("contents");
-            if has_content && !trailing_newline {
-                contents.push('\n');
-            }
-            for entry in entries {
-                contents.push_str(entry);
-                contents.push('\n');
-            }
-            Ok(())
-        }
-
-        fn write_lines(&self, path: &Path, lines: &[String]) -> Result<(), AppError> {
+        fn write(&self, path: &Path, contents: &str) -> Result<(), AppError> {
             if self.fail_write.load(std::sync::atomic::Ordering::SeqCst) {
                 return Err(AppError::BlocklistWrite {
                     path: path.to_path_buf(),
                     source: std::io::Error::other("injected write failure"),
                 });
             }
-            let mut rendered = lines.join("\n");
-            if !rendered.is_empty() {
-                rendered.push('\n');
-            }
-            *self.contents.lock().expect("contents") = rendered;
+            *self.contents.lock().expect("contents") = contents.to_owned();
+            Ok(())
+        }
+
+        fn confirm_durable(&self, _: &Path) -> Result<(), AppError> {
             Ok(())
         }
 

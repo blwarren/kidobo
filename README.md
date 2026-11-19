@@ -56,6 +56,10 @@ Install and initialize in one step:
 curl -fsSL https://raw.githubusercontent.com/blwarren/kidobo/main/scripts/install.sh | sudo bash -s -- --init
 ```
 
+At host paths, `--init` supports `/usr/local/bin/kidobo` or `/usr/bin/kidobo`
+when the former does not take precedence. For a custom binary-only install, set
+`KIDOBO_INSTALL_DIR` and omit `--init`.
+
 Uninstall:
 
 ```bash
@@ -75,7 +79,8 @@ existing installation.
 - Bash, `curl`, `tar`, `sha256sum`, and standard file-installation tools for the
   installer. GNU `realpath` is additionally required for custom-root uninstall.
 - `sudo`, `ipset`, and `iptables` for runtime checks and enforcement.
-- `ip6tables` when IPv6 enforcement is enabled, which is the default.
+- `ip6tables` for IPv6 enforcement (enabled by default), full flush, and host uninstall.
+  Full cleanup checks both families because rules from a previous configuration may remain.
 - `bgpq4` for ASN resolution and for the complete `doctor` check.
 - systemd only when using the generated periodic sync service and timer.
 

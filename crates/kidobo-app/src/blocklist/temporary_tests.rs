@@ -227,16 +227,16 @@ impl AsnCacheRemover for Harness {
 impl BlocklistRepository for Harness {
     fn load(&self, _: &Path) -> Result<BlocklistDocument, AppError> {
         self.record(Event::BlocklistRead);
-        Ok(BlocklistDocument::parse(&self.blocklist.borrow()).expect("fixture blocklist"))
+        Ok(BlocklistDocument::parse(self.blocklist.borrow().clone()).expect("fixture blocklist"))
     }
 
-    fn append_entries(&self, _: &Path, _: &[String], _: bool, _: bool) -> Result<(), AppError> {
-        panic!("ASN operations must not append local IP entries");
-    }
-
-    fn write_lines(&self, _: &Path, lines: &[String]) -> Result<(), AppError> {
+    fn write(&self, _: &Path, contents: &str) -> Result<(), AppError> {
         self.record(Event::BlocklistWrite);
-        *self.blocklist.borrow_mut() = lines.join("\n");
+        *self.blocklist.borrow_mut() = contents.to_owned();
+        Ok(())
+    }
+
+    fn confirm_durable(&self, _: &Path) -> Result<(), AppError> {
         Ok(())
     }
 

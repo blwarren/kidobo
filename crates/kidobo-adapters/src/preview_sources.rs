@@ -13,10 +13,10 @@ use kidobo_app::source::{
     FailurePolicy, Notice, SourceObservation, SourceProvenance, SourceRole, SyncSourceBatch,
     SyncSourceDescriptor,
 };
-use kidobo_core::blocklist::BlocklistDocument;
+use kidobo_core::url_redaction::redact_http_url;
 
 use crate::asn::{AsnPrefixResolver, Bgpq4AsnPrefixResolver, read_asn_for_preview};
-use crate::blocklist_file::{BLOCKLIST_READ_LIMIT, load_blocklist_document};
+use crate::blocklist_file::load_blocklist_networks;
 use crate::github_meta::read_github_meta_for_preview;
 use crate::http_cache::{ReadOnlyIplist, ReadOnlyIplistError, read_iplist_for_preview};
 use crate::http_client::{
@@ -131,28 +131,8 @@ fn disabled(id: &str) -> PreviewSourceLoad {
 }
 
 fn local(context: &PreviewSourceContext<'_>) -> Result<PreviewSourceLoad, AppError> {
-    let path = &context.sync.paths.blocklist_file;
-    let document = load_blocklist_document(path)?;
-    let normalized = document.canonicalized_contents();
-    if normalized.len() > BLOCKLIST_READ_LIMIT {
-        return Err(AppError::PreviewSourceBudget {
-            provider: "local-blocklist",
-            reason: "normalized local blocklist exceeds the existing 16 MiB source bound"
-                .to_string(),
-        });
-    }
-    let document =
-        BlocklistDocument::parse(&normalized).map_err(|source| AppError::BlocklistParseLine {
-            path: path.clone(),
-            line: source.line_number,
-            content: source.content,
-        })?;
     Ok(PreviewSourceLoad::ready(SyncSourceBatch {
-        networks: document
-            .lines
-            .into_iter()
-            .filter_map(|line| line.canonical)
-            .collect(),
+        networks: load_blocklist_networks(&context.sync.paths.blocklist_file)?,
         notices: Vec::new(),
     }))
 }
@@ -217,14 +197,18 @@ fn remote(
                         provenance: SourceProvenance::Unavailable,
                     });
                     notices.push(Notice::warning(format!(
-                        "Preview remote cache unavailable for {url}: {source}"
+                        "Preview remote cache unavailable for {}: {source}",
+                        redact_http_url(url)
                     )));
                     continue;
                 }
                 Err(ReadOnlyIplistError::NormalizedLimit { bytes, limit }) => {
                     return Err(AppError::PreviewSourceBudget {
                         provider: "remote-feeds",
-                        reason: format!("normalized source {url} has {bytes} bytes; limit={limit}"),
+                        reason: format!(
+                            "normalized source {} has {bytes} bytes; limit={limit}",
+                            redact_http_url(url)
+                        ),
                     });
                 }
             };
@@ -544,7 +528,7 @@ mod tests {
     }
 
     #[test]
-    fn local_preview_collapses_in_memory_without_normalization_sidecars_or_rewrites() {
+    fn local_preview_returns_saved_entries_without_sidecars_or_rewrites() {
         let root = tempfile::tempdir().expect("root");
         let paths = paths(root.path());
         fs::create_dir_all(&paths.data_dir).expect("data");
@@ -564,12 +548,12 @@ mod tests {
                 .iter()
                 .map(ToString::to_string)
                 .collect::<Vec<_>>(),
-            ["192.0.2.0/24"]
+            ["192.0.2.128/25", "192.0.2.0/25", "192.0.2.1/32"]
         );
         assert_eq!(
             crate::limited_io::read_to_string_with_limit(
                 &paths.blocklist_file,
-                BLOCKLIST_READ_LIMIT
+                crate::blocklist_file::BLOCKLIST_READ_LIMIT
             )
             .expect("preserved source"),
             original

@@ -214,6 +214,12 @@ exit "${KIDOBO_TEST_FLUSH_STATUS:-0}"
 "#,
         );
         let fake_bin = temp.path().join("fake-bin");
+        for binary in ["ipset", "iptables", "ip6tables"] {
+            write_executable(
+                &fake_bin.join(binary),
+                "#!/bin/bash\n[[ ( \"$*\" == -V || \"$*\" == version ) && \"${KIDOBO_TEST_MISSING_TOOL:-}\" != \"${0##*/}\" ]]\n",
+            );
+        }
         write_executable(
             &fake_bin.join("systemctl"),
             r#"#!/bin/bash
@@ -264,6 +270,11 @@ resolve_uninstall_paths() {
     DATA_DIR="$KIDOBO_TEST_ROOT/data"
     CACHE_DIR="$KIDOBO_TEST_ROOT/cache"
     SYSTEMD_DIR="$KIDOBO_TEST_ROOT/systemd/system"
+    RUNTIME_DIR="$KIDOBO_TEST_ROOT/run"
+    PID1_COMM="$KIDOBO_TEST_ROOT/init-name"
+    mkdir -p "$RUNTIME_DIR"
+    printf '%s\n' "${KIDOBO_TEST_BOOT:-systemd}" > "$PID1_COMM"
+    OFFLINE_UNIT_DIRS=("$SYSTEMD_DIR")
     SYSTEMD_SERVICE_PATH="$SYSTEMD_DIR/kidobo-sync.service"
     SYSTEMD_TIMER_PATH="$SYSTEMD_DIR/kidobo-sync.timer"
 }
@@ -656,6 +667,55 @@ fn uninstall_accepts_absent_timer_and_service_without_changing_scheduling() {
             "remove"
         ]
     );
+}
+
+#[test]
+fn default_uninstall_preserves_scheduling_and_files_when_cleanup_tools_are_missing() {
+    for missing in ["ipset", "iptables", "ip6tables"] {
+        let fixture = DefaultUninstallFixture::new();
+        let output = fixture
+            .command()
+            .env("KIDOBO_TEST_MISSING_TOOL", missing)
+            .output()
+            .expect("uninstall");
+        assert_eq!(output.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&output.stderr).contains(&format!("requires {missing}")));
+        assert!(
+            !fixture.log.exists(),
+            "destructive steps or systemd were called"
+        );
+        fixture.assert_preserved();
+    }
+}
+
+#[test]
+fn non_systemd_uninstall_requires_absent_timer_enablement_and_never_contacts_a_manager() {
+    let fixture = DefaultUninstallFixture::new();
+    let wants = fixture.root.join("systemd/system/timers.target.wants");
+    let dependency_dir = fixture.temp.path().join("dependencies");
+    fs::create_dir(&dependency_dir).expect("timer wants");
+    std::os::unix::fs::symlink(dependency_dir, &wants).expect("linked dependency directory");
+    let link = wants.join("kidobo-sync.timer");
+    std::os::unix::fs::symlink("../kidobo-sync.timer", &link).expect("timer enablement");
+    let run = || {
+        fixture
+            .command()
+            .env("KIDOBO_TEST_BOOT", "other")
+            .output()
+            .expect("uninstall")
+    };
+    let rejected = run();
+    assert_eq!(rejected.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("enablement link"));
+    assert!(!fixture.log.exists());
+    fixture.assert_preserved();
+    fs::remove_file(link).expect("remove fixture enablement");
+    let permitted = run();
+    assert!(permitted.status.success(), "{permitted:?}");
+    let events = fixture.events();
+    assert_eq!(events.first().map(String::as_str), Some("flush"));
+    assert!(events.iter().skip(1).all(|event| event == "remove"));
+    assert!(!fixture.root.join("config").exists());
 }
 
 #[test]
@@ -1078,6 +1138,85 @@ fn custom_root_init_uses_direct_path_without_sudo() {
 }
 
 #[test]
+fn custom_root_init_provisions_the_running_binary_and_preserves_existing_units() {
+    let temp = TempDir::new().expect("tempdir");
+    let binary = temp.path().join("installed tools/kidobo");
+    fs::create_dir(binary.parent().expect("install directory")).expect("mkdir");
+    fs::hard_link(env!("CARGO_BIN_EXE_kidobo"), &binary)
+        .or_else(|_| fs::copy(env!("CARGO_BIN_EXE_kidobo"), &binary).map(|_| ()))
+        .expect("fixture binary");
+    let root = temp.path().join("isolated");
+    let initialize = || {
+        Command::new(&binary)
+            .arg("init")
+            .env("KIDOBO_ROOT", &root)
+            .env("PATH", temp.path())
+            .output()
+            .expect("local init")
+    };
+    let initialized = initialize();
+    assert!(initialized.status.success(), "{initialized:?}");
+    let service = root.join("systemd/system/kidobo-sync.service");
+    let contents = read_to_string_with_limit(&service, FIXTURE_FILE_READ_LIMIT);
+    assert!(
+        contents
+            .lines()
+            .any(|line| line == format!("ExecStart=\"{}\" sync", binary.display()))
+    );
+    fs::write(&service, "# customized unit").expect("customize");
+    assert!(initialize().status.success());
+    assert_eq!(
+        read_to_string_with_limit(&service, FIXTURE_FILE_READ_LIMIT),
+        "# customized unit"
+    );
+}
+
+#[test]
+fn host_init_rejects_a_custom_destination_before_replacing_an_install() {
+    let temp = TempDir::new().expect("tempdir");
+    let directory = temp.path().join("custom");
+    let old = install_old_binary(&directory);
+    let release = prepare_release_fixture(&temp, "#!/bin/sh\necho 'kidobo 9.8.7'\n");
+    let output = installer_command(&temp, &release, &directory)
+        .arg("--init")
+        .env_remove("KIDOBO_ROOT")
+        .output()
+        .expect("installer fixture");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("omit --init"));
+    assert_old_binary_and_no_staging_files(&directory, &old);
+}
+
+#[test]
+fn host_init_destination_requires_the_executable_selected_by_host_init() {
+    let temp = TempDir::new().expect("tempdir");
+    let preferred = temp.path().join("local/bin/kidobo");
+    let fallback = temp.path().join("usr/bin/kidobo");
+    let check = |target: &Path| {
+        Command::new("bash")
+            .arg("-c")
+            .arg(r#"source "$INSTALLER"; check_host_init_destination "$1" "$2" "$3""#)
+            .arg("fixture")
+            .arg(target)
+            .arg(&preferred)
+            .arg(&fallback)
+            .env("INSTALLER", installer_path())
+            .output()
+            .expect("check target")
+    };
+    assert!(
+        check(&preferred).status.success(),
+        "fresh preferred location"
+    );
+    assert!(check(&fallback).status.success(), "fresh fallback location");
+    write_executable(&preferred, "#!/bin/sh\nexit 0\n");
+    assert!(check(&preferred).status.success());
+    let shadowed = check(&fallback);
+    assert_eq!(shadowed.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&shadowed.stderr).contains("would schedule"));
+}
+
+#[test]
 fn custom_root_init_preserves_exact_value_through_sudo_env() {
     let temp = TempDir::new().expect("tempdir");
     let install_dir = temp.path().join("bin");
@@ -1138,6 +1277,17 @@ fn custom_root_init_rejects_explicit_empty_value_before_execution() {
 
     assert_eq!(status.code(), Some(1));
     assert!(!marker.exists());
+
+    let old_binary = install_old_binary(&install_dir);
+    let release = prepare_release_fixture(&temp, "#!/bin/sh\necho 'kidobo 9.8.7'\n");
+    let result = installer_command(&temp, &release, &install_dir)
+        .arg("--init")
+        .env("KIDOBO_ROOT", "")
+        .output()
+        .expect("installer fixture");
+    assert_eq!(result.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&result.stderr).contains("KIDOBO_ROOT must not be empty"));
+    assert_old_binary_and_no_staging_files(&install_dir, &old_binary);
 }
 
 #[test]

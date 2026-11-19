@@ -19,8 +19,16 @@
 - Skip nonmatching ranges during offline lookup and process cached remote feeds one at a time.
 - Install the binary at the intended path, wait for the complete init log before attempting recovery,
   and choose an executable binary when provisioning scheduled sync.
+- Preserve individual saved bans, comments, and formatting during sync. Read comment-heavy
+  local blocklists without allocating a separate record for each blank or comment line.
+- Confirm permanent ban and unban durability on retry before applying enforcement. Preserve
+  file contents and permissions on unchanged source and exemption edits.
+- Reject nonempty all-invalid feed caches during fallback selection.
+- Check the IPv4 and IPv6 firewall tools before full cleanup, support unscheduled non-systemd
+  uninstall, and verify the executable selected for installer initialization.
 
 ### Security
 
 - Redact URL credentials and query/fragment values from doctor JSON configuration-error diagnostics
   and accepted alternative HTTP(S) URL spellings in CLI output and logs.
+- Redact complete feed URLs in fetch diagnostics and offline lookup source labels, including TSV exports.

@@ -1,5 +1,6 @@
 //! Conditional HTTP fetch policy.
 
+use kidobo_core::url_redaction::redact_http_url;
 use log::warn;
 use reqwest::StatusCode;
 
@@ -51,7 +52,10 @@ pub(crate) fn fetch_with_conditional_cache(
     let mut response = match client.fetch(request) {
         Ok(response) => response,
         Err(err) => {
-            warn!("{log_subject} fetch failed for {url}: {err}");
+            warn!(
+                "{log_subject} fetch failed for {}: {err}",
+                redact_http_url(url)
+            );
             return ConditionalFetchResult::FallbackCache;
         }
     };
@@ -69,7 +73,10 @@ pub(crate) fn fetch_with_conditional_cache(
         }) {
             Ok(response) => response,
             Err(err) => {
-                warn!("{log_subject} refetch failed for {url} after 304: {err}");
+                warn!(
+                    "{log_subject} refetch failed for {} after 304: {err}",
+                    redact_http_url(url)
+                );
                 return ConditionalFetchResult::FallbackCache;
             }
         };
@@ -79,7 +86,8 @@ pub(crate) fn fetch_with_conditional_cache(
         ConditionalFetchResult::Network(response)
     } else {
         warn!(
-            "{log_subject} fetch failed for {url}: unexpected status {}",
+            "{log_subject} fetch failed for {}: unexpected status {}",
+            redact_http_url(url),
             response.status
         );
         ConditionalFetchResult::FallbackCache

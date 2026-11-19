@@ -48,3 +48,4 @@ pub mod sync;
 pub mod temporary_bans;
 
 pub use error::AppError;
+pub use kidobo_core::url_redaction;

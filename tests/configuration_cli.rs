@@ -276,6 +276,45 @@ fn covered_distinct_allow_can_be_saved_without_a_confirmation_prompt() {
 }
 
 #[test]
+fn semantic_no_ops_preserve_the_config_file_without_a_final_newline() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let original = INLINE_CONFIG.trim_end_matches('\n');
+    let fixture = Fixture::new(original, "");
+    let path = fixture.root().join("config/config.toml");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).expect("set fixture mode");
+    let before = fs::metadata(&path).expect("original file");
+    for args in [
+        ["allow", "add", "192.0.2.7/24"],
+        ["sources", "remove", "https://absent.example/list"],
+    ] {
+        let output = fixture
+            .spawn(&args, 80, OutputDestination::Pipe, &[])
+            .wait();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stdout.trim(), "No configuration change was needed.");
+        assert_eq!(saved_config(&fixture), original);
+        let after = fs::metadata(&path).expect("preserved file");
+        assert_eq!(after.ino(), before.ino());
+        assert_eq!(after.mode(), before.mode());
+        assert_eq!(after.modified().unwrap(), before.modified().unwrap());
+    }
+
+    let output = fixture
+        .spawn(
+            &["sources", "remove", "https://feed.example/list"],
+            80,
+            OutputDestination::Pipe,
+            &[],
+        )
+        .wait();
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stdout.contains("sudo kidobo sync"));
+    assert!(!saved_config(&fixture).contains("https://feed.example/list"));
+    assert_eq!(fs::metadata(path).unwrap().mode() & 0o777, 0o600);
+}
+
+#[test]
 fn expanding_allow_needs_yes_when_piped_and_tty_decline_does_not_save() {
     let fixture = Fixture::new(INLINE_CONFIG, "");
     let before = saved_config(&fixture);

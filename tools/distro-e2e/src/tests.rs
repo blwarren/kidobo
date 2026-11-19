@@ -851,8 +851,7 @@ port=${port%%/*}
             ),
         );
         let mut runner = runner(temp.path());
-        // The reader must see EOF before the fake servers are stopped. A host
-        // runner using regular capture files alone cannot detect guest FD leaks.
+        // The guest-side reader must see EOF before the fake servers are stopped.
         let outcome = runner.command(
             "bash",
             &strings(&[
@@ -1436,12 +1435,12 @@ fn runner_reports_stdout_larger_than_capture_limit() {
     let program = temp.path().join("large-output");
     executable(
         &program,
-        "#!/bin/sh\ndd if=/dev/zero bs=16777217 count=1 status=none\n",
+        "#!/bin/sh\nhead -c 16777217 /dev/zero | tr '\\000' x\n",
     );
     let mut runner = runner(temp.path());
 
     let error = runner
-        .command(program.to_str().expect("program path is UTF-8"), &[], 5)
+        .command(program.to_str().expect("program path is UTF-8"), &[], 30)
         .expect_err("oversized output must not be silently truncated");
 
     assert!(
@@ -1858,13 +1857,9 @@ esac
         let active_run = coordination::lock_evidence(&root).expect("active writer");
         assert!(cleanup().is_err());
         drop(active_run);
-        let active_project = coordination::lock_for_cleanup(
-            temp.path(),
-            "test-project",
-            &program,
-            &AtomicBool::new(false),
-        )
-        .expect("active project");
+        let active_project =
+            coordination::lock_for_cleanup("test-project", &program, &AtomicBool::new(false))
+                .expect("active project");
         assert!(cleanup().is_err());
         assert_eq!(
             read_text(&root.join("results.json")).expect("preserved result"),

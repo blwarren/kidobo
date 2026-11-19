@@ -16,9 +16,7 @@ use kidobo_app::source::{
 };
 
 use crate::asn::{AsnPrefixResolver, Bgpq4AsnPrefixResolver, load_asn_prefixes_with_cache};
-use crate::blocklist_file::{
-    BlocklistNormalizeResult, load_blocklist_document, normalize_local_blocklist_with_fast_state,
-};
+use crate::blocklist_file::load_blocklist_networks;
 use crate::cache_generation::StagedGeneration;
 use crate::github_meta::{GithubMetaSource, prepare_github_meta_safelist};
 use crate::http_cache::{CacheSource, prepare_iplist_with_cache};
@@ -53,7 +51,6 @@ struct RemoteFeedError {
 
 /// Maximum number of concurrent remote-feed workers.
 pub const MAX_REMOTE_FETCH_WORKERS: usize = 5;
-const BLOCKLIST_FAST_STATE_FILE: &str = "blocklist-normalize.fast-state";
 
 struct StagedCachePromotion(StagedGeneration);
 
@@ -64,7 +61,7 @@ impl PendingCachePromotion for StagedCachePromotion {
     }
 }
 
-/// Required synchronization provider for the normalized local blocklist.
+/// Required synchronization provider for the operator-managed local blocklist.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct LocalBlocklistSyncProvider;
 
@@ -79,27 +76,10 @@ impl SyncSourceProvider for LocalBlocklistSyncProvider {
 
     fn load(&self, context: &SyncSourceContext<'_>) -> Result<SyncSourceLoad, AppError> {
         context.cancellation.check()?;
-        let fast_state_path = context.paths.cache_dir.join(BLOCKLIST_FAST_STATE_FILE);
-        let normalization = normalize_local_blocklist_with_fast_state(
-            &context.paths.blocklist_file,
-            &fast_state_path,
-        )?;
-        let notices = (normalization == BlocklistNormalizeResult::SkippedUnchanged)
-            .then(|| {
-                Notice::info(format!(
-                    "sync blocklist normalization skipped: unchanged path={}",
-                    context.paths.blocklist_file.display()
-                ))
-            })
-            .into_iter()
-            .collect();
-        let document = load_blocklist_document(&context.paths.blocklist_file)?;
-        let networks = document
-            .lines
-            .iter()
-            .filter_map(|line| line.canonical)
-            .collect();
-        Ok(SyncSourceLoad::ready(SyncSourceBatch { networks, notices }))
+        Ok(SyncSourceLoad::ready(SyncSourceBatch {
+            networks: load_blocklist_networks(&context.paths.blocklist_file)?,
+            notices: Vec::new(),
+        }))
     }
 }
 
@@ -428,7 +408,7 @@ where
                                 .map_err(|error| AppError::CacheStaging {
                                     provider: "remote-feeds",
                                     source: Box::new(RemoteFeedError {
-                                        url: url.to_string(),
+                                        url: kidobo_core::url_redaction::redact_http_url(url),
                                         source: error,
                                     }),
                                 });

@@ -25,7 +25,7 @@ kidobo-adapters
 CIDR regeneration, indexed unban classification, ASN token parsing, lookup, and configuration
 parsing/validation from in-memory text. It performs no filesystem, network, process, clock, or
 terminal I/O. It uses `url::Url` only for deterministic
-configuration validation; HTTP clients and transport remain in `kidobo-adapters`.
+configuration validation and safe URL presentation; HTTP clients and transport remain in `kidobo-adapters`.
 
 `kidobo-app` owns command sequencing and failure policy. Its public-in-workspace interfaces are typed
 requests, typed outcomes, focused capability ports, and internal source registries. It never depends on
@@ -128,7 +128,8 @@ The application sync use case explicitly preserves this order:
    IP and ASN entries are active only when `expires_at` is later than the
    captured cutoff; their source edits become eligible at this sync boundary.
 5. Admit externally controlled safelists without allowing them to empty a
-   nonempty enabled-family baseline, then compute family-separated effective lists.
+   nonempty enabled-family baseline. Reuse the selected family-separated effective
+   lists for capacity checks and enforcement.
 6. Validate both enabled-family capacities before either swap.
 7. Promote every accepted staged cache manifest; any promotion failure aborts.
 8. Atomically replace IPv6, then IPv4.

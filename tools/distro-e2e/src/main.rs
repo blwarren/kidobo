@@ -279,7 +279,6 @@ impl Runner {
         seconds: u64,
     ) -> Result<process::Outcome> {
         let request = process::Request {
-            directory: &self.dir,
             program,
             args,
             seconds,
@@ -819,8 +818,7 @@ fn clean_after_run(
     cancelled: Arc<AtomicBool>,
 ) -> Result<()> {
     let _evidence_lock = coordination::lock_evidence(&dir)?;
-    let _operation_lock =
-        coordination::lock_for_cleanup(&dir, &config.project, &program, &cancelled)?;
+    let _operation_lock = coordination::lock_for_cleanup(&config.project, &program, &cancelled)?;
     let mut runner = Runner::open(dir, config, program, cancelled)?;
     runner.stage("cleanup requested after run")?;
     runner.ignore_cancellation = true;

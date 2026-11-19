@@ -85,15 +85,10 @@ pub fn execute_ban(
     };
 
     let document = dependencies.repository.load(&paths.blocklist_file)?;
-    let existing = document
-        .lines
-        .iter()
-        .filter_map(|line| line.canonical)
-        .collect::<Vec<_>>();
     if let Some(duration) = request.duration {
         let path = paths.temporary_bans_file();
         let mut temporary = dependencies.temporary_bans.load(&path)?;
-        let permanent = existing.iter().copied().collect::<HashSet<_>>();
+        let permanent = document.networks().collect::<HashSet<_>>();
         let (changes, has_updates) = record_temporary_bans(
             &mut temporary.ips,
             &targets,
@@ -118,7 +113,7 @@ pub fn execute_ban(
             },
         });
     }
-    let classifications = classify_ban_targets(&existing, &targets);
+    let classifications = classify_ban_targets(document.networks(), &targets);
     let appended = classifications
         .iter()
         .filter_map(|classification| match classification {
@@ -126,14 +121,15 @@ pub fn execute_ban(
             BanClassification::AlreadyPresent(_) => None,
         })
         .collect::<Vec<_>>();
-    if !appended.is_empty() {
-        dependencies.cancellation.check()?;
-        dependencies.repository.append_entries(
-            &paths.blocklist_file,
-            &appended,
-            document.has_content,
-            document.trailing_newline,
-        )?;
+    dependencies.cancellation.check()?;
+    if appended.is_empty() {
+        dependencies
+            .repository
+            .confirm_durable(&paths.blocklist_file)?;
+    } else {
+        dependencies
+            .repository
+            .write(&paths.blocklist_file, &document.with_appended(&appended))?;
     }
     let changes = classifications
         .into_iter()

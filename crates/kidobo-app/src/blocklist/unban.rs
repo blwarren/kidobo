@@ -215,26 +215,24 @@ pub fn apply_unban(
             .temporary_bans
             .save(&temporary_path, &temporary)?;
     }
-    if !removal_indexes.is_empty() {
-        let kept_lines = document
-            .lines
-            .into_iter()
-            .enumerate()
-            .filter(|(index, _)| !removal_indexes.contains(index))
-            .map(|(_, line)| line.original)
-            .collect::<Vec<_>>();
+    let permanent_result = if removal_indexes.is_empty() {
         dependencies
             .repository
-            .write_lines(&paths.blocklist_file, &kept_lines)
-            .map_err(|source| {
-                partial_update_error(
-                    source,
-                    temporary_removed > 0,
-                    &temporary_path,
-                    &paths.blocklist_file,
-                )
-            })?;
-    }
+            .confirm_durable(&paths.blocklist_file)
+    } else {
+        dependencies.repository.write(
+            &paths.blocklist_file,
+            &document.without_entries(&removal_indexes),
+        )
+    };
+    permanent_result.map_err(|source| {
+        partial_update_error(
+            source,
+            temporary_removed > 0,
+            &temporary_path,
+            &paths.blocklist_file,
+        )
+    })?;
     Ok(UnbanOutcome {
         target_label: preview.target_label.clone(),
         requested_target_count: preview.requested_target_count,
@@ -265,7 +263,7 @@ fn build_unban_plan(
     cancellation: &dyn crate::ports::Cancellation,
 ) -> Result<UnbanStatePlan, AppError> {
     cancellation.check()?;
-    let index_plan = targets.plan(document.lines.iter().map(|line| line.canonical));
+    let index_plan = targets.plan(document.networks().map(Some));
     cancellation.check()?;
     let mut exact_entries = entries_for_indexes(document, &index_plan.exact_indexes);
     let mut partial_entries = entries_for_indexes(document, &index_plan.partial_indexes);
@@ -318,7 +316,7 @@ fn unban_target_label(input: &BlocklistInput, targets: &UnbanTargetIndex) -> Str
 fn entries_for_indexes(document: &BlocklistDocument, indexes: &[usize]) -> Vec<String> {
     indexes
         .iter()
-        .filter_map(|index| document.lines.get(*index))
-        .filter_map(|line| line.canonical.map(|cidr| cidr.to_string()))
+        .filter_map(|index| document.network(*index))
+        .map(|cidr| cidr.to_string())
         .collect()
 }

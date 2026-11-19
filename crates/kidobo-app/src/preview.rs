@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use kidobo_core::network::CanonicalCidr;
-use kidobo_core::sync::compute_effective_blocklists;
+use kidobo_core::sync::EffectiveBlocklists;
 pub use kidobo_core::temporary_bans::TemporaryBans;
 
 use crate::AppError;
@@ -15,8 +15,8 @@ use crate::source::{
     SyncSourceBatch, SyncSourceContext, SyncSourceDescriptor, classify_source_failure,
 };
 use crate::sync::{
-    EnforcementPlan, ExternalSafelistSelection, PreparedSyncEntries, SourceSummary,
-    prepare_sync_entries, select_external_safelist,
+    EnforcementPlan, ExternalSafelistSelection, PreparedSyncEntries, SafelistAdmission,
+    SourceSummary, prepare_sync_entries,
 };
 use crate::temporary_bans::{Clock, kernel_timeout_notice};
 
@@ -232,16 +232,15 @@ pub fn execute(
     candidates.dedup();
     safelist.sort_unstable();
     safelist.dedup();
-    admit_external_safelists(
+    let effective = admit_external_safelists(
         &candidates,
-        &mut safelist,
+        safelist,
         external_safelists,
         config.ipset.enable_ipv6,
         &mut summaries,
         &mut notices,
         dependencies.cancellation,
     )?;
-    let effective = compute_effective_blocklists(&candidates, &safelist, config.ipset.enable_ipv6);
     let plan = EnforcementPlan::from_config(&config);
     let entries = prepare_sync_entries(&effective, &plan)?;
     dependencies.cancellation.check()?;
@@ -330,32 +329,23 @@ fn load_sources(
 
 fn admit_external_safelists(
     candidates: &[CanonicalCidr],
-    safelist: &mut Vec<CanonicalCidr>,
+    safelist: Vec<CanonicalCidr>,
     external_safelists: Vec<ExternalSafelist>,
     enable_ipv6: bool,
     summaries: &mut [SourceSummary],
     notices: &mut Vec<Notice>,
     cancellation: &dyn Cancellation,
-) -> Result<(), AppError> {
-    let baseline = compute_effective_blocklists(candidates, safelist, enable_ipv6);
+) -> Result<EffectiveBlocklists, AppError> {
+    let mut admission = SafelistAdmission::new(candidates, safelist, enable_ipv6);
     for external in external_safelists {
         cancellation.check()?;
-        let selection = select_external_safelist(
-            candidates,
-            safelist,
-            &external.primary.networks,
-            &external.fallback,
-            enable_ipv6,
-            &baseline,
-        );
+        let selection = admission.select(&external.primary.networks, &external.fallback);
         if matches!(selection, ExternalSafelistSelection::Primary) {
-            safelist.extend(external.primary.networks);
             continue;
         }
         notices.push(Notice::warning(format!("externally controlled safelist `{}` was rejected because it would empty an enabled address family", external.provider)));
         if let ExternalSafelistSelection::Fallback(fallback) = selection {
             notices.extend(fallback.notices.iter().cloned());
-            safelist.extend(fallback.networks.iter().copied());
             if let Some(summary) = summaries.get_mut(external.summary_index) {
                 summary.entries = fallback.networks.len();
                 for observation in &mut summary.observations {
@@ -373,9 +363,7 @@ fn admit_external_safelists(
             }
         }
     }
-    safelist.sort_unstable();
-    safelist.dedup();
-    Ok(())
+    Ok(admission.effective)
 }
 
 #[cfg(test)]

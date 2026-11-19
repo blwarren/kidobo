@@ -23,7 +23,8 @@ impl RemoteFeedLimits {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RemoteParseBudget {
+pub(crate) enum RemoteParseError {
+    NoValidNetworks,
     DataLines { observed: usize, limit: usize },
     UniqueCidrs { observed: usize, limit: usize },
 }
@@ -31,14 +32,13 @@ pub(crate) enum RemoteParseBudget {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ParsedRemoteCidrs {
     pub(crate) networks: Vec<CanonicalCidr>,
-    pub(crate) data_lines: usize,
     pub(crate) invalid_lines: usize,
 }
 
 pub(crate) fn parse_remote_cidrs_bounded(
     raw: &[u8],
     limits: RemoteFeedLimits,
-) -> Result<ParsedRemoteCidrs, RemoteParseBudget> {
+) -> Result<ParsedRemoteCidrs, RemoteParseError> {
     let text = String::from_utf8_lossy(raw);
     let mut parsed = BTreeSet::new();
     let mut data_lines = 0_usize;
@@ -51,7 +51,7 @@ pub(crate) fn parse_remote_cidrs_bounded(
         }
         data_lines += 1;
         if data_lines > limits.data_lines {
-            return Err(RemoteParseBudget::DataLines {
+            return Err(RemoteParseError::DataLines {
                 observed: data_lines,
                 limit: limits.data_lines,
             });
@@ -67,7 +67,7 @@ pub(crate) fn parse_remote_cidrs_bounded(
         if let Some(cidr) = parse_ip_cidr_non_strict(token) {
             parsed.insert(cidr);
             if parsed.len() > limits.unique_cidrs {
-                return Err(RemoteParseBudget::UniqueCidrs {
+                return Err(RemoteParseError::UniqueCidrs {
                     observed: parsed.len(),
                     limit: limits.unique_cidrs,
                 });
@@ -76,9 +76,11 @@ pub(crate) fn parse_remote_cidrs_bounded(
             invalid_lines += 1;
         }
     }
+    if data_lines > 0 && parsed.is_empty() {
+        return Err(RemoteParseError::NoValidNetworks);
+    }
     Ok(ParsedRemoteCidrs {
         networks: parsed.into_iter().collect(),
-        data_lines,
         invalid_lines,
     })
 }
@@ -86,7 +88,7 @@ pub(crate) fn parse_remote_cidrs_bounded(
 pub(crate) fn parse_cached_iplist_bounded(
     iplist: &str,
     limits: RemoteFeedLimits,
-) -> Result<Vec<CanonicalCidr>, RemoteParseBudget> {
+) -> Result<Vec<CanonicalCidr>, RemoteParseError> {
     parse_remote_cidrs_bounded(iplist.as_bytes(), limits).map(|parsed| parsed.networks)
 }
 

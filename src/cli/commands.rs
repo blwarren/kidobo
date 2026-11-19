@@ -235,7 +235,9 @@ impl LookupRenderer<'_> {
                         self.output,
                         "{}\t{}\t{}",
                         target,
-                        encode_lookup_field(&source.source_label),
+                        encode_lookup_field(&crate::cli::presentation::redact_urls(
+                            &source.source_label
+                        )),
                         encode_lookup_field(&source.source_line)
                     )?;
                 }

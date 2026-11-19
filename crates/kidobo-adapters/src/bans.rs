@@ -5,7 +5,7 @@ use kidobo_app::bans::{SavedBanReader, SavedBanSources};
 use kidobo_app::paths::ResolvedPaths;
 use kidobo_app::temporary_bans::TemporaryBanRepository;
 
-use crate::blocklist_file::load_blocklist_document;
+use crate::blocklist_file::load_blocklist_networks;
 use crate::temporary_bans::FileTemporaryBanRepository;
 
 /// Reads only operator-managed local and temporary files, without normalization or cache access.
@@ -14,16 +14,9 @@ pub struct FileSavedBanReader;
 
 impl SavedBanReader for FileSavedBanReader {
     fn read(&self, paths: &ResolvedPaths) -> Result<SavedBanSources, AppError> {
-        let document = load_blocklist_document(&paths.blocklist_file)?;
+        let local = load_blocklist_networks(&paths.blocklist_file)?;
         let temporary = FileTemporaryBanRepository.load(&paths.temporary_bans_file())?;
-        Ok(SavedBanSources {
-            local: document
-                .lines
-                .into_iter()
-                .filter_map(|line| line.canonical)
-                .collect(),
-            temporary,
-        })
+        Ok(SavedBanSources { local, temporary })
     }
 }
 

@@ -13,13 +13,11 @@ pub(super) fn lock(runner: &mut Runner) -> Result<File> {
 }
 
 pub(super) fn lock_for_cleanup(
-    directory: &Path,
     project: &str,
     program: &Path,
     cancelled: &std::sync::atomic::AtomicBool,
 ) -> Result<File> {
     let request = super::process::Request {
-        directory,
         program: program.to_str().ok_or("invalid Incus program path")?,
         args: &strings(&["query", "/1.0"]),
         seconds: 30,

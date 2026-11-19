@@ -3,7 +3,7 @@
 pub use kidobo_core::AddressFamily;
 use kidobo_core::config::{Config, FirewallAction};
 use kidobo_core::network::{CanonicalCidr, Ipv4Cidr, Ipv6Cidr};
-use kidobo_core::sync::compute_effective_blocklists;
+use kidobo_core::sync::{EffectiveBlocklists, compute_effective_blocklists};
 
 use crate::AppError;
 use crate::paths::{ConfigRequirement, PathResolutionInput};
@@ -389,17 +389,15 @@ pub fn execute(
     candidates.dedup();
     safelist.sort_unstable();
     safelist.dedup();
-    admit_external_safelists(
+    let effective = admit_external_safelists(
         &candidates,
-        &mut safelist,
+        safelist,
         external_safelists,
         enforcement_plan.enable_ipv6,
         &mut pending_promotions,
         &mut summaries,
         dependencies.observer,
     )?;
-    let effective =
-        compute_effective_blocklists(&candidates, &safelist, enforcement_plan.enable_ipv6);
     complete_stage(dependencies.observer, SyncStage::ComputeBlocklists);
 
     let entries = prepare_sync_entries(&effective, &enforcement_plan)?;
@@ -663,26 +661,18 @@ fn promote_pending_caches(
 
 fn admit_external_safelists(
     candidates: &[CanonicalCidr],
-    safelist: &mut Vec<CanonicalCidr>,
+    safelist: Vec<CanonicalCidr>,
     external_safelists: Vec<LoadedExternalSafelist>,
     enable_ipv6: bool,
     pending_promotions: &mut Vec<PendingPromotion>,
     summaries: &mut [SourceSummary],
     observer: &dyn SyncObserver,
-) -> Result<(), AppError> {
-    let baseline = compute_effective_blocklists(candidates, safelist, enable_ipv6);
+) -> Result<EffectiveBlocklists, AppError> {
+    let mut admission = SafelistAdmission::new(candidates, safelist, enable_ipv6);
 
     for external in external_safelists {
-        let selection = select_external_safelist(
-            candidates,
-            safelist,
-            &external.primary.networks,
-            &external.fallback,
-            enable_ipv6,
-            &baseline,
-        );
+        let selection = admission.select(&external.primary.networks, &external.fallback);
         if matches!(selection, ExternalSafelistSelection::Primary) {
-            safelist.extend(external.primary.networks.iter().copied());
             pending_promotions.extend(external.pending_promotions.into_iter().map(|promotion| {
                 PendingPromotion {
                     provider: external.provider,
@@ -700,7 +690,6 @@ fn admit_external_safelists(
             for notice in &fallback.notices {
                 observer.notice(notice);
             }
-            safelist.extend(fallback.networks.iter().copied());
             if let Some(summary) = summaries.get_mut(external.summary_index) {
                 summary.entries = fallback.networks.len();
                 for observation in &mut summary.observations {
@@ -725,9 +714,7 @@ fn admit_external_safelists(
         }
     }
 
-    safelist.sort_unstable();
-    safelist.dedup();
-    Ok(())
+    Ok(admission.effective)
 }
 
 pub(crate) enum ExternalSafelistSelection<'a> {
@@ -736,53 +723,68 @@ pub(crate) enum ExternalSafelistSelection<'a> {
     Unavailable,
 }
 
-pub(crate) fn select_external_safelist<'a>(
-    candidates: &[CanonicalCidr],
-    operator_and_admitted_safelist: &[CanonicalCidr],
-    primary: &[CanonicalCidr],
-    fallback: &'a [SyncSourceBatch],
+/// Retains the last admitted effective result while testing later exemptions against
+/// the families protected by the original operator-only baseline.
+pub(crate) struct SafelistAdmission<'a> {
+    candidates: &'a [CanonicalCidr],
+    safelist: Vec<CanonicalCidr>,
     enable_ipv6: bool,
-    baseline: &kidobo_core::sync::EffectiveBlocklists,
-) -> ExternalSafelistSelection<'a> {
-    if external_safelist_preserves_baseline(
-        candidates,
-        operator_and_admitted_safelist,
-        primary,
-        enable_ipv6,
-        baseline,
-    ) {
-        ExternalSafelistSelection::Primary
-    } else if let Some(fallback) = fallback.iter().find(|fallback| {
-        external_safelist_preserves_baseline(
-            candidates,
-            operator_and_admitted_safelist,
-            &fallback.networks,
-            enable_ipv6,
-            baseline,
-        )
-    }) {
-        ExternalSafelistSelection::Fallback(fallback)
-    } else {
-        ExternalSafelistSelection::Unavailable
-    }
+    protect_ipv4: bool,
+    protect_ipv6: bool,
+    pub(crate) effective: EffectiveBlocklists,
 }
 
-fn external_safelist_preserves_baseline(
-    candidates: &[CanonicalCidr],
-    operator_safelist: &[CanonicalCidr],
-    external_safelist: &[CanonicalCidr],
-    enable_ipv6: bool,
-    baseline: &kidobo_core::sync::EffectiveBlocklists,
-) -> bool {
-    let mut combined = Vec::with_capacity(operator_safelist.len() + external_safelist.len());
-    combined.extend_from_slice(operator_safelist);
-    combined.extend_from_slice(external_safelist);
-    combined.sort_unstable();
-    combined.dedup();
-    let admitted = compute_effective_blocklists(candidates, &combined, enable_ipv6);
+impl<'a> SafelistAdmission<'a> {
+    pub(crate) fn new(
+        candidates: &'a [CanonicalCidr],
+        safelist: Vec<CanonicalCidr>,
+        enable_ipv6: bool,
+    ) -> Self {
+        let effective = compute_effective_blocklists(candidates, &safelist, enable_ipv6);
+        Self {
+            candidates,
+            safelist,
+            enable_ipv6,
+            protect_ipv4: !effective.ipv4.is_empty(),
+            protect_ipv6: !effective.ipv6.is_empty(),
+            effective,
+        }
+    }
 
-    (baseline.ipv4.is_empty() || !admitted.ipv4.is_empty())
-        && (!enable_ipv6 || baseline.ipv6.is_empty() || !admitted.ipv6.is_empty())
+    pub(crate) fn select<'b>(
+        &mut self,
+        primary: &[CanonicalCidr],
+        fallback: &'b [SyncSourceBatch],
+    ) -> ExternalSafelistSelection<'b> {
+        if self.try_admit(primary) {
+            ExternalSafelistSelection::Primary
+        } else if let Some(batch) = fallback
+            .iter()
+            .find(|batch| self.try_admit(&batch.networks))
+        {
+            ExternalSafelistSelection::Fallback(batch)
+        } else {
+            ExternalSafelistSelection::Unavailable
+        }
+    }
+
+    fn try_admit(&mut self, networks: &[CanonicalCidr]) -> bool {
+        if networks.is_empty() {
+            return true;
+        }
+        let previous_len = self.safelist.len();
+        self.safelist.extend_from_slice(networks);
+        let proposed =
+            compute_effective_blocklists(self.candidates, &self.safelist, self.enable_ipv6);
+        if (self.protect_ipv4 && proposed.ipv4.is_empty())
+            || (self.protect_ipv6 && proposed.ipv6.is_empty())
+        {
+            self.safelist.truncate(previous_len);
+            return false;
+        }
+        self.effective = proposed;
+        true
+    }
 }
 
 fn ensure_within_capacity(spec: &ManagedSetSpec, entries: usize) -> Result<(), AppError> {
@@ -2657,6 +2659,36 @@ mod tests {
             enforcement.replacements.lock().expect("replacements").len(),
             0
         );
+    }
+
+    #[test]
+    fn successive_external_safelists_retain_the_last_admitted_result_for_both_families() {
+        let candidates = [cidr("192.0.2.0/24"), cidr("2001:db8::/64")];
+        let operator = cidr("192.0.2.0/26");
+        let mut admission = super::SafelistAdmission::new(&candidates, vec![operator], true);
+        let first = cidr("192.0.2.64/26");
+        assert!(matches!(
+            admission.select(&[first], &[]),
+            super::ExternalSafelistSelection::Primary
+        ));
+        let fallback = [SyncSourceBatch {
+            networks: vec![cidr("2001:db8::/65")],
+            notices: Vec::new(),
+        }];
+        assert!(matches!(
+            admission.select(&[cidr("192.0.2.128/25")], &fallback),
+            super::ExternalSafelistSelection::Fallback(_)
+        ));
+        assert!(matches!(
+            admission.select(&[cidr("2001:db8:0:0:8000::/65")], &[]),
+            super::ExternalSafelistSelection::Unavailable
+        ));
+        let expected = kidobo_core::sync::compute_effective_blocklists(
+            &candidates,
+            &[operator, first, cidr("2001:db8::/65")],
+            true,
+        );
+        assert_eq!(admission.effective, expected);
     }
 
     #[test]

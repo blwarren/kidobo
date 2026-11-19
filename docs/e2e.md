@@ -304,6 +304,10 @@ Start with `summary.txt`, then follow the target-specific paths and line referen
 | `evidence.tar.gz` | Frozen inputs and available supplemental diagnostics |
 | `ownership.json` | Ownership records for safe cleanup |
 
+Each command can contribute up to 16 MiB of raw output per stream. Exceeding
+either limit fails the command and retains the captured prefix in the transcript.
+Byte counts record the bytes observed before capture stopped.
+
 Command/check identifiers and transcript line numbers are local to each target. Concurrent output
 is not merged into one global command history. Full logs remain directly accessible after archive
 finalization. For detailed live output, tail the selected target's log:
@@ -394,7 +398,7 @@ Do not delete all images, the project, or the storage pool.
 
 The private `kidobo-e2e` crate keeps process mechanics separate from qualification policy:
 
-- `process` owns file-backed command capture, bounded output draining, deadlines, cancellation,
+- `process` owns nonblocking pipe capture, per-stream output limits, deadlines, cancellation,
   and child cleanup. Its fallible event callback carries output, heartbeats, and byte counts to
   the runner; the runner owns command records and guest-check validation.
 - `matrix` owns worker scheduling and target finalization, including diagnostics and cleanup.

@@ -138,7 +138,8 @@ Full `flush` asks for confirmation on an interactive terminal. Declining exits
 successfully without cleanup. `flush --yes` skips that prompt; noninteractive
 full flush remains available and warns about the removal unless `--yes` is
 provided. `flush --cache-only` remains confirmation-free and does not change
-firewall or ipset state.
+firewall or ipset state. Full flush and host uninstall check `ipset`, `iptables`,
+and `ip6tables` before cleanup, including on IPv4-only configurations.
 
 ## Machine-readable lookup output
 
@@ -159,7 +160,9 @@ encoded exactly once so they cannot add terminal commands, fields, or records:
 - other ASCII controls: `\xNN` with two uppercase hexadecimal digits
 - non-ASCII control code points: `\u{…}` with uppercase hexadecimal digits
 
-Printable text, including printable Unicode, is unchanged.
+For URL-derived source labels, Kidobo redacts user information, query values,
+and fragments before field encoding. This also applies to labels from legacy
+cache metadata. Public URLs and other printable text retain their spelling.
 
 ## Published artifact
 

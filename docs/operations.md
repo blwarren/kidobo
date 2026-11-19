@@ -43,7 +43,8 @@ sudo kidobo init
 without replacing existing files. At default paths it immediately reloads
 systemd and enables and starts `kidobo-sync.timer`. Prepare your intended
 configuration before activating scheduling. See [scheduling](#scheduling) for
-how to pause automatic runs while making changes.
+how to pause automatic runs while making changes. With `KIDOBO_ROOT`, new
+unit files refer to the executable running `init` and stay under that root.
 
 ## Apply routine changes
 
@@ -293,7 +294,10 @@ already matches the saved state, so it can repair enforcement. If that sync
 fails, the command exits nonzero with `Source change saved; live firewall
 update failed`; the saved source remains in place. Inspect the failure and run
 `sudo kidobo sync` again. A failed sync can leave one address family updated
-because IPv4 and IPv6 set replacements are separate.
+because IPv4 and IPv6 set replacements are separate. If a permanent source
+edit reports a directory-sync failure, retry the same ban or unban command.
+The changed file can already be visible. The retry confirms durability before
+starting a requested sync.
 
 `unban --yes` only approves removal of partially overlapping entries. It does
 not request sync or accept the later application prompt. Without `--yes`,
@@ -326,7 +330,10 @@ successfully replaces the relevant set; delayed or failed syncs can prolong
 enforcement, and another source can continue to block the same address.
 After a fully successful enforcement run, Kidobo
 best-effort removes expired records. Failed enforcement can leave one address
-family updated because IPv4 and IPv6 set replacements are separate.
+family updated because IPv4 and IPv6 set replacements are separate. If a permanent source
+edit reports a directory-sync failure, retry the same ban or unban command.
+The changed file can already be visible. The retry confirms durability before
+starting a requested sync.
 
 With a nonzero `ipset.timeout`, the kernel timeout remains in force for every
 set entry. Kidobo warns when adding or renewing a temporary ban and during a
@@ -384,7 +391,10 @@ suggestions, including shell names after `kidobo completions`.
 ## Remove managed enforcement
 
 `sudo kidobo flush` removes managed firewall rules, ipsets, and remote cache.
-It preserves configuration and saved bans. It also leaves scheduling active:
+Full cleanup requires working `ipset`, `iptables`, and `ip6tables` commands
+before removing rules or clearing cache, even when IPv6 is disabled in the
+current configuration. Cache-only flush has no firewall-tool prerequisite.
+Full flush preserves configuration and saved bans. It also leaves scheduling active:
 the next timer-driven sync can recreate enforcement. To keep enforcement
 removed, [disable scheduling](#scheduling), wait for active syncs to finish,
 then flush. To restore enforcement, run `sudo kidobo sync` and re-enable the
@@ -403,7 +413,8 @@ asks for confirmation and leaves firewall and ipset state unchanged.
   then run `sync`. Unknown configuration keys and invalid non-header local
   blocklist lines fail rather than being silently ignored.
 - **Remote feed or GitHub metadata warning:** A failed fetch, invalid nonempty
-  response, or rejected redirect does not replace good cache data. Redirects
+  response, or rejected redirect does not replace good cache data. A cached
+  feed containing data lines with zero valid entries is unusable as a fallback. Redirects
   are limited to ten hops and the configured URL's origin. Kidobo
   warns and uses a compatible validated cache when available. A whitespace-
   or comment-only HTTP 200 feed is an intentional empty feed. Other success statuses, including
@@ -450,8 +461,11 @@ before deciding whether to retry.
 
 ## Uninstall safely
 
-Do not start manual Kidobo commands while uninstall is running. At default
-paths, uninstall records whether the timer is active and stops scheduling
+Do not start manual Kidobo commands while uninstall is running. Host uninstall
+checks the full-flush tools before stopping a timer. On a confirmed non-systemd
+boot it can proceed when the Kidobo timer is not enabled. If enablement remains,
+resolve the reported scheduling state and retry. On a systemd host, uninstall
+records whether the timer is active and stops scheduling
 before checking that the service has no active run or pending job. It aborts
 if work is active or that state cannot be established; it never stops an
 active sync. Wait for existing work to finish and retry.

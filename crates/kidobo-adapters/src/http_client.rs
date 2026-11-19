@@ -152,7 +152,7 @@ impl HttpClient for ReqwestHttpClient {
             .get(&request.url)
             .header(USER_AGENT, &self.user_agent)
             .build()
-            .map_err(|error| request_error(error.to_string()))?;
+            .map_err(|error| request_error(error.without_url().to_string()))?;
         let mut url = initial.url().clone();
         let mut referer: Option<HeaderValue> = None;
         for hops in 0..=MAX_HTTP_REDIRECTS {
@@ -187,7 +187,7 @@ impl HttpClient for ReqwestHttpClient {
 
             let mut response = client
                 .execute(outgoing)
-                .map_err(|error| request_error(error.to_string()))?;
+                .map_err(|error| request_error(error.without_url().to_string()))?;
             if let Some(mut next_url) = redirect_target(&response, &url)? {
                 if !has_same_http_origin(initial.url(), &next_url) {
                     return Err(request_error("redirect target has a different origin"));

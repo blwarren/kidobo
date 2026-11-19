@@ -5,9 +5,8 @@ use std::collections::HashSet;
 use thiserror::Error;
 
 use crate::network::{
-    CanonicalCidr, IntervalU32, IntervalU128, collapse_ipv4, collapse_ipv6, ipv4_to_interval,
-    ipv6_to_interval, merge_intervals_u32_owned, merge_intervals_u128_owned, parse_ip_cidr_strict,
-    split_by_family,
+    CanonicalCidr, IntervalU32, IntervalU128, ipv4_to_interval, ipv6_to_interval,
+    merge_intervals_u32_owned, merge_intervals_u128_owned, parse_ip_cidr_strict, split_by_family,
 };
 
 /// Error returned when an operator-supplied ban or unban target is invalid.
@@ -28,96 +27,74 @@ pub struct InvalidBlocklistLine {
     pub content: String,
 }
 
-/// Parsed blocklist contents with enough structure to render canonical output.
+/// Original blocklist bytes and the locations of its data entries in source order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlocklistDocument {
-    /// Original lines paired with any canonical CIDR they contain.
-    pub lines: Vec<BlocklistLine>,
-    /// Whether the source document contained any bytes.
-    pub has_content: bool,
-    /// Whether the source document ended in a newline.
-    pub trailing_newline: bool,
+    contents: String,
+    entries: Vec<(std::ops::Range<usize>, CanonicalCidr)>,
 }
 
 impl BlocklistDocument {
-    /// Parses a line-oriented blocklist while preserving its original structure.
+    /// Parses the document and indexes only valid data entries.
     ///
     /// # Errors
     ///
-    /// Returns the first [`InvalidBlocklistLine`] when a non-comment entry is not a valid IP or
-    /// CIDR.
-    pub fn parse(contents: &str) -> Result<Self, InvalidBlocklistLine> {
-        let mut lines = Vec::new();
-
-        for (idx, line) in contents.lines().enumerate() {
-            lines.push(BlocklistLine::parse(line, idx + 1)?);
-        }
-
-        Ok(Self {
-            lines,
-            has_content: !contents.is_empty(),
-            trailing_newline: contents.ends_with('\n'),
-        })
-    }
-
-    /// Renders the preserved header followed by sorted, collapsed CIDRs.
-    #[must_use]
-    pub fn canonicalized_contents(&self) -> String {
-        let mut header_lines = Vec::new();
+    /// Returns the first invalid non-comment line.
+    pub fn parse(contents: impl Into<String>) -> Result<Self, InvalidBlocklistLine> {
+        let contents = contents.into();
         let mut entries = Vec::new();
-        let mut in_header = true;
-
-        for line in &self.lines {
-            let trimmed = line.original.trim();
-
-            if in_header {
-                if line.canonical.is_none() && (trimmed.is_empty() || trimmed.starts_with('#')) {
-                    header_lines.push(trimmed.to_string());
-                    continue;
-                }
-                in_header = false;
+        let mut start = 0;
+        for (index, span) in contents.split_inclusive('\n').enumerate() {
+            let end = start + span.len();
+            let line = span
+                .strip_suffix("\r\n")
+                .or_else(|| span.strip_suffix('\n'))
+                .unwrap_or(span);
+            if let Some(network) = parse_blocklist_entry(line, index + 1)? {
+                entries.push((start..end, network));
             }
-
-            if let Some(cidr) = line.canonical {
-                entries.push(cidr);
-            }
+            start = end;
         }
-
-        let canonical_entries = canonical_entry_lines(&entries);
-        if !canonical_entries.is_empty() {
-            if !header_lines.is_empty() && !header_lines.last().is_some_and(String::is_empty) {
-                header_lines.push(String::new());
-            }
-            header_lines.extend(canonical_entries);
-        } else if header_lines.last().is_some_and(String::is_empty) {
-            header_lines.pop();
-        }
-
-        let mut normalized = header_lines.join("\n");
-        if !normalized.is_empty() {
-            normalized.push('\n');
-        }
-        normalized
+        Ok(Self { contents, entries })
     }
-}
 
-/// One original blocklist line and its optional canonical CIDR.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BlocklistLine {
-    /// Unmodified line contents.
-    pub original: String,
-    /// Parsed CIDR, or `None` for a blank or comment line.
-    pub canonical: Option<CanonicalCidr>,
-}
+    /// Returns canonical identities in their original order, including duplicates.
+    pub fn networks(&self) -> impl ExactSizeIterator<Item = CanonicalCidr> + '_ {
+        self.entries.iter().map(|(_, network)| *network)
+    }
 
-impl BlocklistLine {
-    fn parse(line: &str, line_number: usize) -> Result<Self, InvalidBlocklistLine> {
-        let canonical = parse_blocklist_entry(line, line_number)?;
+    /// Returns the canonical identity for one indexed data entry.
+    #[must_use]
+    pub fn network(&self, index: usize) -> Option<CanonicalCidr> {
+        self.entries.get(index).map(|(_, network)| *network)
+    }
 
-        Ok(Self {
-            original: line.to_string(),
-            canonical,
-        })
+    /// Appends canonical entries, preserving the original document and separating an unterminated line.
+    #[must_use]
+    pub fn with_appended(mut self, entries: &[String]) -> String {
+        if !entries.is_empty() && !self.contents.is_empty() && !self.contents.ends_with('\n') {
+            self.contents.push('\n');
+        }
+        for entry in entries {
+            self.contents.push_str(entry);
+            self.contents.push('\n');
+        }
+        self.contents
+    }
+
+    /// Removes only the selected data entries, including each removed entry's own line ending.
+    #[must_use]
+    pub fn without_entries(&self, remove: &HashSet<usize>) -> String {
+        let mut kept = String::with_capacity(self.contents.len());
+        let mut start = 0;
+        for (index, (span, _)) in self.entries.iter().enumerate() {
+            if remove.contains(&index) {
+                kept.push_str(&self.contents[start..span.start]);
+                start = span.end;
+            }
+        }
+        kept.push_str(&self.contents[start..]);
+        kept
     }
 }
 
@@ -153,10 +130,10 @@ pub fn parse_blocklist_target(input: &str) -> Result<CanonicalCidr, BlocklistTar
 #[must_use]
 /// Classifies ban targets in input order, treating earlier new targets as present.
 pub fn classify_ban_targets(
-    existing: &[CanonicalCidr],
+    existing: impl IntoIterator<Item = CanonicalCidr>,
     targets: &[CanonicalCidr],
 ) -> Vec<BanClassification> {
-    let mut present = existing.iter().copied().collect::<HashSet<_>>();
+    let mut present = existing.into_iter().collect::<HashSet<_>>();
     let mut outcomes = Vec::with_capacity(targets.len());
 
     for target in targets {
@@ -244,39 +221,19 @@ impl UnbanTargetIndex {
 #[must_use]
 /// Returns sorted zero-based indexes exactly matching any requested target.
 pub fn exact_match_indexes(
-    entries: &[Option<CanonicalCidr>],
+    entries: impl IntoIterator<Item = CanonicalCidr>,
     targets: &[CanonicalCidr],
 ) -> Vec<usize> {
     let target_set = targets.iter().copied().collect::<HashSet<_>>();
     let mut indexes = Vec::new();
 
-    for (idx, entry) in entries.iter().enumerate() {
-        if entry.is_some_and(|entry| target_set.contains(&entry)) {
+    for (idx, entry) in entries.into_iter().enumerate() {
+        if target_set.contains(&entry) {
             indexes.push(idx);
         }
     }
 
     indexes
-}
-
-/// Parses, collapses, and renders blocklist contents in canonical order.
-///
-/// # Errors
-///
-/// Returns the first [`InvalidBlocklistLine`] when a non-comment entry is not a valid IP or CIDR.
-pub fn canonicalize_blocklist(contents: &str) -> Result<String, InvalidBlocklistLine> {
-    Ok(BlocklistDocument::parse(contents)?.canonicalized_contents())
-}
-
-fn canonical_entry_lines(entries: &[CanonicalCidr]) -> Vec<String> {
-    let family_split = split_by_family(entries);
-    let collapsed_v4 = collapse_ipv4(&family_split.ipv4);
-    let collapsed_v6 = collapse_ipv6(&family_split.ipv6);
-
-    let mut canonical = Vec::new();
-    canonical.extend(collapsed_v4.into_iter().map(|cidr| cidr.to_string()));
-    canonical.extend(collapsed_v6.into_iter().map(|cidr| cidr.to_string()));
-    canonical
 }
 
 /// Parses a saved blocklist line using its one-based position for diagnostics.
@@ -309,34 +266,12 @@ mod tests {
 
     use super::{
         BanClassification, BlocklistDocument, BlocklistTargetParseError, InvalidBlocklistLine,
-        UnbanTargetIndex, canonicalize_blocklist, classify_ban_targets, exact_match_indexes,
-        parse_blocklist_target,
+        UnbanTargetIndex, classify_ban_targets, exact_match_indexes, parse_blocklist_target,
     };
 
     #[test]
-    fn canonicalize_blocklist_preserves_header_and_canonicalizes_entries() {
-        let normalized = canonicalize_blocklist(
-            "# top comment \n203.0.113.7\n# dropped later comment\n203.0.113.0/24\n2001:db8::/64\n2001:db8::/64\n",
-        )
-        .expect("canonicalize");
-
-        assert_eq!(
-            normalized,
-            "# top comment\n\n203.0.113.0/24\n2001:db8::/64\n"
-        );
-    }
-
-    #[test]
-    fn canonicalize_blocklist_trims_header_trailing_blank_when_no_entries() {
-        assert_eq!(
-            canonicalize_blocklist("# header\n\n").expect("canonicalize"),
-            "# header\n"
-        );
-    }
-
-    #[test]
-    fn canonicalize_blocklist_rejects_invalid_non_header_lines() {
-        let err = canonicalize_blocklist("# header\n203.0.113.7 trailing-junk\n")
+    fn parsing_rejects_invalid_non_header_lines() {
+        let err = BlocklistDocument::parse("# header\n203.0.113.7 trailing-junk\n")
             .expect_err("invalid line must fail");
 
         assert_eq!(
@@ -358,7 +293,7 @@ mod tests {
         ];
 
         assert_eq!(
-            classify_ban_targets(&existing, &targets),
+            classify_ban_targets(existing, &targets),
             vec![
                 BanClassification::Added(parse_ip_cidr_non_strict("203.0.113.7").expect("added")),
                 BanClassification::AlreadyPresent(
@@ -509,7 +444,10 @@ mod tests {
         ];
         let targets = vec![parse_ip_cidr_non_strict("203.0.113.0/24").expect("target")];
 
-        assert_eq!(exact_match_indexes(&entries, &targets), vec![0]);
+        assert_eq!(
+            exact_match_indexes(entries.into_iter().flatten(), &targets),
+            vec![0]
+        );
     }
 
     #[test]
@@ -530,16 +468,22 @@ mod tests {
     }
 
     #[test]
-    fn parse_document_preserves_original_lines_for_mutation_workflows() {
-        let document =
-            BlocklistDocument::parse("# header\n203.0.113.0/24\n# comment\n\n").expect("parse");
-
-        assert_eq!(document.lines.len(), 4);
-        assert_eq!(document.lines[0].original, "# header");
-        assert_eq!(document.lines[1].original, "203.0.113.0/24");
-        assert_eq!(document.lines[2].original, "# comment");
-        assert_eq!(document.lines[3].original, "");
-        assert!(document.trailing_newline);
-        assert!(document.has_content);
+    fn removal_preserves_every_byte_outside_selected_data_entries() {
+        let original =
+            "# header  \r\n192.0.2.4\r\n\r\n 192.0.2.5 \r\n# between\n192.0.2.4\n2001:db8::7";
+        let document = BlocklistDocument::parse(original).expect("parse");
+        assert_eq!(document.networks().len(), 4);
+        assert_eq!(
+            document.without_entries(&[0, 2].into()),
+            "# header  \r\n\r\n 192.0.2.5 \r\n# between\n2001:db8::7"
+        );
+        assert_eq!(
+            document.without_entries(&[3].into()),
+            original.strip_suffix("2001:db8::7").unwrap()
+        );
+        assert_eq!(
+            document.without_entries(&std::collections::HashSet::new()),
+            original
+        );
     }
 }

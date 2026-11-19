@@ -685,10 +685,7 @@ fn offline_cache_errors_keep_io_causes_through_source_wrappers() {
 #[cfg(unix)]
 #[test]
 fn blocklist_read_failures_are_not_missing_files() {
-    use kidobo_adapters::blocklist_file::{
-        load_blocklist_document, normalize_local_blocklist,
-        normalize_local_blocklist_with_fast_state,
-    };
+    use kidobo_adapters::blocklist_file::{load_blocklist_document, load_blocklist_networks};
 
     let temp = TempDir::new().expect("tempdir");
     let blocked = temp.path().join("blocked");
@@ -696,10 +693,7 @@ fn blocklist_read_failures_are_not_missing_files() {
     let path = blocked.join("blocklist.txt");
     let error = load_blocklist_document(&path).expect_err("failed read is not an empty list");
     assert_eq!(io_cause(&error).kind(), io::ErrorKind::NotADirectory);
-    let error = normalize_local_blocklist(&path).expect_err("failed read is not absence");
-    assert_eq!(io_cause(&error).kind(), io::ErrorKind::NotADirectory);
-    let error = normalize_local_blocklist_with_fast_state(&path, &temp.path().join("state"))
-        .expect_err("failed inspection is not absence");
+    let error = load_blocklist_networks(&path).expect_err("failed source read is not absence");
     assert_eq!(io_cause(&error).kind(), io::ErrorKind::NotADirectory);
 }
 
@@ -837,7 +831,7 @@ fn doctor_cache_inspection_does_not_skip_errors() {
 
 #[cfg(unix)]
 #[test]
-fn local_lookup_and_append_report_unreadable_blocklists() {
+fn local_lookup_and_blocklist_editor_report_unreadable_sources() {
     use kidobo_adapters::blocklist_file::FileBlocklistRepository;
     use kidobo_adapters::path::{ENV_KIDOBO_ROOT, SystemPathResolver};
     use kidobo_app::blocklist::BlocklistRepository;
@@ -852,8 +846,8 @@ fn local_lookup_and_append_report_unreadable_blocklists() {
         .expect_err("metadata loop")
         .raw_os_error();
     let error = FileBlocklistRepository
-        .append_entries(&blocklist, &["192.0.2.1/32".into()], false, false)
-        .expect_err("append must preserve unreadable blocklist");
+        .load(&blocklist)
+        .expect_err("blocklist editor must report the unreadable source");
     assert!(matches!(&error, AppError::BlocklistRead { .. }));
     assert_eq!(io_cause(&error).raw_os_error(), expected);
 

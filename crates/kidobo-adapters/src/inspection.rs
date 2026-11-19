@@ -16,7 +16,7 @@ use kidobo_app::sync::{AddressFamily, ManagedSetSpec};
 use kidobo_app::temporary_bans::TemporaryBanRepository;
 use kidobo_core::config::FirewallAction;
 
-use crate::blocklist_file::load_blocklist_document;
+use crate::blocklist_file::load_blocklist_networks;
 use crate::command_runner::{
     CommandExecutor, CommandRequest, CommandResult, SystemCommandExecutor,
 };
@@ -36,16 +36,10 @@ pub struct SystemSavedBanCountReader;
 impl SavedBanCountReader for SystemSavedBanCountReader {
     fn read_counts(&self, paths: &ResolvedPaths, cutoff: Option<u64>) -> SavedBanCounts {
         let mut counts = SavedBanCounts::default();
-        match load_blocklist_document(&paths.blocklist_file) {
-            Ok(document) => {
-                counts.permanent_ip_cidrs = Some(
-                    document
-                        .lines
-                        .iter()
-                        .filter_map(|line| line.canonical)
-                        .collect::<BTreeSet<_>>()
-                        .len(),
-                );
+        match load_blocklist_networks(&paths.blocklist_file) {
+            Ok(networks) => {
+                counts.permanent_ip_cidrs =
+                    Some(networks.into_iter().collect::<BTreeSet<_>>().len());
             }
             Err(error) => counts.notices.push(error.to_string()),
         }

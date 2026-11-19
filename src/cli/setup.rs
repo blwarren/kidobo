@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 use crate::cli::CliIo;
 use crate::cli::args::ReportFormat;
 use crate::cli::mutation::confirm;
@@ -14,10 +12,7 @@ use kidobo_app::configuration::{
     self, ApplyDependencies, ConfigurationDecision, ConfigurationEdit, ConfigurationPreview,
     ConfigurationRequest, ConfigurationView, PreviewDependencies, ReadDependencies,
 };
-use kidobo_app::init::{
-    self, DEFAULT_KIDOBO_BINARY_PATH, FALLBACK_KIDOBO_BINARY_PATH, InitDependencies,
-    InitProvisioner, InitRequest,
-};
+use kidobo_app::init::{self, InitDependencies, InitProvisioner};
 use kidobo_app::inspection::LiveProbe;
 
 const MAX_SETUP_DATA_BYTES: usize = 64 * 1024;
@@ -35,18 +30,7 @@ pub fn run(io: &mut CliIo<'_>) -> Result<(), KidoboError> {
     let alternate_root = preview.paths().root_override.is_some();
     let view = io.presentation();
     review(&preview, io)?;
-    let executable_candidates = if alternate_root {
-        vec![std::env::current_exe().map_err(KidoboError::from)?]
-    } else {
-        vec![
-            PathBuf::from(DEFAULT_KIDOBO_BINARY_PATH),
-            PathBuf::from(FALLBACK_KIDOBO_BINARY_PATH),
-        ]
-    };
-    let request = InitRequest {
-        paths: path_resolution_input_from_process(None),
-        executable_candidates,
-    };
+    let request = super::init::init_request()?;
     SystemInitProvisioner::default()
         .resolve_installed_executable(&request.executable_candidates)?;
     if !confirm(io, "Save these settings and provision missing files?")? {

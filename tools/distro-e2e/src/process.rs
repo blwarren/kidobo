@@ -1,15 +1,20 @@
-//! File-backed subprocess capture with bounded draining and owned process cleanup.
+//! Bounded streaming subprocess capture and owned process-group cleanup.
 use crate::Result;
-use std::fs::{self, File};
-use std::io::{Read, Seek, SeekFrom};
+use nix::errno::Errno;
+use nix::fcntl::{FcntlArg, OFlag, fcntl};
+use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+use nix::sys::signal::{Signal, killpg};
+use nix::sys::wait::{Id, WaitPidFlag, WaitStatus, waitid};
+use nix::unistd::{Pid, pipe2};
+use std::fs::File;
+use std::io::{ErrorKind, Read};
+use std::os::fd::AsFd;
 use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 pub(super) struct Request<'a> {
-    pub directory: &'a Path,
     pub program: &'a str,
     pub args: &'a [String],
     pub seconds: u64,
@@ -36,73 +41,121 @@ pub(super) enum Event<'a> {
     },
 }
 
-/// Each command owns only one pair of temporary files, removed even on failure.
-struct Capture {
-    dir: PathBuf,
-    stdout: File,
-    stderr: File,
-}
 struct ManagedChild {
     child: Child,
-    completed: bool,
+    reaped: bool,
 }
-impl std::ops::Deref for ManagedChild {
-    type Target = Child;
-    fn deref(&self) -> &Child {
-        &self.child
-    }
-}
-impl std::ops::DerefMut for ManagedChild {
-    fn deref_mut(&mut self) -> &mut Child {
-        &mut self.child
-    }
-}
+
 impl ManagedChild {
-    fn terminate(&mut self) {
-        if !self.completed {
-            if let Ok(pid) = i32::try_from(self.child.id()) {
-                let _ = nix::sys::signal::killpg(
-                    nix::unistd::Pid::from_raw(pid),
-                    nix::sys::signal::Signal::SIGKILL,
-                );
-            }
-            let _ = self.child.wait();
-            self.completed = true;
+    fn pid(&self) -> Pid {
+        Pid::from_raw(i32::try_from(self.child.id()).expect("Linux PIDs fit in pid_t"))
+    }
+
+    fn exited(&self) -> Result<Option<bool>> {
+        // Keep the PID reserved until capture finishes, so a reporting failure can still
+        // terminate descendants in this group without racing process-group ID reuse.
+        let flags = WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT;
+        match waitid(Id::Pid(self.pid()), flags) {
+            Ok(WaitStatus::Exited(_, code)) => Ok(Some(code == 0)),
+            Ok(WaitStatus::Signaled(..)) => Ok(Some(false)),
+            Ok(_) | Err(Errno::EINTR) => Ok(None),
+            Err(error) => Err(error.into()),
         }
     }
+
+    fn finish(&mut self, success: bool) -> std::io::Result<ExitStatus> {
+        if !success {
+            let _ = killpg(self.pid(), Signal::SIGKILL);
+        }
+        let status = self.child.wait()?;
+        self.reaped = true;
+        Ok(status)
+    }
 }
+
 impl Drop for ManagedChild {
     fn drop(&mut self) {
-        self.terminate();
-    }
-}
-impl Capture {
-    fn new(root: &Path) -> Result<Self> {
-        static NEXT_CAPTURE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let dir = root.join(format!(
-            ".capture-{}-{}",
-            std::process::id(),
-            NEXT_CAPTURE.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir(&dir)?;
-        let result = (|| -> Result<Self> {
-            Ok(Self {
-                stdout: File::create(dir.join("stdout"))?,
-                stderr: File::create(dir.join("stderr"))?,
-                dir: dir.clone(),
-            })
-        })();
-        if result.is_err() {
-            let _ = fs::remove_dir_all(&dir);
+        if !self.reaped {
+            let _ = self.finish(false);
         }
-        result
     }
 }
-impl Drop for Capture {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.dir);
+
+struct Stream {
+    name: &'static str,
+    reader: File,
+    observed: usize,
+    // Limit the final drain to one pipe capacity. This includes all output still queued
+    // by the direct child even if a descendant keeps writing after the child exits.
+    remaining: usize,
+    stdout: Option<Vec<u8>>,
+}
+
+impl Stream {
+    fn pipe(name: &'static str) -> Result<(Self, Stdio)> {
+        let (reader, writer) = pipe2(OFlag::O_CLOEXEC)?;
+        fcntl(&reader, FcntlArg::F_SETFL(OFlag::O_NONBLOCK))?;
+        Ok((
+            Self {
+                name,
+                reader: File::from(reader),
+                observed: 0,
+                remaining: usize::MAX,
+                stdout: (name == "stdout").then(Vec::new),
+            },
+            Stdio::from(writer),
+        ))
+    }
+
+    fn finish_buffered(&mut self) -> Result<()> {
+        let capacity = usize::try_from(fcntl(&self.reader, FcntlArg::F_GETPIPE_SZ)?)?;
+        self.remaining = self.remaining.min(capacity);
+        Ok(())
+    }
+
+    fn read_chunk(
+        &mut self,
+        limit: usize,
+        observe: &mut impl FnMut(Event<'_>) -> Result<()>,
+    ) -> Result<bool> {
+        let mut buffer = [0; 8192];
+        let available = buffer.len().min(self.remaining);
+        if available == 0 {
+            return Ok(false);
+        }
+        let count = match self.reader.read(&mut buffer[..available]) {
+            Ok(0) => {
+                self.remaining = 0;
+                return Ok(false);
+            }
+            Ok(count) => count,
+            Err(error) if error.kind() == ErrorKind::WouldBlock => return Ok(false),
+            Err(error) if error.kind() == ErrorKind::Interrupted => return Ok(true),
+            Err(error) => return Err(error.into()),
+        };
+        self.remaining -= count;
+        let keep = count.min(limit - self.observed);
+        self.observed += count;
+        if keep > 0 {
+            observe(Event::Output {
+                stream: self.name,
+                bytes: &buffer[..keep],
+            })?;
+            if let Some(output) = &mut self.stdout {
+                output.extend_from_slice(&buffer[..keep]);
+            }
+        }
+        if keep != count {
+            return Err(format!(
+                "{} exceeds the {limit}-byte capture limit; transcript truncated",
+                self.name
+            )
+            .into());
+        }
+        Ok(true)
     }
 }
+
 #[derive(Default)]
 pub(super) struct Heartbeat {
     last_notice: Duration,
@@ -119,142 +172,210 @@ impl Heartbeat {
 }
 pub(super) fn capture(
     request: &Request<'_>,
+    observe: impl FnMut(Event<'_>) -> Result<()>,
+) -> Result<Outcome> {
+    capture_with_limit(request, 16 * 1024 * 1024, observe)
+}
+
+fn capture_with_limit(
+    request: &Request<'_>,
+    limit: usize,
     mut observe: impl FnMut(Event<'_>) -> Result<()>,
 ) -> Result<Outcome> {
-    const OUTPUT_LIMIT: u64 = 16 * 1024 * 1024;
-    let Request {
-        program,
-        args,
-        seconds,
-        ..
-    } = *request;
-    let capture = Capture::new(request.directory)?;
-    let mut out = File::open(capture.dir.join("stdout"))?;
-    let mut err = File::open(capture.dir.join("stderr"))?;
-    let child = Command::new(program)
-        .args(args)
+    let (stdout, out_writer) = Stream::pipe("stdout")?;
+    let (stderr, err_writer) = Stream::pipe("stderr")?;
+    let mut streams = [stdout, stderr];
+    let child = Command::new(request.program)
+        .args(request.args)
         .stdin(Stdio::null())
-        .stdout(capture.stdout.try_clone()?)
-        .stderr(capture.stderr.try_clone()?)
+        .stdout(out_writer)
+        .stderr(err_writer)
         .process_group(0)
         .spawn()
         .map_err(|e| format!("spawn failed: {e}"))?;
     let mut child = ManagedChild {
         child,
-        completed: false,
+        reaped: false,
     };
-    let started = Instant::now();
-    let mut heartbeat = Heartbeat::default();
-    // Regular-file readers cannot block on inherited pipes. Bound each drain so
-    // continuous output never prevents cancellation or timeout checks.
-    let result = (|| -> Result<(Option<i32>, Option<String>)> {
-        loop {
-            let activity =
-                drain(&mut observe, "stdout", &mut out)? | drain(&mut observe, "stderr", &mut err)?;
-            let elapsed = started.elapsed();
-            if heartbeat.due(elapsed) {
-                observe(Event::Heartbeat(elapsed))?;
-            }
-            if let Some(status) = child.try_wait()? {
-                child.completed = true;
-                // The direct child is done; drain the bytes already captured without
-                // waiting for EOF from background descendants.
-                let out_len = out.metadata()?.len();
-                let err_len = err.metadata()?.len();
-                while out.stream_position()? < out_len {
-                    drain(&mut observe, "stdout", &mut out)?;
-                }
-                while err.stream_position()? < err_len {
-                    drain(&mut observe, "stderr", &mut err)?;
-                }
-                return Ok((
-                    status.code(),
-                    (!status.success()).then(|| format!("{program} exited {status}")),
-                ));
-            }
-            if !request.ignore_cancellation && request.cancelled.load(Ordering::Relaxed) {
-                return Ok((None, Some("interrupted".into())));
-            }
-            if elapsed > Duration::from_secs(seconds) {
-                return Ok((None, Some("timed out".into())));
-            }
-            if !activity {
-                std::thread::sleep(request.poll_interval);
-            }
-        }
-    })();
-    if !child.completed {
-        child.terminate();
-        // Best effort on failure; preserve the original reporting/command error.
-        for (stream, source) in [("stdout", &mut out), ("stderr", &mut err)] {
-            let end = source.metadata()?.len();
-            while source.stream_position()? < end {
-                if drain(&mut observe, stream, source).is_err() {
-                    break;
-                }
-            }
-        }
-    }
-    observe(Event::ByteCount {
-        stream: "stdout",
-        bytes: out.metadata()?.len(),
-    })?;
-    observe(Event::ByteCount {
-        stream: "stderr",
-        bytes: err.metadata()?.len(),
-    })?;
-    let (code, mut error) = result?;
-    let mut output = String::new();
-    if error.is_none() {
-        if out.metadata()?.len() > OUTPUT_LIMIT {
-            error = Some(format!(
-                "{program} stdout exceeds the {OUTPUT_LIMIT}-byte capture limit"
-            ));
-        } else {
-            out.seek(SeekFrom::Start(0))?;
-            out.take(OUTPUT_LIMIT).read_to_string(&mut output)?;
-        }
-    }
+    let result = drain(request, &child, &mut streams, limit, &mut observe);
+    let counts = streams.iter().try_for_each(|stream| {
+        observe(Event::ByteCount {
+            stream: stream.name,
+            bytes: stream.observed as u64,
+        })
+    });
+    let success = result?;
+    counts?;
+    let output = if success {
+        String::from_utf8(streams[0].stdout.take().unwrap_or_default())?
+    } else {
+        String::new()
+    };
+    let status = child.finish(success)?;
     Ok(Outcome {
-        code,
+        code: status.code(),
         output,
-        error,
+        error: (!success).then(|| format!("{} exited {status}", request.program)),
     })
 }
 
 fn drain(
+    request: &Request<'_>,
+    child: &ManagedChild,
+    streams: &mut [Stream; 2],
+    limit: usize,
     observe: &mut impl FnMut(Event<'_>) -> Result<()>,
-    stream: &'static str,
-    source: &mut File,
 ) -> Result<bool> {
-    let mut buffer = [0; 8192];
-    let mut activity = false;
-    for _ in 0..32 {
-        let count = source.read(&mut buffer)?;
-        if count == 0 {
-            break;
+    let started = Instant::now();
+    let timeout = Duration::from_secs(request.seconds);
+    let mut heartbeat = Heartbeat::default();
+    let mut exited = None;
+    loop {
+        let elapsed = started.elapsed();
+        if !request.ignore_cancellation && request.cancelled.load(Ordering::Relaxed) {
+            return Err("interrupted".into());
         }
-        activity = true;
-        observe(Event::Output {
-            stream,
-            bytes: &buffer[..count],
-        })?;
+        if elapsed >= timeout {
+            return Err("timed out".into());
+        }
+        if heartbeat.due(elapsed) {
+            observe(Event::Heartbeat(elapsed))?;
+        }
+        if exited.is_none() {
+            exited = child.exited()?;
+            if exited.is_some() {
+                for stream in &mut *streams {
+                    stream.finish_buffered()?;
+                }
+            }
+        }
+        let mut activity = false;
+        for stream in &mut *streams {
+            activity |= stream.read_chunk(limit, observe)?;
+        }
+        if activity {
+            continue;
+        }
+        if let Some(success) = exited {
+            return Ok(success);
+        }
+        let mut descriptors = streams
+            .iter()
+            .filter(|stream| stream.remaining > 0)
+            .map(|stream| PollFd::new(stream.reader.as_fd(), PollFlags::POLLIN))
+            .collect::<Vec<_>>();
+        let interval = request
+            .poll_interval
+            .min(timeout.saturating_sub(started.elapsed()));
+        match poll(&mut descriptors, PollTimeout::try_from(interval)?) {
+            Ok(_) | Err(Errno::EINTR) => (),
+            Err(error) => return Err(error.into()),
+        }
     }
-    Ok(activity)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::TestDir;
 
     #[test]
-    fn output_callback_failure_reaps_command_and_removes_capture_files() {
-        let temp = TestDir::new();
+    fn both_streams_allow_exactly_the_limit_and_transcribe_only_the_prefix_on_overflow() {
+        let cancelled = AtomicBool::new(false);
+        for (stdout, stderr, overflow) in [
+            ("1234", "abcd", None),
+            ("12345", "abcd", Some("stdout")),
+            ("1234", "abcde", Some("stderr")),
+        ] {
+            let args = [
+                "-c".into(),
+                format!("printf '%s' '{stdout}'; printf '%s' '{stderr}' >&2"),
+            ];
+            let request = Request {
+                program: "sh",
+                args: &args,
+                seconds: 5,
+                cancelled: &cancelled,
+                ignore_cancellation: false,
+                poll_interval: Duration::from_millis(1),
+            };
+            let mut captured_out = Vec::new();
+            let mut captured_err = Vec::new();
+            let mut counts = Vec::new();
+            let result = capture_with_limit(&request, 4, |event| {
+                match event {
+                    Event::Output {
+                        stream: "stdout",
+                        bytes,
+                    } => captured_out.extend_from_slice(bytes),
+                    Event::Output {
+                        stream: "stderr",
+                        bytes,
+                    } => captured_err.extend_from_slice(bytes),
+                    Event::ByteCount { stream, bytes } => counts.push((stream, bytes)),
+                    _ => (),
+                }
+                Ok(())
+            });
+            if let Some(stream) = overflow {
+                let Err(error) = result else {
+                    panic!("overflow on {stream} must fail capture")
+                };
+                assert!(
+                    error
+                        .to_string()
+                        .contains(&format!("{stream} exceeds the 4-byte capture limit"))
+                );
+                let prefix = if stream == "stdout" {
+                    &captured_out
+                } else {
+                    &captured_err
+                };
+                assert_eq!(prefix, if stream == "stdout" { b"1234" } else { b"abcd" });
+                assert!(counts.contains(&(stream, 5)));
+            } else {
+                assert_eq!(result.expect("capture exact limits").output, "1234");
+                assert_eq!(captured_out, b"1234");
+                assert_eq!(captured_err, b"abcd");
+            }
+        }
+    }
+
+    #[test]
+    fn interruption_during_output_preserves_the_reported_prefix() {
+        let cancelled = AtomicBool::new(false);
+        let args = ["-c".into(), "printf ready; exec sleep 30".into()];
+        let request = Request {
+            program: "sh",
+            args: &args,
+            seconds: 5,
+            cancelled: &cancelled,
+            ignore_cancellation: false,
+            poll_interval: Duration::from_millis(1),
+        };
+        let mut prefix = Vec::new();
+        let result = capture(&request, |event| {
+            if let Event::Output {
+                stream: "stdout",
+                bytes,
+            } = event
+            {
+                prefix.extend_from_slice(bytes);
+                cancelled.store(true, Ordering::Relaxed);
+            }
+            Ok(())
+        });
+        let Err(error) = result else {
+            panic!("interrupted command succeeded")
+        };
+        assert_eq!(error.to_string(), "interrupted");
+        assert_eq!(prefix, b"ready");
+    }
+
+    #[test]
+    fn output_callback_failure_reaps_command_and_records_byte_count() {
         let cancelled = AtomicBool::new(false);
         let args = vec!["-c".into(), "printf '%s\\n' \"$$\"; exec sleep 30".into()];
         let request = Request {
-            directory: temp.path(),
             program: "sh",
             args: &args,
             seconds: 5,
@@ -291,16 +412,13 @@ mod tests {
             Err(nix::errno::Errno::ESRCH)
         );
         assert!(byte_count.is_some_and(|bytes| bytes > 0));
-        assert_eq!(fs::read_dir(temp.path()).expect("capture root").count(), 0);
     }
 
     #[test]
     fn direct_child_completion_does_not_wait_for_background_descriptors() {
-        let temp = TestDir::new();
         let cancelled = AtomicBool::new(false);
         let args = vec!["-c".into(), "sleep 30 & printf '%s\\n' \"$!\"".into()];
         let request = Request {
-            directory: temp.path(),
             program: "sh",
             args: &args,
             seconds: 2,
@@ -335,6 +453,5 @@ mod tests {
         assert_eq!(outcome.error, None);
         assert_eq!(outcome.output.trim(), pid.to_string());
         assert!(started.elapsed() < Duration::from_secs(2));
-        assert_eq!(fs::read_dir(temp.path()).expect("capture root").count(), 0);
     }
 }

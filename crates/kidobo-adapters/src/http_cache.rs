@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
+use kidobo_core::url_redaction::redact_http_url;
 use log::warn;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -20,7 +21,7 @@ use crate::http_fetch::{
 };
 use crate::limited_io::read_to_string_with_limit;
 use crate::remote_parse::{
-    RemoteFeedLimits, RemoteParseBudget, format_normalized_cidrs, parse_cached_iplist_bounded,
+    RemoteFeedLimits, RemoteParseError, format_normalized_cidrs, parse_cached_iplist_bounded,
     parse_remote_cidrs_bounded,
 };
 use kidobo_app::source::{Notice, SourceProvenance};
@@ -477,7 +478,10 @@ fn handle_network_response(
     ) {
         Ok(promotion) => promotion,
         Err(error) if cached_networks.is_some() => {
-            warn!("remote cache staging failed for {url}; using validated cache: {error}");
+            warn!(
+                "remote cache staging failed for {}; using validated cache: {error}",
+                redact_http_url(url)
+            );
             return Ok(prepared_fallback(cached_networks, cached_meta));
         }
         Err(error) => return Err(error),
@@ -501,7 +505,8 @@ fn validate_remote_response(
 ) -> Option<ValidatedRemoteResponse> {
     if response.status != reqwest::StatusCode::OK {
         warn!(
-            "remote fetch failed for {url}: unexpected status {}",
+            "remote fetch failed for {}: unexpected status {}",
+            redact_http_url(url),
             response.status
         );
         return None;
@@ -509,7 +514,8 @@ fn validate_remote_response(
 
     if response.body.len() > max_bytes {
         warn!(
-            "remote fetch failed for {url}: body size {} exceeds max {} bytes",
+            "remote fetch failed for {}: body size {} exceeds max {} bytes",
+            redact_http_url(url),
             response.body.len(),
             max_bytes
         );
@@ -518,17 +524,11 @@ fn validate_remote_response(
 
     let parsed = match parse_remote_cidrs_bounded(&response.body, feed_limits) {
         Ok(parsed) => parsed,
-        Err(budget) => {
-            warn_remote_budget_rejection(url, budget);
+        Err(error) => {
+            warn_remote_parse_rejection(&redact_http_url(url), error);
             return None;
         }
     };
-    if parsed.data_lines > 0 && parsed.networks.is_empty() {
-        warn!(
-            "remote fetch failed for {url}: non-empty response contained no valid IP/CIDR entries"
-        );
-        return None;
-    }
     if parsed.invalid_lines > 0 {
         let noun = if parsed.invalid_lines == 1 {
             "line"
@@ -536,7 +536,8 @@ fn validate_remote_response(
             "lines"
         };
         warn!(
-            "remote source {url} ignored {} invalid {noun}",
+            "remote source {} ignored {} invalid {noun}",
+            redact_http_url(url),
             parsed.invalid_lines
         );
     }
@@ -640,8 +641,8 @@ fn read_remote_cache(
         };
         let networks = match parse_cached_iplist_bounded(&generation.iplist, feed_limits) {
             Ok(networks) => networks,
-            Err(budget) => {
-                warn_remote_budget_rejection(url, budget);
+            Err(error) => {
+                warn_remote_parse_rejection(&redact_http_url(url), error);
                 continue;
             }
         };
@@ -872,8 +873,8 @@ fn read_optional_iplist_networks(
 
     match parse_cached_iplist_bounded(&iplist, feed_limits) {
         Ok(networks) => Ok(Some(networks)),
-        Err(budget) => {
-            warn_remote_budget_rejection(&paths.iplist_path.display().to_string(), budget);
+        Err(error) => {
+            warn_remote_parse_rejection(&paths.iplist_path.display().to_string(), error);
             Ok(None)
         }
     }
@@ -889,12 +890,15 @@ fn prepared_fallback(
     }
 }
 
-fn warn_remote_budget_rejection(source: &str, budget: RemoteParseBudget) {
-    match budget {
-        RemoteParseBudget::DataLines { observed, limit } => warn!(
+fn warn_remote_parse_rejection(source: &str, error: RemoteParseError) {
+    match error {
+        RemoteParseError::NoValidNetworks => warn!(
+            "remote source {source} rejected: non-empty data contained no valid IP/CIDR entries"
+        ),
+        RemoteParseError::DataLines { observed, limit } => warn!(
             "remote source {source} rejected: data line budget exceeded ({observed} > {limit})"
         ),
-        RemoteParseBudget::UniqueCidrs { observed, limit } => warn!(
+        RemoteParseError::UniqueCidrs { observed, limit } => warn!(
             "remote source {source} rejected: unique CIDR budget exceeded ({observed} > {limit})"
         ),
     }
@@ -1627,7 +1631,14 @@ mod tests {
     #[test]
     fn staging_failure_keeps_validated_legacy_including_empty_cache() {
         let url = "https://example.test/feed";
-        for contents in [Some("203.0.113.0/24\n"), Some(""), None] {
+        for (contents, expected) in [
+            (Some("203.0.113.0/24\n"), Some("203.0.113.0/24")),
+            (Some("invalid\n203.0.113.0/24\n"), Some("203.0.113.0/24")),
+            (Some(""), Some("")),
+            (Some(" # comment\n\n"), Some("")),
+            (Some("invalid\n # comment\n"), None),
+            (None, None),
+        ] {
             let temp = TempDir::new().expect("tempdir");
             fs::write(temp.path().join("v2"), b"block generation staging").expect("block");
             if let Some(contents) = contents {
@@ -1638,12 +1649,12 @@ mod tests {
                 MockHttpClient::new(vec![Ok(network_response_for_test(b"198.51.100.0/24\n"))]);
             let result =
                 prepare_iplist_with_cache(&client, url, temp.path(), &BTreeMap::new(), 100);
-            if let Some(contents) = contents {
+            if let Some(expected) = expected {
                 let result = result.expect("validated fallback");
                 assert_eq!(result.loaded.source, CacheSource::FallbackCache);
                 assert_eq!(
                     crate::remote_parse::format_normalized_cidrs(&result.loaded.networks),
-                    contents.trim()
+                    expected
                 );
                 assert!(result.pending_promotion.is_none());
             } else {

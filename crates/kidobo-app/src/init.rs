@@ -304,30 +304,32 @@ Type=oneshot\n",
     let _journal_environment_write =
         writeln!(&mut output, "Environment=\"KIDOBO_LOG_FORMAT=journal\"");
     if let Some(root) = root_override {
-        let root = root.to_string_lossy();
         let _root_environment_write = writeln!(
             &mut output,
             "Environment=\"KIDOBO_ROOT={}\"",
-            escape_systemd_value(root.as_ref())
+            escape_systemd_path(root)
         );
     }
-    let executable = executable_path.to_string_lossy();
     let _exec_start_write = writeln!(
         &mut output,
         "ExecStart=\"{}\" sync",
-        escape_systemd_value(executable.as_ref())
+        escape_systemd_path(executable_path)
     );
     output
 }
 
-fn escape_systemd_value(value: &str) -> String {
-    let mut escaped = String::with_capacity(value.len());
-    for character in value.chars() {
-        match character {
-            '\\' => escaped.push_str("\\\\"),
-            '"' => escaped.push_str("\\\""),
-            '\n' => escaped.push_str("\\n"),
-            _ => escaped.push(character),
+fn escape_systemd_path(path: &Path) -> String {
+    let bytes = path.as_os_str().as_encoded_bytes();
+    let mut escaped = String::with_capacity(bytes.len());
+    for &byte in bytes {
+        match byte {
+            b'\\' => escaped.push_str("\\\\"),
+            b'"' => escaped.push_str("\\\""),
+            b'%' => escaped.push_str("%%"),
+            b' '..=b'~' => escaped.push(char::from(byte)),
+            _ => {
+                let _escaped_byte = write!(escaped, "\\x{byte:02x}");
+            }
         }
     }
     escaped
@@ -534,11 +536,22 @@ mod tests {
     #[test]
     fn service_template_escapes_root_and_executable() {
         let rendered = build_systemd_service_template(
-            Path::new("/path/with\"quote/kidobo"),
+            Path::new("/path/with\"quote%h/kidobo"),
             Some(Path::new("/root/with\\slash")),
         );
         assert!(rendered.contains("KIDOBO_ROOT=/root/with\\\\slash"));
-        assert!(rendered.contains("ExecStart=\"/path/with\\\"quote/kidobo\" sync"));
+        assert!(rendered.contains("ExecStart=\"/path/with\\\"quote%%h/kidobo\" sync"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn service_template_preserves_native_path_bytes() {
+        use std::os::unix::ffi::OsStrExt;
+        let path = Path::new(std::ffi::OsStr::from_bytes(b"/installed/\xff\n/kidobo"));
+        assert!(
+            build_systemd_service_template(path, None)
+                .contains(r#"ExecStart="/installed/\xff\x0a/kidobo" sync"#)
+        );
     }
 
     #[test]

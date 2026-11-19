@@ -65,18 +65,18 @@ impl ConfigurationEditor for FileConfigurationManager {
     fn render(&self, original: &str, edit: &ConfigurationEdit) -> Result<String, AppError> {
         let config = Config::from_toml_str(original)?;
         let mut document = parse_document(original)?;
-        match edit {
+        let changed = match edit {
             ConfigurationEdit::AddSource(url) => {
-                edit_source(&mut document, &config.remote.urls, url, true)?;
+                edit_source(&mut document, &config.remote.urls, url, true)?
             }
             ConfigurationEdit::RemoveSource(url) => {
-                edit_source(&mut document, &config.remote.urls, url, false)?;
+                edit_source(&mut document, &config.remote.urls, url, false)?
             }
             ConfigurationEdit::AddAllow(target) => {
-                edit_allow(&mut document, &config.safe.ips, target, true)?;
+                edit_allow(&mut document, &config.safe.ips, target, true)?
             }
             ConfigurationEdit::RemoveAllow(target) => {
-                edit_allow(&mut document, &config.safe.ips, target, false)?;
+                edit_allow(&mut document, &config.safe.ips, target, false)?
             }
             ConfigurationEdit::SetBasic {
                 enable_ipv6,
@@ -84,10 +84,12 @@ impl ConfigurationEditor for FileConfigurationManager {
                 remote_urls,
                 safe_ips,
             } => {
-                if config.ipset.enable_ipv6 != *enable_ipv6 {
+                let ipv6_changed = config.ipset.enable_ipv6 != *enable_ipv6;
+                let github_changed = config.safe.include_github_meta != *include_github_meta;
+                if ipv6_changed {
                     set_boolean(&mut document, "ipset", "enable_ipv6", *enable_ipv6)?;
                 }
-                if config.safe.include_github_meta != *include_github_meta {
+                if github_changed {
                     set_boolean(
                         &mut document,
                         "safe",
@@ -95,9 +97,15 @@ impl ConfigurationEditor for FileConfigurationManager {
                         *include_github_meta,
                     )?;
                 }
-                replace_sources(&mut document, &config.remote.urls, remote_urls)?;
-                replace_allow(&mut document, &config.safe.ips, safe_ips)?;
+                let sources_changed =
+                    replace_sources(&mut document, &config.remote.urls, remote_urls)?;
+                let allow_changed = replace_allow(&mut document, &config.safe.ips, safe_ips)?;
+                ipv6_changed || github_changed || sources_changed || allow_changed
             }
+        };
+        if !changed {
+            ensure_size(original)?;
+            return Ok(original.to_owned());
         }
         let candidate = document.to_string();
         ensure_size(&candidate)?;
@@ -238,7 +246,7 @@ fn edit_source(
     existing: &[String],
     input: &str,
     add: bool,
-) -> Result<(), AppError> {
+) -> Result<bool, AppError> {
     let identity = normalized_url(input)?;
     let present = existing
         .iter()
@@ -249,7 +257,7 @@ fn edit_source(
         ));
     }
     if !add && !present {
-        return Ok(());
+        return Ok(false);
     }
     let array = array_mut(document, "remote", "urls")?;
     if add {
@@ -262,7 +270,7 @@ fn edit_source(
                 .is_none_or(|url| url != identity)
         });
     }
-    Ok(())
+    Ok(true)
 }
 
 fn edit_allow(
@@ -270,11 +278,11 @@ fn edit_allow(
     existing: &[CanonicalCidr],
     input: &str,
     add: bool,
-) -> Result<(), AppError> {
+) -> Result<bool, AppError> {
     let identity = canonical_target(input)?;
     let present = existing.contains(&identity);
     if add == present {
-        return Ok(());
+        return Ok(false);
     }
     let array = array_mut(document, "safe", "ips")?;
     if add {
@@ -284,14 +292,14 @@ fn edit_allow(
             value.as_str().and_then(parse_ip_cidr_strict) != Some(identity)
         });
     }
-    Ok(())
+    Ok(true)
 }
 
 fn replace_sources(
     document: &mut DocumentMut,
     existing: &[String],
     requested: &[String],
-) -> Result<(), AppError> {
+) -> Result<bool, AppError> {
     let old_identities = existing
         .iter()
         .map(|url| normalized_url(url).map(|url| url.to_string()))
@@ -301,7 +309,7 @@ fn replace_sources(
         .map(|url| normalized_url(url).map(|url| url.to_string()))
         .collect::<Result<Vec<_>, _>>()?;
     if old_identities == identities {
-        return Ok(());
+        return Ok(false);
     }
     if identities.iter().collect::<BTreeSet<_>>().len() != identities.len() {
         return Err(edit_error(
@@ -340,20 +348,20 @@ fn replace_sources(
             array.push_formatted(value);
         }
     }
-    Ok(())
+    Ok(true)
 }
 
 fn replace_allow(
     document: &mut DocumentMut,
     existing: &[CanonicalCidr],
     requested: &[String],
-) -> Result<(), AppError> {
+) -> Result<bool, AppError> {
     let identities = requested
         .iter()
         .map(|target| canonical_target(target))
         .collect::<Result<BTreeSet<_>, _>>()?;
     if existing.iter().copied().collect::<BTreeSet<_>>() == identities {
-        return Ok(());
+        return Ok(false);
     }
     let array = array_mut(document, "safe", "ips")?;
     let trailing_owner = array
@@ -387,7 +395,7 @@ fn replace_allow(
             array.push_formatted(value);
         }
     }
-    Ok(())
+    Ok(true)
 }
 
 pub(crate) fn retain_array_values(array: &mut Array, mut retain: impl FnMut(&Value) -> bool) {
@@ -746,6 +754,22 @@ mod tests {
             ),
             Err(AppError::ConfigurationEdit { .. })
         ));
+    }
+
+    #[test]
+    fn setup_with_equivalent_inputs_preserves_original_values_and_trailing_bytes() {
+        let original = CONFIG.trim_end_matches('\n');
+        let saved = Config::from_toml_str(original).expect("valid config");
+        let edit = ConfigurationEdit::SetBasic {
+            enable_ipv6: saved.ipset.enable_ipv6,
+            include_github_meta: saved.safe.include_github_meta,
+            remote_urls: vec!["http://example.test/feed".into()],
+            safe_ips: vec!["203.0.113.17/24".into()],
+        };
+        assert_eq!(
+            FileConfigurationManager.render(original, &edit).unwrap(),
+            original
+        );
     }
 
     #[test]

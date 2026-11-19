@@ -36,6 +36,24 @@ impl<R> FlushBackend for CommandFlushBackend<R>
 where
     R: FirewallCommandRunner + IpsetCommandRunner,
 {
+    fn check_cleanup_tools(&self) -> Result<(), String> {
+        for tool in ["ipset", "iptables", "ip6tables"] {
+            let result = match tool {
+                "ipset" => IpsetCommandRunner::run(&self.runner, tool, &["version"]),
+                _ => FirewallCommandRunner::run(&self.runner, tool, &["-V"]),
+            }
+            .map_err(|error| format!("full flush requires {tool}: {error}"))?;
+            if !result.status.success() {
+                return Err(format!(
+                    "full flush requires {tool}: version check failed ({:?}): {}",
+                    result.status,
+                    result.stderr.trim()
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn cleanup_firewall(&self, family: AppFirewallFamily) -> Result<(), String> {
         let family = match family {
             AppFirewallFamily::Ipv4 => FirewallFamily::Ipv4,
