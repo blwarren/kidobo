@@ -457,7 +457,7 @@ asks for confirmation and leaves firewall and ipset state unchanged.
   effective resource that supplied the cached representation. Old caches without that identity
   remain eligible for fallback during a full refresh. If cache
   staging fails and no validated fallback exists, sync stops before replacing
-  either set. Remote HTTP bodies default to an 8 MiB limit; the
+  either set. Remote blocklist downloads default to a 16 MiB limit. The
   `KIDOBO_MAX_HTTP_BODY_BYTES` override is capped at 32 MiB, while GitHub
   metadata remains capped at 8 MiB. Normalized remote lists must fit within
   16 MiB, even when the HTTP body limit is higher. An oversized normalized

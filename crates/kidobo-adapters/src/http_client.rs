@@ -16,7 +16,7 @@ use crate::hash::sha256_hex;
 use crate::limited_io::read_to_end_with_limit;
 
 /// Default maximum accepted HTTP response body size.
-pub const DEFAULT_MAX_HTTP_BODY_BYTES: usize = 8 * 1024 * 1024;
+pub const DEFAULT_MAX_HTTP_BODY_BYTES: usize = 16 * 1024 * 1024;
 /// Hard ceiling for the HTTP response body environment override.
 pub const MAX_HTTP_BODY_BYTES: usize = 32 * 1024 * 1024;
 /// Environment variable that overrides the maximum HTTP body size when valid Unicode and positive.

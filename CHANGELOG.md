@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Raise the default download limit for each remote blocklist from 8 MiB to 16 MiB.
 
 ## [0.15.4] - 2026-11-19
 

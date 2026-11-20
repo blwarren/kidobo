@@ -1208,7 +1208,7 @@ mod tests {
             let requests = client.requests();
             assert_eq!(requests.len(), 1);
             assert_eq!(requests[0].if_none_match.as_deref(), Some("seed-etag"));
-            assert_eq!(requests[0].max_body_bytes, DEFAULT_MAX_HTTP_BODY_BYTES);
+            assert_eq!(requests[0].max_body_bytes, 16 * 1024 * 1024);
             assert_eq!(snapshot(temp.path()), before);
         }
     }
