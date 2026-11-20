@@ -5,6 +5,13 @@ ipset enforcement; `flush` removes managed enforcement. Run the commands below
 on the intended Linux host with the required privileges. For configuration keys
 and paths, see [Configuration](configuration.md).
 
+- [Set up Kidobo](#first-setup) or [manage the sync timer](#scheduling).
+- [Add or remove a ban](#add-and-remove-bans) or [edit feeds and exemptions](#manage-feeds-and-exemptions).
+- [Preview a sync](#preview-a-sync) or [apply changes](#apply-routine-changes).
+- [Check live enforcement and saved bans](#inspect-live-state-and-saved-bans) or [find offline source matches](#find-offline-source-matches).
+- [Read the logs](#logs-and-output-formats) or [troubleshoot a failed command](#when-a-command-fails).
+- [Remove managed enforcement](#remove-managed-enforcement) or [uninstall Kidobo](#uninstall-safely).
+
 File inputs, including `--file` target lists, configuration, local sources, and
 caches, must resolve to regular files. Symlinks to regular files are supported;
 named pipes, sockets, directories, and devices are rejected. Save streamed
@@ -349,20 +356,49 @@ file.
 
 ## Manage feeds and exemptions
 
-Use `kidobo sources list`, `kidobo allow list`, and `kidobo config show` to
-inspect saved configuration. `kidobo config path` locates the file, including
-before initialization. To save a feed or exemption:
+Feed and safelist commands edit `remote.urls` and `safe.ips` in the saved
+configuration. A manual or scheduled sync applies the changes.
+`kidobo config path` prints the selected file path even before initialization.
+With an existing valid file, `sudo kidobo config show`
+displays effective values, their origins, and defaults. It redacts URL
+credentials and query or fragment values.
+
+### Remote feeds
+
+Run `sudo kidobo sources list` (or `sudo kidobo sources`) to see configured
+URLs and validated cache availability. The listing is offline. Refresh time
+is unknown when Kidobo has no reliable record of the last refresh.
+
+To add a feed, replace the example URL with the feed you want to use.
 
 ```bash
 sudo kidobo sources add https://example.org/feed.txt
+```
+
+To remove it later, use `sudo kidobo sources remove URL` with the original
+feed URL. Adding or removing a URL leaves fetching and cache refresh to sync.
+
+### Safelist exemptions
+
+Run `sudo kidobo allow list` (or `sudo kidobo allow`) to see the saved
+exemptions. To exempt an address, add it to the safelist.
+
+```bash
 sudo kidobo allow add 203.0.113.7
 ```
 
-Replace the example URL with your chosen feed. Additions that expand safelist
-coverage require confirmation; use `--yes` when approving one in automation.
-Source and allow edits do not fetch data or change enforcement. Run
-`sudo kidobo sync` to apply them. See [configuration management](configuration.md#managing-configured-sources-and-exemptions)
-for removal rules, overlapping exemptions, and redacted configuration display.
+Adding an address or CIDR that expands coverage asks for confirmation in a
+terminal. Use `--yes` to approve it in automation. An exact canonical duplicate
+leaves the list unchanged. If a broader range already covers the address,
+Kidobo saves the narrower exemption without prompting, so it can remain exempt
+if you remove the broader range later.
+
+`sudo kidobo allow remove 203.0.113.7` removes the exact canonical entry.
+If `203.0.113.0/24` is also on the safelist, that range still exempts the
+address. Removal never splits a wider CIDR.
+
+After editing either list, [preview the sync](#preview-a-sync) if desired,
+then run `sudo kidobo sync` when you are ready to apply the saved changes.
 
 ## Shell completions
 
@@ -460,13 +496,19 @@ before deciding whether to retry.
 
 ## Uninstall safely
 
-After a successful flush, uninstall recursively deletes the configuration,
-data, and cache directories, including the local blocklist and temporary bans.
-Back up any files you want to retain before starting uninstall.
+Uninstall flushes live Kidobo enforcement, then removes the binary and the
+configuration, data, and cache directories, including the local blocklist and
+temporary bans. Back up any files you want to retain. Even with `KIDOBO_ROOT`,
+the flush acts on the current network namespace and the binary is removed
+from `KIDOBO_INSTALL_DIR` (default `/usr/local/bin`). Wait for active syncs to
+finish and avoid starting other Kidobo commands during uninstall.
 
-Do not start manual Kidobo commands while uninstall is running. Host uninstall
-checks the full-flush tools before stopping a timer. On a confirmed non-systemd
-boot it can proceed when the Kidobo timer is not enabled. If enablement remains,
+```bash
+curl -fsSL https://raw.githubusercontent.com/blwarren/kidobo/main/scripts/install.sh | sudo bash -s -- --uninstall
+```
+
+Host uninstall checks the full-flush tools before stopping a timer. On a
+confirmed non-systemd boot it can proceed when the Kidobo timer is not enabled. If enablement remains,
 resolve the reported scheduling state and retry. On a systemd host, uninstall
 records whether the timer is active and stops scheduling
 before checking that the service has no active run or pending job. It aborts
@@ -484,10 +526,7 @@ artifact removal, it restarts the timer only when it was previously active
 and reports any restoration failure.
 
 With `KIDOBO_ROOT`, uninstall skips host systemd operations and removes the
-runtime files and two managed unit files under the selected root. Its full
-flush still acts on the live firewall in the process's network namespace,
-using the selected root's configuration. The binary path is independent of
-`KIDOBO_ROOT`: uninstall removes `kidobo` from `KIDOBO_INSTALL_DIR`, which
-defaults to `/usr/local/bin`. Alternate-root cleanup rejects symlinked
+runtime files and two managed unit files under the selected root. The flush
+uses that root's configuration. Alternate-root cleanup rejects symlinked
 intermediate systemd and cache directories and aborts if the root or unit
 directory changes during flush.
