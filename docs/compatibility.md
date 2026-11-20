@@ -101,8 +101,8 @@ creating the file.
 
 `setup` is an interactive terminal workflow. When stdin or stdout is not a
 terminal, it prints guidance and exits with usage status without writing setup
-files. Its final review precedes configuration writes, existing configuration
-is preserved, and the initial sync is a separate confirmation after
+files. Confirming the final review saves the selected changes and preserves unrelated
+settings. The initial sync requires a separate confirmation after
 provisioning and a successful `doctor` run. `init` remains available for the
 existing provisioning interface. At default paths, setup asks separately
 whether to enable the scheduled timer after the initial-sync choice; under

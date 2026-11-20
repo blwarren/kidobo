@@ -29,7 +29,7 @@ keys are optional. The defaults below apply when a key is omitted.
 | --- | --- | --- |
 | `ipset.set_name` | Required | Nonempty IPv4 set name, at most 31 characters, using only letters, digits, `_`, `-`, or `.`; must not start with `-`. |
 | `ipset.set_name_v6` | `<set_name>-v6` | Explicit names follow the IPv4 name rules and must be distinct. The derived name must fit the 31-character limit when IPv6 is enabled; supply an explicit name if needed. With IPv6 disabled, an overlong derived name is accepted. |
-| `ipset.enable_ipv6` | `true` | Boolean. When false, sync does not enforce IPv6 and cleans up managed IPv6 artifacts. |
+| `ipset.enable_ipv6` | `true` | Boolean. When false, sync skips IPv6 set updates and attempts to remove existing managed IPv6 enforcement. |
 | `ipset.chain_action` | `DROP` | `DROP` or `REJECT` (case insensitive). |
 | `ipset.set_type` | `hash:net` | Nonempty ipset type using only letters, digits, `:`, `,`, `_`, `-`, or `.`; `hash:net` is the supported managed type. |
 | `ipset.hashsize` | `65536` | Positive power of two fitting in a 32-bit unsigned integer. |
@@ -41,8 +41,11 @@ connection-tracking exemption in the reply direction. No setting is needed to
 preserve replies to server-initiated requests. Existing client-initiated sessions
 remain subject to bans. See [Operations](operations.md) for ban coverage.
 
-With IPv6 disabled, sync and flush still remove managed IPv6 firewall wiring
-and any valid configured IPv6 set. If the derived IPv6 name exceeds 31
+With IPv6 disabled, sync attempts to remove managed IPv6 firewall wiring,
+then the configured IPv6 set. If wiring cleanup fails, sync warns and retains
+the set. Existing IPv6 blocking can continue even when sync exits successfully.
+Full `flush` also attempts this cleanup and reports incomplete cleanup as a failure.
+If the derived IPv6 name exceeds 31
 characters, cleanup skips that impossible set name without reporting a failure.
 Explicit IPv6 names must always satisfy the name rules, even with IPv6 disabled.
 

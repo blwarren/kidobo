@@ -97,8 +97,10 @@ statistical significance. Keep datasets and machine load comparable. Use
 
 ## Publication
 
-Authenticate GitHub CLI with `gh auth login`, then run `just publish-release X.Y.Z` from a clean
-branch. The publisher installs the pinned deny, audit, and coverage tools before validation.
+Authenticate GitHub CLI with `gh auth login` and ensure local `main` contains every change
+intended for the release. Run `just publish-release X.Y.Z` from a clean checkout. The publisher
+switches to local `main` and requires it to include the current `origin/main` before preparing
+the candidate. It installs the pinned deny, audit, and coverage tools before validation.
 Publication requires a Linux x86_64 host. Release builds require `musl-gcc` and the pinned
 `x86_64-unknown-linux-musl` Rust target. The compatibility gate additionally
 requires `readelf` and Docker access; it runs only offline Kidobo commands in
@@ -152,55 +154,68 @@ refs were already pushed, use the recovery workflow below instead of retrying pu
 
 The publisher retains the archive, checksum, and release notes under
 `target/release-artifacts/<tag>/` whenever Git refs have been pushed but the GitHub release was
-not confirmed published. In that case it prints commands specialized for that release. The
-equivalent manual recovery flow after refs have been pushed is:
+not confirmed published. Use the repository and tag printed by the publisher. From the checkout
+root, set `RELEASE_TAG` and run these blocks in the same Bash session.
 
 ```bash
-release_tag="${RELEASE_TAG:?set RELEASE_TAG to vX.Y.Z}"
+release_tag="${RELEASE_TAG:?set RELEASE_TAG to the pushed tag}"
+release_repo="${RELEASE_REPO:-blwarren/kidobo}"
 release_artifacts="target/release-artifacts/${release_tag}"
-release_archive="kidobo-${release_tag}-linux-x86_64.tar.gz"
-
-gh release view "${release_tag}" --repo blwarren/kidobo
-
-# Use this only when no draft exists.
-gh release create "${release_tag}" \
-    "${release_artifacts}/${release_archive}" \
-    "${release_artifacts}/SHA256SUMS" \
-    --repo blwarren/kidobo \
-    --draft \
-    --verify-tag \
-    --title "${release_tag}" \
-    --notes-file "${release_artifacts}/release-notes.md"
-
-# Use this instead when the draft already exists.
-gh release upload "${release_tag}" \
-    "${release_artifacts}/${release_archive}" \
-    "${release_artifacts}/SHA256SUMS" \
-    --repo blwarren/kidobo \
-    --clobber
-
-release_downloads="${release_artifacts}/downloaded"
-mkdir -p "${release_downloads}"
-gh release download "${release_tag}" \
-    --repo blwarren/kidobo \
-    --dir "${release_downloads}" \
-    --clobber \
-    --pattern "${release_archive}" \
-    --pattern SHA256SUMS
-cmp "${release_artifacts}/SHA256SUMS" "${release_downloads}/SHA256SUMS"
-(cd "${release_downloads}" && sha256sum --check SHA256SUMS)
-tar -tzf "${release_downloads}/${release_archive}"
-release_extract="${release_downloads}/extracted"
-mkdir -p "${release_extract}"
-tar -C "${release_extract}" -xzf "${release_downloads}/${release_archive}"
-"${release_extract}/kidobo-${release_tag}-linux-x86_64/kidobo" --version
-gh release edit "${release_tag}" \
-    --repo blwarren/kidobo \
-    --draft=false \
-    --latest
+release_root="kidobo-${release_tag}-linux-x86_64"
+release_archive="${release_root}.tar.gz"
+create_flags=()
+publish_flags=()
+if [[ "${release_tag}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    publish_flags+=(--latest)
+else
+    create_flags+=(--prerelease)
+fi
+gh release view "${release_tag}" --repo "${release_repo}" --json url,isDraft
 ```
 
-Before the final edit, confirm that the archive listing contains only the binary,
-README, and license under the expected top-level directory, and that the version
-output matches the tag. For a suffixed prerelease, add `--prerelease` when
-creating the draft and omit `--latest` when publishing it.
+If the release is already published, recovery is complete. If GitHub confirms that the release
+is absent, create the draft. Resolve authentication or network errors before proceeding.
+
+```bash
+gh release create "${release_tag}" \
+    "${release_artifacts}/${release_archive}" "${release_artifacts}/SHA256SUMS" \
+    --repo "${release_repo}" --draft --verify-tag --title "${release_tag}" \
+    --notes-file "${release_artifacts}/release-notes.md" "${create_flags[@]}"
+```
+
+If a draft already exists, replace its assets.
+
+```bash
+if [[ "$(gh release view "${release_tag}" --repo "${release_repo}" --json isDraft --jq .isDraft)" == true ]]; then
+    gh release upload "${release_tag}" \
+        "${release_artifacts}/${release_archive}" "${release_artifacts}/SHA256SUMS" \
+        --repo "${release_repo}" --clobber
+fi
+```
+
+After a successful create or upload, run the following block when ready to publish. It downloads
+the draft assets into a fresh directory under the retained artifacts and stops on any failed check.
+
+```bash
+(
+    set -euo pipefail
+    [[ "$(gh release view "${release_tag}" --repo "${release_repo}" --json isDraft --jq .isDraft)" == true ]]
+    release_downloads="$(mktemp -d "${release_artifacts}/downloaded-XXXXXXXX")"
+    gh release download "${release_tag}" --repo "${release_repo}" --dir "${release_downloads}" \
+        --pattern "${release_archive}" --pattern SHA256SUMS
+    cmp "${release_artifacts}/SHA256SUMS" "${release_downloads}/SHA256SUMS"
+    cd "${release_downloads}"
+    sha256sum --check SHA256SUMS
+    printf '%s\n' "${release_root}/" "${release_root}/LICENSE" \
+        "${release_root}/README.md" "${release_root}/kidobo" | LC_ALL=C sort > expected-listing
+    tar -tzf "${release_archive}" | LC_ALL=C sort > actual-listing
+    diff -u expected-listing actual-listing
+    tar -xzf "${release_archive}"
+    actual_version="$("./${release_root}/kidobo" --version)"
+    if [[ "${actual_version}" != "kidobo ${release_tag#v}" ]]; then
+        echo "Unexpected binary version: ${actual_version}" >&2
+        exit 1
+    fi
+    gh release edit "${release_tag}" --repo "${release_repo}" --draft=false "${publish_flags[@]}"
+)
+```

@@ -115,7 +115,7 @@ failures may remain soft only where the workflow explicitly documents and tests 
 
 The application sync use case explicitly preserves this order:
 
-1. Resolve paths and validate config before acquiring the nonblocking lock,
+1. Resolve paths and validate config before acquiring the nonblocking storage-root lock,
    preserving configuration-error precedence. Discard this preliminary snapshot.
 2. Capture the temporary-ban cutoff time, then reload config under the lock.
    Use only this locked revision for sources and enforcement. Secure the remote
@@ -123,7 +123,8 @@ The application sync use case explicitly preserves this order:
    port, then load/validate temporary state once before preparing firewall artifacts.
    A failed config reload aborts without source, cache, or firewall work; a storage
    permission failure aborts before source loading or firewall preparation.
-3. Ensure sets and chains without activating new wiring.
+3. Acquire the firewall lock shared across storage roots in the same network namespace,
+   then ensure sets and chains without activating new wiring.
 4. Load every registered source and apply provider failure policy. Temporary
    IP and ASN entries are active only when `expires_at` is later than the
    captured cutoff; their source edits become eligible at this sync boundary.
@@ -134,9 +135,9 @@ The application sync use case explicitly preserves this order:
 7. Promote every accepted staged cache manifest; any promotion failure aborts.
 8. Atomically replace IPv6, then IPv4.
 9. Activate and normalize fail-closed firewall wiring.
-10. Best-effort clean disabled-family artifacts and prune expired temporary
-    entries after enforcement succeeds.
-11. Release the lock before logging the final outcome.
+10. Attempt disabled-family cleanup, then release the firewall lock. Prune expired
+    temporary entries under the storage-root lock. Cleanup and pruning are best effort.
+11. Release the storage-root lock before logging the final outcome.
 
 Temporary-ban file writes are bounded and atomic. They do not modify the local
 blocklist or `[asn].banned`. Expiration is evaluated at the sync cutoff, so an
@@ -214,9 +215,11 @@ source semantics and both enabled-family capacities pass, and before either set 
 `v2/remote/<url-hash>/generations/<sha256>/`; GitHub metadata is stored below
 `v2/github-meta/generations/<sha256>/`. Each manifest names a current and optional previous generation.
 
-Readers validate the manifest, generation identifiers, bounded members, configured URL, checksums, and
-GitHub category scope before accepting data. They try current, then previous, then the legacy flat-file
-layout. New writes use only v2, while legacy files remain readable and unchanged for compatibility.
+Generation readers validate the manifest, generation identifiers, bounded members, and checksums.
+Sync and preview check remote feeds against their configured URLs and GitHub metadata against its
+configured category scope. Offline lookup enumerates cached remote feeds independently of the current
+feed list, so a removed feed can still produce a match. Readers try the current generation, then
+the previous generation, then the legacy flat-file layout. New writes use only v2, while legacy files remain readable and unchanged for compatibility.
 Promotion selects the current and optional previous generations; removing other generations is best effort,
 so extra unselected directories can remain after success. Incomplete or unselected staging directories are
 never selected and are removed opportunistically by online cache work. Normal cache flush removes the

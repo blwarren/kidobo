@@ -111,6 +111,11 @@ Diagnostic capture uses GNU coreutils `head` and `stdbuf`. Candidate launcher us
 Image discovery uses `curl`; vendor-image processing also requires `gpg` and `qemu-img`.
 The suite never installs these host tools automatically.
 
+Candidate runs require host HTTPS access to the GitHub releases API, raw installer source, and
+release assets. Before starting VMs, the coordinator selects an earlier stable release and
+downloads its installer, checksum manifest, and archive for upgrade testing. Supplying a local
+candidate archive still requires these baseline downloads.
+
 After joining `incus-admin`, start a fresh login session. In an existing terminal, a command can
 use the new group membership with:
 
@@ -263,7 +268,7 @@ packager in a unique directory under `target/e2e-candidate/<tag>/`. Supplying `-
 from scratch. `just e2e-artifact ARCHIVE TAG` accepts exactly those two arguments and selects
 all required targets. No prior success substitutes for a check in the current run.
 
-Each guest serves the frozen archive through a local HTTP fixture and uses the real installer,
+Each candidate guest serves the frozen archive through a local HTTP fixture and uses the real installer,
 including checksum verification, extraction, and replacement. `KIDOBO_RELEASE_BASE_URL` selects
 this fixture directory and requires an explicit installer `--version`; ordinary installation
 continues to use GitHub. The publisher tests its packaged archive without rebuilding it and

@@ -38,7 +38,9 @@
 
 - Redact URL credentials and query/fragment values from doctor JSON configuration-error diagnostics
   and accepted alternative HTTP(S) URL spellings in CLI output and logs.
-- Redact complete feed URLs in fetch diagnostics and offline lookup source labels, including TSV exports.
+- Redact credentials, queries, and fragments in feed URLs shown in fetch diagnostics and
+  offline lookup source labels, including TSV exports. Hostnames and paths remain visible
+  for ordinary feed URLs.
 
 ## [0.15.3] - 2026-11-11
 
@@ -305,9 +307,10 @@
 - `kidobo init` now generates default systemd units only when `kidobo` is
   installed at `/usr/local/bin/kidobo` or `/usr/bin/kidobo`, preventing broken
   `ExecStart` entries from arbitrary build paths.
-- Remote feed, GitHub meta, and ASN cache writes now use atomic replacement,
-  and cache readers now reject hash-mismatched or malformed cached content
-  instead of silently reusing partial or corrupted cache state.
+- Remote feed, GitHub meta, and ASN cache writes now use atomic replacement.
+  Remote feed and GitHub meta readers reject cached bodies whose checksums
+  disagree with stored metadata. ASN cache readers reject malformed prefix
+  entries. Remote feed readers still skip malformed lines.
 
 ### Changed
 

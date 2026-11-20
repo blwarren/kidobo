@@ -20,8 +20,8 @@ configuration alone does not change the firewall; `sync` applies those changes.
   replacing either set. Each `ipset` replacement is atomic; the IPv4 and IPv6
   replacements are separate operations.
 - It establishes new firewall enforcement before removing old managed rules.
-  A failed source refresh uses a compatible validated cache when available;
-  errors that prevent a safe update stop `sync` with a nonzero exit status.
+  If a feed fetch fails, Kidobo uses a compatible validated cache when available.
+  Without one, sync can succeed with that feed omitted.
 
 Kidobo creates a managed chain for each enabled family and a jump to it from
 `INPUT`. `doctor` checks the host without changing firewall state, and `lookup`
@@ -60,7 +60,11 @@ At host paths, `--init` supports `/usr/local/bin/kidobo` or `/usr/bin/kidobo`
 when the former does not take precedence. For a custom binary-only install, set
 `KIDOBO_INSTALL_DIR` and omit `--init`.
 
-Uninstall:
+Uninstall removes live Kidobo enforcement, the installed binary, and the
+configuration, data, and cache directories. Even with `KIDOBO_ROOT`, uninstall
+flushes the current network namespace and removes the binary from `KIDOBO_INSTALL_DIR`
+(default `/usr/local/bin`). Back up any configuration and saved bans you want to keep. See [uninstalling safely](docs/operations.md#uninstall-safely)
+for custom paths and timer handling.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/blwarren/kidobo/main/scripts/install.sh | sudo bash -s -- --uninstall
@@ -178,8 +182,8 @@ subcommand also opens the status view.
 Inspect saved bans and offline source overlaps:
 
 ```bash
-kidobo bans
-kidobo lookup 203.0.113.7
+sudo kidobo bans
+sudo kidobo lookup 203.0.113.7
 ```
 
 `bans` lists operator-managed entries; `lookup` reports local and cached source

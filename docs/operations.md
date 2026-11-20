@@ -134,8 +134,8 @@ At default paths, `init` requires an installed binary at
 `/usr/local/bin/kidobo` or `/usr/bin/kidobo` for its generated service.
 The generated `Type=oneshot` service runs `kidobo sync`; its timer starts two
 minutes after boot and schedules another run one hour after the service was
-last active. The timer is persistent. The generated service writes journal
-format logs. To inspect scheduling and the most recent service run, use:
+last activated. Missed hourly runs during downtime are not replayed. The generated
+service writes journal format logs. To inspect scheduling and the most recent service run, use:
 
 ```bash
 systemctl status kidobo-sync.timer
@@ -328,12 +328,8 @@ source edit becomes eligible at the next sync. A ban that expires before its
 first sync is never enforced. Expiration takes effect when a later sync
 successfully replaces the relevant set; delayed or failed syncs can prolong
 enforcement, and another source can continue to block the same address.
-After a fully successful enforcement run, Kidobo
-best-effort removes expired records. Failed enforcement can leave one address
-family updated because IPv4 and IPv6 set replacements are separate. If a permanent source
-edit reports a directory-sync failure, retry the same ban or unban command.
-The changed file can already be visible. The retry confirms durability before
-starting a requested sync.
+After a fully successful enforcement run, Kidobo attempts to remove expired records.
+A failed sync can leave one family updated because IPv4 and IPv6 are replaced separately.
 
 With a nonzero `ipset.timeout`, the kernel timeout remains in force for every
 set entry. Kidobo warns when adding or renewing a temporary ban and during a
@@ -416,7 +412,10 @@ asks for confirmation and leaves firewall and ipset state unchanged.
   response, or rejected redirect does not replace good cache data. A cached
   feed containing data lines with zero valid entries is unusable as a fallback. Redirects
   are limited to ten hops and the configured URL's origin. Kidobo
-  warns and uses a compatible validated cache when available. A whitespace-
+  warns and uses a compatible validated cache when available. If a fetch or
+  response validation fails without usable cache data, sync can proceed without
+  that source. Addresses blocked only by the omitted feed can lose coverage,
+  and addresses exempted only by GitHub metadata can become blocked. A whitespace-
   or comment-only HTTP 200 feed is an intentional empty feed. Other success statuses, including
   HTTP 202 and 204, cannot publish an empty replacement. Conditional requests apply to the
   effective resource that supplied the cached representation. Old caches without that identity
@@ -461,6 +460,10 @@ before deciding whether to retry.
 
 ## Uninstall safely
 
+After a successful flush, uninstall recursively deletes the configuration,
+data, and cache directories, including the local blocklist and temporary bans.
+Back up any files you want to retain before starting uninstall.
+
 Do not start manual Kidobo commands while uninstall is running. Host uninstall
 checks the full-flush tools before stopping a timer. On a confirmed non-systemd
 boot it can proceed when the Kidobo timer is not enabled. If enablement remains,
@@ -478,8 +481,13 @@ remain visible. Standalone interactive `kidobo flush` still asks for confirmatio
 A missing binary, invalid configuration, held lock, or
 cleanup failure preserves the installed files. If uninstall fails before
 artifact removal, it restarts the timer only when it was previously active
-and reports any restoration failure. With `KIDOBO_ROOT`, uninstall skips host
-systemd operations and applies cleanup to the selected root.
-Alternate-root cleanup rejects symlinked intermediate systemd and cache directories and
-aborts if the root or unit directory changes during flush. It removes only
-the managed unit names, preserving unrelated units.
+and reports any restoration failure.
+
+With `KIDOBO_ROOT`, uninstall skips host systemd operations and removes the
+runtime files and two managed unit files under the selected root. Its full
+flush still acts on the live firewall in the process's network namespace,
+using the selected root's configuration. The binary path is independent of
+`KIDOBO_ROOT`: uninstall removes `kidobo` from `KIDOBO_INSTALL_DIR`, which
+defaults to `/usr/local/bin`. Alternate-root cleanup rejects symlinked
+intermediate systemd and cache directories and aborts if the root or unit
+directory changes during flush.

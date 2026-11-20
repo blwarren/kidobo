@@ -17,10 +17,11 @@ it with `RUSTUP_TOOLCHAIN=1.97.1 just test` when changing toolchain compatibilit
 new scripts or documentation. See the [command reference](../scripts/README.md) for prerequisites,
 available recipes, and release recovery.
 
-From the checkout root, install the pinned task runner and validation tools, then check the
-checkout. These tool versions follow the repository's [release-age policy](dependency-release-age.md).
+From the checkout root, enable the repository's Git hooks for this clone, install the pinned
+tools, and run the checks. Tool versions follow the [release-age policy](dependency-release-age.md).
 
 ```bash
+git config --local core.hooksPath .githooks
 cargo install --locked just --version 1.55.1
 just _install-cooldown _install-deny _install-audit
 just check
@@ -170,7 +171,9 @@ Do not bump versions or create tags unless explicitly requested. When requested,
 `Cargo.lock`, README install examples, and tag-named release notes aligned.
 
 Publication is a separate, explicitly requested operation. Authenticate GitHub CLI with
-`gh auth login`, then use `just publish-release X.Y.Z` from a clean branch. The publisher prepares
+`gh auth login`, then run `just publish-release X.Y.Z` from a clean checkout with all intended
+release changes on local `main`. The publisher selects local `main` as its source even when
+invoked from another branch. It prepares
 and validates a candidate in a temporary worktree, asks for confirmation, pushes the release commit
 and tag atomically, verifies uploaded assets, and publishes the release. Every attempt runs its
 selected gates; prior validation does not qualify a new attempt. See
