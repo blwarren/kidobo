@@ -63,7 +63,7 @@ feed. See [sync warnings and recovery](docs/operations.md#when-a-command-fails).
 This example installs a specific binary release with the installer from `main`.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/blwarren/kidobo/main/scripts/install.sh | sudo bash -s -- --version v0.15.4
+curl -fsSL https://raw.githubusercontent.com/blwarren/kidobo/main/scripts/install.sh | sudo bash -s -- --version v0.15.5
 ```
 
 To pin the installer as well, replace both occurrences of `vX.Y.Z` with the same

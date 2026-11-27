@@ -954,7 +954,7 @@ dependencies = [
 
 [[package]]
 name = "kidobo"
-version = "0.15.4"
+version = "0.15.5"
 dependencies = [
  "clap",
  "clap_complete",
