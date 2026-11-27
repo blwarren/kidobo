@@ -36,7 +36,7 @@ terminal_size = "=0.4.4"
 unicode-width = "=0.2.2"
 unicode-segmentation = "=1.13.3"
 toml_edit = { version = "0.25", features = ["serde"] }
-url = "2.5"
+url = "2.5.9"
 
 [workspace.lints.rust]
 dead_code = "deny"
